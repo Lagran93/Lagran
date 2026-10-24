@@ -209,7 +209,7 @@ pub async fn proxy_handler(
                 return (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response();
             }
             Ok(Ok((status, headers, body))) => {
-                state.metrics.record_bypass(body.len() as u64);
+                state.metrics.record_bypass(&host, body.len() as u64).await;
                 let resp = build_response(status, headers, body, "BYPASS", &cors, &custom_headers);
                 log_access(
                     &state.access_log,
@@ -234,13 +234,13 @@ pub async fn proxy_handler(
         let etag = compute_etag(&entry);
         if let Some(ref client_etag) = inm {
             if client_etag.trim() == etag || client_etag.trim() == format!("W/{etag}") {
-                state.metrics.record_hit(0);
+                state.metrics.record_hit(&host, 0).await;
                 log_access(&state.access_log, &method, &host, &path_only, 304, start).await;
                 return not_modified_response(&etag);
             }
         }
         tracing::debug!(%key, %host, "cache HIT");
-        state.metrics.record_hit(entry.body.len() as u64);
+        state.metrics.record_hit(&host, entry.body.len() as u64).await;
         let resp = entry_to_response(entry, "HIT", &etag, &cors, &custom_headers);
         log_access(&state.access_log, &method, &host, &path_only, 200, start).await;
         return resp;
@@ -264,7 +264,7 @@ pub async fn proxy_handler(
             if (200..300).contains(&entry.status) && ttl > 0 {
                 state.cache.set(&key, entry.clone(), ttl).await;
             }
-            state.metrics.record_miss(bytes);
+            state.metrics.record_miss(&host, bytes).await;
             let status = entry.status;
             let resp = entry_to_response(entry, "MISS", &etag, &cors, &custom_headers);
             log_access(&state.access_log, &method, &host, &path_only, status, start).await;

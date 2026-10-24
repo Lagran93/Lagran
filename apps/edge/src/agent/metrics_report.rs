@@ -1,4 +1,4 @@
-//! Flush local counters to control plane
+//! Flush per-domain counters to control plane
 
 use crate::config::EdgeConfig;
 use crate::metrics::EdgeMetrics;
@@ -24,27 +24,39 @@ pub fn spawn_metrics_report(config: EdgeConfig, metrics: Arc<EdgeMetrics>) {
             config.control_url.trim_end_matches('/')
         );
         let interval = Duration::from_secs(15);
-        tracing::info!(%url, "metrics reporter started");
+        tracing::info!(%url, "metrics reporter started (per-domain)");
 
         loop {
             tokio::time::sleep(interval).await;
-            let (requests, hits, misses, bytes) = metrics.take_snapshot();
-            if requests == 0 && hits == 0 && misses == 0 {
+            let snaps = metrics.take_snapshots().await;
+            if snaps.is_empty() {
                 continue;
             }
-            let body = json!({
-                "node_id": config.node_id,
-                "domain": config.domain,
-                "requests": requests,
-                "cache_hits": hits,
-                "cache_misses": misses,
-                "bytes_sent": bytes,
-            });
-            if let Err(e) = post_json(&client, &url, &body, &config.agent_token).await {
-                tracing::warn!(error = %e, "metrics report failed");
-                // put counters back roughly by re-adding (best-effort lost on failure)
-            } else {
-                tracing::debug!(requests, hits, misses, "metrics reported");
+            for s in snaps {
+                // Prefer real host from traffic; fallback EDGE_DOMAIN only if unknown
+                let domain = if s.domain == "(unknown)" && !config.domain.is_empty() {
+                    config.domain.clone()
+                } else {
+                    s.domain.clone()
+                };
+                let body = json!({
+                    "node_id": config.node_id,
+                    "domain": domain,
+                    "requests": s.requests,
+                    "cache_hits": s.cache_hits,
+                    "cache_misses": s.cache_misses,
+                    "bytes_sent": s.bytes_sent,
+                });
+                if let Err(e) = post_json(&client, &url, &body, &config.agent_token).await {
+                    tracing::warn!(error = %e, domain = %domain, "metrics report failed");
+                } else {
+                    tracing::debug!(
+                        domain = %domain,
+                        requests = s.requests,
+                        hits = s.cache_hits,
+                        "metrics reported"
+                    );
+                }
             }
         }
     });

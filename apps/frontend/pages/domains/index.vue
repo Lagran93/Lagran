@@ -1,21 +1,34 @@
 <template>
   <div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.25rem;">
-      <p class="muted" style="margin:0;">接入待加速域名，每个域名可配置独立源站</p>
+      <p class="muted" style="margin:0;">接入待加速域名，每个域名可配置独立源站并归属项目</p>
       <button class="btn" @click="showForm = !showForm">接入域名</button>
     </div>
 
     <div v-if="showForm" class="card" style="margin-bottom:1.25rem;">
       <h3 style="margin-top:0;">接入加速域名</h3>
-      <p class="muted" style="font-size:0.85rem;">用户 DNS 将域名 CNAME/A 到边缘节点后，须在此完成接入，否则将看到「域名未接入」提示页。</p>
-      <div class="form-row">
-        <input v-model="form.name" placeholder="加速域名 cdn.example.com" />
-        <input v-model="form.origin_host" placeholder="源站 origin.example.com" />
-        <input v-model.number="form.origin_port" type="number" placeholder="443" style="width:100px;" />
+      <p class="muted" style="font-size:0.85rem;">
+        用户 DNS 将域名 CNAME/A 到边缘节点后，须在此完成接入，否则将看到「域名未接入」提示页。
+      </p>
+      <div class="form-grid">
+        <label>加速域名</label>
+        <input v-model="form.name" placeholder="cdn.example.com" />
+        <label>源站主机</label>
+        <input v-model="form.origin_host" placeholder="origin.example.com" />
+        <label>端口</label>
+        <input v-model.number="form.origin_port" type="number" placeholder="443" />
+        <label>协议</label>
         <select v-model="form.origin_proto">
           <option value="https">https</option>
           <option value="http">http</option>
         </select>
+        <label>所属项目</label>
+        <select v-model="form.project_id">
+          <option value="">（不关联项目）</option>
+          <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
+        </select>
+      </div>
+      <div style="margin-top:0.75rem;">
         <button class="btn" @click="createDomain">接入</button>
       </div>
       <p v-if="formError" class="error">{{ formError }}</p>
@@ -27,7 +40,7 @@
           <tr>
             <th>加速域名</th>
             <th>源站</th>
-            <th>协议</th>
+            <th>项目</th>
             <th>状态</th>
             <th>操作</th>
           </tr>
@@ -35,12 +48,23 @@
         <tbody>
           <tr v-for="d in domains" :key="d.id">
             <td><strong>{{ d.name }}</strong></td>
-            <td class="muted">{{ d.origin_host }}:{{ d.origin_port }}</td>
-            <td>{{ d.origin_proto }}</td>
+            <td class="muted">{{ d.origin_proto }}://{{ d.origin_host }}:{{ d.origin_port }}</td>
+            <td>
+              <select
+                class="proj-select"
+                :value="d.project_id || ''"
+                @change="onProjectChange(d, ($event.target as HTMLSelectElement).value)"
+              >
+                <option value="">—</option>
+                <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
+              </select>
+            </td>
             <td><span class="badge">{{ d.status }}</span></td>
             <td>
               <button class="btn btn-ghost" @click="openSettings(d)">高级</button>
-              <button class="btn btn-ghost" @click="toggleStatus(d)">{{ d.status === 'disabled' ? '启用' : '停用' }}</button>
+              <button class="btn btn-ghost" @click="toggleStatus(d)">
+                {{ d.status === 'disabled' ? '启用' : '停用' }}
+              </button>
               <button class="btn btn-ghost" @click="editOrigin(d)">改源站</button>
               <button class="btn btn-ghost" @click="removeDomain(d.id)">删除</button>
             </td>
@@ -51,18 +75,20 @@
         </tbody>
       </table>
     </div>
-  
+
     <div v-if="settingsDomain" class="card" style="margin-top:1.25rem;">
       <h3 style="margin-top:0;">高级设置 — {{ settingsDomain.name }}</h3>
       <div class="form-col">
-        <label class="check"><input v-model="settings.ignore_query_string" type="checkbox" /> 忽略 URL 查询串（缓存键）</label>
+        <label class="check">
+          <input v-model="settings.ignore_query_string" type="checkbox" /> 忽略 URL 查询串（缓存键）
+        </label>
         <label>限流 RPS（0=不限）</label>
         <input v-model.number="settings.rate_limit_rps" type="number" />
         <label>限流突发</label>
         <input v-model.number="settings.rate_limit_burst" type="number" />
         <label>CORS 允许源（* 或逗号分隔）</label>
         <input v-model="settings.cors_origins" placeholder="*" />
-        <label>防盗链 Referer 白名单（空=关闭，逗号分隔关键字）</label>
+        <label>防盗链 Referer 白名单（空=关闭）</label>
         <input v-model="settings.hotlink_allow_referers" placeholder="example.com" />
         <label>回源超时 (ms)</label>
         <input v-model.number="settings.origin_timeout_ms" type="number" />
@@ -72,6 +98,7 @@
           <button class="btn" @click="saveSettings">保存</button>
           <button class="btn btn-ghost" @click="settingsDomain = null">关闭</button>
         </div>
+        <p class="muted" style="font-size:0.8rem;">保存后边缘节点约 15 秒内自动同步，无需停用/启用。</p>
       </div>
     </div>
   </div>
@@ -80,6 +107,7 @@
 <script setup lang="ts">
 const api = useApi()
 const domains = ref<any[]>([])
+const projects = ref<any[]>([])
 const showForm = ref(false)
 const formError = ref('')
 const form = ref({
@@ -87,35 +115,8 @@ const form = ref({
   origin_host: '',
   origin_port: 443,
   origin_proto: 'https',
-  ssl_enabled: true,
+  project_id: '',
 })
-
-async function load() {
-  try {
-    domains.value = await api.get('/api/v1/domains')
-  } catch {
-    domains.value = []
-  }
-}
-
-async function createDomain() {
-  formError.value = ''
-  if (!form.value.name || !form.value.origin_host) {
-    formError.value = '请填写加速域名与源站'
-    return
-  }
-  try {
-    await api.post('/api/v1/domains', {
-      ...form.value,
-      ssl_enabled: form.value.origin_proto === 'https',
-    })
-    showForm.value = false
-    form.value = { name: '', origin_host: '', origin_port: 443, origin_proto: 'https', ssl_enabled: true }
-    await load()
-  } catch (e: any) {
-    formError.value = e?.data?.error || e?.message || '接入失败'
-  }
-}
 
 const settingsDomain = ref<any>(null)
 const settings = ref<any>({
@@ -128,12 +129,69 @@ const settings = ref<any>({
   custom_headers: '',
 })
 
+async function load() {
+  try {
+    const [d, p] = await Promise.all([
+      api.get('/api/v1/domains'),
+      api.get('/api/v1/projects').catch(() => []),
+    ])
+    domains.value = d || []
+    projects.value = p || []
+  } catch {
+    domains.value = []
+  }
+}
+
+async function createDomain() {
+  formError.value = ''
+  if (!form.value.name.trim() || !form.value.origin_host.trim()) {
+    formError.value = '请填写域名与源站'
+    return
+  }
+  try {
+    const body: any = {
+      name: form.value.name.trim(),
+      origin_host: form.value.origin_host.trim(),
+      origin_port: form.value.origin_port || 80,
+      origin_proto: form.value.origin_proto,
+      ssl_enabled: form.value.origin_proto === 'https',
+    }
+    if (form.value.project_id) {
+      body.project_id = form.value.project_id
+    }
+    await api.post('/api/v1/domains', body)
+    form.value = {
+      name: '',
+      origin_host: '',
+      origin_port: 443,
+      origin_proto: 'https',
+      project_id: '',
+    }
+    showForm.value = false
+    await load()
+  } catch (e: any) {
+    formError.value = e?.data?.error || e?.message || '接入失败'
+  }
+}
+
+async function onProjectChange(d: any, projectId: string) {
+  try {
+    await api.put(`/api/v1/domains/${d.id}`, {
+      project_id: projectId || null,
+    })
+    await load()
+  } catch (e: any) {
+    alert(e?.data?.error || '更新项目归属失败')
+    await load()
+  }
+}
+
 async function openSettings(d: any) {
   settingsDomain.value = d
   try {
     settings.value = await api.get(`/api/v1/domains/${d.id}/settings`)
   } catch {
-    /* keep defaults */
+    /* defaults */
   }
 }
 
@@ -141,7 +199,7 @@ async function saveSettings() {
   if (!settingsDomain.value) return
   try {
     await api.put(`/api/v1/domains/${settingsDomain.value.id}/settings`, settings.value)
-    alert('已保存，边缘约 15s 内同步')
+    alert('已保存，边缘约 15s 内自动同步（无需停用/启用）')
     settingsDomain.value = null
   } catch (e: any) {
     alert(e?.data?.error || '保存失败')
@@ -198,29 +256,26 @@ onMounted(load)
 </script>
 
 <style scoped>
-.form-row {
-  display: flex;
-  gap: 0.75rem;
-  flex-wrap: wrap;
+.form-grid {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 0.5rem 0.75rem;
   align-items: center;
+  max-width: 560px;
 }
-.form-row input, .form-row select {
-  flex: 1;
-  min-width: 100px;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid #334155;
-  border-radius: 6px;
-  background: #0f172a;
-  color: #e2e8f0;
+.form-grid label { font-size: 0.85rem; color: #94a3b8; }
+.form-grid input, .form-grid select {
+  padding: 0.5rem 0.75rem; border: 1px solid #334155; border-radius: 6px;
+  background: #0f172a; color: #e2e8f0;
+}
+.proj-select {
+  padding: 0.25rem 0.5rem; border: 1px solid #334155; border-radius: 6px;
+  background: #0f172a; color: #e2e8f0; max-width: 160px;
 }
 .error { color: #f87171; font-size: 0.85rem; margin-top: 0.75rem; }
 .badge {
-  display: inline-block;
-  padding: 0.15rem 0.5rem;
-  border-radius: 999px;
-  background: rgba(56, 189, 248, 0.15);
-  color: #38bdf8;
-  font-size: 0.8rem;
+  display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px;
+  background: rgba(56, 189, 248, 0.15); color: #38bdf8; font-size: 0.8rem;
 }
 .form-col { display: flex; flex-direction: column; gap: 0.5rem; max-width: 520px; }
 .form-col label { font-size: 0.85rem; color: #94a3b8; }

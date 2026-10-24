@@ -293,6 +293,26 @@ pub async fn update(
         let proto = req.backup_origin_proto.as_deref().unwrap_or("http");
         let _ = repository::set_backup_origin(&state.pool, uid, host, port, proto).await;
     }
+    // project_id: Some("") or null-ish clears; Some(uuid) assigns
+    if let Some(ref pid) = req.project_id {
+        let project_id = if pid.is_empty() {
+            None
+        } else {
+            Some(Uuid::parse_str(pid).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: "invalid project_id".into(),
+                    }),
+                )
+            })?)
+        };
+        let _ = repository::assign_domain_project(&state.pool, uid, project_id).await;
+        // re-fetch for response
+        if let Ok(Some(r)) = repository::get_domain(&state.pool, uid).await {
+            return Ok(Json(to_dto(r)));
+        }
+    }
     Ok(Json(to_dto(row)))
 }
 
