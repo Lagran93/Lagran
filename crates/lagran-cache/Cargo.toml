@@ -1,0 +1,16 @@
+[package]
+name = "lagran-cache"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+lagran-common = { workspace = true }

@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lagran-postgres
+    environment:
+      POSTGRES_USER: lagran
+      POSTGRES_PASSWORD: lagran
+      POSTGRES_DB: lagran
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lagran"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: lagran-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Optional: etcd for config center later
+  # etcd:
+  #   image: quay.io/coreos/etcd:v3.5.16
+  #   ...
+
+volumes:
+  postgres_data:
+  redis_data:

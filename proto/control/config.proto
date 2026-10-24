@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package lagran.control;
+
+option go_package = "lagran/control";
+
+import "common/types.proto";
+
+// Configuration service between control plane and edge nodes
+
+message CacheRule {
+  string id = 1;
+  string path_pattern = 2;
+  uint64 ttl_seconds = 3;
+  int32 priority = 4;
+}
+
+message Origin {
+  string host = 1;
+  uint32 port = 2;
+  string protocol = 3; // "http" | "https"
+  string path_prefix = 4;
+}
+
+message DomainConfig {
+  string id = 1;
+  string name = 2;
+  Origin origin = 3;
+  bool ssl_enabled = 4;
+  repeated CacheRule rules = 5;
+}
+
+message FullConfig {
+  string version = 1;
+  repeated DomainConfig domains = 2;
+  int64 updated_at = 3;
+}
+
+service ConfigService {
+  // Edge nodes pull the latest configuration
+  rpc GetConfig(GetConfigRequest) returns (FullConfig);
+  // Server streaming for config push (optional)
+  rpc WatchConfig(WatchConfigRequest) returns (stream FullConfig);
+}
+
+message GetConfigRequest {
+  string node_id = 1;
+  string current_version = 2;
+}
+
+message WatchConfigRequest {
+  string node_id = 1;
+}

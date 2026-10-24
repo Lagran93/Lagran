@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package lagran.control;
+
+message HeartbeatRequest {
+  string node_id = 1;
+  string region = 2;
+  string ip = 3;
+  double cpu_usage = 4;
+  double memory_usage = 5;
+  uint64 active_connections = 6;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+service NodeService {
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}

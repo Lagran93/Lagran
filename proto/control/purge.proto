@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package lagran.control;
+
+message PurgeRequest {
+  string domain = 1;
+  repeated string urls = 2;      // exact URLs
+  repeated string prefixes = 3;  // path prefixes
+  repeated string tags = 4;      // cache tags
+}
+
+message PurgeResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 purged_count = 3;
+}
+
+service PurgeService {
+  rpc Purge(PurgeRequest) returns (PurgeResponse);
+}

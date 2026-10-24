@@ -1,0 +1,40 @@
+[package]
+name = "edge"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lagran-edge"
+path = "src/main.rs"
+
+[dependencies]
+lagran-common = { workspace = true }
+lagran-model = { workspace = true }
+lagran-cache = { workspace = true }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+dotenvy = { workspace = true }
+axum-server = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+
+rcgen = { workspace = true }

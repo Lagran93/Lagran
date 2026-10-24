@@ -1,0 +1,12 @@
+[package]
+name = "lagran-metrics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+lagran-common = { workspace = true }

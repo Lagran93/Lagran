@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package lagran.control;
+
+message StatsReport {
+  string node_id = 1;
+  int64 timestamp = 2;
+  uint64 total_requests = 3;
+  uint64 cache_hits = 4;
+  uint64 cache_misses = 5;
+  uint64 bytes_sent = 6;
+  uint64 bytes_received = 7;
+  map<string, uint64> status_codes = 8;
+}
+
+message StatsAck {
+  bool accepted = 1;
+}
+
+service StatsService {
+  rpc Report(StatsReport) returns (StatsAck);
+}

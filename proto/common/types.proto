@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package lagran.common;
+
+option go_package = "lagran/common";
+
+// Common status codes
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OK = 1;
+  STATUS_ERROR = 2;
+}
+
+message Empty {}
