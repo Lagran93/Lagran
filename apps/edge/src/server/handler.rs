@@ -51,6 +51,20 @@ pub async fn proxy_handler(
         .unwrap_or_else(|| "/".to_string());
     let path_only = req.uri().path().to_string();
     let host = host_util::resolve_request_host(&req);
+    let client_ip = client_ip_from_headers(req.headers());
+    let user_agent = req
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let referer = req
+        .headers()
+        .get("referer")
+        .or_else(|| req.headers().get("referrer"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let inm = req
         .headers()
         .get("if-none-match")
@@ -74,7 +88,7 @@ pub async fn proxy_handler(
         };
         tracing::info!(%host, registry_len, "domain not onboarded");
         let resp = default_page::unknown_domain_page(display);
-        log_access(&state.access_log, &method, &host, &path_only, 404, start).await;
+        log_access(&state.access_log, &method, &host, &path_only, 404, start, &client_ip, &user_agent, &referer, 0, "NONE").await;
         return resp;
     }
 
@@ -95,7 +109,7 @@ pub async fn proxy_handler(
         .unwrap_or((0, 0));
     let rl_key = if host.is_empty() { "default" } else { host.as_str() };
     if !state.rate_limiter.check(rl_key, rps, burst).await {
-        log_access(&state.access_log, &method, &host, &path_only, 429, start).await;
+        log_access(&state.access_log, &method, &host, &path_only, 429, start, &client_ip, &user_agent, &referer, 0, "RATE").await;
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", "1")],
@@ -106,7 +120,7 @@ pub async fn proxy_handler(
 
     // Origin health gate
     if !host.is_empty() && !state.origin_health.is_healthy(&host).await {
-        log_access(&state.access_log, &method, &host, &path_only, 503, start).await;
+        log_access(&state.access_log, &method, &host, &path_only, 503, start, &client_ip, &user_agent, &referer, 0, "UNHEALTHY").await;
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Origin Unhealthy",
@@ -144,7 +158,7 @@ pub async fn proxy_handler(
             // is completed on the origin side of the tunnel. Client may need origin to answer 101.
             // Alternative path: we already dialed origin in spawn after client upgrade —
             // order is wrong. Fix: do origin upgrade first in spawn after both sides.
-            log_access(&state.access_log, &method, &host, &path_only, 101, start).await;
+            log_access(&state.access_log, &method, &host, &path_only, 101, start, &client_ip, &user_agent, &referer, 0, "WS").await;
             return resp;
         }
     }
@@ -165,7 +179,7 @@ pub async fn proxy_handler(
                 .filter(|s| !s.is_empty())
                 .any(|pat| referer.contains(pat) || pat == "*");
             if !allowed {
-                log_access(&state.access_log, &method, &host, &path_only, 403, start).await;
+                log_access(&state.access_log, &method, &host, &path_only, 403, start, &client_ip, &user_agent, &referer, 0, "HOTLINK").await;
                 return (StatusCode::FORBIDDEN, "Hotlink Forbidden").into_response();
             }
         }
@@ -200,16 +214,17 @@ pub async fn proxy_handler(
         .await
         {
             Err(_) => {
-                log_access(&state.access_log, &method, &host, &path_only, 504, start).await;
+                log_access(&state.access_log, &method, &host, &path_only, 504, start, &client_ip, &user_agent, &referer, 0, "TIMEOUT").await;
                 return (StatusCode::GATEWAY_TIMEOUT, "Origin Timeout").into_response();
             }
             Ok(Err(e)) => {
                 tracing::error!(error = %e, origin = %origin_url, "origin fetch failed");
-                log_access(&state.access_log, &method, &host, &path_only, 502, start).await;
+                log_access(&state.access_log, &method, &host, &path_only, 502, start, &client_ip, &user_agent, &referer, 0, "ERROR").await;
                 return (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response();
             }
             Ok(Ok((status, headers, body))) => {
-                state.metrics.record_bypass(&host, body.len() as u64).await;
+                let bypass_bytes = body.len() as u64;
+                state.metrics.record_bypass(&host, bypass_bytes).await;
                 let resp = build_response(status, headers, body, "BYPASS", &cors, &custom_headers);
                 log_access(
                     &state.access_log,
@@ -218,6 +233,11 @@ pub async fn proxy_handler(
                     &path_only,
                     status.as_u16(),
                     start,
+                    &client_ip,
+                    &user_agent,
+                    &referer,
+                    bypass_bytes,
+                    "BYPASS",
                 )
                 .await;
                 return resp;
@@ -235,14 +255,15 @@ pub async fn proxy_handler(
         if let Some(ref client_etag) = inm {
             if client_etag.trim() == etag || client_etag.trim() == format!("W/{etag}") {
                 state.metrics.record_hit(&host, 0).await;
-                log_access(&state.access_log, &method, &host, &path_only, 304, start).await;
+                log_access(&state.access_log, &method, &host, &path_only, 304, start, &client_ip, &user_agent, &referer, 0, "HIT").await;
                 return not_modified_response(&etag);
             }
         }
         tracing::debug!(%key, %host, "cache HIT");
-        state.metrics.record_hit(&host, entry.body.len() as u64).await;
+        let hit_bytes = entry.body.len() as u64;
+        state.metrics.record_hit(&host, hit_bytes).await;
         let resp = entry_to_response(entry, "HIT", &etag, &cors, &custom_headers);
-        log_access(&state.access_log, &method, &host, &path_only, 200, start).await;
+        log_access(&state.access_log, &method, &host, &path_only, 200, start, &client_ip, &user_agent, &referer, hit_bytes, "HIT").await;
         return resp;
     }
 
@@ -267,13 +288,13 @@ pub async fn proxy_handler(
             state.metrics.record_miss(&host, bytes).await;
             let status = entry.status;
             let resp = entry_to_response(entry, "MISS", &etag, &cors, &custom_headers);
-            log_access(&state.access_log, &method, &host, &path_only, status, start).await;
+            log_access(&state.access_log, &method, &host, &path_only, status, start, &client_ip, &user_agent, &referer, bytes, "MISS").await;
             resp
         }
         Err(e) => {
             tracing::error!(error = %e, origin = %origin_url, "origin failover exhausted");
             let code = if e.contains("timeout") { 504 } else { 502 };
-            log_access(&state.access_log, &method, &host, &path_only, code, start).await;
+            log_access(&state.access_log, &method, &host, &path_only, code, start, &client_ip, &user_agent, &referer, 0, "ERROR").await;
             if code == 504 {
                 (StatusCode::GATEWAY_TIMEOUT, "Origin Timeout").into_response()
             } else {
@@ -290,12 +311,44 @@ async fn log_access(
     path: &str,
     status: u16,
     start: Instant,
+    client_ip: &str,
+    user_agent: &str,
+    referer: &str,
+    bytes: u64,
+    cache_status: &str,
 ) {
-    let ms = start.elapsed().as_millis();
-    let line = format!(
-        "{method} host={host} path={path} status={status} {ms}ms"
+    let ms = start.elapsed().as_millis() as u64;
+    let rec = log.record(
+        client_ip,
+        method.as_str(),
+        host,
+        path,
+        status,
+        bytes,
+        ms,
+        cache_status,
+        user_agent,
+        referer,
     );
-    log.write(&line).await;
+    log.write(rec).await;
+}
+
+fn client_ip_from_headers(headers: &HeaderMap) -> String {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = xff.split(',').next() {
+            let ip = first.trim();
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
+        }
+    }
+    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let ip = real.trim();
+        if !ip.is_empty() {
+            return ip.to_string();
+        }
+    }
+    "-".into()
 }
 
 fn match_rule_ttl(rules: &[crate::cache::policy::CacheRule], path: &str) -> Option<u64> {

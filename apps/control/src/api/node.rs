@@ -1,5 +1,4 @@
 //! Edge node management
-
 use crate::middleware::agent_auth::AgentAuth;
 
 use crate::repository;

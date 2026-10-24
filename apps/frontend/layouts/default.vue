@@ -12,6 +12,7 @@
         <NuxtLink to="/nodes">边缘节点</NuxtLink>
         <NuxtLink to="/purge">缓存刷新</NuxtLink>
         <NuxtLink to="/stats">统计分析</NuxtLink>
+        <NuxtLink to="/access-logs">访问日志</NuxtLink>
         <NuxtLink to="/audit">操作审计</NuxtLink>
         <NuxtLink to="/certs">证书</NuxtLink>
         <NuxtLink to="/settings">设置</NuxtLink>
@@ -47,6 +48,7 @@ const pageTitle = computed(() => {
     '/nodes': '边缘节点',
     '/purge': '缓存刷新',
     '/stats': '统计分析',
+    '/access-logs': '访问日志',
     '/audit': '操作审计',
     '/certs': '证书管理',
     '/settings': '系统设置',

@@ -25,6 +25,10 @@ pub struct EdgeConfig {
     pub tls_key_file: Option<String>,
     pub access_log_path: Option<String>,
     pub agent_token: String,
+    pub access_log_json: bool,
+    pub access_log_buffer: usize,
+    pub access_log_report: bool,
+    pub access_log_report_interval_secs: u64,
 }
 
 impl Default for EdgeConfig {
@@ -77,6 +81,20 @@ impl Default for EdgeConfig {
             agent_token: std::env::var("AGENT_TOKEN")
                 .or_else(|_| std::env::var("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
+            access_log_json: std::env::var("ACCESS_LOG_JSON")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            access_log_buffer: std::env::var("ACCESS_LOG_BUFFER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2000),
+            access_log_report: std::env::var("ACCESS_LOG_REPORT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
+            access_log_report_interval_secs: std::env::var("ACCESS_LOG_REPORT_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
         }
     }
 }

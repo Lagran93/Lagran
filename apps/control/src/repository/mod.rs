@@ -1092,3 +1092,104 @@ pub async fn set_backup_origin(
     .await?;
     Ok(())
 }
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AccessLogRow {
+    pub id: i64,
+    pub ts: DateTime<Utc>,
+    pub node_id: String,
+    pub client_ip: String,
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub status: i32,
+    pub bytes: i64,
+    pub latency_ms: i32,
+    pub cache_status: String,
+    pub user_agent: String,
+    pub referer: String,
+}
+
+pub async fn insert_access_logs_batch(
+    pool: &PgPool,
+    entries: &[(
+        String, // ts
+        String, // node_id
+        String, // client_ip
+        String, // method
+        String, // host
+        String, // path
+        i32,    // status
+        i64,    // bytes
+        i32,    // latency_ms
+        String, // cache
+        String, // ua
+        String, // ref
+    )],
+) -> sqlx::Result<u64> {
+    let mut n = 0u64;
+    for e in entries {
+        let r = sqlx::query(
+            r#"
+            INSERT INTO access_logs
+              (ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, user_agent, referer)
+            VALUES (
+              COALESCE($1::timestamptz, NOW()),
+              $2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+            )
+            "#,
+        )
+        .bind(&e.0)
+        .bind(&e.1)
+        .bind(&e.2)
+        .bind(&e.3)
+        .bind(&e.4)
+        .bind(&e.5)
+        .bind(e.6)
+        .bind(e.7)
+        .bind(e.8)
+        .bind(&e.9)
+        .bind(&e.10)
+        .bind(&e.11)
+        .execute(pool)
+        .await?;
+        n += r.rows_affected();
+    }
+    Ok(n)
+}
+
+pub async fn list_access_logs(
+    pool: &PgPool,
+    host: Option<&str>,
+    limit: i64,
+) -> sqlx::Result<Vec<AccessLogRow>> {
+    if let Some(h) = host.filter(|s| !s.is_empty()) {
+        sqlx::query_as::<_, AccessLogRow>(
+            r#"
+            SELECT id, ts, node_id, client_ip, method, host, path, status, bytes,
+                   latency_ms, cache_status, user_agent, referer
+            FROM access_logs
+            WHERE host = $1
+            ORDER BY ts DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(h)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_as::<_, AccessLogRow>(
+            r#"
+            SELECT id, ts, node_id, client_ip, method, host, path, status, bytes,
+                   latency_ms, cache_status, user_agent, referer
+            FROM access_logs
+            ORDER BY ts DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    }
+}

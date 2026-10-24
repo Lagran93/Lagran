@@ -1,4 +1,5 @@
 //! Background agents: heartbeat, config sync, metrics
+pub mod access_report;
 
 pub mod cert_sync;
 pub mod config_sync;

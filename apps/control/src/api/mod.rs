@@ -1,5 +1,6 @@
 //! HTTP API routes — nest("/api/v1", ...) + path params :name
 
+pub mod access_log;
 pub mod acme;
 pub mod audit;
 pub mod auth;
@@ -79,6 +80,8 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/stats/by-domain", get(stats::by_domain))
                 .route("/stats/summary", get(stats::summary))
                 .route("/audit", get(audit::list))
+                .route("/access-logs", get(access_log::list))
+                .route("/access-logs/report", post(access_log::report))
                 .route("/config", get(config::list_all_configs))
                 .route("/config/:domain", get(config::get_domain_config)),
         )

@@ -1,4 +1,4 @@
-use edge::agent::{self, cert_sync, config_sync, metrics_report, origin_health};
+use edge::agent::{self, access_report, cert_sync, config_sync, metrics_report, origin_health};
 use edge::cache::{self, policy::RuleSet};
 use edge::config::registry::DomainRegistry;
 use edge::config::EdgeConfig;
@@ -37,7 +37,13 @@ async fn main() -> anyhow::Result<()> {
     let metrics = EdgeMetrics::new();
     let cert_store = Arc::new(CertStore::new());
     let challenges = ChallengeStore::new();
-    let access_log = AccessLog::open(config.access_log_path.as_deref()).await;
+    let access_log = AccessLog::open(
+        config.access_log_path.as_deref(),
+        &config.node_id,
+        config.access_log_buffer,
+        config.access_log_json,
+    )
+    .await;
     let rate_limiter = RateLimiter::new(
         std::env::var("RATE_LIMIT_RPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         std::env::var("RATE_LIMIT_BURST").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -53,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         domains.clone(),
     );
     metrics_report::spawn_metrics_report(config.clone(), metrics.clone());
+    access_report::spawn_access_report(config.clone(), access_log.clone());
     origin_health::spawn_origin_health(
         config.clone(),
         domains.clone(),
