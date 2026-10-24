@@ -13,4 +13,3 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-lagran-common = { workspace = true }

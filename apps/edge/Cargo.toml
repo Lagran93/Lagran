@@ -9,9 +9,11 @@ license.workspace = true
 name = "lagran-edge"
 path = "src/main.rs"
 
+[lib]
+name = "edge"
+path = "src/lib.rs"
+
 [dependencies]
-lagran-common = { workspace = true }
-lagran-model = { workspace = true }
 lagran-cache = { workspace = true }
 
 tokio = { workspace = true }
@@ -31,10 +33,6 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 async-trait = { workspace = true }
-dashmap = { workspace = true }
 dotenvy = { workspace = true }
-axum-server = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
-
-rcgen = { workspace = true }

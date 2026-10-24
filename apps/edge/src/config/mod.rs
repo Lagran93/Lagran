@@ -1,22 +1,26 @@
 //! Edge node configuration
 
+pub mod registry;
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EdgeConfig {
     pub listen_addr: String,
-    /// Optional HTTPS listen address, e.g. 0.0.0.0:8443
     pub https_listen_addr: Option<String>,
     pub origin_url: String,
     pub default_ttl_secs: u64,
     pub cache_capacity: u64,
+    /// memory | disk | hybrid
+    pub cache_backend: String,
+    pub disk_cache_dir: String,
+    pub disk_cache_max_bytes: u64,
     pub node_id: String,
     pub region: String,
     pub control_url: String,
     pub agent_url: String,
     pub heartbeat_interval_secs: u64,
     pub domain: String,
-    /// Local PEM paths (optional, override control cert)
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
 }
@@ -31,7 +35,6 @@ impl Default for EdgeConfig {
                 format!("http://{listen}")
             }
         });
-
         let https_listen_addr = std::env::var("EDGE_HTTPS_LISTEN").ok().filter(|s| !s.is_empty());
 
         Self {
@@ -47,6 +50,15 @@ impl Default for EdgeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
+            cache_backend: std::env::var("CACHE_BACKEND")
+                .unwrap_or_else(|_| "memory".into())
+                .to_lowercase(),
+            disk_cache_dir: std::env::var("DISK_CACHE_DIR")
+                .unwrap_or_else(|_| "./data/cache".into()),
+            disk_cache_max_bytes: std::env::var("DISK_CACHE_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_073_741_824), // 1 GiB
             node_id: std::env::var("NODE_ID").unwrap_or_else(|_| "edge-001".into()),
             region: std::env::var("NODE_REGION").unwrap_or_else(|_| "local".into()),
             control_url: std::env::var("CONTROL_URL")

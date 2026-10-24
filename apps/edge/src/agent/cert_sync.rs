@@ -20,15 +20,7 @@ struct EdgeCertResponse {
     key_pem: String,
     status: String,
 }
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct CertListItem {
-    domain_name: String,
-    status: String,
-    has_cert: bool,
-    has_key: bool,
-    id: String,
-}
+
 
 pub fn spawn_cert_sync(config: EdgeConfig, store: Arc<CertStore>) {
     tokio::spawn(async move {
@@ -77,11 +69,9 @@ pub fn spawn_cert_sync(config: EdgeConfig, store: Arc<CertStore>) {
                         let fp = format!("{}:{}", cert.cert_pem.len(), cert.key_pem.len());
                         if fp != last {
                             let names = vec![cert.domain.clone()];
-                            if let Err(e) = store.upsert(
-                                &names,
-                                cert.cert_pem.as_bytes(),
-                                cert.key_pem.as_bytes(),
-                            ) {
+                            if let Err(e) =
+                                store.upsert(&names, cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
+                            {
                                 tracing::error!(error = %e, "apply cert failed");
                             } else {
                                 tracing::info!(domain = %cert.domain, "cert hot-updated from control");

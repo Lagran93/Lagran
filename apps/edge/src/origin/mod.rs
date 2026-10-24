@@ -17,6 +17,7 @@ type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Byte
 #[derive(Clone)]
 pub struct OriginClient {
     client: Arc<HttpsClient>,
+    /// Fallback default origin (legacy single-origin)
     base_url: Arc<RwLock<String>>,
 }
 
@@ -46,7 +47,7 @@ impl OriginClient {
     pub async fn set_base_url(&self, url: String) {
         let mut w = self.base_url.write().await;
         if *w != url {
-            tracing::info!(old = %*w, new = %url, "origin base_url changed");
+            tracing::info!(old = %*w, new = %url, "default origin base_url changed");
             *w = url;
         }
     }
@@ -61,9 +62,18 @@ impl OriginClient {
         headers: &HeaderMap,
     ) -> Result<(StatusCode, HeaderMap, Bytes)> {
         let base = self.base_url.read().await.clone();
+        self.fetch_from(&base, path_and_query, headers).await
+    }
+
+    pub async fn fetch_from(
+        &self,
+        base_url: &str,
+        path_and_query: &str,
+        headers: &HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap, Bytes)> {
         let url = format!(
             "{}{}",
-            base.trim_end_matches('/'),
+            base_url.trim_end_matches('/'),
             if path_and_query.starts_with('/') {
                 path_and_query.to_string()
             } else {
@@ -132,7 +142,20 @@ impl OriginClient {
         path_and_query: &str,
         headers: &HeaderMap,
     ) -> Result<CacheEntry> {
-        let (status, headers, body) = self.fetch(path_and_query, headers).await?;
+        let base = self.base_url.read().await.clone();
+        self.fetch_as_entry_from(&base, path_and_query, headers)
+            .await
+    }
+
+    pub async fn fetch_as_entry_from(
+        &self,
+        base_url: &str,
+        path_and_query: &str,
+        headers: &HeaderMap,
+    ) -> Result<CacheEntry> {
+        let (status, headers, body) = self
+            .fetch_from(base_url, path_and_query, headers)
+            .await?;
         let headers_vec: Vec<(String, String)> = headers
             .iter()
             .filter_map(|(k, v)| {

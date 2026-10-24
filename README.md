@@ -87,3 +87,6 @@ MIT
 前端登录后将 JWT 存入 localStorage，请求自动带 `Authorization: Bearer <token>`。
 
 边缘端默认回源 `https://example.com`，可通过 `ORIGIN_URL` 覆盖（支持 http/https）。
+
+1、把axum路由总的参数形式由{参数}改为:参数
+2、写一份详细的.env配置文件示例，并详细注释

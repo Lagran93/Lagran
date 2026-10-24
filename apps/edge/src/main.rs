@@ -1,6 +1,6 @@
 use edge::agent::{self, cert_sync, config_sync, metrics_report};
-use edge::cache::policy::RuleSet;
-use edge::cache::MemoryCache;
+use edge::cache::{self, policy::RuleSet};
+use edge::config::registry::DomainRegistry;
 use edge::config::EdgeConfig;
 use edge::metrics::EdgeMetrics;
 use edge::origin::OriginClient;
@@ -9,7 +9,6 @@ use edge::server::cert_store::CertStore;
 use edge::server::handler::AppState;
 use edge::server::listener;
 use edge::server::tls;
-use lagran_cache::CacheBackend;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -19,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "lagran_edge=debug,edge=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "lagran_edge=debug,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -28,19 +27,26 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         http = %config.listen_addr,
         https = ?config.https_listen_addr,
+        cache = %config.cache_backend,
         domain = %config.domain,
-        "Lagran Edge starting (SNI + hot-reload + ACME challenge)"
+        "Lagran Edge starting (multi-domain + disk cache)"
     );
 
-    let cache: Arc<dyn CacheBackend> = Arc::new(MemoryCache::new(config.cache_capacity));
+    let cache = cache::build_cache(&config).await?;
     let origin = OriginClient::new(config.origin_url.clone());
     let rules = RuleSet::new();
     let metrics = EdgeMetrics::new();
     let cert_store = Arc::new(CertStore::new());
     let challenges = ChallengeStore::new();
+    let domains = DomainRegistry::new();
 
     agent::spawn_heartbeat(config.clone());
-    config_sync::spawn_config_sync(config.clone(), origin.clone(), rules.clone());
+    config_sync::spawn_config_sync(
+        config.clone(),
+        origin.clone(),
+        rules.clone(),
+        domains.clone(),
+    );
     metrics_report::spawn_metrics_report(config.clone(), metrics.clone());
     cert_sync::spawn_cert_sync(config.clone(), cert_store.clone());
 
@@ -52,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         metrics,
         challenges,
         certs: cert_store.clone(),
+        domains,
     });
 
     let app = listener::create_router(state);

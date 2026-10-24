@@ -618,16 +618,3 @@ pub async fn get_acme_challenge(pool: &PgPool, token: &str) -> sqlx::Result<Opti
     Ok(row.map(|r| r.0))
 }
 
-pub async fn list_active_certs_full(pool: &PgPool) -> sqlx::Result<Vec<CertRow>> {
-    sqlx::query_as::<_, CertRow>(
-        r#"
-        SELECT id, domain_id, domain_name, cert_pem, key_pem, issuer,
-               not_before, not_after, status, auto_renew, created_at
-        FROM certificates
-        WHERE status = 'active' AND cert_pem <> '' AND key_pem <> ''
-        ORDER BY updated_at DESC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-}

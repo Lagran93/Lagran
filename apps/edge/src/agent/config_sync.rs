@@ -1,6 +1,7 @@
-//! Pull origin + cache rules from control plane
+//! Sync all accelerated domains + rules from control plane
 
 use crate::cache::policy::{CacheRule, RuleSet};
+use crate::config::registry::{DomainEntry, DomainRegistry};
 use crate::config::EdgeConfig;
 use crate::origin::OriginClient;
 use bytes::Bytes;
@@ -13,33 +14,41 @@ use serde::Deserialize;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct OriginCfg {
-    pub host: String,
-    pub port: u16,
-    pub protocol: String,
+struct OriginCfg {
+    host: String,
+    port: u16,
+    protocol: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RuleCfg {
-    pub path_pattern: String,
-    pub ttl_seconds: u64,
-    pub priority: i32,
+struct RuleCfg {
+    path_pattern: String,
+    ttl_seconds: u64,
+    priority: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct DomainConfig {
-    pub domain: String,
-    pub origin: OriginCfg,
-    pub rules: Vec<RuleCfg>,
-    pub version: String,
+struct DomainCfg {
+    domain: String,
+    origin: OriginCfg,
+    rules: Vec<RuleCfg>,
+    #[serde(default)]
+    status: String,
+    version: String,
 }
 
-pub fn spawn_config_sync(config: EdgeConfig, origin: OriginClient, rules: RuleSet) {
-    let domain = config.domain.clone();
-    if domain.is_empty() {
-        tracing::info!("EDGE_DOMAIN not set; using ORIGIN_URL + default TTL only");
-        return;
-    }
+#[derive(Debug, Clone, Deserialize)]
+struct AllConfig {
+    domains: Vec<DomainCfg>,
+    version: String,
+}
+
+pub fn spawn_config_sync(
+    config: EdgeConfig,
+    origin: OriginClient,
+    rules: RuleSet,
+    registry: DomainRegistry,
+) {
     tokio::spawn(async move {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
@@ -47,22 +56,69 @@ pub fn spawn_config_sync(config: EdgeConfig, origin: OriginClient, rules: RuleSe
             Client::builder(TokioExecutor::new()).build(connector);
 
         let url = format!(
-            "{}/api/v1/config/{}",
-            config.control_url.trim_end_matches('/'),
-            domain
+            "{}/api/v1/config",
+            config.control_url.trim_end_matches('/')
         );
-        tracing::info!(%url, "config+rules sync started");
+        tracing::info!(%url, "domain registry sync started");
 
+        let mut last_version = String::new();
         loop {
-            match fetch_config(&client, &url).await {
+            match fetch_all(&client, &url).await {
                 Ok(cfg) => {
-                    let origin_url = format!(
-                        "{}://{}:{}",
-                        cfg.origin.protocol, cfg.origin.host, cfg.origin.port
-                    );
-                    tracing::info!(origin_url = %origin_url, "set origin url");
-                    origin.set_base_url(origin_url).await;
-                    let mapped: Vec<CacheRule> = cfg
+                    if cfg.version != last_version {
+                        let mut entries = Vec::new();
+                        let mut global_rules = Vec::new();
+                        for d in cfg.domains {
+                            let origin_url = format!(
+                                "{}://{}:{}",
+                                d.origin.protocol, d.origin.host, d.origin.port
+                            );
+                            let mapped: Vec<CacheRule> = d
+                                .rules
+                                .iter()
+                                .map(|r| CacheRule {
+                                    path_pattern: r.path_pattern.clone(),
+                                    ttl_seconds: r.ttl_seconds,
+                                    priority: r.priority,
+                                })
+                                .collect();
+                            global_rules.extend(mapped.clone());
+                            entries.push(DomainEntry {
+                                domain: d.domain.clone(),
+                                origin_url: origin_url.clone(),
+                                rules: mapped,
+                                version: d.version,
+                            });
+                        }
+                        let n = entries.len();
+                        registry.replace_all(entries, cfg.version.clone()).await;
+                        rules.replace(global_rules).await;
+
+                        if !config.domain.is_empty() {
+                            if let Some(d) = registry.get(&config.domain).await {
+                                origin.set_base_url(d.origin_url).await;
+                            }
+                        }
+
+                        tracing::info!(domains = n, version = %cfg.version, "domain registry updated");
+                        last_version = cfg.version;
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "config sync failed"),
+            }
+
+            // Single-domain fallback if EDGE_DOMAIN set and registry empty
+            if !config.domain.is_empty() && registry.len().await == 0 {
+                let single = format!(
+                    "{}/api/v1/config/{}",
+                    config.control_url.trim_end_matches('/'),
+                    config.domain
+                );
+                if let Ok(d) = fetch_one(&client, &single).await {
+                    let origin_url =
+                        format!("{}://{}:{}", d.origin.protocol, d.origin.host, d.origin.port);
+                    origin.set_base_url(origin_url.clone()).await;
+                    let mapped: Vec<CacheRule> = d
                         .rules
                         .into_iter()
                         .map(|r| CacheRule {
@@ -71,20 +127,27 @@ pub fn spawn_config_sync(config: EdgeConfig, origin: OriginClient, rules: RuleSe
                             priority: r.priority,
                         })
                         .collect();
-                    tracing::info!(count = mapped.len(), version = %cfg.version, "rules updated");
-                    rules.replace(mapped).await;
+                    rules.replace(mapped.clone()).await;
+                    registry
+                        .upsert(DomainEntry {
+                            domain: d.domain,
+                            origin_url,
+                            rules: mapped,
+                            version: d.version,
+                        })
+                        .await;
                 }
-                Err(e) => tracing::warn!(error = %e, domain = %domain, "config sync failed"),
             }
-            tokio::time::sleep(Duration::from_secs(30)).await;
+
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
 }
 
-async fn fetch_config(
+async fn fetch_all(
     client: &Client<HttpConnector, Full<Bytes>>,
     url: &str,
-) -> Result<DomainConfig, String> {
+) -> Result<AllConfig, String> {
     let req = Request::builder()
         .method("GET")
         .uri(url)
@@ -104,6 +167,29 @@ async fn fetch_config(
             status,
             String::from_utf8_lossy(&body)
         ));
+    }
+    serde_json::from_slice(&body).map_err(|e| e.to_string())
+}
+
+async fn fetch_one(
+    client: &Client<HttpConnector, Full<Bytes>>,
+    url: &str,
+) -> Result<DomainCfg, String> {
+    let req = Request::builder()
+        .method("GET")
+        .uri(url)
+        .body(Full::new(Bytes::new()))
+        .map_err(|e| e.to_string())?;
+    let resp = client.request(req).await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| e.to_string())?
+        .to_bytes();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
     }
     serde_json::from_slice(&body).map_err(|e| e.to_string())
 }

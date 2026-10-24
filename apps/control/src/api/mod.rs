@@ -32,7 +32,7 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health::health))
-        .route("/.well-known/acme-challenge/{token}", get(acme::challenge))
+        .route("/.well-known/acme-challenge/:token", get(acme::challenge))
         .route("/ready", get(health::ready))
         .nest(
             "/api/v1",
@@ -57,6 +57,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/certs/by-domain/:domain", get(cert::edge_get))
                 .route("/purge", post(purge::purge))
                 .route("/stats/summary", get(stats::summary))
+                .route("/config", get(config::list_all_configs))
                 .route("/config/:domain", get(config::get_domain_config)),
         )
         .fallback(not_found)

@@ -1,2 +1,2 @@
-//! Re-export memory cache from lagran-cache
-pub use lagran_cache::MemoryCache;
+//! Re-export memory cache from shared crate
+pub use lagran_cache::MemoryCache as EdgeMemoryCache;

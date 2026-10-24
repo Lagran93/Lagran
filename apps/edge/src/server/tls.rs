@@ -1,7 +1,10 @@
 //! HTTPS terminator with SNI + hot-reloadable cert store
 
 use crate::server::cert_store::CertStore;
+use crate::server::host_util::TlsSni;
 use anyhow::{anyhow, Context, Result};
+use axum::http::header::HOST;
+use axum::http::HeaderValue;
 use axum::Router;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -13,24 +16,21 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 
-/// Build a rustls ServerConfig that resolves certs via SNI from CertStore.
 pub fn build_server_config(store: Arc<CertStore>) -> Result<Arc<ServerConfig>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let resolver = store.resolver();
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // Prefer HTTP/1.1 first — avoids empty Host edge cases with some h2 clients in local test
+    config.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
     Ok(Arc::new(config))
 }
 
-/// Serve HTTPS; cert changes in CertStore apply to **new** connections immediately (no process restart).
 pub async fn serve_https(addr: SocketAddr, app: Router, store: Arc<CertStore>) -> Result<()> {
     let listener = TcpListener::bind(addr).await.context("bind https")?;
     tracing::info!(%addr, "HTTPS terminator listening (SNI + hot-reload)");
 
-    // Accept loop: rebuild acceptor from latest ServerConfig each connection is fine —
-    // resolver reads store on each handshake so we only need one ServerConfig.
     let server_config = build_server_config(store)?;
     let acceptor = TlsAcceptor::from(server_config);
     let app = app.clone();
@@ -47,11 +47,44 @@ pub async fn serve_https(addr: SocketAddr, app: Router, store: Arc<CertStore>) -
                     return;
                 }
             };
+
+            // Capture SNI for domain routing (Host may be IP or missing on some clients)
+            let sni = {
+                let (_, conn) = tls_stream.get_ref();
+                conn.server_name().map(|s| s.to_string())
+            };
+            if let Some(ref name) = sni {
+                tracing::debug!(%peer, sni = %name, "TLS handshake ok");
+            }
+
             let io = TokioIo::new(tls_stream);
             let hyper_service =
-                hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
                     let mut app = app.clone();
-                    async move { app.call(req).await }
+                    let sni = sni.clone();
+                    async move {
+                        if let Some(ref name) = sni {
+                            req.extensions_mut().insert(TlsSni(name.clone()));
+                            // If Host is missing or is a bare IP, set Host from SNI
+                            // so downstream logic and caches key on the domain name
+                            let host_is_bad = req
+                                .headers()
+                                .get(HOST)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|h| {
+                                    let h = h.trim();
+                                    h.is_empty()
+                                        || crate::config::registry::is_ip_host(h)
+                                })
+                                .unwrap_or(true);
+                            if host_is_bad {
+                                if let Ok(val) = HeaderValue::from_str(name) {
+                                    req.headers_mut().insert(HOST, val);
+                                }
+                            }
+                        }
+                        app.call(req).await
+                    }
                 });
             let builder = HyperBuilder::new(TokioExecutor::new());
             if let Err(e) = builder.serve_connection(io, hyper_service).await {
