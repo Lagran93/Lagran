@@ -33,7 +33,24 @@ struct DomainCfg {
     origin: OriginCfg,
     rules: Vec<RuleCfg>,
     #[serde(default)]
+    #[allow(dead_code)]
     status: String,
+    #[serde(default)]
+    rate_limit_rps: u32,
+    #[serde(default)]
+    rate_limit_burst: u32,
+    #[serde(default)]
+    ignore_query_string: bool,
+    #[serde(default)]
+    cors_origins: String,
+    #[serde(default)]
+    hotlink_allow_referers: String,
+    #[serde(default)]
+    origin_timeout_ms: u32,
+    #[serde(default)]
+    custom_headers: String,
+    #[serde(default)]
+    backup_origin: Option<OriginCfg>,
     version: String,
 }
 
@@ -88,6 +105,16 @@ pub fn spawn_config_sync(
                                 origin_url: origin_url.clone(),
                                 rules: mapped,
                                 version: d.version,
+                                rate_limit_rps: d.rate_limit_rps,
+                                rate_limit_burst: d.rate_limit_burst,
+                                ignore_query_string: d.ignore_query_string,
+                                cors_origins: d.cors_origins.clone(),
+                                hotlink_allow_referers: d.hotlink_allow_referers.clone(),
+                                origin_timeout_ms: if d.origin_timeout_ms == 0 { 10000 } else { d.origin_timeout_ms },
+                                custom_headers: d.custom_headers.clone(),
+                                backup_origin_url: d.backup_origin.as_ref().map(|o| {
+                                    format!("{}://{}:{}", o.protocol, o.host, o.port)
+                                }).unwrap_or_default(),
                             });
                         }
                         let n = entries.len();
@@ -134,6 +161,16 @@ pub fn spawn_config_sync(
                             origin_url,
                             rules: mapped,
                             version: d.version,
+                            rate_limit_rps: d.rate_limit_rps,
+                            rate_limit_burst: d.rate_limit_burst,
+                                ignore_query_string: d.ignore_query_string,
+                                cors_origins: d.cors_origins.clone(),
+                                hotlink_allow_referers: d.hotlink_allow_referers.clone(),
+                                origin_timeout_ms: if d.origin_timeout_ms == 0 { 10000 } else { d.origin_timeout_ms },
+                                custom_headers: d.custom_headers.clone(),
+                                backup_origin_url: d.backup_origin.as_ref().map(|o| {
+                                    format!("{}://{}:{}", o.protocol, o.host, o.port)
+                                }).unwrap_or_default(),
                         })
                         .await;
                 }

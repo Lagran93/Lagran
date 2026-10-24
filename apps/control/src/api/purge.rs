@@ -66,7 +66,7 @@ fn http_client() -> &'static Client<HttpConnector, Full<Bytes>> {
 
 pub async fn purge(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Json(req): Json<PurgeRequest>,
 ) -> Json<PurgeResponse> {
     tracing::info!(
@@ -116,7 +116,7 @@ pub async fn purge(
             "{}/__lagran/purge",
             node.agent_url.trim_end_matches('/')
         );
-        let result = dispatch_one(client, &url, body_bytes.clone()).await;
+        let result = dispatch_one(client, &url, body_bytes.clone(), &state.config.agent_token).await;
         match result {
             Ok(reply) => {
                 total += reply.purged_count;
@@ -145,6 +145,9 @@ pub async fn purge(
         }
     }
 
+    let detail = format!("domain={} total={} nodes={}", req.domain, total, results.len());
+    let _ = repository::insert_audit(&state.pool, &user.0.email, "purge", &req.domain, &detail).await;
+
     Json(PurgeResponse {
         success: !any_fail,
         message: if any_fail {
@@ -161,11 +164,13 @@ async fn dispatch_one(
     client: &Client<HttpConnector, Full<Bytes>>,
     url: &str,
     body: Bytes,
+    token: &str,
 ) -> Result<EdgePurgeReply, String> {
     let req = Request::builder()
         .method("POST")
         .uri(url)
         .header("content-type", "application/json")
+        .header("x-lagran-agent-token", token)
         .body(Full::new(body))
         .map_err(|e| e.to_string())?;
 

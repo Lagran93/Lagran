@@ -3,6 +3,7 @@
 pub mod cert_sync;
 pub mod config_sync;
 pub mod metrics_report;
+pub mod origin_health;
 
 use crate::config::EdgeConfig;
 use bytes::Bytes;
@@ -58,6 +59,7 @@ async fn send_once(
         .method("POST")
         .uri(url)
         .header("content-type", "application/json")
+        .header("x-lagran-agent-token", config.agent_token.as_str())
         .body(Full::new(bytes))
         .map_err(|e| e.to_string())?;
     let resp = client.request(req).await.map_err(|e| e.to_string())?;

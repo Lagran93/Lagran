@@ -39,6 +39,8 @@
             <td>{{ d.origin_proto }}</td>
             <td><span class="badge">{{ d.status }}</span></td>
             <td>
+              <button class="btn btn-ghost" @click="openSettings(d)">高级</button>
+              <button class="btn btn-ghost" @click="toggleStatus(d)">{{ d.status === 'disabled' ? '启用' : '停用' }}</button>
               <button class="btn btn-ghost" @click="editOrigin(d)">改源站</button>
               <button class="btn btn-ghost" @click="removeDomain(d.id)">删除</button>
             </td>
@@ -48,6 +50,29 @@
           </tr>
         </tbody>
       </table>
+    </div>
+  
+    <div v-if="settingsDomain" class="card" style="margin-top:1.25rem;">
+      <h3 style="margin-top:0;">高级设置 — {{ settingsDomain.name }}</h3>
+      <div class="form-col">
+        <label class="check"><input v-model="settings.ignore_query_string" type="checkbox" /> 忽略 URL 查询串（缓存键）</label>
+        <label>限流 RPS（0=不限）</label>
+        <input v-model.number="settings.rate_limit_rps" type="number" />
+        <label>限流突发</label>
+        <input v-model.number="settings.rate_limit_burst" type="number" />
+        <label>CORS 允许源（* 或逗号分隔）</label>
+        <input v-model="settings.cors_origins" placeholder="*" />
+        <label>防盗链 Referer 白名单（空=关闭，逗号分隔关键字）</label>
+        <input v-model="settings.hotlink_allow_referers" placeholder="example.com" />
+        <label>回源超时 (ms)</label>
+        <input v-model.number="settings.origin_timeout_ms" type="number" />
+        <label>自定义响应头（每行 Name: Value）</label>
+        <textarea v-model="settings.custom_headers" rows="3" placeholder="X-CDN: lagran"></textarea>
+        <div style="display:flex;gap:0.5rem;">
+          <button class="btn" @click="saveSettings">保存</button>
+          <button class="btn btn-ghost" @click="settingsDomain = null">关闭</button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -92,19 +117,66 @@ async function createDomain() {
   }
 }
 
+const settingsDomain = ref<any>(null)
+const settings = ref<any>({
+  ignore_query_string: false,
+  rate_limit_rps: 0,
+  rate_limit_burst: 0,
+  cors_origins: '',
+  hotlink_allow_referers: '',
+  origin_timeout_ms: 10000,
+  custom_headers: '',
+})
+
+async function openSettings(d: any) {
+  settingsDomain.value = d
+  try {
+    settings.value = await api.get(`/api/v1/domains/${d.id}/settings`)
+  } catch {
+    /* keep defaults */
+  }
+}
+
+async function saveSettings() {
+  if (!settingsDomain.value) return
+  try {
+    await api.put(`/api/v1/domains/${settingsDomain.value.id}/settings`, settings.value)
+    alert('已保存，边缘约 15s 内同步')
+    settingsDomain.value = null
+  } catch (e: any) {
+    alert(e?.data?.error || '保存失败')
+  }
+}
+
+async function toggleStatus(d: any) {
+  const next = d.status === 'disabled' ? 'active' : 'disabled'
+  try {
+    await api.post(`/api/v1/domains/${d.id}/status`, { status: next })
+    await load()
+  } catch (e: any) {
+    alert(e?.data?.error || '状态更新失败')
+  }
+}
+
 async function editOrigin(d: any) {
-  const host = prompt('源站主机', d.origin_host)
+  const host = prompt('主源站主机', d.origin_host)
   if (host === null) return
   const port = prompt('源站端口', String(d.origin_port))
   if (port === null) return
   const proto = prompt('协议 http/https', d.origin_proto)
   if (proto === null) return
   try {
+    const bhost = prompt('备用源站主机（可空）', '') || ''
+    const bport = bhost ? prompt('备用源站端口', '80') : '0'
+    const bproto = bhost ? prompt('备用协议 http/https', 'http') : 'http'
     await api.put(`/api/v1/domains/${d.id}`, {
       origin_host: host,
       origin_port: Number(port) || d.origin_port,
       origin_proto: proto,
       ssl_enabled: proto === 'https',
+      backup_origin_host: bhost,
+      backup_origin_port: Number(bport) || 0,
+      backup_origin_proto: bproto,
     })
     await load()
   } catch (e: any) {
@@ -150,4 +222,11 @@ onMounted(load)
   color: #38bdf8;
   font-size: 0.8rem;
 }
+.form-col { display: flex; flex-direction: column; gap: 0.5rem; max-width: 520px; }
+.form-col label { font-size: 0.85rem; color: #94a3b8; }
+.form-col input, .form-col textarea {
+  padding: 0.5rem 0.75rem; border: 1px solid #334155; border-radius: 6px;
+  background: #0f172a; color: #e2e8f0;
+}
+.check { display: flex; align-items: center; gap: 0.5rem; color: #e2e8f0; }
 </style>

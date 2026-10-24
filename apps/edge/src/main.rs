@@ -1,13 +1,16 @@
-use edge::agent::{self, cert_sync, config_sync, metrics_report};
+use edge::agent::origin_health::OriginHealthMap;
+use edge::agent::{self, cert_sync, config_sync, metrics_report, origin_health};
 use edge::cache::{self, policy::RuleSet};
 use edge::config::registry::DomainRegistry;
 use edge::config::EdgeConfig;
 use edge::metrics::EdgeMetrics;
 use edge::origin::OriginClient;
+use edge::server::access_log::AccessLog;
 use edge::server::acme_challenge::ChallengeStore;
 use edge::server::cert_store::CertStore;
 use edge::server::handler::AppState;
 use edge::server::listener;
+use edge::server::rate_limit::RateLimiter;
 use edge::server::tls;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "lagran_edge=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "edge=debug,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -38,6 +41,18 @@ async fn main() -> anyhow::Result<()> {
     let metrics = EdgeMetrics::new();
     let cert_store = Arc::new(CertStore::new());
     let challenges = ChallengeStore::new();
+    let access_log = AccessLog::open(config.access_log_path.as_deref()).await;
+    let rate_limiter = RateLimiter::new(
+        std::env::var("RATE_LIMIT_RPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        std::env::var("RATE_LIMIT_BURST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    );
+    let origin_health_map = OriginHealthMap::new();
     let domains = DomainRegistry::new();
 
     agent::spawn_heartbeat(config.clone());
@@ -48,6 +63,12 @@ async fn main() -> anyhow::Result<()> {
         domains.clone(),
     );
     metrics_report::spawn_metrics_report(config.clone(), metrics.clone());
+    origin_health::spawn_origin_health(
+        config.clone(),
+        domains.clone(),
+        origin.clone(),
+        origin_health_map.clone(),
+    );
     cert_sync::spawn_cert_sync(config.clone(), cert_store.clone());
 
     let state = Arc::new(AppState {
@@ -59,6 +80,10 @@ async fn main() -> anyhow::Result<()> {
         challenges,
         certs: cert_store.clone(),
         domains,
+        access_log,
+        rate_limiter,
+        origin_health: origin_health_map,
+        agent_token: config.agent_token.clone(),
     });
 
     let app = listener::create_router(state);

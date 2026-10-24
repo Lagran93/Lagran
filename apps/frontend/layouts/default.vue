@@ -10,7 +10,9 @@
         <NuxtLink to="/domains">域名</NuxtLink>
         <NuxtLink to="/rules">缓存规则</NuxtLink>
         <NuxtLink to="/nodes">边缘节点</NuxtLink>
+        <NuxtLink to="/purge">缓存刷新</NuxtLink>
         <NuxtLink to="/stats">统计分析</NuxtLink>
+        <NuxtLink to="/audit">操作审计</NuxtLink>
         <NuxtLink to="/certs">证书</NuxtLink>
         <NuxtLink to="/settings">设置</NuxtLink>
       </nav>
@@ -43,7 +45,9 @@ const pageTitle = computed(() => {
     '/domains': '域名管理',
     '/rules': '缓存规则',
     '/nodes': '边缘节点',
+    '/purge': '缓存刷新',
     '/stats': '统计分析',
+    '/audit': '操作审计',
     '/certs': '证书管理',
     '/settings': '系统设置',
   }

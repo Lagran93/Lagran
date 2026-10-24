@@ -1,4 +1,4 @@
-//! Multi-domain registry: Host → origin + rules
+//! Multi-domain registry: Host → origin + rules + CDN settings
 
 use crate::cache::policy::CacheRule;
 use std::collections::HashMap;
@@ -11,6 +11,15 @@ pub struct DomainEntry {
     pub origin_url: String,
     pub rules: Vec<CacheRule>,
     pub version: String,
+    pub rate_limit_rps: u32,
+    pub rate_limit_burst: u32,
+    pub ignore_query_string: bool,
+    pub cors_origins: String,
+    pub hotlink_allow_referers: String,
+    pub origin_timeout_ms: u32,
+    pub custom_headers: String,
+    /// Optional backup origin URL (empty = none)
+    pub backup_origin_url: String,
 }
 
 #[derive(Clone, Default)]
@@ -59,9 +68,11 @@ impl DomainRegistry {
         self.version.read().await.clone()
     }
 
+    pub async fn list_domains(&self) -> Vec<String> {
+        self.inner.read().await.keys().cloned().collect()
+    }
 }
 
-/// Strip port / brackets, lowercase. Handles `a.com:443`, `[::1]:8443`.
 pub fn normalize_host(host: &str) -> String {
     let host = host.trim().to_lowercase();
     if host.is_empty() {
@@ -72,7 +83,6 @@ pub fn normalize_host(host: &str) -> String {
             return host[1..end].to_string();
         }
     }
-    // only strip :port when the suffix is numeric (not IPv6 without brackets)
     if let Some((name, port)) = host.rsplit_once(':') {
         if !name.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
             return name.to_string();
@@ -81,14 +91,7 @@ pub fn normalize_host(host: &str) -> String {
     host
 }
 
-/// True if host looks like a bare IP (v4/v6), not a domain name
 pub fn is_ip_host(host: &str) -> bool {
     let h = normalize_host(host);
-    if h.parse::<std::net::Ipv4Addr>().is_ok() {
-        return true;
-    }
-    if h.parse::<std::net::Ipv6Addr>().is_ok() {
-        return true;
-    }
-    false
+    h.parse::<std::net::Ipv4Addr>().is_ok() || h.parse::<std::net::Ipv6Addr>().is_ok()
 }

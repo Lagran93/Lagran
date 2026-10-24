@@ -82,7 +82,7 @@ pub async fn issue(
             "token": token,
             "key_authorization": key_auth,
         });
-        let _ = request_json(http_client(), "PUT", &url, &body).await;
+        let _ = request_json(http_client(), "PUT", &url, &body, &state.config.agent_token).await;
     }
 
     let (cert_pem, key_pem) = issue_dev_cert(&domain).map_err(|e| {
@@ -131,7 +131,7 @@ pub async fn issue(
                 "cert_pem": cert_pem,
                 "key_pem": key_pem,
             });
-            if request_json(http_client(), "POST", &url, &body).await.is_ok() {
+            if request_json(http_client(), "POST", &url, &body, &state.config.agent_token).await.is_ok() {
                 edges_pushed += 1;
             }
         }
@@ -166,12 +166,14 @@ async fn request_json(
     method: &str,
     url: &str,
     body: &serde_json::Value,
+    token: &str,
 ) -> Result<(), String> {
     let bytes = Bytes::from(serde_json::to_vec(body).map_err(|e| e.to_string())?);
     let req = Request::builder()
         .method(method)
         .uri(url)
         .header("content-type", "application/json")
+        .header("x-lagran-agent-token", token)
         .body(Full::new(bytes))
         .map_err(|e| e.to_string())?;
     let resp = client.request(req).await.map_err(|e| e.to_string())?;

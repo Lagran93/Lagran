@@ -71,3 +71,24 @@ pub fn cache_key<B>(req: &Request<B>) -> String {
 pub fn is_cacheable<B>(req: &Request<B>) -> bool {
     req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD
 }
+
+
+/// Cache key; when ignore_query is true, strip ?query
+pub fn cache_key_opts<B>(req: &Request<B>, ignore_query: bool) -> String {
+    let method = req.method().as_str();
+    let path = if ignore_query {
+        req.uri().path().to_string()
+    } else {
+        req.uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string())
+    };
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    let host = host.split(':').next().unwrap_or(host);
+    format!("{method}:{host}:{path}")
+}

@@ -23,6 +23,8 @@ pub struct EdgeConfig {
     pub domain: String,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
+    pub access_log_path: Option<String>,
+    pub agent_token: String,
 }
 
 impl Default for EdgeConfig {
@@ -71,6 +73,10 @@ impl Default for EdgeConfig {
             domain: std::env::var("EDGE_DOMAIN").unwrap_or_default(),
             tls_cert_file: std::env::var("EDGE_TLS_CERT").ok().filter(|s| !s.is_empty()),
             tls_key_file: std::env::var("EDGE_TLS_KEY").ok().filter(|s| !s.is_empty()),
+            access_log_path: std::env::var("ACCESS_LOG_PATH").ok().filter(|s| !s.is_empty()),
+            agent_token: std::env::var("AGENT_TOKEN")
+                .or_else(|_| std::env::var("EDGE_AGENT_TOKEN"))
+                .unwrap_or_default(),
         }
     }
 }

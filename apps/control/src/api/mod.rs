@@ -1,13 +1,17 @@
-//! HTTP API routes — nest("/api/v1", ...) + Axum 0.7
+//! HTTP API routes — nest("/api/v1", ...) + path params :name
 
 pub mod acme;
+pub mod audit;
 pub mod auth;
 pub mod cert;
 pub mod config;
 pub mod domain;
 pub mod health;
+pub mod health_origin;
 pub mod metrics;
 pub mod node;
+pub mod prefetch;
+pub mod project;
 pub mod purge;
 pub mod rule;
 pub mod stats;
@@ -40,11 +44,21 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/auth/login", post(auth::login))
                 .route("/auth/register", post(auth::register))
                 .route("/auth/me", get(auth::me))
+                .route("/projects", get(project::list).post(project::create))
+                .route("/projects/:id", get(project::get).delete(project::delete))
+                .route("/projects/:id/domains", get(project::list_domains))
                 .route("/domains", get(domain::list).post(domain::create))
+                .route("/origin-health", get(health_origin::list))
+                .route("/origin-health/report", post(health_origin::report))
                 .route(
                     "/domains/:id",
                     get(domain::get).put(domain::update).delete(domain::delete),
                 )
+                .route(
+                    "/domains/:id/settings",
+                    get(domain::get_settings).put(domain::put_settings),
+                )
+                .route("/domains/:id/status", post(domain::set_status))
                 .route("/rules", get(rule::list).post(rule::create))
                 .route("/rules/:id", axum::routing::delete(rule::delete))
                 .route("/nodes", get(node::list))
@@ -56,7 +70,10 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/certs/:id", get(cert::get).delete(cert::delete))
                 .route("/certs/by-domain/:domain", get(cert::edge_get))
                 .route("/purge", post(purge::purge))
+                .route("/prefetch", get(prefetch::list).post(prefetch::create))
+                .route("/stats/by-domain", get(stats::by_domain))
                 .route("/stats/summary", get(stats::summary))
+                .route("/audit", get(audit::list))
                 .route("/config", get(config::list_all_configs))
                 .route("/config/:domain", get(config::get_domain_config)),
         )

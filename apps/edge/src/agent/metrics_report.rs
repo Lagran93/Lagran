@@ -40,7 +40,7 @@ pub fn spawn_metrics_report(config: EdgeConfig, metrics: Arc<EdgeMetrics>) {
                 "cache_misses": misses,
                 "bytes_sent": bytes,
             });
-            if let Err(e) = post_json(&client, &url, &body).await {
+            if let Err(e) = post_json(&client, &url, &body, &config.agent_token).await {
                 tracing::warn!(error = %e, "metrics report failed");
                 // put counters back roughly by re-adding (best-effort lost on failure)
             } else {
@@ -54,12 +54,14 @@ async fn post_json(
     client: &Client<HttpConnector, Full<Bytes>>,
     url: &str,
     body: &serde_json::Value,
+    token: &str,
 ) -> Result<(), String> {
     let bytes = Bytes::from(serde_json::to_vec(body).map_err(|e| e.to_string())?);
     let req = Request::builder()
         .method("POST")
         .uri(url)
         .header("content-type", "application/json")
+        .header("x-lagran-agent-token", token)
         .body(Full::new(bytes))
         .map_err(|e| e.to_string())?;
     let resp = client.request(req).await.map_err(|e| e.to_string())?;

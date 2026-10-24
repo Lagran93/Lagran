@@ -1,7 +1,8 @@
 //! HTTP listener setup
 
+use crate::server::agent_auth::RequireAgentToken;
 use crate::server::handler::{proxy_handler, AppState};
-use crate::server::purge;
+use crate::server::purge::{self, EdgePurgeRequest};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -16,10 +17,10 @@ use tower_http::trace::TraceLayer;
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/__lagran/health", get(health))
-        .route("/__lagran/purge", post(purge::purge_handler))
-        .route("/__lagran/acme/challenge", put(put_challenge))
+        .route("/__lagran/purge", post(purge_authed))
+        .route("/__lagran/acme/challenge", put(put_challenge_authed))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
-        .route("/__lagran/certs/load", post(load_cert))
+        .route("/__lagran/certs/load", post(load_cert_authed))
         .fallback(proxy_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -27,6 +28,26 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn purge_authed(
+    _auth: RequireAgentToken,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EdgePurgeRequest>,
+) -> impl IntoResponse {
+    purge::purge_handler(State(state), Json(req)).await
+}
+
+async fn put_challenge_authed(
+    _auth: RequireAgentToken,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ChallengeBody>,
+) -> StatusCode {
+    state
+        .challenges
+        .put(&body.token, &body.key_authorization);
+    tracing::info!(token = %body.token, "ACME challenge installed");
+    StatusCode::NO_CONTENT
 }
 
 async fn acme_challenge(
@@ -45,17 +66,6 @@ struct ChallengeBody {
     key_authorization: String,
 }
 
-async fn put_challenge(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<ChallengeBody>,
-) -> StatusCode {
-    state
-        .challenges
-        .put(&body.token, &body.key_authorization);
-    tracing::info!(token = %body.token, "ACME challenge installed");
-    StatusCode::NO_CONTENT
-}
-
 #[derive(Deserialize)]
 struct LoadCertBody {
     names: Vec<String>,
@@ -63,7 +73,8 @@ struct LoadCertBody {
     key_pem: String,
 }
 
-async fn load_cert(
+async fn load_cert_authed(
+    _auth: RequireAgentToken,
     State(state): State<Arc<AppState>>,
     Json(body): Json<LoadCertBody>,
 ) -> impl IntoResponse {

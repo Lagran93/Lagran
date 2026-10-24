@@ -1,5 +1,7 @@
 //! Auth middleware / extractors
 
+pub mod agent_auth;
+
 use crate::state::AppState;
 use crate::utils::{decode_token, Claims};
 use axum::{

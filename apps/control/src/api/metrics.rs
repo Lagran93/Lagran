@@ -1,5 +1,6 @@
 //! Edge metrics ingest
 
+use crate::middleware::agent_auth::AgentAuth;
 use crate::repository;
 use crate::state::AppState;
 use axum::{extract::State, Json};
@@ -22,6 +23,7 @@ pub struct MetricsAck {
 
 pub async fn report(
     State(state): State<AppState>,
+    _agent: AgentAuth,
     Json(req): Json<MetricsReport>,
 ) -> Json<MetricsAck> {
     if let Err(e) = repository::insert_metrics(

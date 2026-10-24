@@ -43,3 +43,43 @@ pub async fn summary(
         online_nodes,
     })
 }
+
+
+#[derive(Serialize)]
+pub struct DomainMetricsDto {
+    pub domain: String,
+    pub requests: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub bytes_sent: u64,
+    pub hit_ratio: f64,
+}
+
+pub async fn by_domain(
+    State(state): State<AppState>,
+    _user: AuthUser,
+) -> Json<Vec<DomainMetricsDto>> {
+    let rows = repository::metrics_by_domain(&state.pool)
+        .await
+        .unwrap_or_default();
+    Json(
+        rows.into_iter()
+            .map(|(domain, requests, hits, misses, bytes)| {
+                let total = hits + misses;
+                let hit_ratio = if total > 0 {
+                    hits as f64 / total as f64
+                } else {
+                    0.0
+                };
+                DomainMetricsDto {
+                    domain,
+                    requests: requests as u64,
+                    cache_hits: hits as u64,
+                    cache_misses: misses as u64,
+                    bytes_sent: bytes as u64,
+                    hit_ratio,
+                }
+            })
+            .collect(),
+    )
+}

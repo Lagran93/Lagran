@@ -1,5 +1,5 @@
 //! Edge node management
-
+use crate::middleware::agent_auth::AgentAuth;
 use crate::repository;
 use crate::state::AppState;
 use axum::{
@@ -60,6 +60,7 @@ pub async fn list(State(state): State<AppState>) -> Json<Vec<NodeDto>> {
 
 pub async fn heartbeat(
     State(state): State<AppState>,
+    _agent: AgentAuth,
     Json(req): Json<HeartbeatRequest>,
 ) -> Json<HeartbeatResponse> {
     let node_id = req
@@ -72,6 +73,7 @@ pub async fn heartbeat(
 
 pub async fn heartbeat_by_path(
     State(state): State<AppState>,
+    _agent: AgentAuth,
     Path(id): Path<String>,
     Json(req): Json<HeartbeatRequest>,
 ) -> Json<HeartbeatResponse> {

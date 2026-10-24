@@ -29,6 +29,14 @@ pub struct DomainConfigResponse {
     pub origin: OriginConfig,
     pub rules: Vec<CacheRuleConfig>,
     pub status: String,
+    pub rate_limit_rps: u32,
+    pub rate_limit_burst: u32,
+    pub ignore_query_string: bool,
+    pub cors_origins: String,
+    pub hotlink_allow_referers: String,
+    pub origin_timeout_ms: u32,
+    pub custom_headers: String,
+    pub backup_origin: Option<OriginConfig>,
     pub version: String,
 }
 
@@ -41,6 +49,67 @@ pub struct AllDomainsConfigResponse {
 #[derive(Serialize)]
 pub struct ErrorBody {
     pub error: String,
+}
+
+async fn build_domain_cfg(
+    pool: &sqlx::PgPool,
+    row: repository::DomainRow,
+) -> DomainConfigResponse {
+    let rules = repository::list_rules_for_domain(pool, row.id)
+        .await
+        .unwrap_or_default();
+    let rule_count = rules.len();
+    let settings = repository::get_domain_settings(pool, &row.name)
+        .await
+        .ok()
+        .flatten();
+    let (rps, burst, ignore_q, cors, hotlink, timeout, headers) = match settings {
+        Some(s) => (
+            s.rate_limit_rps.max(0) as u32,
+            s.rate_limit_burst.max(0) as u32,
+            s.ignore_query_string,
+            s.cors_origins,
+            s.hotlink_allow_referers,
+            s.origin_timeout_ms.max(1000) as u32,
+            s.custom_headers,
+        ),
+        None => (0, 0, false, String::new(), String::new(), 10000, String::new()),
+    };
+    let backup = repository::get_backup_origin(pool, &row.name)
+        .await
+        .ok()
+        .flatten()
+        .map(|(h, p, proto)| OriginConfig {
+            host: h,
+            port: p as u16,
+            protocol: proto,
+        });
+    DomainConfigResponse {
+        domain: row.name,
+        origin: OriginConfig {
+            host: row.origin_host,
+            port: row.origin_port as u16,
+            protocol: row.origin_proto,
+        },
+        rules: rules
+            .into_iter()
+            .map(|r| CacheRuleConfig {
+                path_pattern: r.path_pattern,
+                ttl_seconds: r.ttl_seconds as u64,
+                priority: r.priority,
+            })
+            .collect(),
+        status: row.status,
+        rate_limit_rps: rps,
+        rate_limit_burst: burst,
+        ignore_query_string: ignore_q,
+        cors_origins: cors,
+        hotlink_allow_referers: hotlink,
+        origin_timeout_ms: timeout,
+        custom_headers: headers,
+        backup_origin: backup,
+        version: format!("{}-r{}", row.id, rule_count),
+    }
 }
 
 pub async fn get_domain_config(
@@ -65,33 +134,9 @@ pub async fn get_domain_config(
                 }),
             )
         })?;
-
-    let rules = repository::list_rules_for_domain(&state.pool, row.id)
-        .await
-        .unwrap_or_default();
-    let rule_count = rules.len();
-
-    Ok(Json(DomainConfigResponse {
-        domain: row.name,
-        origin: OriginConfig {
-            host: row.origin_host,
-            port: row.origin_port as u16,
-            protocol: row.origin_proto,
-        },
-        rules: rules
-            .into_iter()
-            .map(|r| CacheRuleConfig {
-                path_pattern: r.path_pattern,
-                ttl_seconds: r.ttl_seconds as u64,
-                priority: r.priority,
-            })
-            .collect(),
-        status: row.status,
-        version: format!("{}-r{}", row.id, rule_count),
-    }))
+    Ok(Json(build_domain_cfg(&state.pool, row).await))
 }
 
-/// GET /api/v1/config — all accelerated domains for edge bulk sync
 pub async fn list_all_configs(
     State(state): State<AppState>,
 ) -> Result<Json<AllDomainsConfigResponse>, (StatusCode, Json<ErrorBody>)> {
@@ -105,41 +150,14 @@ pub async fn list_all_configs(
         )
     })?;
 
-    let mut domains = Vec::with_capacity(rows.len());
+    let mut domains = Vec::new();
     let mut version_parts = Vec::new();
-
     for row in rows {
-        // only active / enabled domains
-        if row.status != "active" && row.status != "enabled" && row.status != "ok" {
-            // still include "active" default; seed uses status often "active"
-            // include all non-disabled
-            if row.status == "disabled" || row.status == "deleted" {
-                continue;
-            }
+        if row.status == "disabled" || row.status == "deleted" {
+            continue;
         }
-        let rules = repository::list_rules_for_domain(&state.pool, row.id)
-            .await
-            .unwrap_or_default();
-        let rule_count = rules.len();
-        version_parts.push(format!("{}:{}", row.id, rule_count));
-        domains.push(DomainConfigResponse {
-            domain: row.name,
-            origin: OriginConfig {
-                host: row.origin_host,
-                port: row.origin_port as u16,
-                protocol: row.origin_proto,
-            },
-            rules: rules
-                .into_iter()
-                .map(|r| CacheRuleConfig {
-                    path_pattern: r.path_pattern,
-                    ttl_seconds: r.ttl_seconds as u64,
-                    priority: r.priority,
-                })
-                .collect(),
-            status: row.status,
-            version: format!("{}-r{}", row.id, rule_count),
-        });
+        version_parts.push(format!("{}:{}", row.id, row.status));
+        domains.push(build_domain_cfg(&state.pool, row).await);
     }
 
     let version = {

@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub database_url: String,
     pub jwt_secret: String,
     pub jwt_expire_hours: i64,
+    /// Shared secret for edge agent APIs (empty = no check)
+    pub agent_token: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,6 +37,9 @@ impl Default for AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(72),
+            agent_token: std::env::var("AGENT_TOKEN")
+                .or_else(|_| std::env::var("EDGE_AGENT_TOKEN"))
+                .unwrap_or_default(),
         }
     }
 }
