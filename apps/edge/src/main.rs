@@ -35,7 +35,10 @@ async fn main() -> anyhow::Result<()> {
     let origin = OriginClient::new(config.origin_url.clone());
     let rules = RuleSet::new();
     let metrics = EdgeMetrics::new();
-    let cert_store = Arc::new(CertStore::new());
+    let cert_store = Arc::new(CertStore::with_persist_dir(&config.cert_dir));
+    if !cert_store.is_empty() {
+        tracing::info!(count = cert_store.len(), "HTTPS can start with disk-loaded certs");
+    }
     let challenges = ChallengeStore::new();
     let access_log = AccessLog::open(
         config.access_log_path.as_deref(),
@@ -102,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
                 if store.len() > 0 {
                     break;
                 }
-                tracing::info!("waiting for certificate before HTTPS bind…");
+                tracing::info!("waiting for certificate (disk empty; syncing from control)…");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
             if let Err(e) = tls::serve_https(https_addr, https_app, store).await {

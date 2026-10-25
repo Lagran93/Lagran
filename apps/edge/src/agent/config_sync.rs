@@ -25,6 +25,10 @@ struct RuleCfg {
     path_pattern: String,
     ttl_seconds: u64,
     priority: i32,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    swr_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,6 +101,8 @@ pub fn spawn_config_sync(
                                     path_pattern: r.path_pattern.clone(),
                                     ttl_seconds: r.ttl_seconds,
                                     priority: r.priority,
+                                    action: r.action.clone().unwrap_or_else(|| "cache".into()),
+                                    swr_seconds: r.swr_seconds.unwrap_or(0),
                                 })
                                 .collect();
                             global_rules.extend(mapped.clone());
@@ -152,6 +158,8 @@ pub fn spawn_config_sync(
                             path_pattern: r.path_pattern,
                             ttl_seconds: r.ttl_seconds,
                             priority: r.priority,
+                            action: r.action.unwrap_or_else(|| "cache".into()),
+                            swr_seconds: r.swr_seconds.unwrap_or(0),
                         })
                         .collect();
                     rules.replace(mapped.clone()).await;

@@ -75,6 +75,7 @@ pub fn create_router(state: AppState) -> Router {
                     get(cert::get).delete(cert::delete),
                 )
                 .route("/certs/by-domain/:domain", get(cert::edge_get))
+                .route("/certs/edge-sync", get(cert::edge_list_active))
                 .route("/purge", post(purge::purge))
                 .route("/prefetch", get(prefetch::list).post(prefetch::create))
                 .route("/stats/by-domain", get(stats::by_domain))

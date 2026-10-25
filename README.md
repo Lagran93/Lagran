@@ -87,3 +87,4 @@ MIT
 前端登录后将 JWT 存入 localStorage，请求自动带 `Authorization: Bearer <token>`。
 
 边缘端默认回源 `https://example.com`，可通过 `ORIGIN_URL` 覆盖（支持 http/https）。
+目前最基本的功能已经实现，请继续加强丰富其他功能。

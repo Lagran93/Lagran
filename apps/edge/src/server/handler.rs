@@ -1,7 +1,7 @@
 //! Main request handler: domain lookup → cache → origin
 
-use crate::cache::policy::{cache_key_opts, is_cacheable, RuleSet};
-use crate::cache::{CacheEntry, SharedCache};
+use crate::cache::policy::{cache_key_opts, is_cacheable, request_bypasses_cache, CacheStatus, RuleSet};
+use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
 use crate::config::registry::DomainRegistry;
 use crate::metrics::EdgeMetrics;
 use crate::origin::OriginClient;
@@ -203,7 +203,14 @@ pub async fn proxy_handler(
         .filter(|t| *t > 0)
         .unwrap_or(10000);
 
-    if !is_cacheable(&req) {
+    // Rule action bypass / request Cache-Control
+    let policy = state.rules.match_policy(&path_only).await;
+    let rule_bypass = policy
+        .as_ref()
+        .map(|p| p.action == "bypass" || p.action == "no_store")
+        .unwrap_or(false);
+
+    if !is_cacheable(&req) || request_bypasses_cache(&req) || rule_bypass {
         let fetch = state
             .origin
             .fetch_from(&origin_url, &path_and_query, req.headers());
@@ -237,7 +244,7 @@ pub async fn proxy_handler(
                     &user_agent,
                     &referer,
                     bypass_bytes,
-                    "BYPASS",
+                    CacheStatus::Dynamic.as_str(),
                 )
                 .await;
                 return resp;
@@ -245,29 +252,61 @@ pub async fn proxy_handler(
         }
     }
 
-        let key = cache_key_opts(&req, ignore_query);
+    let key = cache_key_opts(&req, ignore_query);
+    let pol = state.rules.match_policy(&path_only).await;
     let ttl = domain_rules_ttl
-        .or(state.rules.match_ttl(&path_only).await)
+        .or(pol.as_ref().map(|p| p.ttl_seconds))
         .unwrap_or(state.default_ttl_secs);
+    let swr = pol.as_ref().map(|p| p.swr_seconds).unwrap_or(0);
 
-    if let Some(entry) = state.cache.get(&key).await {
-        let etag = compute_etag(&entry);
-        if let Some(ref client_etag) = inm {
-            if client_etag.trim() == etag || client_etag.trim() == format!("W/{etag}") {
-                state.metrics.record_hit(&host, 0).await;
-                log_access(&state.access_log, &method, &host, &path_only, 304, start, &client_ip, &user_agent, &referer, 0, "HIT").await;
-                return not_modified_response(&etag);
+    let mut from_expired = false;
+    match state.cache.get_result(&key).await {
+        CacheGetResult::Hit(entry) => {
+            let etag = compute_etag(&entry);
+            if let Some(ref client_etag) = inm {
+                if client_etag.trim() == etag || client_etag.trim() == format!("W/{etag}") {
+                    state.metrics.record_hit(&host, 0).await;
+                    log_access(&state.access_log, &method, &host, &path_only, 304, start, &client_ip, &user_agent, &referer, 0, CacheStatus::Revalidated.as_str()).await;
+                    return not_modified_response(&etag, CacheStatus::Revalidated.as_str());
+                }
             }
+            let hit_bytes = entry.body.len() as u64;
+            state.metrics.record_hit(&host, hit_bytes).await;
+            let resp = entry_to_response(entry, CacheStatus::Hit.as_str(), &etag, &cors, &custom_headers);
+            log_access(&state.access_log, &method, &host, &path_only, 200, start, &client_ip, &user_agent, &referer, hit_bytes, CacheStatus::Hit.as_str()).await;
+            return resp;
         }
-        tracing::debug!(%key, %host, "cache HIT");
-        let hit_bytes = entry.body.len() as u64;
-        state.metrics.record_hit(&host, hit_bytes).await;
-        let resp = entry_to_response(entry, "HIT", &etag, &cors, &custom_headers);
-        log_access(&state.access_log, &method, &host, &path_only, 200, start, &client_ip, &user_agent, &referer, hit_bytes, "HIT").await;
-        return resp;
+        CacheGetResult::Stale(entry) => {
+            let etag = compute_etag(&entry);
+            let hit_bytes = entry.body.len() as u64;
+            state.metrics.record_hit(&host, hit_bytes).await;
+            let label = CacheStatus::Stale.as_str();
+            // background revalidation → next request may be REVALIDATED/HIT
+            let origin = state.origin.clone();
+            let cache = state.cache.clone();
+            let ou = origin_url.clone();
+            let pq = path_and_query.clone();
+            let hdrs = req.headers().clone();
+            let k = key.clone();
+            tokio::spawn(async move {
+                if let Ok(ne) = origin.fetch_as_entry_from(&ou, &pq, &hdrs).await {
+                    if (200..300).contains(&ne.status) && ttl > 0 {
+                        cache.set_with_swr(&k, ne, ttl, swr).await;
+                    }
+                }
+            });
+            let resp = entry_to_response(entry, label, &etag, &cors, &custom_headers);
+            log_access(&state.access_log, &method, &host, &path_only, 200, start, &client_ip, &user_agent, &referer, hit_bytes, label).await;
+            return resp;
+        }
+        CacheGetResult::Expired => {
+            from_expired = true;
+            tracing::debug!(%key, %host, "cache EXPIRED → fetch origin");
+        }
+        CacheGetResult::Miss => {
+            tracing::debug!(%key, %host, origin = %origin_url, ttl, "cache MISS");
+        }
     }
-
-    tracing::debug!(%key, %host, origin = %origin_url, ttl, "cache MISS");
 
     match fetch_with_failover(
         &state.origin,
@@ -283,12 +322,18 @@ pub async fn proxy_handler(
             let bytes = entry.body.len() as u64;
             let etag = compute_etag(&entry);
             if (200..300).contains(&entry.status) && ttl > 0 {
-                state.cache.set(&key, entry.clone(), ttl).await;
+                state.cache.set_with_swr(&key, entry.clone(), ttl, swr).await;
             }
             state.metrics.record_miss(&host, bytes).await;
             let status = entry.status;
-            let resp = entry_to_response(entry, "MISS", &etag, &cors, &custom_headers);
-            log_access(&state.access_log, &method, &host, &path_only, status, start, &client_ip, &user_agent, &referer, bytes, "MISS").await;
+            let label = if from_expired {
+                CacheStatus::Expired.as_str()
+            } else {
+                CacheStatus::Miss.as_str()
+            };
+            // After origin fetch following expired, response is filled from origin — use EXPIRED to signal why
+            let resp = entry_to_response(entry, label, &etag, &cors, &custom_headers);
+            log_access(&state.access_log, &method, &host, &path_only, status, start, &client_ip, &user_agent, &referer, bytes, label).await;
             resp
         }
         Err(e) => {
@@ -391,12 +436,16 @@ fn compute_etag(entry: &CacheEntry) -> String {
     format!("\"{:x}\"", h.finish())
 }
 
-fn not_modified_response(etag: &str) -> Response {
+fn not_modified_response(etag: &str, cache_status: &str) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static("etag"),
         HeaderValue::from_str(etag).unwrap_or_else(|_| HeaderValue::from_static("\"0\"")),
     );
+    if let Ok(v) = HeaderValue::from_str(cache_status) {
+        headers.insert(HeaderName::from_static("x-cache"), v.clone());
+        headers.insert(HeaderName::from_static("x-cache-status"), v);
+    }
     apply_security_headers(&mut headers);
     let mut resp = Response::new(Body::empty());
     *resp.status_mut() = StatusCode::NOT_MODIFIED;
@@ -459,8 +508,16 @@ fn entry_to_response(entry: CacheEntry, cache_status: &str, etag: &str, cors: &s
     }
     headers.insert(
         HeaderName::from_static("x-cache"),
-        HeaderValue::from_str(cache_status).unwrap(),
+        HeaderValue::from_str(cache_status).unwrap_or(HeaderValue::from_static("UNKNOWN")),
     );
+    headers.insert(
+        HeaderName::from_static("x-cache-status"),
+        HeaderValue::from_str(cache_status).unwrap_or(HeaderValue::from_static("UNKNOWN")),
+    );
+    let age = entry.age_secs();
+    if let Ok(v) = HeaderValue::from_str(&age.to_string()) {
+        headers.insert(HeaderName::from_static("age"), v);
+    }
     headers.insert(
         HeaderName::from_static("x-powered-by"),
         HeaderValue::from_static("lagran-edge"),

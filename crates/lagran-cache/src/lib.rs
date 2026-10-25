@@ -8,11 +8,18 @@ use std::time::{Duration, Instant};
 
 #[async_trait]
 pub trait CacheBackend: Send + Sync {
-    async fn get(&self, key: &str) -> Option<CacheEntry>;
+    async fn get_result(&self, key: &str) -> CacheGetResult;
+    async fn get(&self, key: &str) -> Option<CacheEntry> {
+        match self.get_result(key).await {
+            CacheGetResult::Hit(e) | CacheGetResult::Stale(e) => Some(e),
+            CacheGetResult::Miss | CacheGetResult::Expired => None,
+        }
+    }
     async fn set(&self, key: &str, entry: CacheEntry, ttl_secs: u64);
+    /// Set with soft (fresh) TTL and optional stale-while-revalidate window
+    async fn set_with_swr(&self, key: &str, entry: CacheEntry, fresh_secs: u64, swr_secs: u64);
     async fn delete(&self, key: &str);
     async fn clear(&self);
-    /// Delete keys that contain any of the substrings (path/url match)
     async fn purge_matching(&self, patterns: &[String]) -> u64;
     async fn len(&self) -> usize;
 }
@@ -22,11 +29,43 @@ pub struct CacheEntry {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Bytes,
+    /// When this entry was stored (for Age header)
+    pub stored_at_epoch_secs: u64,
+}
+
+impl CacheEntry {
+    pub fn new(status: u16, headers: Vec<(String, String)>, body: Bytes) -> Self {
+        Self {
+            status,
+            headers,
+            body,
+            stored_at_epoch_secs: now_epoch_secs(),
+        }
+    }
+
+    pub fn age_secs(&self) -> u64 {
+        now_epoch_secs().saturating_sub(self.stored_at_epoch_secs)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum CacheGetResult {
+    /// Within fresh TTL
+    Hit(CacheEntry),
+    /// Past fresh TTL but within stale-while-revalidate window
+    Stale(CacheEntry),
+    /// Entry existed but hard-expired (removed)
+    Expired,
+    /// No entry
+    Miss,
 }
 
 struct TimedEntry {
     entry: CacheEntry,
-    expires_at: Instant,
+    /// Fresh until this instant
+    fresh_until: Instant,
+    /// Soft-usable (stale) until this instant; after that hard miss
+    stale_until: Instant,
 }
 
 #[derive(Clone, Default)]
@@ -46,21 +85,48 @@ impl MemoryCache {
     }
 }
 
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[async_trait]
 impl CacheBackend for MemoryCache {
-    async fn get(&self, key: &str) -> Option<CacheEntry> {
-        let item = self.inner.get(key)?;
-        if Instant::now() > item.expires_at {
-            drop(item);
-            self.inner.remove(key);
-            return None;
+    async fn get_result(&self, key: &str) -> CacheGetResult {
+        let item = match self.inner.get(key) {
+            Some(i) => i,
+            None => return CacheGetResult::Miss,
+        };
+        let now = Instant::now();
+        if now <= item.fresh_until {
+            return CacheGetResult::Hit(item.entry.clone());
         }
-        Some(item.entry.clone())
+        if now <= item.stale_until {
+            return CacheGetResult::Stale(item.entry.clone());
+        }
+        drop(item);
+        self.inner.remove(key);
+        CacheGetResult::Expired
     }
 
     async fn set(&self, key: &str, entry: CacheEntry, ttl_secs: u64) {
-        let expires_at = Instant::now() + Duration::from_secs(ttl_secs.max(1));
-        self.inner.insert(key.to_string(), TimedEntry { entry, expires_at });
+        self.set_with_swr(key, entry, ttl_secs, 0).await;
+    }
+
+    async fn set_with_swr(&self, key: &str, entry: CacheEntry, fresh_secs: u64, swr_secs: u64) {
+        let now = Instant::now();
+        let fresh = Duration::from_secs(fresh_secs.max(1));
+        let swr = Duration::from_secs(swr_secs);
+        self.inner.insert(
+            key.to_string(),
+            TimedEntry {
+                entry,
+                fresh_until: now + fresh,
+                stale_until: now + fresh + swr,
+            },
+        );
     }
 
     async fn delete(&self, key: &str) {
@@ -79,16 +145,9 @@ impl CacheBackend for MemoryCache {
         }
         let mut removed = 0u64;
         let keys: Vec<String> = self.inner.iter().map(|e| e.key().clone()).collect();
-        for key in keys {
-            let hit = patterns.iter().any(|p| {
-                if p.is_empty() {
-                    return false;
-                }
-                // match full key or path portion
-                key.contains(p.as_str())
-            });
-            if hit {
-                self.inner.remove(&key);
+        for k in keys {
+            if patterns.iter().any(|p| k.contains(p)) {
+                self.inner.remove(&k);
                 removed += 1;
             }
         }

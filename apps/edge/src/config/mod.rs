@@ -29,6 +29,8 @@ pub struct EdgeConfig {
     pub access_log_buffer: usize,
     pub access_log_report: bool,
     pub access_log_report_interval_secs: u64,
+    /// Directory to persist TLS certs across restarts
+    pub cert_dir: String,
 }
 
 impl Default for EdgeConfig {
@@ -95,6 +97,7 @@ impl Default for EdgeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+            cert_dir: std::env::var("CERT_DIR").unwrap_or_else(|_| "./data/certs".into()),
         }
     }
 }

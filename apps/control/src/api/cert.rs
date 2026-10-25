@@ -1,5 +1,6 @@
 //! Certificate management
 
+use crate::middleware::agent_auth::AgentAuth;
 use crate::middleware::AuthUser;
 use crate::repository;
 use crate::state::AppState;
@@ -231,4 +232,40 @@ pub async fn edge_get(
         key_pem: row.key_pem,
         status: row.status,
     }))
+}
+
+
+#[derive(Serialize)]
+pub struct EdgeCertBundle {
+    pub domain: String,
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub status: String,
+}
+
+/// Edge: list all active certs with PEM (agent token)
+pub async fn edge_list_active(
+    State(state): State<AppState>,
+    _agent: AgentAuth,
+) -> Result<Json<Vec<EdgeCertBundle>>, (StatusCode, Json<ErrorBody>)> {
+    let rows = repository::list_certs(&state.pool).await.map_err(|e| {
+        tracing::error!(error = %e, "list certs for edge");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "database error".into(),
+            }),
+        )
+    })?;
+    let out: Vec<_> = rows
+        .into_iter()
+        .filter(|r| r.status == "active" && !r.cert_pem.is_empty() && !r.key_pem.is_empty())
+        .map(|r| EdgeCertBundle {
+            domain: r.domain_name,
+            cert_pem: r.cert_pem,
+            key_pem: r.key_pem,
+            status: r.status,
+        })
+        .collect();
+    Ok(Json(out))
 }

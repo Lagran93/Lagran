@@ -164,10 +164,6 @@ impl OriginClient {
                     .map(|s| (k.as_str().to_string(), s.to_string()))
             })
             .collect();
-        Ok(CacheEntry {
-            status: status.as_u16(),
-            headers: headers_vec,
-            body,
-        })
+        Ok(CacheEntry::new(status.as_u16(), headers_vec, body))
     }
 }

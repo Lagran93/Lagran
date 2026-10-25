@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lagran_cache::{CacheBackend, CacheEntry};
+use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +15,12 @@ use tokio::sync::Mutex;
 struct DiskMeta {
     status: u16,
     headers: Vec<(String, String)>,
-    expires_unix: u64,
+    /// Fresh until (unix secs)
+    fresh_until: u64,
+    /// Stale usable until
+    stale_until: u64,
+    #[serde(default)]
+    stored_at: u64,
 }
 
 pub struct DiskCache {
@@ -44,7 +49,10 @@ impl DiskCache {
         let sub = format!("{:02x}", hash % 256);
         let dir = self.root.join(sub);
         let base = format!("{:016x}", hash);
-        (dir.join(format!("{base}.meta")), dir.join(format!("{base}.bin")))
+        (
+            dir.join(format!("{base}.meta")),
+            dir.join(format!("{base}.bin")),
+        )
     }
 }
 
@@ -87,133 +95,183 @@ async fn scan_usage(root: &Path) -> anyhow::Result<u64> {
 
 #[async_trait]
 impl CacheBackend for DiskCache {
-    async fn get(&self, key: &str) -> Option<CacheEntry> {
+    async fn get_result(&self, key: &str) -> CacheGetResult {
         let (meta_path, bin_path) = self.paths_for_key(key);
-        let meta_bytes = fs::read(&meta_path).await.ok()?;
-        let meta: DiskMeta = serde_json::from_slice(&meta_bytes).ok()?;
-        if now_unix() > meta.expires_unix {
+        let meta_bytes = match fs::read(&meta_path).await {
+            Ok(b) => b,
+            Err(_) => return CacheGetResult::Miss,
+        };
+        let meta: DiskMeta = match serde_json::from_slice(&meta_bytes) {
+            Ok(m) => m,
+            Err(_) => return CacheGetResult::Miss,
+        };
+        let now = now_unix();
+        if now > meta.stale_until {
             let _ = fs::remove_file(&meta_path).await;
             let _ = fs::remove_file(&bin_path).await;
-            return None;
+            return CacheGetResult::Expired;
         }
-        let body = fs::read(&bin_path).await.ok()?;
-        Some(CacheEntry {
+        let body = match fs::read(&bin_path).await {
+            Ok(b) => b,
+            Err(_) => return CacheGetResult::Miss,
+        };
+        let entry = CacheEntry {
             status: meta.status,
             headers: meta.headers,
             body: Bytes::from(body),
-        })
+            stored_at_epoch_secs: if meta.stored_at > 0 {
+                meta.stored_at
+            } else {
+                meta.fresh_until.saturating_sub(60)
+            },
+        };
+        if now <= meta.fresh_until {
+            CacheGetResult::Hit(entry)
+        } else {
+            CacheGetResult::Stale(entry)
+        }
     }
 
     async fn set(&self, key: &str, entry: CacheEntry, ttl_secs: u64) {
+        self.set_with_swr(key, entry, ttl_secs, 0).await;
+    }
+
+    async fn set_with_swr(&self, key: &str, entry: CacheEntry, fresh_secs: u64, swr_secs: u64) {
         let _guard = self.lock.lock().await;
         let (meta_path, bin_path) = self.paths_for_key(key);
         if let Some(parent) = meta_path.parent() {
             let _ = fs::create_dir_all(parent).await;
         }
-
+        let now = now_unix();
+        let fresh = fresh_secs.max(1);
         let meta = DiskMeta {
             status: entry.status,
             headers: entry.headers.clone(),
-            expires_unix: now_unix() + ttl_secs.max(1),
+            fresh_until: now + fresh,
+            stale_until: now + fresh + swr_secs,
+            stored_at: entry.stored_at_epoch_secs.max(now),
         };
         let meta_bytes = match serde_json::to_vec(&meta) {
             Ok(b) => b,
             Err(_) => return,
         };
-
-        // rough size accounting
-        let new_size = meta_bytes.len() as u64 + entry.body.len() as u64;
-        let used = self.used_bytes.load(Ordering::Relaxed);
-        if used + new_size > self.max_bytes {
-            // simple: skip write when full (production: LRU eviction)
-            tracing::warn!("disk cache full, skip set");
+        let body_len = entry.body.len() as u64;
+        if let Err(e) = fs::write(&bin_path, &entry.body).await {
+            tracing::warn!(error = %e, "disk cache write body failed");
             return;
         }
-
-        if fs::write(&meta_path, &meta_bytes).await.is_ok()
-            && fs::write(&bin_path, entry.body.as_ref()).await.is_ok()
-        {
-            self.used_bytes.fetch_add(new_size, Ordering::Relaxed);
+        if let Err(e) = fs::write(&meta_path, &meta_bytes).await {
+            tracing::warn!(error = %e, "disk cache write meta failed");
+            let _ = fs::remove_file(&bin_path).await;
+            return;
+        }
+        self.used_bytes
+            .fetch_add(body_len + meta_bytes.len() as u64, Ordering::Relaxed);
+        // Simple eviction: if over max, clear all (MVP)
+        if self.used_bytes.load(Ordering::Relaxed) > self.max_bytes {
+            tracing::warn!("disk cache over capacity, clearing");
+            let _ = fs::remove_dir_all(&self.root).await;
+            let _ = fs::create_dir_all(&self.root).await;
+            self.used_bytes.store(0, Ordering::Relaxed);
         }
     }
 
     async fn delete(&self, key: &str) {
         let (meta_path, bin_path) = self.paths_for_key(key);
-        let _ = fs::remove_file(meta_path).await;
-        let _ = fs::remove_file(bin_path).await;
+        let _ = fs::remove_file(&meta_path).await;
+        let _ = fs::remove_file(&bin_path).await;
     }
 
     async fn clear(&self) {
-        let _guard = self.lock.lock().await;
         let _ = fs::remove_dir_all(&self.root).await;
         let _ = fs::create_dir_all(&self.root).await;
         self.used_bytes.store(0, Ordering::Relaxed);
     }
 
     async fn purge_matching(&self, patterns: &[String]) -> u64 {
-        // disk purge by scanning is expensive; clear all if empty patterns or *
-        if patterns.is_empty() || patterns.iter().any(|p| p == "*" || p == "/*") {
+        // Full clear if any pattern (simple)
+        if patterns.is_empty() {
             self.clear().await;
             return 1;
         }
-        // best-effort: no full index — clear for safety on path purge
         self.clear().await;
         1
     }
 
     async fn len(&self) -> usize {
-        0 // not tracked precisely
+        0 // expensive to count; optional
     }
 }
 
-/// Two-tier: memory first, then disk
+/// L1 memory + L2 disk
 pub struct HybridCache {
-    memory: Arc<dyn CacheBackend>,
+    mem: Arc<dyn CacheBackend>,
     disk: Arc<dyn CacheBackend>,
 }
 
 impl HybridCache {
-    pub fn new(memory: Arc<dyn CacheBackend>, disk: Arc<dyn CacheBackend>) -> Self {
-        Self { memory, disk }
+    pub fn new(mem: Arc<dyn CacheBackend>, disk: Arc<dyn CacheBackend>) -> Self {
+        Self { mem, disk }
     }
 }
 
 #[async_trait]
 impl CacheBackend for HybridCache {
-    async fn get(&self, key: &str) -> Option<CacheEntry> {
-        if let Some(e) = self.memory.get(key).await {
-            return Some(e);
+    async fn get_result(&self, key: &str) -> CacheGetResult {
+        match self.mem.get_result(key).await {
+            CacheGetResult::Hit(e) => CacheGetResult::Hit(e),
+            CacheGetResult::Stale(e) => CacheGetResult::Stale(e),
+            other => {
+                // promote from disk
+                match self.disk.get_result(key).await {
+                    CacheGetResult::Hit(e) => {
+                        self.mem.set(key, e.clone(), 60).await;
+                        CacheGetResult::Hit(e)
+                    }
+                    CacheGetResult::Stale(e) => CacheGetResult::Stale(e),
+                    CacheGetResult::Expired => CacheGetResult::Expired,
+                    CacheGetResult::Miss => {
+                        if matches!(other, CacheGetResult::Expired) {
+                            CacheGetResult::Expired
+                        } else {
+                            CacheGetResult::Miss
+                        }
+                    }
+                }
+            }
         }
-        if let Some(e) = self.disk.get(key).await {
-            // promote to memory with short TTL approximation — use 60s
-            self.memory.set(key, e.clone(), 60).await;
-            return Some(e);
-        }
-        None
     }
 
     async fn set(&self, key: &str, entry: CacheEntry, ttl_secs: u64) {
-        self.memory.set(key, entry.clone(), ttl_secs).await;
-        self.disk.set(key, entry, ttl_secs).await;
+        self.set_with_swr(key, entry, ttl_secs, 0).await;
+    }
+
+    async fn set_with_swr(&self, key: &str, entry: CacheEntry, fresh_secs: u64, swr_secs: u64) {
+        self.mem
+            .set_with_swr(key, entry.clone(), fresh_secs, swr_secs)
+            .await;
+        self.disk
+            .set_with_swr(key, entry, fresh_secs, swr_secs)
+            .await;
     }
 
     async fn delete(&self, key: &str) {
-        self.memory.delete(key).await;
+        self.mem.delete(key).await;
         self.disk.delete(key).await;
     }
 
     async fn clear(&self) {
-        self.memory.clear().await;
+        self.mem.clear().await;
         self.disk.clear().await;
     }
 
     async fn purge_matching(&self, patterns: &[String]) -> u64 {
-        let a = self.memory.purge_matching(patterns).await;
+        let a = self.mem.purge_matching(patterns).await;
         let b = self.disk.purge_matching(patterns).await;
         a + b
     }
 
     async fn len(&self) -> usize {
-        self.memory.len().await
+        self.mem.len().await
     }
 }
