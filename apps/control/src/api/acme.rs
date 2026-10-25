@@ -1,5 +1,6 @@
-//! Certificate auto-issuance (dev: rcgen; challenge fan-out to edges)
+//! Certificate auto-issuance: Let's Encrypt (ACME v2) or local dev CA.
 
+use crate::acme as acme_client;
 use crate::middleware::authz::Actor;
 use crate::repository;
 use crate::state::AppState;
@@ -24,6 +25,8 @@ pub struct IssueRequest {
     pub domain_name: String,
     pub push_to_edges: Option<bool>,
     pub auto_renew: Option<bool>,
+    /// `letsencrypt` (default), `letsencrypt-staging`, or `dev`.
+    pub provider: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -75,46 +78,103 @@ pub async fn issue(
         ));
     }
 
-    let domain = req.domain_name.trim().to_string();
-    let token = Uuid::new_v4().to_string().replace('-', "");
-    let key_auth = format!("{token}.lagran-acme-dev");
-    let _ = repository::put_acme_challenge(&state.pool, &token, &key_auth, &domain).await;
+    let domain = req.domain_name.trim().trim_end_matches('.').to_string();
+    let provider = req
+        .provider
+        .as_deref()
+        .unwrap_or("letsencrypt")
+        .trim()
+        .to_ascii_lowercase();
 
     let nodes = repository::list_online_nodes_with_agent(&state.pool)
         .await
         .unwrap_or_default();
 
-    for node in &nodes {
-        let url = format!(
-            "{}/__lagran/acme/challenge",
-            node.agent_url.trim_end_matches('/')
-        );
-        let body = serde_json::json!({
-            "token": token,
-            "key_authorization": key_auth,
-        });
-        let _ = request_json(
-            http_client(),
-            "PUT",
-            &url,
-            &body,
-            if node.auth_token.is_empty() {
-                &state.config.agent_token
-            } else {
-                &node.auth_token
-            },
-        )
-        .await;
-    }
+    let (cert_pem, key_pem, mut issuer) = match provider.as_str() {
+        "dev" => {
+            let token = Uuid::new_v4().to_string().replace('-', "");
+            let key_auth = format!("{token}.lagran-acme-dev");
+            let _ = repository::put_acme_challenge(&state.pool, &token, &key_auth, &domain).await;
 
-    let (cert_pem, key_pem) = issue_dev_cert(&domain).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: format!("issue failed: {e}"),
-            }),
-        )
-    })?;
+            for node in &nodes {
+                let url = format!(
+                    "{}/__lagran/acme/challenge",
+                    node.agent_url.trim_end_matches('/')
+                );
+                let body = serde_json::json!({
+                    "token": token,
+                    "key_authorization": key_auth,
+                });
+                let _ = request_json(
+                    http_client(),
+                    "PUT",
+                    &url,
+                    &body,
+                    if node.auth_token.is_empty() {
+                        &state.config.agent_token
+                    } else {
+                        &node.auth_token
+                    },
+                )
+                .await;
+            }
+
+            let (cert_pem, key_pem) = issue_dev_cert(&domain).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("issue failed: {e}"),
+                    }),
+                )
+            })?;
+            (cert_pem, key_pem, "Lagran Dev CA (rcgen)".to_string())
+        }
+        "letsencrypt" | "letsencrypt-staging" => {
+            let directory = if provider == "letsencrypt-staging" {
+                &state.config.acme_staging_directory_url
+            } else {
+                &state.config.acme_directory_url
+            };
+            if directory.trim().is_empty() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        error: "ACME directory is not configured".into(),
+                    }),
+                ));
+            }
+            let contact = state.config.acme_contact_email.trim();
+            let contact = if contact.is_empty() {
+                None
+            } else {
+                Some(contact)
+            };
+            let issued = acme_client::issue_letsencrypt(&state, &domain, directory, contact)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(domain = %domain, error = %e, "Let's Encrypt issuance failed");
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorBody {
+                            error: format!("Let's Encrypt 签发失败: {e}"),
+                        }),
+                    )
+                })?;
+            (issued.cert_pem, issued.key_pem, issued.issuer)
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: format!("unsupported provider: {other}"),
+                }),
+            ))
+        }
+    };
+
+    if provider == "letsencrypt-staging" {
+        issuer = "Let's Encrypt (Staging)".to_string();
+    }
 
     let domain_id = repository::get_domain_by_name(&state.pool, &domain)
         .await
@@ -128,7 +188,7 @@ pub async fn issue(
         &domain,
         &cert_pem,
         &key_pem,
-        "Lagran Dev CA (rcgen)",
+        &issuer,
         req.auto_renew.unwrap_or(true),
     )
     .await
@@ -171,8 +231,8 @@ pub async fn issue(
         success: true,
         cert_id: row.id.to_string(),
         domain_name: domain,
-        issuer: "Lagran Dev CA (rcgen)".into(),
-        message: "certificate issued; hot-reloaded on reachable edges".into(),
+        issuer,
+        message: format!("certificate issued via {provider}; hot-reloaded on reachable edges"),
         edges_pushed,
     }))
 }

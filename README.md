@@ -20,7 +20,7 @@
 - 域名源站支持主备：备用源站可随时启用/修改/清空，端口留空按协议默认 80/443；
   主源站不可用时自动回源到备用源站（含 bypass/动态请求）
 - 域名 HTTPS：开启后 HTTP 请求 301/308 跳转到 HTTPS（`EDGE_HTTPS_REDIRECT_PORT` 控制端口）
-- 证书：上传、SNI 下发、开发用自动签发（rcgen + ACME challenge 下发）
+- 证书：上传、SNI 下发、**Let's Encrypt（ACME v2 / HTTP-01）生产签发**、Staging 调试、自动续期
 - 节点管理：预注册节点 + 一键生成安装命令（二进制/Docker）、单节点令牌、启用/停用（下发边缘立即 503）、删除吊销、心跳与 CPU/内存/版本
 - 节点调度（Geo/ISP Phase 1）：节点公网 IP / 省份 / 城市 / 运营商 / 权重，`/api/v1/schedule` 按客户端 IP 与
   GeoIP CIDR 表打分返回主备节点；附 PowerDNS pipe backend 接入示例
@@ -115,6 +115,9 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | CONTROL_PUBLIC_URL | 空 | 控制面公网地址，用于生成节点安装命令；留空按请求 Host 推导 |
 | GEOIP_JSON_PATH | ./data/geoip.json | 调度用 CIDR → 国家/省/市/运营商 JSON 表；缺失时按权重/负载调度 |
 | SCHEDULE_TTL | 30 | `/api/v1/schedule` 返回的 DNS TTL（秒） |
+| ACME_DIRECTORY_URL | Let's Encrypt 生产 | ACME v2 目录地址 |
+| ACME_STAGING_DIRECTORY_URL | Let's Encrypt Staging | Staging 目录地址 |
+| ACME_CONTACT_EMAIL | 空 | ACME 账户联系邮箱 |
 | EDGE_LISTEN | 0.0.0.0:8081 | 边缘 HTTP 监听 |
 | EDGE_HTTPS_LISTEN | 空 | 边缘 HTTPS 监听（需证书） |
 | ORIGIN_URL | https://example.com | 默认源站（未接入域名时兜底） |

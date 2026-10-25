@@ -1,5 +1,6 @@
 //! Lagran Control Plane library
 
+pub mod acme;
 pub mod api;
 pub mod config;
 pub mod middleware;

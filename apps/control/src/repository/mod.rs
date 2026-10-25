@@ -995,6 +995,39 @@ pub async fn get_cert(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<CertRow>> 
     .await
 }
 
+pub async fn update_cert_material(
+    pool: &PgPool,
+    id: Uuid,
+    cert_pem: &str,
+    key_pem: &str,
+    issuer: &str,
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE certificates
+        SET cert_pem = $2,
+            key_pem = $3,
+            issuer = $4,
+            not_before = $5,
+            not_after = $6,
+            status = 'active',
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(cert_pem)
+    .bind(key_pem)
+    .bind(issuer)
+    .bind(not_before)
+    .bind(not_after)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn get_cert_by_domain(pool: &PgPool, domain_name: &str) -> sqlx::Result<Option<CertRow>> {
     sqlx::query_as::<_, CertRow>(
         r#"
@@ -1104,6 +1137,42 @@ pub async fn get_acme_challenge(pool: &PgPool, token: &str) -> sqlx::Result<Opti
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| r.0))
+}
+
+pub async fn get_acme_account(
+    pool: &PgPool,
+    directory: &str,
+) -> sqlx::Result<Option<(String, String)>> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT key_pem, kid FROM acme_accounts WHERE directory = $1")
+            .bind(directory)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row)
+}
+
+pub async fn save_acme_account(
+    pool: &PgPool,
+    directory: &str,
+    key_pem: &str,
+    kid: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO acme_accounts (directory, key_pem, kid)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (directory) DO UPDATE
+          SET key_pem = EXCLUDED.key_pem,
+              kid = EXCLUDED.kid,
+              updated_at = NOW()
+        "#,
+    )
+    .bind(directory)
+    .bind(key_pem)
+    .bind(kid)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]

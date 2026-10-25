@@ -24,7 +24,8 @@
     <div class="alert alert-warning mb-16">
       <AppIcon name="alert" :size="16" class="icon" />
       <span>
-        当前「自动签发」使用 rcgen 生成的开发用 CA，仅适合本地测试；生产环境请上传正式证书或接入 Let's Encrypt。
+        自动签发支持 Let's Encrypt（ACME v2 / HTTP-01）。生产域名请先接入并解析到边缘节点；
+        调试建议先使用 Staging，避免触发生产速率限制。
       </span>
     </div>
 
@@ -97,7 +98,7 @@
         v-else
         icon="cert"
         title="还没有证书"
-        text="上传 PEM 证书与私钥，或使用自动签发为域名生成开发用证书。"
+        text="上传 PEM 证书与私钥，或通过 Let's Encrypt 自动签发。"
       >
         <button class="btn btn-primary btn-sm" type="button" @click="openUpload">上传证书</button>
       </EmptyState>
@@ -145,7 +146,7 @@
         </div>
         <label class="check">
           <input v-model="uploadForm.auto_renew" type="checkbox" />
-          自动续期（预留）
+          自动续期（仅自动签发的 Let's Encrypt 证书）
         </label>
         <p v-if="error" class="text-danger" style="font-size: 13px">{{ error }}</p>
       </div>
@@ -161,7 +162,15 @@
       <div class="form-col">
         <div class="alert alert-info">
           <AppIcon name="info" :size="16" class="icon" />
-          <span>签发使用开发 CA，并将 HTTP-01 challenge 下发到在线边缘节点，签发完成后证书会自动推送。</span>
+          <span>通过 HTTP-01 校验域名：控制面把 challenge 下发到在线边缘节点，Let's Encrypt 从公网访问该域名完成验证。生产证书约 90 天有效，控制面会定期检查并自动续期。</span>
+        </div>
+        <div class="field">
+          <label class="field-label">签发方式 <span class="req">*</span></label>
+          <select v-model="issueForm.provider" class="select">
+            <option value="letsencrypt">Let's Encrypt（生产）</option>
+            <option value="letsencrypt-staging">Let's Encrypt（Staging / 测试）</option>
+            <option value="dev">本地开发 CA（仅测试）</option>
+          </select>
         </div>
         <div class="field">
           <label class="field-label">域名 <span class="req">*</span></label>
@@ -204,6 +213,7 @@ const uploadForm = ref({
 const issueOpen = ref(false)
 const issueForm = ref({
   domain_name: '',
+  provider: 'letsencrypt',
   push_to_edges: true,
   auto_renew: true,
 })
@@ -303,7 +313,7 @@ async function createCert() {
 
 function openIssue() {
   error.value = ''
-  issueForm.value = { domain_name: '', push_to_edges: true, auto_renew: true }
+  issueForm.value = { domain_name: '', provider: 'letsencrypt', push_to_edges: true, auto_renew: true }
   issueOpen.value = true
 }
 
@@ -317,11 +327,12 @@ async function issueCert() {
   try {
     const res = await api.post<any>('/api/v1/certs/issue', {
       domain_name: issueForm.value.domain_name.trim(),
+      provider: issueForm.value.provider,
       push_to_edges: issueForm.value.push_to_edges,
       auto_renew: issueForm.value.auto_renew,
     })
     issueOpen.value = false
-    toast.success(`已签发 ${res.domain_name}，推送到 ${res.edges_pushed} 个边缘节点`)
+    toast.success(`已签发 ${res.domain_name}（${res.issuer}），推送到 ${res.edges_pushed} 个边缘节点`)
     await load()
   } catch (e: any) {
     error.value = e?.data?.error || '签发失败，请确认域名已接入'

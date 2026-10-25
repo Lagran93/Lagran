@@ -21,7 +21,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/__lagran/challenge/verify", get(challenge::verify))
         .route("/__lagran/purge", post(purge_authed))
         .route("/__lagran/acme/challenge", put(put_challenge_authed))
-        .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
+        .route("/.well-known/acme-challenge/:token", get(acme_challenge))
         .route("/__lagran/certs/load", post(load_cert_authed))
         .route("/__lagran/access-logs", get(list_access_logs))
         .fallback(proxy_handler)

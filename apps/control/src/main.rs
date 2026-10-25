@@ -7,6 +7,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls may be built with multiple provider features (ring + aws-lc-rs),
+    // which leaves no automatic process-level provider. Pick ring explicitly
+    // before any TLS client (ACME / hyper-rustls) is constructed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Load .env BEFORE EnvFilter reads RUST_LOG
     let _ = dotenvy::dotenv();
 
@@ -50,6 +55,21 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = config.bind_addr();
     let state = AppState::new(pool, config);
+
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                tick.tick().await;
+                let renewed = control::acme::renew_due(&state).await;
+                if renewed > 0 {
+                    tracing::info!(renewed, "Let's Encrypt auto-renewal completed");
+                }
+            }
+        });
+    }
+
     let app = api::create_router(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

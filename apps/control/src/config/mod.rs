@@ -23,6 +23,12 @@ pub struct AppConfig {
     pub schedule_ttl: u64,
     /// DNS server used by the console "DNS test" endpoint (host:port).
     pub dns_test_server: String,
+    /// ACME directory for Let's Encrypt production.
+    pub acme_directory_url: String,
+    /// ACME directory for Let's Encrypt staging.
+    pub acme_staging_directory_url: String,
+    /// Optional ACME account contact email.
+    pub acme_contact_email: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +60,12 @@ impl Default for AppConfig {
                 .clamp(5, 3600),
             dns_test_server: std::env::var("DNS_TEST_SERVER")
                 .unwrap_or_else(|_| "127.0.0.1:53".into()),
+            acme_directory_url: std::env::var("ACME_DIRECTORY_URL")
+                .unwrap_or_else(|_| "https://acme-v02.api.letsencrypt.org/directory".into()),
+            acme_staging_directory_url: std::env::var("ACME_STAGING_DIRECTORY_URL").unwrap_or_else(
+                |_| "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+            ),
+            acme_contact_email: std::env::var("ACME_CONTACT_EMAIL").unwrap_or_default(),
         }
     }
 }
