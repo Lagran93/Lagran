@@ -21,6 +21,10 @@
           <AppIcon name="globe" :size="15" />
           调度测试
         </button>
+        <button class="btn btn-default" type="button" @click="openDnsTest">
+          <AppIcon name="search" :size="15" />
+          DNS 测试
+        </button>
         <button class="btn btn-primary" type="button" @click="openCreate">
           <AppIcon name="plus" :size="15" />
           添加节点
@@ -489,6 +493,63 @@
         </template>
       </div>
     </BaseModal>
+    <!-- DNS 测试 -->
+    <BaseModal v-model="dnsOpen" title="DNS 解析测试" width="620px" hide-footer>
+      <div class="form-col">
+        <div class="form-grid">
+          <div class="field span-2">
+            <label class="field-label">查询名称</label>
+            <input v-model="dnsForm.name" class="input" placeholder="cdn.edge.lagran.net" />
+          </div>
+          <div class="field span-2">
+            <label class="field-label">客户端 IP / 子网（可选，作为 ECS）</label>
+            <input v-model="dnsForm.ip" class="input" placeholder="203.0.113.9/24" />
+            <span class="field-hint">控制面用 DNS_TEST_SERVER 指定的权威 DNS 发起真实查询。</span>
+          </div>
+        </div>
+        <div class="flex-between">
+          <span class="text-muted" style="font-size: 12px">
+            返回 rcode / IP / TTL；DNS 未配置或超时会显示错误。
+          </span>
+          <button class="btn btn-primary" type="button" :disabled="dnsLoading" @click="runDnsTest">
+            {{ dnsLoading ? '查询中…' : '查询' }}
+          </button>
+        </div>
+
+        <template v-if="dnsResult">
+          <div class="alert alert-info">
+            <AppIcon name="info" :size="16" class="icon" />
+            <span>
+              {{ dnsResult.server }} · rcode={{ dnsResult.rcode }} ·
+              {{ dnsResult.elapsed_ms }}ms{{ dnsResult.truncated ? ' · TC' : '' }}
+            </span>
+          </div>
+          <div v-if="dnsResult.answers.length" class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>IP</th>
+                  <th class="num">TTL</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="a in dnsResult.answers" :key="a.ip">
+                  <td class="mono">{{ a.ip }}</td>
+                  <td class="num">{{ a.ttl }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-else class="text-muted" style="font-size: 13px">
+            没有 A 记录（rcode={{ dnsResult.rcode }}）。
+          </div>
+          <div class="flex-between">
+            <span />
+            <button class="btn btn-default" type="button" @click="dnsOpen = false">关闭</button>
+          </div>
+        </template>
+      </div>
+    </BaseModal>
   </div>
 </template>
 
@@ -528,6 +589,11 @@ const schedOpen = ref(false)
 const schedLoading = ref(false)
 const schedResult = ref<any>(null)
 const schedForm = ref({ domain: '', ip: '', province: '', isp: '', city: '' })
+
+const dnsOpen = ref(false)
+const dnsLoading = ref(false)
+const dnsResult = ref<any>(null)
+const dnsForm = ref({ name: 'cdn.edge.lagran.net', ip: '' })
 
 const installOpen = ref(false)
 const installTab = ref<'binary' | 'docker'>('binary')
@@ -646,6 +712,29 @@ async function runSchedule() {
     toast.error(e?.data?.error || '调度测试失败')
   } finally {
     schedLoading.value = false
+  }
+}
+
+function openDnsTest() {
+  dnsResult.value = null
+  dnsOpen.value = true
+}
+
+async function runDnsTest() {
+  if (!dnsForm.value.name.trim()) {
+    toast.error('请填写查询名称')
+    return
+  }
+  dnsLoading.value = true
+  try {
+    dnsResult.value = await api.post('/api/v1/dns/test', {
+      name: dnsForm.value.name.trim(),
+      ip: dnsForm.value.ip.trim(),
+    })
+  } catch (e: any) {
+    toast.error(e?.data?.error || 'DNS 查询失败')
+  } finally {
+    dnsLoading.value = false
   }
 }
 

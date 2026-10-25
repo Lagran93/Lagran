@@ -13,7 +13,13 @@ export default defineNuxtConfig({
   css: ['~/assets/css/main.css'],
   runtimeConfig: {
     public: {
-      apiBase: process.env.NUXT_PUBLIC_API_BASE || 'http://localhost:8080',
+      // In production the console is served by Caddy and calls the API on the
+      // same origin (Caddy proxies /api/* to the control plane). During
+      // `nuxt dev` we still point at the local control plane.
+      // NUXT_PUBLIC_API_BASE can override this at build/generate time.
+      apiBase:
+        process.env.NUXT_PUBLIC_API_BASE ??
+        (process.env.NODE_ENV === 'development' ? 'http://localhost:8080' : ''),
     },
   },
   app: {

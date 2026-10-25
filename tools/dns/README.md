@@ -1,5 +1,25 @@
 # GeoDNS 接入示例（Phase 1）
 
+## 方案 A：自研权威 DNS（推荐先跑通）
+
+仓库内 `apps/dns` 是完整可运行的权威 DNS：
+
+```bash
+DNS_LISTEN=0.0.0.0:53 \
+DNS_ZONE=edge.lagran.net \
+DNS_NS_NAME=ns1.edge.lagran.net \
+DNS_NS_IP=203.0.113.53 \
+CONTROL_URL=http://127.0.0.1:8080 \
+AGENT_TOKEN=<token> \
+./target/debug/lagran-dns
+```
+
+注册商配置 `edge.lagran.net` 的 NS 为 `ns1.edge.lagran.net`，并添加 glue A；客户域名
+CNAME 到 `edge.lagran.net`。DNS 解析 ECS 后调用控制面 `/api/v1/schedule`，缓存结果并返回 A。
+完整参数与部署注意事项见 `docs/development.md` 的「自研权威 DNS」。
+
+## 方案 B：PowerDNS pipe backend
+
 `powerdns-pipe.sh` 是一个最小可用的 **PowerDNS pipe backend**：收到 DNS 查询后调用
 控制面 `GET /api/v1/schedule`，把调度结果作为 A/AAAA 记录返回。
 

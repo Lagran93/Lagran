@@ -73,7 +73,9 @@ pub struct RulePayload {
     pub note: Option<String>,
 }
 
-fn deserialize_double_option<'de, D>(deserializer: D) -> Result<Option<Option<bool>>, D::Error>
+fn deserialize_double_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<bool>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -157,16 +159,8 @@ fn normalize(
     if !ACTIONS.contains(&action.as_str()) {
         return Err("action must be cache, bypass or no_store".into());
     }
-    let ttl_seconds = if action == "cache" {
-        ttl.min(31_536_000)
-    } else {
-        0
-    };
-    let swr_seconds = if action == "cache" {
-        swr.min(31_536_000)
-    } else {
-        0
-    };
+    let ttl_seconds = if action == "cache" { ttl.min(31_536_000) } else { 0 };
+    let swr_seconds = if action == "cache" { swr.min(31_536_000) } else { 0 };
     let match_methods = normalize_methods(methods)?;
     let match_query = query.trim().to_string();
     if match_query.len() > 200 {
@@ -221,8 +215,7 @@ pub async fn create(
     actor: Actor,
     Json(req): Json<CreateRuleRequest>,
 ) -> Result<(StatusCode, Json<RuleDto>), (StatusCode, Json<ErrorBody>)> {
-    let domain_id =
-        Uuid::parse_str(&req.domain_id).map_err(|_| bad_request("invalid domain_id"))?;
+    let domain_id = Uuid::parse_str(&req.domain_id).map_err(|_| bad_request("invalid domain_id"))?;
     if !actor.can_write_domain(&state, domain_id).await {
         return Err(forbidden_body());
     }
@@ -308,12 +301,17 @@ pub async fn update(
     let path = req.path_pattern.as_deref().unwrap_or(&current.path_pattern);
     let action = req.action.as_deref().unwrap_or(&current.action);
     let ttl = req.ttl_seconds.unwrap_or(current.ttl_seconds.max(0) as u64);
-    let swr = req.swr_seconds.unwrap_or(current.swr_seconds.max(0) as u64);
+    let swr = req
+        .swr_seconds
+        .unwrap_or(current.swr_seconds.max(0) as u64);
     let methods = req
         .match_methods
         .as_deref()
         .unwrap_or(&current.match_methods);
-    let query = req.match_query.as_deref().unwrap_or(&current.match_query);
+    let query = req
+        .match_query
+        .as_deref()
+        .unwrap_or(&current.match_query);
     let browser_ttl = req
         .browser_ttl_seconds
         .unwrap_or(current.browser_ttl_seconds.max(0) as u64);
@@ -434,10 +432,7 @@ fn method_matches(csv: &str, method: &str) -> bool {
 
 fn query_matches(needle: &str, query: &str) -> bool {
     let needle = needle.trim();
-    needle.is_empty()
-        || query
-            .to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase())
+    needle.is_empty() || query.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
 }
 
 fn path_matches(pattern: &str, path: &str) -> bool {
@@ -445,9 +440,7 @@ fn path_matches(pattern: &str, path: &str) -> bool {
         return true;
     }
     if let Some(prefix) = pattern.strip_suffix("/*") {
-        return path == prefix
-            || path.starts_with(&format!("{prefix}/"))
-            || path.starts_with(prefix);
+        return path == prefix || path.starts_with(&format!("{prefix}/")) || path.starts_with(prefix);
     }
     if let Some(prefix) = pattern.strip_suffix('*') {
         return path.starts_with(prefix);
@@ -483,8 +476,7 @@ pub async fn test(
     actor: Actor,
     Json(req): Json<TestRequest>,
 ) -> Result<Json<TestResponse>, (StatusCode, Json<ErrorBody>)> {
-    let domain_id =
-        Uuid::parse_str(&req.domain_id).map_err(|_| bad_request("invalid domain_id"))?;
+    let domain_id = Uuid::parse_str(&req.domain_id).map_err(|_| bad_request("invalid domain_id"))?;
     if !actor.can_read_domain(&state, domain_id).await {
         return Err(forbidden_body());
     }
@@ -577,13 +569,7 @@ fn not_found_body(msg: &str) -> (StatusCode, Json<ErrorBody>) {
 mod tests {
     use super::*;
 
-    fn row(
-        pattern: &str,
-        priority: i32,
-        methods: &str,
-        query: &str,
-        enabled: bool,
-    ) -> repository::CacheRuleRow {
+    fn row(pattern: &str, priority: i32, methods: &str, query: &str, enabled: bool) -> repository::CacheRuleRow {
         repository::CacheRuleRow {
             id: Uuid::nil(),
             domain_id: Uuid::nil(),
@@ -614,10 +600,7 @@ mod tests {
             pick(&rows, "/api/x", "GET", "debug=1").unwrap().priority,
             20
         );
-        assert_eq!(
-            pick(&rows, "/api/x", "POST", "debug=1").unwrap().priority,
-            10
-        );
+        assert_eq!(pick(&rows, "/api/x", "POST", "debug=1").unwrap().priority, 10);
         assert_eq!(pick(&rows, "/", "GET", "").unwrap().priority, 0);
         assert_eq!(
             pick(&rows, "/api/x", "DELETE", "debug=1").unwrap().priority,

@@ -35,10 +35,7 @@ async fn main() -> anyhow::Result<()> {
         &config.cert_dir,
     ));
     if !cert_store.is_empty() {
-        tracing::info!(
-            count = cert_store.len(),
-            "HTTPS can start with disk-loaded certs"
-        );
+        tracing::info!(count = cert_store.len(), "HTTPS can start with disk-loaded certs");
     }
     let challenges = edge::server::acme_challenge::ChallengeStore::new();
     let access_log = AccessLog::open(
@@ -171,13 +168,13 @@ fn random_secret() -> String {
     }
 }
 
-fn init_tracing() {
-    // RUST_LOG examples:
+fn init_tracing() {    // RUST_LOG examples:
     //   RUST_LOG=debug
     //   RUST_LOG=edge=debug,tower_http=info
     //   RUST_LOG=info,edge::server=debug,edge::agent=debug
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("edge=debug,tower_http=info"));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("edge=debug,tower_http=info")
+    });
     tracing_subscriber::registry()
         .with(filter)
         .with(

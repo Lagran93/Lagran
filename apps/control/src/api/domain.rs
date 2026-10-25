@@ -78,7 +78,11 @@ pub(crate) fn to_dto(r: repository::DomainRow) -> DomainDto {
 
 /// Validate/normalise the optional backup origin.
 /// Empty host clears it; a missing port defaults by protocol.
-fn normalize_backup(host: &str, port: u16, proto: &str) -> Result<(String, i32, String), String> {
+fn normalize_backup(
+    host: &str,
+    port: u16,
+    proto: &str,
+) -> Result<(String, i32, String), String> {
     let host = host.trim();
     if host.is_empty() {
         return Ok((String::new(), 0, "http".into()));
@@ -144,10 +148,12 @@ pub async fn list(
     State(state): State<AppState>,
     actor: Actor,
 ) -> Result<Json<Vec<DomainDto>>, (StatusCode, Json<ErrorBody>)> {
-    let rows = repository::list_domains(&state.pool).await.map_err(|e| {
-        tracing::error!(error = %e, "list domains");
-        db_error()
-    })?;
+    let rows = repository::list_domains(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list domains");
+            db_error()
+        })?;
     let visible = actor.visible_domain_ids(&state).await;
     Ok(Json(
         rows.into_iter()
@@ -246,8 +252,8 @@ pub async fn create(
 
     if let Some(rps) = req.rate_limit_rps {
         let burst = req.rate_limit_burst.unwrap_or(rps * 2);
-        let _ =
-            repository::set_domain_rate_limit(&state.pool, row.id, rps as i32, burst as i32).await;
+        let _ = repository::set_domain_rate_limit(&state.pool, row.id, rps as i32, burst as i32)
+            .await;
     }
     if let Some(ref host) = req.backup_origin_host {
         let (h, p, pr) = normalize_backup(
@@ -255,7 +261,14 @@ pub async fn create(
             req.backup_origin_port.unwrap_or(0),
             req.backup_origin_proto.as_deref().unwrap_or("http"),
         )
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: e,
+                }),
+            )
+        })?;
         if !h.is_empty() {
             repository::set_backup_origin(&state.pool, row.id, &h, p, &pr)
                 .await
@@ -319,8 +332,14 @@ pub async fn delete(
             tracing::error!(error = %e, %id, "delete domain");
             db_error()
         })?;
-    let _ =
-        repository::insert_audit(&state.pool, &actor.email, "domain.delete", &row.name, "").await;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "domain.delete",
+        &row.name,
+        "",
+    )
+    .await;
     tracing::info!(%id, "domain deleted ok");
     Ok(Json(DeleteResponse { success: true, id }))
 }
@@ -399,8 +418,14 @@ pub async fn update(
         let port = req
             .backup_origin_port
             .unwrap_or(before.backup_origin_port.max(0) as u16);
-        let (h, p, pr) = normalize_backup(host, port, proto)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        let (h, p, pr) = normalize_backup(host, port, proto).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: e,
+                }),
+            )
+        })?;
         repository::set_backup_origin(&state.pool, uid, &h, p, &pr)
             .await
             .map_err(|_| db_error())?;
@@ -444,8 +469,14 @@ pub async fn update(
         .ok()
         .flatten()
         .unwrap_or(row);
-    let _ =
-        repository::insert_audit(&state.pool, &actor.email, "domain.update", &row.name, "").await;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "domain.update",
+        &row.name,
+        "",
+    )
+    .await;
     Ok(Json(to_dto(row)))
 }
 
@@ -535,7 +566,8 @@ async fn resolve_domain(
     } else {
         repository::get_domain_by_name(&state.pool, id).await
     };
-    row.map_err(|_| db_error())?.ok_or_else(|| not_found(id))
+    row.map_err(|_| db_error())?
+        .ok_or_else(|| not_found(id))
 }
 
 /// GET /api/v1/domains/{id}/settings — id can be uuid or domain name

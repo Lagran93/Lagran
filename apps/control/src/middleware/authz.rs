@@ -54,7 +54,11 @@ impl ActorError {
 
 impl IntoResponse for ActorError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(json!({ "error": self.message })),
+        )
+            .into_response()
     }
 }
 

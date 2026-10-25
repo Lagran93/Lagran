@@ -582,10 +582,7 @@ pub async fn upsert_node_heartbeat(
     }
 }
 
-pub async fn list_rules_for_domain(
-    pool: &PgPool,
-    domain_id: Uuid,
-) -> sqlx::Result<Vec<CacheRuleRow>> {
+pub async fn list_rules_for_domain(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<CacheRuleRow>> {
     sqlx::query_as::<_, CacheRuleRow>(
         r#"
         SELECT id, domain_id, path_pattern, ttl_seconds, priority, action, swr_seconds,
@@ -836,9 +833,11 @@ pub async fn count_domains(pool: &PgPool) -> sqlx::Result<i64> {
 }
 
 pub async fn count_online_nodes(pool: &PgPool) -> sqlx::Result<i64> {
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM edge_nodes WHERE status = 'online'")
-        .fetch_one(pool)
-        .await?;
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM edge_nodes WHERE status = 'online'",
+    )
+    .fetch_one(pool)
+    .await?;
     Ok(n)
 }
 
@@ -1106,6 +1105,7 @@ pub async fn get_acme_challenge(pool: &PgPool, token: &str) -> sqlx::Result<Opti
     Ok(row.map(|r| r.0))
 }
 
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AuditRow {
     pub id: Uuid,
@@ -1356,12 +1356,16 @@ pub async fn list_origin_health(pool: &PgPool) -> sqlx::Result<Vec<OriginHealthR
     .await
 }
 
-pub async fn get_domain_rate_limit(pool: &PgPool, name: &str) -> sqlx::Result<Option<(i32, i32)>> {
-    let row: Option<(i32, i32)> =
-        sqlx::query_as("SELECT rate_limit_rps, rate_limit_burst FROM domains WHERE name = $1")
-            .bind(name)
-            .fetch_optional(pool)
-            .await?;
+pub async fn get_domain_rate_limit(
+    pool: &PgPool,
+    name: &str,
+) -> sqlx::Result<Option<(i32, i32)>> {
+    let row: Option<(i32, i32)> = sqlx::query_as(
+        "SELECT rate_limit_rps, rate_limit_burst FROM domains WHERE name = $1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
     Ok(row)
 }
 
@@ -1487,7 +1491,11 @@ pub async fn update_domain_settings(
     Ok(r.rows_affected())
 }
 
-pub async fn create_prefetch(pool: &PgPool, domain: &str, url_path: &str) -> sqlx::Result<Uuid> {
+pub async fn create_prefetch(
+    pool: &PgPool,
+    domain: &str,
+    url_path: &str,
+) -> sqlx::Result<Uuid> {
     let (id,): (Uuid,) = sqlx::query_as(
         r#"
         INSERT INTO prefetch_tasks (domain, url_path, status)
@@ -1502,10 +1510,7 @@ pub async fn create_prefetch(pool: &PgPool, domain: &str, url_path: &str) -> sql
     Ok(id)
 }
 
-pub async fn list_prefetch(
-    pool: &PgPool,
-    limit: i64,
-) -> sqlx::Result<Vec<(Uuid, String, String, String, String)>> {
+pub async fn list_prefetch(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<(Uuid, String, String, String, String)>> {
     sqlx::query_as(
         r#"
         SELECT id, domain, url_path, status, message
@@ -1717,7 +1722,10 @@ pub async fn project_role(
 }
 
 /// Project a domain belongs to. `None` = domain missing, `Some(None)` = no project.
-pub async fn domain_project(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Option<Option<Uuid>>> {
+pub async fn domain_project(
+    pool: &PgPool,
+    domain_id: Uuid,
+) -> sqlx::Result<Option<Option<Uuid>>> {
     let row: Option<(Option<Uuid>,)> =
         sqlx::query_as("SELECT project_id FROM domains WHERE id = $1")
             .bind(domain_id)
@@ -1745,11 +1753,12 @@ pub async fn domains_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<
 
 /// The per-user "Default" project, created on first use.
 pub async fn ensure_personal_project(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Uuid> {
-    let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM projects WHERE owner_id = $1 AND name = 'Default' LIMIT 1")
-            .bind(user_id)
-            .fetch_optional(pool)
-            .await?;
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM projects WHERE owner_id = $1 AND name = 'Default' LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
     if let Some((id,)) = existing {
         return Ok(id);
     }
@@ -1766,7 +1775,10 @@ pub struct MemberRow {
     pub created_at: DateTime<Utc>,
 }
 
-pub async fn list_project_members(pool: &PgPool, project_id: Uuid) -> sqlx::Result<Vec<MemberRow>> {
+pub async fn list_project_members(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> sqlx::Result<Vec<MemberRow>> {
     sqlx::query_as::<_, MemberRow>(
         r#"
         SELECT u.id AS user_id, u.email, u.name, m.role, m.created_at
@@ -2227,7 +2239,10 @@ pub struct WafEventInput {
     pub mode: String,
 }
 
-pub async fn insert_waf_events_batch(pool: &PgPool, events: &[WafEventInput]) -> sqlx::Result<u64> {
+pub async fn insert_waf_events_batch(
+    pool: &PgPool,
+    events: &[WafEventInput],
+) -> sqlx::Result<u64> {
     let mut n = 0u64;
     for e in events {
         let r = sqlx::query(
@@ -2257,8 +2272,7 @@ pub async fn list_waf_events(
     pool: &PgPool,
     domain: Option<&str>,
     limit: i64,
-) -> sqlx::Result<Vec<WafEventRow>> {
-    if let Some(domain) = domain.filter(|d| !d.is_empty()) {
+) -> sqlx::Result<Vec<WafEventRow>> {    if let Some(domain) = domain.filter(|d| !d.is_empty()) {
         sqlx::query_as::<_, WafEventRow>(
             r#"
             SELECT id, ts, domain, node_id, client_ip, method, path, action, category, rule_name, mode

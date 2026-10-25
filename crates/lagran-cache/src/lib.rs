@@ -264,11 +264,7 @@ impl CacheBackend for MemoryCache {
         let keys: Vec<String> = self
             .inner
             .iter()
-            .filter(|e| {
-                patterns
-                    .iter()
-                    .any(|p| !p.is_empty() && e.key().contains(p))
-            })
+            .filter(|e| patterns.iter().any(|p| !p.is_empty() && e.key().contains(p)))
             .map(|e| e.key().clone())
             .collect();
         let mut removed = 0u64;

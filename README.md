@@ -2,6 +2,8 @@
 
 高性能、可自托管的 CDN 系统。
 
+> 完整部署步骤见 [docs/deployment.md](docs/deployment.md)。
+
 - **控制端（Control Plane）**：Rust + Axum + PostgreSQL（sqlx）
 - **边缘端（Edge Plane）**：Rust 反向代理 + 内存/磁盘缓存
 - **前端**：Nuxt 4 管理后台
@@ -22,6 +24,8 @@
 - 节点管理：预注册节点 + 一键生成安装命令（二进制/Docker）、单节点令牌、启用/停用（下发边缘立即 503）、删除吊销、心跳与 CPU/内存/版本
 - 节点调度（Geo/ISP Phase 1）：节点公网 IP / 省份 / 城市 / 运营商 / 权重，`/api/v1/schedule` 按客户端 IP 与
   GeoIP CIDR 表打分返回主备节点；附 PowerDNS pipe backend 接入示例
+- 自研权威 DNS（`apps/dns`）：UDP/TCP 53、SOA/NS/A/AAAA、EDNS0 + ECS、调度结果缓存、控制面故障时
+  用旧结果兜底；可直接作为 `edge.lagran.net` 的权威服务器
 - WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器 / **RCE / SSRF / XXE / Log4Shell / CRLF**）、
   自定义规则（含**请求头匹配**，拦截/放行/记录/浏览器质询）、IP 黑白名单、观察/拦截模式、
   **安全级别（低/中/高/攻击中）**、事件日志与**统计概览**
@@ -87,6 +91,7 @@ bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（�
 bash tests/integration/backup-origin.sh # 端到端：备用源站创建/读取/修改/清空与配置下发
 bash tests/integration/failover-https.sh # 端到端：主源站宕机切换备用 + HTTPS 跳转开关
 bash tests/integration/schedule.sh # 端到端：节点 Geo/ISP 元数据、调度打分、admin 测试与 PowerDNS 示例
+bash tests/integration/dns.sh # 端到端：自研权威 DNS 的 ECS 调度、SOA/NS、TCP、缓存降级
 bash tests/integration/nodes.sh # 端到端：节点预注册→安装命令→单节点令牌→上下线→删除
 bash tests/integration/cache-rules.sh # 端到端：方法/Query 条件、禁用规则、浏览器 TTL、规则测试器
 bash tests/integration/waf.sh   # 端到端：WAF 规则、IP 名单、观察/拦截模式与事件
@@ -120,6 +125,12 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | TRUST_PROXY_HEADERS | false | 是否信任 `X-Forwarded-For` 作为客户端 IP（WAF 用；仅前置可信代理时开启） |
 | EDGE_HTTPS_REDIRECT_PORT | 空 | 域名开启 HTTPS 后，HTTP→HTTPS 跳转使用的端口；留空取 HTTPS 监听端口，443 时省略 |
 | PUBLIC_IP | 空 | 节点公网 IP，随心跳上报给控制面用于 GeoDNS 调度 |
+| DNS_LISTEN | 0.0.0.0:53 | 权威 DNS 监听地址（UDP/TCP 同端口） |
+| DNS_ZONE | edge.lagran.net | 权威 Zone（客户域名 CNAME 到这里） |
+| DNS_TTL | 30 | 调度 A 记录的 TTL（秒） |
+| DNS_CACHE_SECS / DNS_STALE_SECS | 5 / 300 | 调度结果缓存与故障时允许的旧结果时间 |
+| DNS_FALLBACK_IP | 空 | 控制面不可用且无缓存时返回的兜底 IP |
+| DNS_TEST_SERVER | 127.0.0.1:53 | 控制台「DNS 测试」查询的权威 DNS 地址 |
 | WAF_REPORT_INTERVAL | 5 | WAF 事件上报间隔（秒），`WAF_REPORT=false` 可关闭 |
 | CHALLENGE_SECRET | 空 | 质询 nonce / 免质询 Cookie 的 HMAC 密钥；多节点部署必须一致，留空用 AGENT_TOKEN 派生或随机 |
 | RATE_LIMIT_RPS / BURST | 0 | 全局默认限流（0=不限） |

@@ -181,7 +181,14 @@ pub async fn delete(
             }),
         ));
     }
-    let _ = repository::insert_audit(&state.pool, &actor.email, "project.delete", &id, "").await;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "project.delete",
+        &id,
+        "",
+    )
+    .await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 
@@ -198,7 +205,9 @@ pub async fn list_domains(
         .await
         .map_err(|_| db_error())?;
     Ok(Json(
-        rows.into_iter().map(crate::api::domain::to_dto).collect(),
+        rows.into_iter()
+            .map(crate::api::domain::to_dto)
+            .collect(),
     ))
 }
 
@@ -237,12 +246,7 @@ pub async fn add_member(
     if !actor.can_write_project(&state, pid).await {
         return Err(forbidden());
     }
-    let role = req
-        .role
-        .as_deref()
-        .unwrap_or("member")
-        .trim()
-        .to_ascii_lowercase();
+    let role = req.role.as_deref().unwrap_or("member").trim().to_ascii_lowercase();
     if role != "member" && role != "admin" {
         return Err((
             StatusCode::BAD_REQUEST,

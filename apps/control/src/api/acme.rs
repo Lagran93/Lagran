@@ -63,10 +63,7 @@ pub async fn issue(
             }),
         ));
     }
-    if !actor
-        .can_write_domain_name(&state, req.domain_name.trim())
-        .await
-    {
+    if !actor.can_write_domain_name(&state, req.domain_name.trim()).await {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorBody {

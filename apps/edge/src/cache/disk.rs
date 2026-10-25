@@ -85,8 +85,7 @@ impl DiskCache {
         }
         let now = now_unix();
         if now > meta.stale_until {
-            self.remove_files(&meta_path, &bin_path, meta_bytes.len() as u64)
-                .await;
+            self.remove_files(&meta_path, &bin_path, meta_bytes.len() as u64).await;
             return (CacheGetResult::Expired, 0, 0);
         }
         let body = match fs::read(&bin_path).await {
@@ -118,10 +117,7 @@ impl DiskCache {
             freed += m.len();
         }
         if fs::remove_file(meta_path).await.is_ok() || fs::remove_file(bin_path).await.is_ok() {
-            self.used_bytes.fetch_sub(
-                freed.min(self.used_bytes.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
+            self.used_bytes.fetch_sub(freed.min(self.used_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
             self.entries.fetch_sub(1, Ordering::Relaxed);
         }
         let _ = fs::remove_file(bin_path).await;
@@ -147,15 +143,11 @@ impl DiskCache {
                 Err(_) => continue,
             };
             while let Ok(Some(ent)) = rd.next_entry().await {
-                let Ok(ft) = ent.file_type().await else {
-                    continue;
-                };
+                let Ok(ft) = ent.file_type().await else { continue };
                 if ft.is_dir() {
                     stack.push(ent.path());
                 } else if ft.is_file() {
-                    let Ok(meta) = ent.metadata().await else {
-                        continue;
-                    };
+                    let Ok(meta) = ent.metadata().await else { continue };
                     let mtime = meta
                         .modified()
                         .ok()
@@ -299,7 +291,10 @@ impl CacheBackend for DiskCache {
 
     async fn delete(&self, key: &str) {
         let (meta_path, bin_path) = self.paths_for_key(key);
-        let meta_len = fs::metadata(&meta_path).await.map(|m| m.len()).unwrap_or(0);
+        let meta_len = fs::metadata(&meta_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         self.remove_files(&meta_path, &bin_path, meta_len).await;
     }
 
@@ -335,9 +330,7 @@ impl CacheBackend for DiskCache {
                 Err(_) => continue,
             };
             while let Ok(Some(ent)) = rd.next_entry().await {
-                let Ok(ft) = ent.file_type().await else {
-                    continue;
-                };
+                let Ok(ft) = ent.file_type().await else { continue };
                 if ft.is_dir() {
                     stack.push(ent.path());
                     continue;
@@ -346,9 +339,7 @@ impl CacheBackend for DiskCache {
                 if path.extension().is_none_or(|e| e != "meta") {
                     continue;
                 }
-                let Ok(bytes) = fs::read(&path).await else {
-                    continue;
-                };
+                let Ok(bytes) = fs::read(&path).await else { continue };
                 let Ok(meta) = serde_json::from_slice::<DiskMeta>(&bytes) else {
                     continue;
                 };
@@ -400,12 +391,7 @@ impl CacheBackend for HybridCache {
                 match disk_res {
                     CacheGetResult::Hit(e) => {
                         self.mem
-                            .set_with_swr(
-                                key,
-                                e.clone(),
-                                fresh_left.max(1),
-                                stale_left.saturating_sub(fresh_left),
-                            )
+                            .set_with_swr(key, e.clone(), fresh_left.max(1), stale_left.saturating_sub(fresh_left))
                             .await;
                         CacheGetResult::Hit(e)
                     }
@@ -470,9 +456,7 @@ mod tests {
             vec![("content-type".into(), "text/plain".into())],
             Bytes::from_static(b"body"),
         );
-        cache
-            .set_with_swr("GET:a.test/x", entry.clone(), 60, 30)
-            .await;
+        cache.set_with_swr("GET:a.test/x", entry.clone(), 60, 30).await;
         cache.set_with_swr("GET:b.test/y", entry, 60, 30).await;
         assert_eq!(cache.len().await, 2);
 

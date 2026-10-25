@@ -91,10 +91,7 @@ impl GeoTable {
             return Self::default();
         }
         let Ok(raw) = std::fs::read_to_string(path) else {
-            tracing::warn!(
-                path,
-                "geoip json not found; scheduling falls back to weights"
-            );
+            tracing::warn!(path, "geoip json not found; scheduling falls back to weights");
             return Self::default();
         };
         let parsed: Vec<GeoRule> = match serde_json::from_str(&raw) {
@@ -196,7 +193,9 @@ fn client_ip(req: &ScheduleRequest) -> Option<IpAddr> {
 
 fn resolve_geo(state: &AppState, req: &ScheduleRequest) -> (GeoInfo, Option<IpAddr>) {
     let ip = client_ip(req);
-    let mut geo = ip.and_then(|ip| state.geo.lookup(ip)).unwrap_or_default();
+    let mut geo = ip
+        .and_then(|ip| state.geo.lookup(ip))
+        .unwrap_or_default();
     if let Some(v) = req.country.as_deref().filter(|s| !s.is_empty()) {
         geo.country = v.to_string();
     }
@@ -256,9 +255,7 @@ pub async fn resolve(state: &AppState, req: ScheduleRequest) -> ScheduleResponse
     let ttl = state.schedule_ttl;
     let domain = req.domain.clone().unwrap_or_default();
 
-    let nodes = repository::list_nodes(&state.pool)
-        .await
-        .unwrap_or_default();
+    let nodes = repository::list_nodes(&state.pool).await.unwrap_or_default();
     let mut candidates: Vec<(i32, Candidate)> = nodes
         .into_iter()
         .filter(|n| n.status == "online" && !n.public_ip.trim().is_empty())

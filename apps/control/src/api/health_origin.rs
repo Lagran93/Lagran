@@ -41,9 +41,7 @@ pub async fn list(State(state): State<AppState>, actor: Actor) -> Json<Vec<Origi
     let visible_names: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
         Some(ids) => {
-            let domains = repository::list_domains(&state.pool)
-                .await
-                .unwrap_or_default();
+            let domains = repository::list_domains(&state.pool).await.unwrap_or_default();
             Some(
                 domains
                     .into_iter()

@@ -42,7 +42,10 @@ fn forbidden() -> (StatusCode, Json<ErrorBody>) {
 }
 
 fn not_found(msg: &str) -> (StatusCode, Json<ErrorBody>) {
-    (StatusCode::NOT_FOUND, Json(ErrorBody { error: msg.into() }))
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorBody { error: msg.into() }),
+    )
 }
 
 fn bad_request(msg: String) -> (StatusCode, Json<ErrorBody>) {
@@ -414,10 +417,7 @@ pub async fn create_rule(
         &actor.email,
         "waf.rule.create",
         &domain_id.to_string(),
-        &format!(
-            "{} {} {} {}",
-            rule.field, rule.operator, rule.value, rule.action
-        ),
+        &format!("{} {} {} {}", rule.field, rule.operator, rule.value, rule.action),
     )
     .await;
     Ok((StatusCode::CREATED, Json(row.into())))
@@ -723,9 +723,7 @@ pub async fn stats(
     let visible: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
         Some(ids) => {
-            let rows = repository::list_domains(&state.pool)
-                .await
-                .unwrap_or_default();
+            let rows = repository::list_domains(&state.pool).await.unwrap_or_default();
             Some(
                 rows.into_iter()
                     .filter(|d| ids.contains(&d.id))
@@ -753,14 +751,7 @@ pub async fn stats(
     let domains_vec: Option<Vec<String>> = visible.map(|s| s.into_iter().collect());
 
     let group = |expr: &'static str, limit: i64| {
-        repository::waf_stats_group(
-            &state.pool,
-            days,
-            domain_filter,
-            domains_vec.clone(),
-            expr,
-            limit,
-        )
+        repository::waf_stats_group(&state.pool, days, domain_filter, domains_vec.clone(), expr, limit)
     };
 
     let by_action = group("action", 20).await.map_err(|_| db_error())?;
@@ -783,6 +774,7 @@ pub async fn stats(
     }))
 }
 
+
 pub async fn list_events(
     State(state): State<AppState>,
     actor: Actor,
@@ -791,9 +783,7 @@ pub async fn list_events(
     let visible: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
         Some(ids) => {
-            let rows = repository::list_domains(&state.pool)
-                .await
-                .unwrap_or_default();
+            let rows = repository::list_domains(&state.pool).await.unwrap_or_default();
             Some(
                 rows.into_iter()
                     .filter(|d| ids.contains(&d.id))

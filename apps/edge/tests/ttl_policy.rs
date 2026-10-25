@@ -50,10 +50,7 @@ fn s_maxage_wins_over_max_age_and_expires() {
 
 #[test]
 fn max_age_wins_over_expires() {
-    let both = hdrs(&[
-        ("Cache-Control", "public, max-age=50"),
-        ("Expires", FAR_FUTURE),
-    ]);
+    let both = hdrs(&[("Cache-Control", "public, max-age=50"), ("Expires", FAR_FUTURE)]);
     let d = decide_storage(200, &both, policy(None, 0), 60).unwrap();
     assert_eq!(d.ttl_secs, 50);
 }

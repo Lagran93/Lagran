@@ -246,10 +246,7 @@ fn method_matches_rule(csv: &str, method: &str) -> bool {
 
 fn query_matches_rule(needle: &str, query: &str) -> bool {
     let needle = needle.trim();
-    needle.is_empty()
-        || query
-            .to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase())
+    needle.is_empty() || query.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
 }
 
 pub fn rule_policy(rule: &CacheRule) -> ResolvedPolicy {
@@ -307,10 +304,7 @@ fn parse_cache_control(value: &str) -> CacheControl {
             continue;
         }
         let (name, val) = match part.split_once('=') {
-            Some((n, v)) => (
-                n.trim().to_ascii_lowercase(),
-                Some(v.trim().trim_matches('"')),
-            ),
+            Some((n, v)) => (n.trim().to_ascii_lowercase(), Some(v.trim().trim_matches('"'))),
             None => (part.to_ascii_lowercase(), None),
         };
         match name.as_str() {
@@ -350,8 +344,7 @@ fn vary_allows_storage(vary: Option<&str>) -> bool {
                 .filter(|s| !s.is_empty())
                 .collect();
             fields.iter().all(|f| {
-                f.eq_ignore_ascii_case("accept-encoding")
-                    || f.eq_ignore_ascii_case("accept-language")
+                f.eq_ignore_ascii_case("accept-encoding") || f.eq_ignore_ascii_case("accept-language")
             })
         }
     }
@@ -391,7 +384,10 @@ pub fn decide_storage(
         return None;
     }
 
-    let origin_ttl = cc.s_maxage.or(cc.max_age).or_else(|| expires_ttl(headers));
+    let origin_ttl = cc
+        .s_maxage
+        .or(cc.max_age)
+        .or_else(|| expires_ttl(headers));
 
     // Explicit rule TTL wins over the origin; otherwise honour the origin.
     let ttl = match policy.ttl_override {
@@ -438,11 +434,7 @@ pub fn request_bypasses_cache<B>(req: &Request<B>) -> bool {
             return true;
         }
     }
-    if let Some(p) = req
-        .headers()
-        .get(header::PRAGMA)
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(p) = req.headers().get(header::PRAGMA).and_then(|v| v.to_str().ok()) {
         if p.eq_ignore_ascii_case("no-cache") {
             return true;
         }
@@ -708,10 +700,7 @@ mod tests {
                 .priority,
             30
         );
-        assert_eq!(
-            match_rule(&rules, "/api/x", "DELETE", "").unwrap().priority,
-            0
-        );
+        assert_eq!(match_rule(&rules, "/api/x", "DELETE", "").unwrap().priority, 0);
     }
 
     #[test]
@@ -733,10 +722,7 @@ mod tests {
     fn origin_max_age_used_when_no_rule() {
         let d = decide_storage(
             200,
-            &hdrs(&[(
-                "Cache-Control",
-                "public, max-age=120, stale-while-revalidate=30",
-            )]),
+            &hdrs(&[("Cache-Control", "public, max-age=120, stale-while-revalidate=30")]),
             ResolvedPolicy::default(),
             60,
         )
@@ -766,8 +752,7 @@ mod tests {
             browser_ttl_secs: None,
             ignore_query: None,
         };
-        let d =
-            decide_storage(200, &hdrs(&[("cache-control", "max-age=600")]), policy, 60).unwrap();
+        let d = decide_storage(200, &hdrs(&[("cache-control", "max-age=600")]), policy, 60).unwrap();
         assert_eq!(d.ttl_secs, 5);
         assert_eq!(d.swr_secs, 10);
     }
@@ -793,13 +778,8 @@ mod tests {
     #[test]
     fn expires_is_used_as_fallback() {
         let expires = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(90));
-        let d = decide_storage(
-            200,
-            &hdrs(&[("expires", &expires)]),
-            ResolvedPolicy::default(),
-            60,
-        )
-        .unwrap();
+        let d = decide_storage(200, &hdrs(&[("expires", &expires)]), ResolvedPolicy::default(), 60)
+            .unwrap();
         assert!(d.ttl_secs >= 85 && d.ttl_secs <= 90, "got {}", d.ttl_secs);
     }
 

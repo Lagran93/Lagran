@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub geoip_json_path: String,
     /// TTL returned by the scheduling API (seconds).
     pub schedule_ttl: u64,
+    /// DNS server used by the console "DNS test" endpoint (host:port).
+    pub dns_test_server: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,8 +36,9 @@ impl Default for AppConfig {
         let (host, port) = parse_bind();
         Self {
             server: ServerConfig { host, port },
-            database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://lagran:lagran@127.0.0.1:5432/lagran".into()),
+            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://lagran:lagran@127.0.0.1:5432/lagran".into()
+            }),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "lagran-dev-secret-change-me".into()),
             jwt_expire_hours: jwt_expire_hours(),
@@ -50,6 +53,8 @@ impl Default for AppConfig {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(30)
                 .clamp(5, 3600),
+            dns_test_server: std::env::var("DNS_TEST_SERVER")
+                .unwrap_or_else(|_| "127.0.0.1:53".into()),
         }
     }
 }

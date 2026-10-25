@@ -273,7 +273,10 @@ fn into_waf(cfg: Option<WafCfg>) -> WafConfig {
 }
 
 fn parse_nets(entries: Vec<String>) -> Vec<IpNet> {
-    entries.iter().filter_map(|s| IpNet::parse(s)).collect()
+    entries
+        .iter()
+        .filter_map(|s| IpNet::parse(s))
+        .collect()
 }
 
 fn format_origin(o: &OriginCfg) -> String {
@@ -304,9 +307,7 @@ pub fn spawn_config_sync(
                         let entries: Vec<DomainEntry> =
                             cfg.domains.into_iter().map(DomainCfg::into_entry).collect();
                         let n = entries.len();
-                        registry
-                            .replace_all(entries.clone(), cfg.version.clone())
-                            .await;
+                        registry.replace_all(entries.clone(), cfg.version.clone()).await;
                         // Global rule set is only a legacy single-domain fallback,
                         // so keep the union but never use it for onboarded hosts.
                         rules
