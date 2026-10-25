@@ -57,10 +57,7 @@ fn parse_target(url: &str) -> Result<Target> {
             Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
                 (h.to_string(), p.parse::<u16>()?)
             }
-            _ => (
-                authority.to_string(),
-                if tls { 443 } else { 80 },
-            ),
+            _ => (authority.to_string(), if tls { 443 } else { 80 }),
         }
     };
     if host.is_empty() {
@@ -218,7 +215,11 @@ impl ControlClient {
         subnet: Option<&str>,
         client_ip: Option<IpAddr>,
     ) -> Result<ScheduleReply> {
-        let mut path = format!("{}/api/v1/schedule?domain={}", self.target.base_path, url_encode(qname));
+        let mut path = format!(
+            "{}/api/v1/schedule?domain={}",
+            self.target.base_path,
+            url_encode(qname)
+        );
         if let Some(subnet) = subnet {
             path.push_str("&subnet=");
             path.push_str(&url_encode(subnet));

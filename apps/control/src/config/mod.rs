@@ -36,9 +36,8 @@ impl Default for AppConfig {
         let (host, port) = parse_bind();
         Self {
             server: ServerConfig { host, port },
-            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://lagran:lagran@127.0.0.1:5432/lagran".into()
-            }),
+            database_url: std::env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://lagran:lagran@127.0.0.1:5432/lagran".into()),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "lagran-dev-secret-change-me".into()),
             jwt_expire_hours: jwt_expire_hours(),

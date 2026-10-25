@@ -56,8 +56,33 @@ impl Service {
         )
     }
 
-    fn ns(&self) -> Record {
-        ns_record(&self.cfg.zone, &self.cfg.ns_name, 300)
+    fn ns_records(&self) -> Vec<Record> {
+        self.cfg
+            .ns_names
+            .iter()
+            .map(|name| ns_record(&self.cfg.zone, name, 300))
+            .collect()
+    }
+
+    fn ns_glue(&self, name: &str) -> Option<Record> {
+        let index = self
+            .cfg
+            .ns_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(name))?;
+        let ip = *self.cfg.ns_ips.get(index)?;
+        Some(match ip {
+            IpAddr::V4(v4) => a_record(name, v4, 300),
+            IpAddr::V6(v6) => aaaa_record(name, v6, 300),
+        })
+    }
+
+    fn ns_glue_records(&self) -> Vec<Record> {
+        self.cfg
+            .ns_names
+            .iter()
+            .filter_map(|name| self.ns_glue(name))
+            .collect()
     }
 
     fn fallback_ip(&self) -> Option<IpAddr> {
@@ -102,7 +127,9 @@ impl Service {
                         },
                     );
                     if cache.len() > 20_000 {
-                        cache.retain(|_, e| now.duration_since(e.at).as_secs() <= self.cfg.stale_secs);
+                        cache.retain(|_, e| {
+                            now.duration_since(e.at).as_secs() <= self.cfg.stale_secs
+                        });
                     }
                 }
                 ip.map(|ip| (ip, reply.ttl))
@@ -125,32 +152,44 @@ impl Service {
         }
     }
 
-    fn resolve(&self, q: &Query, client_ip: IpAddr) -> (u8, Vec<Record>, Vec<Record>) {
+    fn resolve(&self, q: &Query, client_ip: IpAddr) -> (u8, Vec<Record>, Vec<Record>, Vec<Record>) {
         let qname = q.qname.as_str();
         if q.qclass != 1 {
-            return (RCODE_REFUSED, vec![], vec![]);
+            return (RCODE_REFUSED, vec![], vec![], vec![]);
         }
         if !self.in_zone(qname) {
-            return (RCODE_REFUSED, vec![], vec![]);
+            return (RCODE_REFUSED, vec![], vec![], vec![]);
         }
         if q.qtype == TYPE_ANY {
-            return (RCODE_REFUSED, vec![], vec![]);
+            return (RCODE_REFUSED, vec![], vec![], vec![]);
         }
         if qname == self.cfg.zone {
             match q.qtype {
-                TYPE_SOA => return (RCODE_NOERROR, vec![self.soa()], vec![]),
-                TYPE_NS => return (RCODE_NOERROR, vec![self.ns()], vec![]),
+                TYPE_SOA => return (RCODE_NOERROR, vec![self.soa()], vec![], vec![]),
+                TYPE_NS => {
+                    return (
+                        RCODE_NOERROR,
+                        self.ns_records(),
+                        vec![],
+                        self.ns_glue_records(),
+                    )
+                }
                 _ => {}
             }
         }
         // NS host itself is glue, not a scheduled CDN record.
-        if qname == self.cfg.ns_name && q.qtype == TYPE_A {
-            if let Ok(ip) = self.cfg.ns_ip.parse::<Ipv4Addr>() {
-                return (RCODE_NOERROR, vec![a_record(qname, ip, 300)], vec![]);
+        if q.qtype == TYPE_A || q.qtype == TYPE_AAAA {
+            if let Some(glue) = self.ns_glue(qname) {
+                if (q.qtype == TYPE_A && glue.rtype == TYPE_A)
+                    || (q.qtype == TYPE_AAAA && glue.rtype == TYPE_AAAA)
+                {
+                    return (RCODE_NOERROR, vec![glue], vec![], vec![]);
+                }
+                return (RCODE_NOERROR, vec![], vec![self.soa()], vec![]);
             }
         }
         if q.qtype != TYPE_A && q.qtype != TYPE_AAAA {
-            return (RCODE_NOERROR, vec![], vec![self.soa()]);
+            return (RCODE_NOERROR, vec![], vec![self.soa()], vec![]);
         }
 
         let subnet = q
@@ -160,21 +199,21 @@ impl Service {
         let subnet_key = subnet.clone().unwrap_or_else(|| client_ip.to_string());
         let key = format!("{}|{}|{}", qname, q.qtype, subnet_key);
         let Some((ip, ttl)) = self.lookup(&key, qname, subnet.as_deref(), client_ip) else {
-            return (RCODE_SERVFAIL, vec![], vec![]);
+            return (RCODE_SERVFAIL, vec![], vec![], vec![]);
         };
         let ttl = ttl.min(self.cfg.ttl).max(5);
         let answers = match (q.qtype, ip) {
             (TYPE_A, IpAddr::V4(v4)) => vec![a_record(qname, v4, ttl)],
             (TYPE_AAAA, IpAddr::V6(v6)) => vec![aaaa_record(qname, v6, ttl)],
             (TYPE_A, IpAddr::V6(_)) | (TYPE_AAAA, IpAddr::V4(_)) => {
-                return (RCODE_NOERROR, vec![], vec![self.soa()]);
+                return (RCODE_NOERROR, vec![], vec![self.soa()], vec![]);
             }
             _ => vec![],
         };
         if answers.is_empty() {
-            (RCODE_NOERROR, vec![], vec![self.soa()])
+            (RCODE_NOERROR, vec![], vec![self.soa()], vec![])
         } else {
-            (RCODE_NOERROR, answers, vec![])
+            (RCODE_NOERROR, answers, vec![], vec![])
         }
     }
 
@@ -189,9 +228,9 @@ impl Service {
                 return Vec::new();
             }
         };
-        let (rcode, answers, authority) = self.resolve(&query, client_ip);
+        let (rcode, answers, authority, additional) = self.resolve(&query, client_ip);
         let limit = if tcp { 65_535 } else { query.udp_limit() };
-        let resp = encode_response(&query, rcode, &answers, &authority, tcp, limit);
+        let resp = encode_response(&query, rcode, &answers, &authority, &additional, tcp, limit);
         tracing::debug!(
             qname = %query.qname,
             qtype = query.qtype,
@@ -270,7 +309,9 @@ fn handle_tcp(mut stream: TcpStream, service: Arc<Service>) {
     if stream.read_exact(&mut buf).is_err() {
         return;
     }
-    let client_ip = peer.map(|p| p.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let client_ip = peer
+        .map(|p| p.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let resp = service.handle(&buf, client_ip, true);
     if resp.len() > 65_535 {
         return;
@@ -288,6 +329,7 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
     tracing::info!(
         listen = %cfg.listen,
         zone = %cfg.zone,
+        ns = %cfg.ns_names.join(","),
         ttl = cfg.ttl,
         control = %cfg.control_url,
         "authoritative DNS started"

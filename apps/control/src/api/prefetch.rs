@@ -85,10 +85,7 @@ pub async fn create(
     }))
 }
 
-pub async fn list(
-    State(state): State<AppState>,
-    actor: Actor,
-) -> Json<Vec<PrefetchTaskDto>> {
+pub async fn list(State(state): State<AppState>, actor: Actor) -> Json<Vec<PrefetchTaskDto>> {
     let rows = repository::list_prefetch(&state.pool, 50)
         .await
         .unwrap_or_default();
@@ -96,7 +93,9 @@ pub async fn list(
     let visible_names: Option<std::collections::HashSet<String>> = match visible {
         None => None,
         Some(ids) => {
-            let rows = repository::list_domains(&state.pool).await.unwrap_or_default();
+            let rows = repository::list_domains(&state.pool)
+                .await
+                .unwrap_or_default();
             Some(
                 rows.into_iter()
                     .filter(|d| ids.contains(&d.id))

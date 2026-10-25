@@ -63,7 +63,9 @@ async fn sync_once(
                         applied += 1;
                         tracing::debug!(domain = %cert.domain, "cert applied from edge-sync");
                     }
-                    Err(e) => tracing::warn!(domain = %cert.domain, error = %e, "cert apply failed"),
+                    Err(e) => {
+                        tracing::warn!(domain = %cert.domain, error = %e, "cert apply failed")
+                    }
                 }
             }
         }

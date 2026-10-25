@@ -127,6 +127,8 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | PUBLIC_IP | 空 | 节点公网 IP，随心跳上报给控制面用于 GeoDNS 调度 |
 | DNS_LISTEN | 0.0.0.0:53 | 权威 DNS 监听地址（UDP/TCP 同端口） |
 | DNS_ZONE | edge.lagran.net | 权威 Zone（客户域名 CNAME 到这里） |
+| DNS_NS_NAME | ns1.$zone | 一个或多个 NS 名，逗号分隔（如 ns1,ns2） |
+| DNS_NS_IP | 127.0.0.1 | 与 NS 名一一对应的 glue IP，逗号分隔 |
 | DNS_TTL | 30 | 调度 A 记录的 TTL（秒） |
 | DNS_CACHE_SECS / DNS_STALE_SECS | 5 / 300 | 调度结果缓存与故障时允许的旧结果时间 |
 | DNS_FALLBACK_IP | 空 | 控制面不可用且无缓存时返回的兜底 IP |

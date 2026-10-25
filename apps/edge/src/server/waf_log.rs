@@ -102,10 +102,21 @@ mod tests {
     #[tokio::test]
     async fn pushes_and_drains_in_order() {
         let log = WafLog::new("node-1", 100);
-        log.push("a.test", "1.2.3.4", "GET", "/x", "block", "sqli", "SQL 注入", "block")
-            .await;
-        log.push("a.test", "1.2.3.5", "GET", "/y", "monitor", "xss", "XSS", "monitor")
-            .await;
+        log.push(
+            "a.test",
+            "1.2.3.4",
+            "GET",
+            "/x",
+            "block",
+            "sqli",
+            "SQL 注入",
+            "block",
+        )
+        .await;
+        log.push(
+            "a.test", "1.2.3.5", "GET", "/y", "monitor", "xss", "XSS", "monitor",
+        )
+        .await;
         assert_eq!(log.len().await, 2);
         let drained = log.drain(10).await;
         assert_eq!(drained.len(), 2);

@@ -38,7 +38,12 @@ pub struct AccessLog {
 }
 
 impl AccessLog {
-    pub async fn open(path: Option<&str>, node_id: &str, buffer_cap: usize, json_lines: bool) -> Self {
+    pub async fn open(
+        path: Option<&str>,
+        node_id: &str,
+        buffer_cap: usize,
+        json_lines: bool,
+    ) -> Self {
         let file = if let Some(p) = path.filter(|s| !s.is_empty()) {
             let path = PathBuf::from(p);
             if let Some(parent) = path.parent() {
@@ -274,8 +279,10 @@ mod tests {
     #[tokio::test]
     async fn records_reach_ring_buffer() {
         let log = AccessLog::open(None, "n1", 100, false).await;
-        log.write(log.record("1.2.3.4", "GET", "a.test", "/x", 200, 10, 5, "HIT", "ua", ""))
-            .await;
+        log.write(log.record(
+            "1.2.3.4", "GET", "a.test", "/x", 200, 10, 5, "HIT", "ua", "",
+        ))
+        .await;
         // The writer task applies the record asynchronously.
         for _ in 0..50 {
             if !log.snapshot(1).await.is_empty() {

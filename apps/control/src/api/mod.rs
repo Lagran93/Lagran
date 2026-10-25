@@ -48,10 +48,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/auth/register", post(auth::register))
                 .route("/auth/me", get(auth::me))
                 .route("/projects", get(project::list).post(project::create))
-                .route(
-                    "/projects/:id",
-                    get(project::get).delete(project::delete),
-                )
+                .route("/projects/:id", get(project::get).delete(project::delete))
                 .route("/projects/:id/domains", get(project::list_domains))
                 .route(
                     "/projects/:id/members",
@@ -66,9 +63,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/origin-health/report", post(health_origin::report))
                 .route(
                     "/domains/:id",
-                    get(domain::get)
-                        .put(domain::update)
-                        .delete(domain::delete),
+                    get(domain::get).put(domain::update).delete(domain::delete),
                 )
                 .route(
                     "/domains/:id/settings",
@@ -95,7 +90,10 @@ pub fn create_router(state: AppState) -> Router {
                     get(waf::list_ips).post(waf::create_ip),
                 )
                 .route("/waf/ips/:id", delete(waf::delete_ip))
-                .route("/waf/events", get(waf::list_events).post(waf::report_events))
+                .route(
+                    "/waf/events",
+                    get(waf::list_events).post(waf::report_events),
+                )
                 .route("/waf/stats", get(waf::stats))
                 .route("/schedule", get(crate::scheduler::resolve_agent))
                 .route("/schedule/test", post(crate::scheduler::test))

@@ -128,10 +128,7 @@ pub async fn purge(
     let mut any_fail = false;
 
     for node in nodes {
-        let url = format!(
-            "{}/__lagran/purge",
-            node.agent_url.trim_end_matches('/')
-        );
+        let url = format!("{}/__lagran/purge", node.agent_url.trim_end_matches('/'));
         let token = if node.auth_token.is_empty() {
             state.config.agent_token.clone()
         } else {
@@ -172,7 +169,8 @@ pub async fn purge(
         total,
         results.len()
     );
-    let _ = repository::insert_audit(&state.pool, &actor.email, "purge", &req.domain, &detail).await;
+    let _ =
+        repository::insert_audit(&state.pool, &actor.email, "purge", &req.domain, &detail).await;
 
     Ok(Json(PurgeResponse {
         success: !any_fail,

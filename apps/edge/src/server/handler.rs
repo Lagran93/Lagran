@@ -23,9 +23,9 @@ use crate::origin::{OriginClient, OriginResponse};
 use crate::server::access_log::AccessLog;
 use crate::server::acme_challenge::ChallengeStore;
 use crate::server::cert_store::CertStore;
+use crate::server::challenge;
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::host_util;
-use crate::server::challenge;
 use crate::server::inflight::{self, Inflight, Slot};
 use crate::server::rate_limit::RateLimiter;
 use crate::server::waf_log::WafLog;
@@ -303,7 +303,11 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     };
 
     // Rate limit per host.
-    let rl_key = if host.is_empty() { "default" } else { host.as_str() };
+    let rl_key = if host.is_empty() {
+        "default"
+    } else {
+        host.as_str()
+    };
     if !state
         .rate_limiter
         .check(rl_key, eff.rate_limit_rps, eff.rate_limit_burst)
@@ -363,7 +367,10 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         && (verdict.is_block()
                             || (verdict.action == WafAction::Challenge && !challenge_method));
 
-                    if challenge_needed || blocked || verdict.action == WafAction::Log || !mode_is_block
+                    if challenge_needed
+                        || blocked
+                        || verdict.action == WafAction::Log
+                        || !mode_is_block
                     {
                         let action = if blocked {
                             "block"
@@ -409,10 +416,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                             )
                             .await;
                             let nonce = challenge::issue_nonce(&host, &state.challenge_secret);
-                            let secure = req
-                                .extensions()
-                                .get::<host_util::TlsSni>()
-                                .is_some()
+                            let secure = req.extensions().get::<host_util::TlsSni>().is_some()
                                 || headers
                                     .get("x-forwarded-proto")
                                     .and_then(|v| v.to_str().ok())
@@ -1397,7 +1401,10 @@ mod tests {
     #[test]
     fn hotlink_rules() {
         assert!(hotlink_allowed("*", ""));
-        assert!(hotlink_allowed("example.com, foo.com", "https://example.com/a"));
+        assert!(hotlink_allowed(
+            "example.com, foo.com",
+            "https://example.com/a"
+        ));
         assert!(!hotlink_allowed("example.com", "https://evil.test/a"));
         assert!(!hotlink_allowed("example.com", ""));
     }

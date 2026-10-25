@@ -147,13 +147,8 @@ fn parse_response(buf: &[u8]) -> (u8, bool, Vec<DnsAnswer>) {
         }
         if rtype == 1 && rdlen == 4 {
             answers.push(DnsAnswer {
-                ip: Ipv4Addr::new(
-                    buf[rdata],
-                    buf[rdata + 1],
-                    buf[rdata + 2],
-                    buf[rdata + 3],
-                )
-                .to_string(),
+                ip: Ipv4Addr::new(buf[rdata], buf[rdata + 1], buf[rdata + 2], buf[rdata + 3])
+                    .to_string(),
                 ttl,
             });
         }

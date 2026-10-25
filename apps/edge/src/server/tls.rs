@@ -76,8 +76,7 @@ pub async fn serve_https(addr: SocketAddr, app: Router, store: Arc<CertStore>) -
                                 .and_then(|v| v.to_str().ok())
                                 .map(|h| {
                                     let h = h.trim();
-                                    h.is_empty()
-                                        || crate::config::registry::is_ip_host(h)
+                                    h.is_empty() || crate::config::registry::is_ip_host(h)
                                 })
                                 .unwrap_or(true);
                             if host_is_bad {

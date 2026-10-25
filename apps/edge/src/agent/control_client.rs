@@ -93,7 +93,10 @@ impl ControlClient {
             if !status.is_success() {
                 return Err(format!(
                     "HTTP {status}: {}",
-                    String::from_utf8_lossy(&bytes).chars().take(200).collect::<String>()
+                    String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
                 ));
             }
             Ok(bytes)
@@ -111,9 +114,14 @@ impl ControlClient {
 
     pub async fn post_json<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
         let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-        self.send("POST", path, Some(Bytes::from(bytes)), Some("application/json"))
-            .await
-            .map(|_| ())
+        self.send(
+            "POST",
+            path,
+            Some(Bytes::from(bytes)),
+            Some("application/json"),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// POST and decode the JSON reply (used by the heartbeat agent).
@@ -124,7 +132,12 @@ impl ControlClient {
     ) -> Result<T, String> {
         let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
         let reply = self
-            .send("POST", path, Some(Bytes::from(bytes)), Some("application/json"))
+            .send(
+                "POST",
+                path,
+                Some(Bytes::from(bytes)),
+                Some("application/json"),
+            )
             .await?;
         serde_json::from_slice(&reply).map_err(|e| format!("invalid JSON from {path}: {e}"))
     }
@@ -145,8 +158,14 @@ mod tests {
     #[test]
     fn endpoint_joins_without_double_slash() {
         let c = ControlClient::new(&config("http://control.test:8080/", ""));
-        assert_eq!(c.endpoint("/api/v1/config"), "http://control.test:8080/api/v1/config");
-        assert_eq!(c.endpoint("api/v1/config"), "http://control.test:8080/api/v1/config");
+        assert_eq!(
+            c.endpoint("/api/v1/config"),
+            "http://control.test:8080/api/v1/config"
+        );
+        assert_eq!(
+            c.endpoint("api/v1/config"),
+            "http://control.test:8080/api/v1/config"
+        );
         assert!(!c.has_https());
 
         let c = ControlClient::new(&config("https://control.test", "secret"));

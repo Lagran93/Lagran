@@ -332,13 +332,7 @@ pub fn ns_record(name: &str, target: &str, ttl: u32) -> Record {
     }
 }
 
-pub fn soa_record(
-    name: &str,
-    mname: &str,
-    rname: &str,
-    serial: u32,
-    ttl: u32,
-) -> Record {
+pub fn soa_record(name: &str, mname: &str, rname: &str, serial: u32, ttl: u32) -> Record {
     let mut rdata = Vec::new();
     put_name(&mut rdata, mname);
     put_name(&mut rdata, rname);
@@ -392,6 +386,7 @@ fn encode_with(
     rcode: u8,
     answers: &[Record],
     authority: &[Record],
+    additional: &[Record],
     truncated: bool,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(512);
@@ -404,13 +399,16 @@ fn encode_with(
     out.extend_from_slice(&1u16.to_be_bytes());
     out.extend_from_slice(&(answers.len() as u16).to_be_bytes());
     out.extend_from_slice(&(authority.len() as u16).to_be_bytes());
-    let ar = if query.edns.is_some() { 1u16 } else { 0 };
+    let ar = additional.len() as u16 + u16::from(query.edns.is_some());
     out.extend_from_slice(&ar.to_be_bytes());
     out.extend_from_slice(&query.question);
     for rec in answers {
         write_record(&mut out, rec);
     }
     for rec in authority {
+        write_record(&mut out, rec);
+    }
+    for rec in additional {
         write_record(&mut out, rec);
     }
     if query.edns.is_some() {
@@ -425,12 +423,13 @@ pub fn encode_response(
     rcode: u8,
     answers: &[Record],
     authority: &[Record],
+    additional: &[Record],
     tcp: bool,
     udp_limit: usize,
 ) -> Vec<u8> {
-    let full = encode_with(query, rcode, answers, authority, false);
+    let full = encode_with(query, rcode, answers, authority, additional, false);
     if !tcp && full.len() > udp_limit {
-        return encode_with(query, rcode, &[], &[], true);
+        return encode_with(query, rcode, &[], &[], &[], true);
     }
     full
 }
@@ -494,6 +493,7 @@ mod tests {
             RCODE_NOERROR,
             &[a_record(&q.qname, "203.0.113.10".parse().unwrap(), 30)],
             &[],
+            &[],
             false,
             512,
         );
@@ -518,7 +518,7 @@ mod tests {
         let big: Vec<Record> = (0..80)
             .map(|i| a_record(&q.qname, Ipv4Addr::new(10, 0, 0, i), 30))
             .collect();
-        let resp = encode_response(&q, RCODE_NOERROR, &big, &[], false, 512);
+        let resp = encode_response(&q, RCODE_NOERROR, &big, &[], &[], false, 512);
         assert!(resp.len() <= 512);
         assert_ne!(be16(&resp, 2).unwrap() & 0x0200, 0, "TC bit set");
     }

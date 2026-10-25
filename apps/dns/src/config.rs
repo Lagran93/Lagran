@@ -1,5 +1,6 @@
 //! Authoritative DNS configuration.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -8,8 +9,10 @@ pub struct DnsConfig {
     /// Zone apex, lower-case, without trailing dot.
     pub zone: String,
     pub ttl: u32,
-    pub ns_name: String,
-    pub ns_ip: String,
+    /// One or more NS names (comma separated), e.g. ns1,ns2.
+    pub ns_names: Vec<String>,
+    /// One A/AAAA per NS name (comma separated, same order).
+    pub ns_ips: Vec<IpAddr>,
     pub soa_mname: String,
     pub soa_rname: String,
     pub control_url: String,
@@ -21,6 +24,14 @@ pub struct DnsConfig {
     pub fallback_ip: Option<String>,
 }
 
+fn split_list(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 impl DnsConfig {
     pub fn from_env() -> Self {
         let zone = std::env::var("DNS_ZONE")
@@ -28,9 +39,28 @@ impl DnsConfig {
             .trim()
             .trim_end_matches('.')
             .to_ascii_lowercase();
-        let ns_name = std::env::var("DNS_NS_NAME").unwrap_or_else(|_| format!("ns1.{zone}"));
-        let ns_ip = std::env::var("DNS_NS_IP").unwrap_or_else(|_| "127.0.0.1".into());
-        let soa_mname = std::env::var("DNS_SOA_MNAME").unwrap_or_else(|_| ns_name.clone());
+
+        let mut ns_names =
+            split_list(&std::env::var("DNS_NS_NAME").unwrap_or_else(|_| format!("ns1.{zone}")));
+        if ns_names.is_empty() {
+            ns_names.push(format!("ns1.{zone}"));
+        }
+
+        let mut ns_ips: Vec<IpAddr> = std::env::var("DNS_NS_IP")
+            .unwrap_or_else(|_| "127.0.0.1".into())
+            .split(',')
+            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+            .collect();
+        if ns_ips.is_empty() {
+            ns_ips.push("127.0.0.1".parse().expect("valid fallback IP"));
+        }
+        // If fewer IPs than names, repeat the last one instead of dropping NS.
+        while ns_ips.len() < ns_names.len() {
+            let last = *ns_ips.last().expect("at least one NS IP");
+            ns_ips.push(last);
+        }
+
+        let soa_mname = std::env::var("DNS_SOA_MNAME").unwrap_or_else(|_| ns_names[0].clone());
         let soa_rname =
             std::env::var("DNS_SOA_RNAME").unwrap_or_else(|_| format!("hostmaster.{zone}"));
         Self {
@@ -41,8 +71,8 @@ impl DnsConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30)
                 .clamp(5, 300),
-            ns_name,
-            ns_ip,
+            ns_names,
+            ns_ips,
             soa_mname,
             soa_rname,
             control_url: std::env::var("CONTROL_URL")

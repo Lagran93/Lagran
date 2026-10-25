@@ -21,7 +21,10 @@ impl OriginHealthMap {
     }
 
     pub async fn set(&self, domain: &str, healthy: bool) {
-        self.inner.write().await.insert(domain.to_lowercase(), healthy);
+        self.inner
+            .write()
+            .await
+            .insert(domain.to_lowercase(), healthy);
     }
 
     pub async fn is_healthy(&self, domain: &str) -> bool {
@@ -54,7 +57,14 @@ pub fn spawn_origin_health(
                 let (healthy, err) = match result {
                     Ok((status, _, _)) => {
                         let ok = status.as_u16() < 500;
-                        (ok, if ok { String::new() } else { format!("HTTP {status}") })
+                        (
+                            ok,
+                            if ok {
+                                String::new()
+                            } else {
+                                format!("HTTP {status}")
+                            },
+                        )
                     }
                     Err(e) => (false, e.to_string()),
                 };
@@ -66,7 +76,9 @@ pub fn spawn_origin_health(
                     "latency_ms": latency,
                     "error": err,
                 });
-                let _ = control.post_json("/api/v1/origin-health/report", &body).await;
+                let _ = control
+                    .post_json("/api/v1/origin-health/report", &body)
+                    .await;
                 if !healthy {
                     tracing::warn!(domain = %entry.domain, %err, latency_ms = latency, "origin unhealthy");
                 }

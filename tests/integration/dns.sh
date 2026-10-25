@@ -85,6 +85,8 @@ CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 AGENT_TOKEN= \
 DNS_LISTEN="127.0.0.1:$DNS_PORT" \
 DNS_ZONE="edge.lagran.net" \
+DNS_NS_NAME="ns1.edge.lagran.net,ns2.edge.lagran.net" \
+DNS_NS_IP="127.0.0.1,127.0.0.2" \
 DNS_TTL=30 \
 DNS_CACHE_SECS=2 \
 DNS_STALE_SECS=60 \
@@ -111,7 +113,11 @@ check "Beijing ECS → bj node" "$(printf '%s' "$OUT" | jq -r '.answers[0].ip')"
 OUT=$(q "edge.lagran.net" SOA)
 check "SOA answered" "$(printf '%s' "$OUT" | jq -r '.soa')" "true"
 OUT=$(q "edge.lagran.net" NS)
-check "NS answered" "$(printf '%s' "$OUT" | jq -r '.answers | length')" "1"
+check "both NS answered" "$(printf '%s' "$OUT" | jq -r '.answers | length')" "2"
+OUT=$(q "ns2.edge.lagran.net" A)
+check "ns2 glue A" "$(printf '%s' "$OUT" | jq -r '.answers[0].ip')" "127.0.0.2"
+OUT=$(q "ns1.edge.lagran.net" A)
+check "ns1 glue A" "$(printf '%s' "$OUT" | jq -r '.answers[0].ip')" "127.0.0.1"
 
 OUT=$(q "example.com" A)
 check "out-of-zone refused" "$(printf '%s' "$OUT" | jq -r '.rcode')" "5"

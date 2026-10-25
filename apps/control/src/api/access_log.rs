@@ -99,7 +99,9 @@ pub async fn list(
     let visible_hosts: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
         Some(ids) => {
-            let rows = repository::list_domains(&state.pool).await.unwrap_or_default();
+            let rows = repository::list_domains(&state.pool)
+                .await
+                .unwrap_or_default();
             Some(
                 rows.into_iter()
                     .filter(|d| ids.contains(&d.id))

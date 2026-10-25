@@ -192,15 +192,15 @@ pub fn node_disabled_page(host: &str) -> Response {
         "NODE_DISABLED",
         true,
     );
-    response.headers_mut().insert(
-        header::X_FRAME_OPTIONS,
-        HeaderValue::from_static("DENY"),
-    );
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     response
 }
 
 /// Page for a Host that has not been onboarded to this edge.
-pub fn unknown_domain_page(host: &str) -> Response {    let host_esc = html_escape(host);
+pub fn unknown_domain_page(host: &str) -> Response {
+    let host_esc = html_escape(host);
     let body = format!(
         r#"<h1>该域名尚未接入加速</h1>
     <p>您访问的域名 <code>{host_esc}</code> 已解析到 CDN 节点，但尚未在控制台完成接入配置。</p>
@@ -334,7 +334,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_domain_is_not_cacheable() {        let resp = unknown_domain_page("not-onboarded.test");
+    fn unknown_domain_is_not_cacheable() {
+        let resp = unknown_domain_page("not-onboarded.test");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             resp.headers().get("cache-control").unwrap(),

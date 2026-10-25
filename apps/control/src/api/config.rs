@@ -324,14 +324,18 @@ pub async fn list_all_configs(
     State(state): State<AppState>,
     _agent: AgentAuth,
 ) -> Result<Json<AllDomainsConfigResponse>, (StatusCode, Json<ErrorBody>)> {
-    let rows = repository::list_domains_full(&state.pool).await.map_err(|e| {
-        tracing::error!(error = %e, "list domains for config");
-        db_error()
-    })?;
-    let all_rules = repository::list_rules_flat(&state.pool).await.map_err(|e| {
-        tracing::error!(error = %e, "list rules for config");
-        db_error()
-    })?;
+    let rows = repository::list_domains_full(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list domains for config");
+            db_error()
+        })?;
+    let all_rules = repository::list_rules_flat(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list rules for config");
+            db_error()
+        })?;
 
     let mut by_domain: HashMap<Uuid, Vec<repository::CacheRuleRow>> = HashMap::new();
     for r in all_rules {
@@ -357,10 +361,8 @@ pub async fn list_all_configs(
             db_error()
         })?;
 
-    let mut waf_settings_by: HashMap<Uuid, repository::WafSettingsRow> = waf_settings
-        .into_iter()
-        .map(|s| (s.domain_id, s))
-        .collect();
+    let mut waf_settings_by: HashMap<Uuid, repository::WafSettingsRow> =
+        waf_settings.into_iter().map(|s| (s.domain_id, s)).collect();
     let mut waf_rules_by: HashMap<Uuid, Vec<repository::WafRuleRow>> = HashMap::new();
     for r in waf_rules {
         waf_rules_by.entry(r.domain_id).or_default().push(r);

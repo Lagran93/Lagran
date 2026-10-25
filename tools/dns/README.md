@@ -7,8 +7,8 @@
 ```bash
 DNS_LISTEN=0.0.0.0:53 \
 DNS_ZONE=edge.lagran.net \
-DNS_NS_NAME=ns1.edge.lagran.net \
-DNS_NS_IP=203.0.113.53 \
+DNS_NS_NAME=ns1.edge.lagran.net,ns2.edge.lagran.net \
+DNS_NS_IP=203.0.113.53,203.0.113.54 \
 CONTROL_URL=http://127.0.0.1:8080 \
 AGENT_TOKEN=<token> \
 ./target/debug/lagran-dns

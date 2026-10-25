@@ -400,7 +400,12 @@ pub async fn update(
             )
         })?;
 
-    let name = req.name.as_deref().unwrap_or(&current.name).trim().to_string();
+    let name = req
+        .name
+        .as_deref()
+        .unwrap_or(&current.name)
+        .trim()
+        .to_string();
     if name.is_empty() || name.len() > 64 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -533,14 +538,7 @@ pub async fn delete(
     repository::delete_node(&state.pool, node_id)
         .await
         .map_err(|_| db_error())?;
-    let _ = repository::insert_audit(
-        &state.pool,
-        &actor.email,
-        "node.delete",
-        &row.name,
-        "",
-    )
-    .await;
+    let _ = repository::insert_audit(&state.pool, &actor.email, "node.delete", &row.name, "").await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 

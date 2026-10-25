@@ -109,7 +109,10 @@ fn clearance_signature(host: &str, ts: u64, secret: &str) -> String {
 pub fn clearance_value(host: &str, ttl_secs: u64, secret: &str) -> (String, u64) {
     let ts = now_secs();
     let ttl = ttl_secs.clamp(60, 86_400);
-    (format!("{ts}.{}", clearance_signature(host, ts, secret)), ttl)
+    (
+        format!("{ts}.{}", clearance_signature(host, ts, secret)),
+        ttl,
+    )
 }
 
 fn cookie_from_headers<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -164,13 +167,7 @@ fn safe_next(next: &str) -> String {
 }
 
 /// The interstitial served at the original URL.
-pub fn page(
-    host: &str,
-    nonce: &str,
-    next: &str,
-    difficulty: u8,
-    secure: bool,
-) -> Response {
+pub fn page(host: &str, nonce: &str, next: &str, difficulty: u8, secure: bool) -> Response {
     let nonce_json = serde_json::to_string(nonce).unwrap_or_else(|_| "\"\"".into());
     let next_json = serde_json::to_string(&safe_next(next)).unwrap_or_else(|_| "\"/\"".into());
     let difficulty = difficulty.clamp(1, 6);
@@ -201,15 +198,15 @@ pub fn page(
             "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'self'",
         ),
     );
-    headers.insert(
-        header::X_FRAME_OPTIONS,
-        HeaderValue::from_static("DENY"),
-    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         "x-lagran-challenge",
         HeaderValue::from_static(if secure { "1; secure" } else { "1" }),
     );
-    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     response
 }
 
@@ -246,7 +243,8 @@ pub async fn verify(
     }
 
     let (value, ttl) = clearance_value(&host, ttl, &state.challenge_secret);
-    let mut cookie = format!("{CLEARANCE_COOKIE}={value}; Path=/; Max-Age={ttl}; HttpOnly; SameSite=Lax");
+    let mut cookie =
+        format!("{CLEARANCE_COOKIE}={value}; Path=/; Max-Age={ttl}; HttpOnly; SameSite=Lax");
     if secure_request(&req, &headers) {
         cookie.push_str("; Secure");
     }
@@ -260,10 +258,7 @@ pub async fn verify(
     if let Ok(v) = HeaderValue::from_str(&cookie) {
         headers.insert(header::SET_COOKIE, v);
     }
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -278,10 +273,9 @@ h1{{font-size:18px;margin:0 0 8px}}p{{color:#4e5969;font-size:14px;line-height:1
 <body><div class="card"><h1>{title}</h1><p>{message}</p></div></body></html>"#
     );
     let mut response = (StatusCode::FORBIDDEN, Html(html)).into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

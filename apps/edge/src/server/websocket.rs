@@ -53,9 +53,7 @@ pub fn origin_tcp_addr(origin_url: &str) -> Result<(String, u16, bool)> {
         match rest.split_once(']') {
             Some((h, tail)) => (
                 h.to_string(),
-                tail.trim_start_matches(':')
-                    .parse()
-                    .unwrap_or(default_port),
+                tail.trim_start_matches(':').parse().unwrap_or(default_port),
             ),
             None => (hostport.to_string(), default_port),
         }
@@ -268,7 +266,11 @@ pub async fn handle_upgrade(
         return (StatusCode::BAD_REQUEST, "missing Sec-WebSocket-Key").into_response();
     };
     let Some(on_upgrade) = req.extensions().get::<OnUpgrade>().cloned() else {
-        return (StatusCode::BAD_REQUEST, "connection does not support upgrades").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "connection does not support upgrades",
+        )
+            .into_response();
     };
 
     let timeout = Duration::from_millis(timeout_ms.clamp(1_000, 30_000));
@@ -286,14 +288,14 @@ pub async fn handle_upgrade(
             return (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response();
         }
     };
-    let reply = match origin_handshake(&mut upstream, &host, port, tls, path_and_query, headers).await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "websocket origin handshake failed");
-            return (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response();
-        }
-    };
+    let reply =
+        match origin_handshake(&mut upstream, &host, port, tls, path_and_query, headers).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "websocket origin handshake failed");
+                return (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response();
+            }
+        };
 
     let accept = reply
         .headers
@@ -353,7 +355,10 @@ mod tests {
     fn upgrade_detection() {
         let mut h = HeaderMap::new();
         h.insert("upgrade", HeaderValue::from_static("websocket"));
-        h.insert("connection", HeaderValue::from_static("keep-alive, Upgrade"));
+        h.insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, Upgrade"),
+        );
         assert!(is_websocket_upgrade(&h));
         h.insert("upgrade", HeaderValue::from_static("h2c"));
         assert!(!is_websocket_upgrade(&h));

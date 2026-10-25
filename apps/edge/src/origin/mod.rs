@@ -145,7 +145,8 @@ impl OriginClient {
         headers: &HeaderMap,
     ) -> Result<CacheEntry> {
         let base = self.base_url.read().await.clone();
-        self.fetch_as_entry_from(&base, path_and_query, headers).await
+        self.fetch_as_entry_from(&base, path_and_query, headers)
+            .await
     }
 
     pub async fn fetch_as_entry_from(
@@ -247,7 +248,9 @@ impl OriginClient {
 fn build_url(base_url: &str, path_and_query: &str) -> Result<String> {
     let base = base_url.trim_end_matches('/');
     if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err(anyhow!("origin url must start with http:// or https://: {base}"));
+        return Err(anyhow!(
+            "origin url must start with http:// or https://: {base}"
+        ));
     }
     let path = if path_and_query.starts_with('/') {
         path_and_query.to_string()
