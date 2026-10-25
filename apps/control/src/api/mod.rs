@@ -70,7 +70,8 @@ pub fn create_router(state: AppState) -> Router {
                 )
                 .route("/domains/:id/status", post(domain::set_status))
                 .route("/rules", get(rule::list).post(rule::create))
-                .route("/rules/:id", delete(rule::delete))
+                .route("/rules/test", post(rule::test))
+                .route("/rules/:id", put(rule::update).delete(rule::delete))
                 .route(
                     "/domains/:id/waf",
                     get(waf::get_settings).put(waf::put_settings),

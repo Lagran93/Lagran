@@ -23,6 +23,8 @@ fn policy(ttl: Option<u64>, swr: u64) -> ResolvedPolicy {
         action: RuleAction::Cache,
         ttl_override: ttl,
         swr_secs: swr,
+        browser_ttl_secs: None,
+        ignore_query: None,
     }
 }
 

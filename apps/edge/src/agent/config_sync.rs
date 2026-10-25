@@ -30,6 +30,16 @@ struct RuleCfg {
     action: Option<String>,
     #[serde(default)]
     swr_seconds: Option<u64>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    match_methods: String,
+    #[serde(default)]
+    match_query: String,
+    #[serde(default)]
+    browser_ttl_seconds: u64,
+    #[serde(default)]
+    ignore_query: Option<bool>,
 }
 
 impl RuleCfg {
@@ -40,6 +50,11 @@ impl RuleCfg {
             priority: self.priority,
             action: self.action.unwrap_or_else(|| "cache".into()),
             swr_seconds: self.swr_seconds.unwrap_or(0),
+            enabled: self.enabled,
+            match_methods: self.match_methods,
+            match_query: self.match_query,
+            browser_ttl_seconds: self.browser_ttl_seconds,
+            ignore_query: self.ignore_query,
         }
     }
 }

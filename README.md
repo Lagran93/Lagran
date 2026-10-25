@@ -13,7 +13,8 @@
 - 注册 / 登录（bcrypt + JWT）、`GET /api/v1/auth/me`（含角色）
 - 项目与成员（多租户）：`/api/v1/projects`、`/projects/{id}/members`
 - 域名接入与管理：源站/备源、SSL、限流、CORS、防盗链、回源超时、自定义头
-- 缓存规则：路径匹配、TTL、优先级、**动作（cache/bypass/no_store）**、**SWR**
+- 缓存规则：路径通配、**请求方法 / 查询串条件**、TTL、优先级、SWR、**动作（cache/bypass/no_store）**、
+  **浏览器 TTL 覆盖**、**按规则忽略 Query**、启用/停用与**规则测试器**
 - 证书：上传、SNI 下发、开发用自动签发（rcgen + ACME challenge 下发）
 - 节点管理：预注册节点 + 一键生成安装命令（二进制/Docker）、单节点令牌、启用/停用（下发边缘立即 503）、删除吊销、心跳与 CPU/内存/版本
 - WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器）、自定义规则（拦截/放行/记录/**浏览器质询**）、IP 黑白名单、观察/拦截模式、事件日志
@@ -76,6 +77,7 @@ cargo test --workspace          # 单元/契约测试（含 TTL 优先级矩阵�
 cargo clippy --workspace --all-targets
 bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（需 Postgres）
 bash tests/integration/nodes.sh # 端到端：节点预注册→安装命令→单节点令牌→上下线→删除
+bash tests/integration/cache-rules.sh # 端到端：方法/Query 条件、禁用规则、浏览器 TTL、规则测试器
 bash tests/integration/waf.sh   # 端到端：WAF 规则、IP 名单、观察/拦截模式与事件
 bash tests/integration/ttl.sh   # 端到端：TTL 优先级（规则→s-maxage→max-age→Expires→默认）
 PGPASS=... bash tests/integration/fresh-db.sh   # 全新库迁移 + demo admin 引导

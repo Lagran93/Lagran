@@ -32,6 +32,11 @@ pub struct CacheRuleConfig {
     pub priority: i32,
     pub action: String,
     pub swr_seconds: u64,
+    pub enabled: bool,
+    pub match_methods: String,
+    pub match_query: String,
+    pub browser_ttl_seconds: u64,
+    pub ignore_query: Option<bool>,
 }
 
 #[derive(Serialize, Clone)]
@@ -102,6 +107,11 @@ fn rule_configs(rows: Vec<repository::CacheRuleRow>) -> Vec<CacheRuleConfig> {
             priority: r.priority,
             action: r.action,
             swr_seconds: r.swr_seconds.max(0) as u64,
+            enabled: r.enabled,
+            match_methods: r.match_methods,
+            match_query: r.match_query,
+            browser_ttl_seconds: r.browser_ttl_seconds.max(0) as u64,
+            ignore_query: r.ignore_query,
         })
         .collect()
 }
@@ -205,6 +215,11 @@ fn build(
         r.priority.hash(&mut h);
         r.action.hash(&mut h);
         r.swr_seconds.hash(&mut h);
+        r.enabled.hash(&mut h);
+        r.match_methods.hash(&mut h);
+        r.match_query.hash(&mut h);
+        r.browser_ttl_seconds.hash(&mut h);
+        r.ignore_query.hash(&mut h);
     }
     match &waf {
         Some(w) => {

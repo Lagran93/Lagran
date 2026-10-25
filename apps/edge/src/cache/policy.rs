@@ -90,6 +90,15 @@ pub struct CacheRule {
     pub action: String,
     /// stale-while-revalidate seconds
     pub swr_seconds: u64,
+    pub enabled: bool,
+    /// Comma separated methods; empty matches all.
+    pub match_methods: String,
+    /// Case-insensitive substring of the raw query string.
+    pub match_query: String,
+    /// `Cache-Control: max-age` override sent to clients (0 = keep origin).
+    pub browser_ttl_seconds: u64,
+    /// Override the domain's ignore_query setting; `None` inherits it.
+    pub ignore_query: Option<bool>,
 }
 
 impl CacheRule {
@@ -100,6 +109,11 @@ impl CacheRule {
             priority,
             action: "cache".into(),
             swr_seconds: 0,
+            enabled: true,
+            match_methods: String::new(),
+            match_query: String::new(),
+            browser_ttl_seconds: 0,
+            ignore_query: None,
         }
     }
 
@@ -115,6 +129,10 @@ pub struct ResolvedPolicy {
     /// `None` means "derive from origin response headers, then default TTL".
     pub ttl_override: Option<u64>,
     pub swr_secs: u64,
+    /// Override the `Cache-Control: max-age` we send to clients.
+    pub browser_ttl_secs: Option<u64>,
+    /// Override the domain's ignore-query-string setting.
+    pub ignore_query: Option<bool>,
 }
 
 impl Default for ResolvedPolicy {
@@ -123,6 +141,8 @@ impl Default for ResolvedPolicy {
             action: RuleAction::Cache,
             ttl_override: None,
             swr_secs: 0,
+            browser_ttl_secs: None,
+            ignore_query: None,
         }
     }
 }
@@ -138,6 +158,10 @@ pub struct MatchedPolicy {
     pub ttl_seconds: u64,
     pub swr_seconds: u64,
     pub action: String,
+    pub browser_ttl_seconds: u64,
+    pub ignore_query: Option<bool>,
+    pub match_methods: String,
+    pub match_query: String,
 }
 
 #[derive(Clone, Default)]
@@ -155,32 +179,46 @@ impl RuleSet {
         *self.inner.write().await = rules;
     }
 
-    pub async fn resolve(&self, path: &str) -> Option<ResolvedPolicy> {
+    pub async fn resolve(&self, path: &str, method: &str, query: &str) -> Option<ResolvedPolicy> {
         let rules = self.inner.read().await;
-        match_rule(&rules, path).map(rule_policy)
+        match_rule(&rules, path, method, query).map(rule_policy)
     }
 
-    pub async fn match_ttl(&self, path: &str) -> Option<u64> {
-        self.resolve(path)
+    pub async fn match_ttl(&self, path: &str, method: &str, query: &str) -> Option<u64> {
+        self.resolve(path, method, query)
             .await
             .map(|p| p.ttl_override.unwrap_or(0))
     }
 
-    pub async fn match_policy(&self, path: &str) -> Option<MatchedPolicy> {
+    pub async fn match_policy(
+        &self,
+        path: &str,
+        method: &str,
+        query: &str,
+    ) -> Option<MatchedPolicy> {
         let rules = self.inner.read().await;
-        match_rule(&rules, path).map(|r| MatchedPolicy {
+        match_rule(&rules, path, method, query).map(|r| MatchedPolicy {
             ttl_seconds: r.ttl_seconds,
             swr_seconds: r.swr_seconds,
             action: r.action.clone(),
+            browser_ttl_seconds: r.browser_ttl_seconds,
+            ignore_query: r.ignore_query,
+            match_methods: r.match_methods.clone(),
+            match_query: r.match_query.clone(),
         })
     }
 }
 
-/// Highest-priority rule matching `path` (ties keep the first configured rule).
-pub fn match_rule<'a>(rules: &'a [CacheRule], path: &str) -> Option<&'a CacheRule> {
+/// Highest-priority enabled rule matching path + method + query.
+pub fn match_rule<'a>(
+    rules: &'a [CacheRule],
+    path: &str,
+    method: &str,
+    query: &str,
+) -> Option<&'a CacheRule> {
     let mut best: Option<&CacheRule> = None;
     for r in rules {
-        if !path_matches(&r.path_pattern, path) {
+        if !r.enabled || !request_matches_rule(r, path, method, query) {
             continue;
         }
         match best {
@@ -191,17 +229,49 @@ pub fn match_rule<'a>(rules: &'a [CacheRule], path: &str) -> Option<&'a CacheRul
     best
 }
 
+pub fn request_matches_rule(rule: &CacheRule, path: &str, method: &str, query: &str) -> bool {
+    path_matches(&rule.path_pattern, path)
+        && method_matches_rule(&rule.match_methods, method)
+        && query_matches_rule(&rule.match_query, query)
+}
+
+fn method_matches_rule(csv: &str, method: &str) -> bool {
+    if csv.trim().is_empty() {
+        return true;
+    }
+    csv.split(',')
+        .map(str::trim)
+        .any(|m| m.eq_ignore_ascii_case(method))
+}
+
+fn query_matches_rule(needle: &str, query: &str) -> bool {
+    let needle = needle.trim();
+    needle.is_empty()
+        || query
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+}
+
 pub fn rule_policy(rule: &CacheRule) -> ResolvedPolicy {
     ResolvedPolicy {
         action: rule.action_kind(),
         ttl_override: (rule.ttl_seconds > 0).then_some(rule.ttl_seconds),
         swr_secs: rule.swr_seconds,
+        browser_ttl_secs: (rule.browser_ttl_seconds > 0).then_some(rule.browser_ttl_seconds),
+        ignore_query: rule.ignore_query,
     }
 }
 
-/// Resolve the effective policy for `path` from a domain's rule list.
-pub fn resolve_rule_policy(rules: &[CacheRule], path: &str) -> ResolvedPolicy {
-    match_rule(rules, path).map(rule_policy).unwrap_or_default()
+/// Resolve the effective policy for a request from a domain's rule list.
+pub fn resolve_rule_policy(
+    rules: &[CacheRule],
+    path: &str,
+    method: &str,
+    query: &str,
+) -> ResolvedPolicy {
+    match_rule(rules, path, method, query)
+        .map(rule_policy)
+        .unwrap_or_default()
 }
 
 pub fn path_matches(pattern: &str, path: &str) -> bool {
@@ -550,6 +620,34 @@ mod tests {
             priority,
             action: action.into(),
             swr_seconds: swr,
+            enabled: true,
+            match_methods: String::new(),
+            match_query: String::new(),
+            browser_ttl_seconds: 0,
+            ignore_query: None,
+        }
+    }
+
+    fn rule_with(
+        path: &str,
+        priority: i32,
+        enabled: bool,
+        methods: &str,
+        query: &str,
+        browser_ttl: u64,
+        ignore_query: Option<bool>,
+    ) -> CacheRule {
+        CacheRule {
+            path_pattern: path.into(),
+            ttl_seconds: 60,
+            priority,
+            action: "cache".into(),
+            swr_seconds: 0,
+            enabled,
+            match_methods: methods.into(),
+            match_query: query.into(),
+            browser_ttl_seconds: browser_ttl,
+            ignore_query,
         }
     }
 
@@ -581,7 +679,47 @@ mod tests {
     }
 
     fn resolve_rules(rules: &[CacheRule], path: &str) -> ResolvedPolicy {
-        match_rule(rules, path).map(rule_policy).unwrap_or_default()
+        match_rule(rules, path, "GET", "")
+            .map(rule_policy)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn conditions_filter_and_disable_rules() {
+        let rules = vec![
+            rule_with("/api/*", 0, true, "", "", 0, None),
+            rule_with("/api/*", 20, true, "GET,POST", "", 0, None),
+            rule_with("/api/*", 30, true, "GET", "debug=1", 0, None),
+            rule_with("/api/*", 40, false, "GET", "", 0, None),
+        ];
+        assert_eq!(
+            match_rule(&rules, "/api/x", "GET", "").unwrap().priority,
+            20
+        );
+        assert_eq!(
+            match_rule(&rules, "/api/x", "POST", "debug=1")
+                .unwrap()
+                .priority,
+            20
+        );
+        assert_eq!(
+            match_rule(&rules, "/api/x", "GET", "a=1&DEBUG=1")
+                .unwrap()
+                .priority,
+            30
+        );
+        assert_eq!(
+            match_rule(&rules, "/api/x", "DELETE", "").unwrap().priority,
+            0
+        );
+    }
+
+    #[test]
+    fn policy_carries_browser_ttl_and_query_override() {
+        let rules = vec![rule_with("/img/*", 5, true, "", "", 3600, Some(true))];
+        let p = resolve_rules(&rules, "/img/a.png");
+        assert_eq!(p.browser_ttl_secs, Some(3600));
+        assert_eq!(p.ignore_query, Some(true));
     }
 
     fn hdrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -625,6 +763,8 @@ mod tests {
             action: RuleAction::Cache,
             ttl_override: Some(5),
             swr_secs: 10,
+            browser_ttl_secs: None,
+            ignore_query: None,
         };
         let d =
             decide_storage(200, &hdrs(&[("cache-control", "max-age=600")]), policy, 60).unwrap();

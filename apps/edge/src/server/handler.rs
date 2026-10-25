@@ -212,31 +212,44 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     // Resolve the effective config once; rules stay per-domain so two hosted
     // domains can never influence each other's TTL/action.
     let eff = match domain_entry {
-        Some(ref e) => Effective {
-            origin_url: e.origin_url.clone(),
-            backup_url: e.backup_origin_url.clone(),
-            policy: resolve_rule_policy(&e.rules, &path_only),
-            ignore_query: e.ignore_query_string,
-            cors: e.cors_origins.clone(),
-            custom_headers: e.custom_headers.clone(),
-            timeout_ms: u64::from(if e.origin_timeout_ms == 0 {
-                10_000
-            } else {
-                e.origin_timeout_ms
-            }),
-            hotlink: e.hotlink_allow_referers.as_str(),
-            rate_limit_rps: e.rate_limit_rps,
-            rate_limit_burst: e.rate_limit_burst,
-        },
+        Some(ref e) => {
+            let policy = resolve_rule_policy(
+                &e.rules,
+                &path_only,
+                method.as_str(),
+                req.uri().query().unwrap_or(""),
+            );
+            Effective {
+                origin_url: e.origin_url.clone(),
+                backup_url: e.backup_origin_url.clone(),
+                ignore_query: policy.ignore_query.unwrap_or(e.ignore_query_string),
+                policy,
+                cors: e.cors_origins.clone(),
+                custom_headers: e.custom_headers.clone(),
+                timeout_ms: u64::from(if e.origin_timeout_ms == 0 {
+                    10_000
+                } else {
+                    e.origin_timeout_ms
+                }),
+                hotlink: e.hotlink_allow_referers.as_str(),
+                rate_limit_rps: e.rate_limit_rps,
+                rate_limit_burst: e.rate_limit_burst,
+            }
+        }
         None => {
             // Legacy single-origin mode: only reachable while the registry is
             // empty. Global rules are the best available approximation here.
-            let policy = state.rules.resolve(&path_only).await.unwrap_or_default();
+            let policy = state
+                .rules
+                .resolve(&path_only, method.as_str(), req.uri().query().unwrap_or(""))
+                .await
+                .unwrap_or_default();
+            let ignore_query = policy.ignore_query.unwrap_or(false);
             Effective {
                 origin_url: state.origin.base_url().await,
                 backup_url: String::new(),
+                ignore_query,
                 policy,
-                ignore_query: false,
                 cors: String::new(),
                 custom_headers: String::new(),
                 timeout_ms: 10_000,
@@ -575,6 +588,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         &etag,
                         &eff.cors,
                         &eff.custom_headers,
+                        policy_browser_ttl(&eff.policy),
                     )
                 }
                 Ok((Fetched::FromOrigin(resp), _)) => {
@@ -597,6 +611,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         &etag,
                         &eff.cors,
                         &eff.custom_headers,
+                        policy_browser_ttl(&eff.policy),
                     );
                     log_access(
                         &state.access_log,
@@ -980,7 +995,45 @@ async fn serve_cached(
         label.as_str(),
     )
     .await;
-    entry_to_response(entry, label.as_str(), &etag, &eff.cors, &eff.custom_headers)
+    entry_to_response(
+        entry,
+        label.as_str(),
+        &etag,
+        &eff.cors,
+        &eff.custom_headers,
+        policy_browser_ttl(&eff.policy),
+    )
+}
+
+fn policy_browser_ttl(policy: &ResolvedPolicy) -> Option<u64> {
+    if policy.action == RuleAction::Cache {
+        policy.browser_ttl_secs
+    } else {
+        None
+    }
+}
+
+fn apply_browser_ttl(headers: &mut HeaderMap, ttl: Option<u64>) {
+    let Some(ttl) = ttl.filter(|t| *t > 0) else {
+        return;
+    };
+    // Never override an explicit "do not cache" signal from the origin, and
+    // never make a response with Set-Cookie client-cacheable.
+    if headers.contains_key(header::SET_COOKIE) {
+        return;
+    }
+    if let Some(cc) = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+    {
+        let cc = cc.to_ascii_lowercase();
+        if cc.contains("no-store") || cc.contains("private") {
+            return;
+        }
+    }
+    if let Ok(v) = HeaderValue::from_str(&format!("public, max-age={ttl}")) {
+        headers.insert(header::CACHE_CONTROL, v);
+    }
 }
 
 fn entry_etag(resp: &OriginResponse) -> String {
@@ -1135,6 +1188,7 @@ fn entry_to_response(
     etag: &str,
     cors: &str,
     custom: &str,
+    browser_ttl: Option<u64>,
 ) -> Response {
     let status = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
     let mut headers = HeaderMap::new();
@@ -1162,6 +1216,7 @@ fn entry_to_response(
     if let Ok(v) = HeaderValue::from_str(etag) {
         headers.insert(header::ETAG, v);
     }
+    apply_browser_ttl(&mut headers, browser_ttl);
     apply_security_headers(&mut headers);
     apply_cors_and_custom(&mut headers, cors, custom);
     let mut resp = Response::new(Body::from(entry.body));
@@ -1176,6 +1231,7 @@ fn origin_response(
     etag: &str,
     cors: &str,
     custom: &str,
+    browser_ttl: Option<u64>,
 ) -> Response {
     let mut headers = resp.headers;
     strip_response_headers(&mut headers);
@@ -1189,6 +1245,7 @@ fn origin_response(
             headers.insert(header::ETAG, v);
         }
     }
+    apply_browser_ttl(&mut headers, browser_ttl);
     apply_security_headers(&mut headers);
     apply_cors_and_custom(&mut headers, cors, custom);
     let mut out = Response::new(Body::from(resp.body));
@@ -1266,7 +1323,7 @@ mod tests {
             ],
             Bytes::from_static(b"hi"),
         );
-        let resp = entry_to_response(entry, "HIT", "\"abc\"", "", "");
+        let resp = entry_to_response(entry, "HIT", "\"abc\"", "", "", None);
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get("set-cookie").is_none());
         assert_eq!(resp.headers().get("age").unwrap(), "0");
