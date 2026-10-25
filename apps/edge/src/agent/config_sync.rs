@@ -117,6 +117,18 @@ struct WafCfg {
     ip_allow: Vec<String>,
     #[serde(default)]
     ip_deny: Vec<String>,
+    #[serde(default = "default_challenge_difficulty")]
+    challenge_difficulty: u8,
+    #[serde(default = "default_challenge_ttl")]
+    challenge_ttl_secs: u64,
+}
+
+fn default_challenge_difficulty() -> u8 {
+    4
+}
+
+fn default_challenge_ttl() -> u64 {
+    1800
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,6 +189,7 @@ fn into_waf(cfg: Option<WafCfg>) -> WafConfig {
             let action = match r.action.trim().to_ascii_lowercase().as_str() {
                 "allow" => WafAction::Allow,
                 "log" => WafAction::Log,
+                "challenge" => WafAction::Challenge,
                 _ => WafAction::Block,
             };
             Some(WafRule {
@@ -211,6 +224,8 @@ fn into_waf(cfg: Option<WafCfg>) -> WafConfig {
         rules,
         ip_allow: parse_nets(cfg.ip_allow),
         ip_deny: parse_nets(cfg.ip_deny),
+        challenge_difficulty: cfg.challenge_difficulty.clamp(1, 6),
+        challenge_ttl_secs: cfg.challenge_ttl_secs.clamp(60, 86_400),
     }
 }
 

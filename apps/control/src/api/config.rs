@@ -61,6 +61,8 @@ pub struct WafConfigOut {
     pub rules: Vec<WafRuleOut>,
     pub ip_allow: Vec<String>,
     pub ip_deny: Vec<String>,
+    pub challenge_difficulty: u8,
+    pub challenge_ttl_secs: u64,
 }
 
 #[derive(Serialize)]
@@ -160,6 +162,8 @@ fn waf_config_from(
             .collect(),
         ip_allow,
         ip_deny,
+        challenge_difficulty: settings.challenge_difficulty.clamp(1, 6) as u8,
+        challenge_ttl_secs: settings.challenge_ttl_secs.clamp(60, 86_400) as u64,
     }
 }
 
@@ -225,6 +229,8 @@ fn build(
             for ip in &w.ip_deny {
                 ip.hash(&mut h);
             }
+            w.challenge_difficulty.hash(&mut h);
+            w.challenge_ttl_secs.hash(&mut h);
         }
         None => "waf-none".hash(&mut h),
     }

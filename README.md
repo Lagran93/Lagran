@@ -15,7 +15,7 @@
 - 域名接入与管理：源站/备源、SSL、限流、CORS、防盗链、回源超时、自定义头
 - 缓存规则：路径匹配、TTL、优先级、**动作（cache/bypass/no_store）**、**SWR**
 - 证书：上传、SNI 下发、开发用自动签发（rcgen + ACME challenge 下发）
-- WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器）、自定义规则、IP 黑白名单、观察/拦截模式、事件日志
+- WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器）、自定义规则（拦截/放行/记录/**浏览器质询**）、IP 黑白名单、观察/拦截模式、事件日志
 - 缓存刷新（purge 扇出到在线边缘）、预热任务
 - 统计：总览 / 分域名（24h）、访问日志、操作审计、源站健康
 
@@ -26,6 +26,7 @@
   `no-store`/`private`/`no-cache`/复杂 `Vary` 不写入；SWR + single-flight 合并回源
 - 条件请求（304）、`Age`、`X-Cache` / `X-Cache-Status`、每域名限流、防盗链
 - WAF：托管特征匹配 + 自定义规则 + IP 白/黑名单，支持观察模式；命中后返回 403 拦截页并上报事件
+- WAF Challenge：规则动作为「质询」时返回 JS 工作量证明页面，通过后签发 HMAC 签名的免质询 Cookie
 - 源站故障（宕机/超时/健康检查失败）且无可用缓存时，返回本地 HTML 提示页
   （502/504/503，`no-store` + `X-Lagran-Error`），不会把裸文本或空响应给访客
 - POST/PUT 等请求完整透传 method/body/headers；WebSocket 隧道（HTTP/1.1）
@@ -99,6 +100,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | CACHE_BACKEND | memory | memory / disk / hybrid |
 | TRUST_PROXY_HEADERS | false | 是否信任 `X-Forwarded-For` 作为客户端 IP（WAF 用；仅前置可信代理时开启） |
 | WAF_REPORT_INTERVAL | 5 | WAF 事件上报间隔（秒），`WAF_REPORT=false` 可关闭 |
+| CHALLENGE_SECRET | 空 | 质询 nonce / 免质询 Cookie 的 HMAC 密钥；多节点部署必须一致，留空用 AGENT_TOKEN 派生或随机 |
 | RATE_LIMIT_RPS / BURST | 0 | 全局默认限流（0=不限） |
 
 完整列表见 `.env.example`。

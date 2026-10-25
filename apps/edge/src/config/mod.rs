@@ -36,6 +36,8 @@ pub struct EdgeConfig {
     /// Ship WAF events to the control plane.
     pub waf_report: bool,
     pub waf_report_interval_secs: u64,
+    /// HMAC secret for challenge nonces / clearance cookies (empty = derive).
+    pub challenge_secret: String,
 }
 
 impl Default for EdgeConfig {
@@ -115,6 +117,7 @@ impl Default for EdgeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5),
+            challenge_secret: std::env::var("CHALLENGE_SECRET").unwrap_or_default(),
         }
     }
 }

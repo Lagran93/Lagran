@@ -106,10 +106,13 @@ done
 
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H "$AUTH" \
   -H 'content-type: application/json' \
-  -d '{"enabled":true,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true}' >/dev/null
+  -d '{"enabled":true,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true,"challenge_difficulty":2,"challenge_ttl_secs":300}' >/dev/null
 curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf/rules" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"name":"拦截后台探测","field":"path","operator":"prefix","value":"/blocked","action":"block","priority":10}' >/dev/null
+curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf/rules" -H "$AUTH" \
+  -H 'content-type: application/json' \
+  -d '{"name":"敏感目录质询","field":"path","operator":"prefix","value":"/challenge-me","action":"challenge","priority":20}' >/dev/null
 curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf/ips" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"kind":"deny","ip":"203.0.113.9","note":"攻击来源"}' >/dev/null
@@ -168,6 +171,44 @@ contains "deny verdict is ip_deny" "$(cat "$LOG_DIR/body")" "IP 黑名单"
 CODE=$(request "/search?q=union%20select" -H 'X-Forwarded-For: 198.51.100.7')
 check "allow-listed IP bypasses WAF" "$CODE" "200"
 
+echo "== browser challenge =="
+CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.1')
+check "challenge rule returns interstitial" "$CODE" "403"
+contains "challenge page marker" "$(cat "$LOG_DIR/body")" "正在进行安全验证"
+contains "challenge response header" "$(cat "$LOG_DIR/headers")" "x-lagran-challenge:"
+
+NONCE=$(grep -o 'var nonce = "[^"]*"' "$LOG_DIR/body" | head -1 | sed 's/.*"\(.*\)"/\1/')
+if [[ -n "$NONCE" ]]; then
+  pass "challenge nonce extracted"
+else
+  fail "challenge nonce extracted"
+fi
+
+ANSWER=""
+for i in $(seq 0 20000); do
+  H=$(printf '%s:%s' "$NONCE" "$i" | sha256sum | cut -c1-2)
+  if [[ "$H" == "00" ]]; then ANSWER=$i; break; fi
+done
+if [[ -n "$ANSWER" ]]; then
+  pass "proof-of-work solved (counter $ANSWER)"
+else
+  fail "proof-of-work solved"
+fi
+
+CODE=$(curl -s -o "$LOG_DIR/verify_body" -D "$LOG_DIR/verify_headers" -w '%{http_code}' \
+  -c "$LOG_DIR/challenge.jar" -H "Host: $DOMAIN" \
+  "http://127.0.0.1:$EDGE_PORT/__lagran/challenge/verify?n=$NONCE&a=$ANSWER&next=%2Fchallenge-me")
+check "verify endpoint redirects" "$CODE" "303"
+contains "clearance cookie issued" "$(cat "$LOG_DIR/verify_headers")" "lagran_clearance="
+contains "clearance cookie is HttpOnly" "$(cat "$LOG_DIR/verify_headers")" "HttpOnly"
+
+CODE=$(curl -s -o "$LOG_DIR/body" -b "$LOG_DIR/challenge.jar" -w '%{http_code}' \
+  -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/challenge-me")
+check "clearance cookie passes the challenge" "$CODE" "200"
+
+CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.2')
+check "a different client is still challenged" "$CODE" "403"
+
 echo "== events (block) =="
 sleep 3
 EVENTS=$(curl -s -H "$AUTH" "http://127.0.0.1:$CONTROL_PORT/api/v1/waf/events?domain=$DOMAIN&limit=50")
@@ -179,6 +220,7 @@ else
 fi
 contains "event carries category" "$EVENTS" '"category":"sqli"'
 contains "event carries rule name" "$EVENTS" '"rule_name":"SQL 注入"'
+contains "challenge event recorded" "$EVENTS" '"action":"challenge"'
 
 echo "== monitor mode =="
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H "$AUTH" \

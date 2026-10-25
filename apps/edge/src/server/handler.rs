@@ -22,6 +22,7 @@ use crate::origin::{OriginClient, OriginResponse};
 use crate::server::access_log::AccessLog;
 use crate::server::acme_challenge::ChallengeStore;
 use crate::server::cert_store::CertStore;
+use crate::server::challenge;
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::host_util;
 use crate::server::inflight::{self, Inflight, Slot};
@@ -65,6 +66,8 @@ pub struct AppState {
     pub waf_log: WafLog,
     /// Trust X-Forwarded-For when determining the client IP (WAF ACLs).
     pub trust_proxy_headers: bool,
+    /// HMAC secret for challenge nonces and clearance cookies.
+    pub challenge_secret: String,
 }
 
 /// Per-request view of the effective domain configuration.
@@ -267,57 +270,114 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             };
             if let Some(verdict) = waf_evaluate(&entry.waf, &waf_request) {
                 if verdict.action != WafAction::Allow {
-                    let blocked = verdict.is_block() && entry.waf.mode == WafMode::Block;
-                    let action = if blocked {
-                        "block"
-                    } else if verdict.action == WafAction::Log {
-                        "log"
-                    } else {
-                        "monitor"
-                    };
-                    let mode = if entry.waf.mode == WafMode::Block {
-                        "block"
-                    } else {
-                        "monitor"
-                    };
-                    state
-                        .waf_log
-                        .push(
-                            &host,
-                            &client_ip,
-                            method.as_str(),
-                            &path_and_query,
-                            action,
-                            &verdict.category,
-                            &verdict.rule_name,
-                            mode,
-                        )
-                        .await;
-                    if blocked {
-                        tracing::warn!(
-                            %host, %client_ip, rule = %verdict.rule_name,
-                            category = %verdict.category, "request blocked by WAF"
-                        );
-                        log_access(
-                            &state.access_log,
-                            &method,
-                            &host,
-                            &path_only,
-                            403,
-                            start,
-                            &client_ip,
-                            &user_agent,
-                            &referer,
-                            0,
-                            "WAF",
-                        )
-                        .await;
-                        return default_page::waf_blocked_page(
-                            &host,
-                            &path_only,
-                            &verdict.rule_name,
-                            &verdict.category,
-                        );
+                    let mode_is_block = entry.waf.mode == WafMode::Block;
+                    let challenge_method = method == Method::GET || method == Method::HEAD;
+                    let cleared = challenge::has_clearance(
+                        &headers,
+                        &host,
+                        entry.waf.challenge_ttl_secs,
+                        &state.challenge_secret,
+                    );
+                    // A challenge only makes sense for a document navigation;
+                    // non-GET requests in block mode are rejected outright.
+                    let challenge_needed = verdict.action == WafAction::Challenge
+                        && mode_is_block
+                        && challenge_method
+                        && !cleared;
+                    let blocked = mode_is_block
+                        && (verdict.is_block()
+                            || (verdict.action == WafAction::Challenge && !challenge_method));
+
+                    if challenge_needed
+                        || blocked
+                        || verdict.action == WafAction::Log
+                        || !mode_is_block
+                    {
+                        let action = if blocked {
+                            "block"
+                        } else if challenge_needed {
+                            "challenge"
+                        } else if verdict.action == WafAction::Log {
+                            "log"
+                        } else {
+                            "monitor"
+                        };
+                        let mode = if mode_is_block { "block" } else { "monitor" };
+                        state
+                            .waf_log
+                            .push(
+                                &host,
+                                &client_ip,
+                                method.as_str(),
+                                &path_and_query,
+                                action,
+                                &verdict.category,
+                                &verdict.rule_name,
+                                mode,
+                            )
+                            .await;
+
+                        if challenge_needed {
+                            tracing::info!(
+                                %host, %client_ip, rule = %verdict.rule_name,
+                                "serving WAF challenge"
+                            );
+                            log_access(
+                                &state.access_log,
+                                &method,
+                                &host,
+                                &path_only,
+                                403,
+                                start,
+                                &client_ip,
+                                &user_agent,
+                                &referer,
+                                0,
+                                "CHALLENGE",
+                            )
+                            .await;
+                            let nonce = challenge::issue_nonce(&host, &state.challenge_secret);
+                            let secure = req.extensions().get::<host_util::TlsSni>().is_some()
+                                || headers
+                                    .get("x-forwarded-proto")
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|v| v.eq_ignore_ascii_case("https"))
+                                    .unwrap_or(false);
+                            return challenge::page(
+                                &host,
+                                &nonce,
+                                &path_and_query,
+                                entry.waf.challenge_difficulty,
+                                secure,
+                            );
+                        }
+
+                        if blocked {
+                            tracing::warn!(
+                                %host, %client_ip, rule = %verdict.rule_name,
+                                category = %verdict.category, "request blocked by WAF"
+                            );
+                            log_access(
+                                &state.access_log,
+                                &method,
+                                &host,
+                                &path_only,
+                                403,
+                                start,
+                                &client_ip,
+                                &user_agent,
+                                &referer,
+                                0,
+                                "WAF",
+                            )
+                            .await;
+                            return default_page::waf_blocked_page(
+                                &host,
+                                &path_only,
+                                &verdict.rule_name,
+                                &verdict.category,
+                            );
+                        }
                     }
                 }
             }

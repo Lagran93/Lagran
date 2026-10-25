@@ -27,6 +27,9 @@ pub enum WafAction {
     Block,
     Allow,
     Log,
+    /// Serve a JS proof-of-work challenge; a signed clearance cookie lets the
+    /// client through on subsequent requests.
+    Challenge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +174,7 @@ pub fn parse_ip(input: &str) -> Option<IpAddr> {
     input.parse::<IpAddr>().ok()
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WafConfig {
     pub enabled: bool,
     pub mode: WafMode,
@@ -179,6 +182,25 @@ pub struct WafConfig {
     pub rules: Vec<WafRule>,
     pub ip_allow: Vec<IpNet>,
     pub ip_deny: Vec<IpNet>,
+    /// Number of leading hex zeroes the challenge hash must have (1..=6).
+    pub challenge_difficulty: u8,
+    /// How long a solved challenge keeps the client cleared (seconds).
+    pub challenge_ttl_secs: u64,
+}
+
+impl Default for WafConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: WafMode::Block,
+            managed: ManagedRules::default(),
+            rules: Vec::new(),
+            ip_allow: Vec::new(),
+            ip_deny: Vec::new(),
+            challenge_difficulty: 4,
+            challenge_ttl_secs: 1800,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +407,8 @@ mod tests {
             rules: vec![],
             ip_allow: vec![],
             ip_deny: vec![],
+            challenge_difficulty: 4,
+            challenge_ttl_secs: 1800,
         }
     }
 

@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 const FIELDS: [&str; 6] = ["path", "query", "user_agent", "referer", "method", "ip"];
 const OPERATORS: [&str; 4] = ["contains", "equals", "prefix", "suffix"];
-const ACTIONS: [&str; 3] = ["block", "allow", "log"];
+const ACTIONS: [&str; 4] = ["block", "allow", "log", "challenge"];
 
 #[derive(Serialize)]
 pub struct ErrorBody {
@@ -79,6 +79,8 @@ pub struct WafSettingsDto {
     pub xss: bool,
     pub traversal: bool,
     pub scanners: bool,
+    pub challenge_difficulty: u8,
+    pub challenge_ttl_secs: u32,
 }
 
 impl Default for WafSettingsDto {
@@ -90,6 +92,8 @@ impl Default for WafSettingsDto {
             xss: true,
             traversal: true,
             scanners: true,
+            challenge_difficulty: 4,
+            challenge_ttl_secs: 1800,
         }
     }
 }
@@ -103,6 +107,8 @@ impl From<repository::WafSettingsRow> for WafSettingsDto {
             xss: r.xss,
             traversal: r.traversal,
             scanners: r.scanners,
+            challenge_difficulty: r.challenge_difficulty.clamp(1, 6) as u8,
+            challenge_ttl_secs: r.challenge_ttl_secs.clamp(60, 86_400) as u32,
         }
     }
 }
@@ -130,6 +136,8 @@ pub struct SettingsRequest {
     pub xss: Option<bool>,
     pub traversal: Option<bool>,
     pub scanners: Option<bool>,
+    pub challenge_difficulty: Option<u8>,
+    pub challenge_ttl_secs: Option<u32>,
 }
 
 pub async fn put_settings(
@@ -168,6 +176,12 @@ pub async fn put_settings(
         req.xss.unwrap_or(current.xss),
         req.traversal.unwrap_or(current.traversal),
         req.scanners.unwrap_or(current.scanners),
+        req.challenge_difficulty
+            .unwrap_or(current.challenge_difficulty)
+            .clamp(1, 6) as i32,
+        req.challenge_ttl_secs
+            .unwrap_or(current.challenge_ttl_secs)
+            .clamp(60, 86_400) as i32,
     )
     .await
     .map_err(|e| {
@@ -181,8 +195,14 @@ pub async fn put_settings(
         "waf.settings",
         &domain_id.to_string(),
         &format!(
-            "enabled={} mode={mode} sqli={} xss={} traversal={} scanners={}",
-            row.enabled, row.sqli, row.xss, row.traversal, row.scanners
+            "enabled={} mode={mode} sqli={} xss={} traversal={} scanners={} challenge={}/{}s",
+            row.enabled,
+            row.sqli,
+            row.xss,
+            row.traversal,
+            row.scanners,
+            row.challenge_difficulty,
+            row.challenge_ttl_secs
         ),
     )
     .await;

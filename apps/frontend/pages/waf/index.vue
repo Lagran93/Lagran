@@ -123,6 +123,35 @@
             </label>
           </div>
 
+          <div class="section-label">浏览器质询</div>
+          <div class="form-grid">
+            <div class="field">
+              <label class="field-label">质询难度（前导 0 的十六进制位数）</label>
+              <input
+                v-model.number="settings.challenge_difficulty"
+                class="input"
+                type="number"
+                min="1"
+                max="6"
+              />
+              <span class="field-hint">1 最轻、6 最重，默认 4（约 6.5 万次哈希）。</span>
+            </div>
+            <div class="field">
+              <label class="field-label">免质询有效期（秒）</label>
+              <input
+                v-model.number="settings.challenge_ttl_secs"
+                class="input"
+                type="number"
+                min="60"
+                max="86400"
+              />
+              <span class="field-hint">通过后签发 HttpOnly Cookie，默认 1800 秒。</span>
+            </div>
+          </div>
+          <p class="text-muted" style="font-size: 12px; margin-top: 8px">
+            规则动作选择「质询」时生效；仅对 GET/HEAD 导航返回质询页，其他方法按拦截处理。
+          </p>
+
           <div class="flex-between mt-24">
             <span class="text-muted" style="font-size: 12px">
               托管规则基于常见攻击特征匹配 URL、查询串、UA 与 Referer，不检查请求体。
@@ -263,6 +292,7 @@
             <select v-model="eventAction" class="select">
               <option value="">全部动作</option>
               <option value="block">拦截</option>
+              <option value="challenge">质询</option>
               <option value="monitor">观察</option>
               <option value="log">仅记录</option>
             </select>
@@ -362,6 +392,7 @@
             <label class="field-label">命中动作</label>
             <select v-model="ruleForm.action" class="select">
               <option value="block">拦截</option>
+              <option value="challenge">质询（JS 验证）</option>
               <option value="allow">放行</option>
               <option value="log">仅记录</option>
             </select>
@@ -432,6 +463,8 @@ const settings = ref<any>({
   xss: true,
   traversal: true,
   scanners: true,
+  challenge_difficulty: 4,
+  challenge_ttl_secs: 1800,
 })
 
 const rules = ref<any[]>([])
@@ -495,19 +528,25 @@ function opLabel(op: string) {
 }
 
 function actionLabel(action: string) {
-  return ({ block: '拦截', allow: '放行', log: '仅记录' } as Record<string, string>)[action] || action
+  return (
+    { block: '拦截', allow: '放行', log: '仅记录', challenge: '质询' } as Record<string, string>
+  )[action] || action
 }
 
 function actionTone(action: string) {
-  return action === 'block' ? 'danger' : action === 'allow' ? 'success' : 'info'
+  if (action === 'block') return 'danger'
+  if (action === 'allow') return 'success'
+  return 'info'
 }
 
 function eventLabel(action: string) {
-  return ({ block: '拦截', monitor: '观察', log: '记录' } as Record<string, string>)[action] || action
+  return (
+    { block: '拦截', monitor: '观察', log: '记录', challenge: '质询' } as Record<string, string>
+  )[action] || action
 }
 
 function eventTone(action: string) {
-  return action === 'block' ? 'danger' : action === 'log' ? 'info' : 'warning'
+  return action === 'block' ? 'danger' : action === 'monitor' ? 'warning' : 'info'
 }
 
 function categoryLabel(category: string) {
@@ -541,6 +580,8 @@ async function loadSettings() {
       xss: !!s.xss,
       traversal: !!s.traversal,
       scanners: !!s.scanners,
+      challenge_difficulty: s.challenge_difficulty || 4,
+      challenge_ttl_secs: s.challenge_ttl_secs || 1800,
     }
   } catch {
     settings.value = {
@@ -550,6 +591,8 @@ async function loadSettings() {
       xss: true,
       traversal: true,
       scanners: true,
+      challenge_difficulty: 4,
+      challenge_ttl_secs: 1800,
     }
   }
 }
@@ -611,6 +654,8 @@ async function saveSettings() {
       xss: !!s.xss,
       traversal: !!s.traversal,
       scanners: !!s.scanners,
+      challenge_difficulty: s.challenge_difficulty || 4,
+      challenge_ttl_secs: s.challenge_ttl_secs || 1800,
     }
     toast.success('WAF 设置已保存，边缘约 15 秒内同步')
   } catch (e: any) {

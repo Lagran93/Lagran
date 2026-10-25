@@ -1,6 +1,7 @@
 //! HTTP listener setup
 
 use crate::server::agent_auth::RequireAgentToken;
+use crate::server::challenge;
 use crate::server::handler::{proxy_handler, AppState};
 use crate::server::purge::{self, EdgePurgeRequest};
 use axum::{
@@ -17,6 +18,7 @@ use tower_http::trace::TraceLayer;
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/__lagran/health", get(health))
+        .route("/__lagran/challenge/verify", get(challenge::verify))
         .route("/__lagran/purge", post(purge_authed))
         .route("/__lagran/acme/challenge", put(put_challenge_authed))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))

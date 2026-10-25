@@ -62,6 +62,13 @@ async fn main() -> anyhow::Result<()> {
     let domains = DomainRegistry::new();
     let control = agent::ControlClient::new(&config);
     let waf_log = edge::server::waf_log::WafLog::new(&config.node_id, 2000);
+    let challenge_secret = if !config.challenge_secret.is_empty() {
+        config.challenge_secret.clone()
+    } else if !config.agent_token.is_empty() {
+        format!("{}-challenge", config.agent_token)
+    } else {
+        random_secret()
+    };
 
     agent::spawn_heartbeat(config.clone(), control.clone());
     config_sync::spawn_config_sync(
@@ -104,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         inflight: Inflight::default(),
         waf_log,
         trust_proxy_headers: config.trust_proxy_headers,
+        challenge_secret,
     });
 
     let app = listener::create_router(state);
@@ -141,6 +149,23 @@ async fn main() -> anyhow::Result<()> {
         h.await.ok();
     }
     Ok(())
+}
+
+fn random_secret() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut buf = [0u8; 32];
+    if SystemRandom::new().fill(&mut buf).is_ok() {
+        buf.iter().map(|b| format!("{b:02x}")).collect()
+    } else {
+        format!(
+            "{:x}{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    }
 }
 
 fn init_tracing() {

@@ -1498,6 +1498,8 @@ pub struct WafSettingsRow {
     pub xss: bool,
     pub traversal: bool,
     pub scanners: bool,
+    pub challenge_difficulty: i32,
+    pub challenge_ttl_secs: i32,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1545,7 +1547,8 @@ pub async fn get_waf_settings(
 ) -> sqlx::Result<Option<WafSettingsRow>> {
     sqlx::query_as::<_, WafSettingsRow>(
         r#"
-        SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners
+        SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
+               challenge_difficulty, challenge_ttl_secs
         FROM waf_settings WHERE domain_id = $1
         "#,
     )
@@ -1564,11 +1567,15 @@ pub async fn upsert_waf_settings(
     xss: bool,
     traversal: bool,
     scanners: bool,
+    challenge_difficulty: i32,
+    challenge_ttl_secs: i32,
 ) -> sqlx::Result<WafSettingsRow> {
     sqlx::query_as::<_, WafSettingsRow>(
         r#"
-        INSERT INTO waf_settings (domain_id, enabled, mode, sqli, xss, traversal, scanners)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO waf_settings
+            (domain_id, enabled, mode, sqli, xss, traversal, scanners,
+             challenge_difficulty, challenge_ttl_secs)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (domain_id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
           mode = EXCLUDED.mode,
@@ -1576,8 +1583,11 @@ pub async fn upsert_waf_settings(
           xss = EXCLUDED.xss,
           traversal = EXCLUDED.traversal,
           scanners = EXCLUDED.scanners,
+          challenge_difficulty = EXCLUDED.challenge_difficulty,
+          challenge_ttl_secs = EXCLUDED.challenge_ttl_secs,
           updated_at = NOW()
-        RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners
+        RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners,
+                  challenge_difficulty, challenge_ttl_secs
         "#,
     )
     .bind(domain_id)
@@ -1587,13 +1597,19 @@ pub async fn upsert_waf_settings(
     .bind(xss)
     .bind(traversal)
     .bind(scanners)
+    .bind(challenge_difficulty)
+    .bind(challenge_ttl_secs)
     .fetch_one(pool)
     .await
 }
 
 pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSettingsRow>> {
     sqlx::query_as::<_, WafSettingsRow>(
-        "SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners FROM waf_settings",
+        r#"
+        SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
+               challenge_difficulty, challenge_ttl_secs
+        FROM waf_settings
+        "#,
     )
     .fetch_all(pool)
     .await
