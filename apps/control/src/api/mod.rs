@@ -93,6 +93,7 @@ pub fn create_router(state: AppState) -> Router {
                     "/waf/events",
                     get(waf::list_events).post(waf::report_events),
                 )
+                .route("/waf/stats", get(waf::stats))
                 .route("/nodes", get(node::list).post(node::create))
                 .route(
                     "/nodes/:id",

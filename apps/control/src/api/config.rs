@@ -45,6 +45,11 @@ pub struct WafManagedOut {
     pub xss: bool,
     pub traversal: bool,
     pub scanners: bool,
+    pub rce: bool,
+    pub ssrf: bool,
+    pub xxe: bool,
+    pub log4shell: bool,
+    pub crlf: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -68,6 +73,7 @@ pub struct WafConfigOut {
     pub ip_deny: Vec<String>,
     pub challenge_difficulty: u8,
     pub challenge_ttl_secs: u64,
+    pub security_level: String,
 }
 
 #[derive(Serialize)]
@@ -76,6 +82,7 @@ pub struct DomainConfigResponse {
     pub origin: OriginConfig,
     pub rules: Vec<CacheRuleConfig>,
     pub status: String,
+    pub ssl_enabled: bool,
     pub rate_limit_rps: u32,
     pub rate_limit_burst: u32,
     pub ignore_query_string: bool,
@@ -157,6 +164,11 @@ fn waf_config_from(
             xss: settings.xss,
             traversal: settings.traversal,
             scanners: settings.scanners,
+            rce: settings.rce,
+            ssrf: settings.ssrf,
+            xxe: settings.xxe,
+            log4shell: settings.log4shell,
+            crlf: settings.crlf,
         },
         rules: rules
             .into_iter()
@@ -174,6 +186,7 @@ fn waf_config_from(
         ip_deny,
         challenge_difficulty: settings.challenge_difficulty.clamp(1, 6) as u8,
         challenge_ttl_secs: settings.challenge_ttl_secs.clamp(60, 86_400) as u64,
+        security_level: settings.security_level,
     }
 }
 
@@ -201,6 +214,7 @@ fn build(
     timeout.hash(&mut h);
     row.custom_headers.hash(&mut h);
     row.status.hash(&mut h);
+    row.ssl_enabled.hash(&mut h);
     origin.host.hash(&mut h);
     origin.port.hash(&mut h);
     origin.protocol.hash(&mut h);
@@ -229,6 +243,12 @@ fn build(
             w.managed.xss.hash(&mut h);
             w.managed.traversal.hash(&mut h);
             w.managed.scanners.hash(&mut h);
+            w.managed.rce.hash(&mut h);
+            w.managed.ssrf.hash(&mut h);
+            w.managed.xxe.hash(&mut h);
+            w.managed.log4shell.hash(&mut h);
+            w.managed.crlf.hash(&mut h);
+            w.security_level.hash(&mut h);
             for r in &w.rules {
                 r.name.hash(&mut h);
                 r.field.hash(&mut h);
@@ -255,6 +275,7 @@ fn build(
         origin,
         rules,
         status: row.status.clone(),
+        ssl_enabled: row.ssl_enabled,
         rate_limit_rps: rps,
         rate_limit_burst: burst,
         ignore_query_string: row.ignore_query_string,

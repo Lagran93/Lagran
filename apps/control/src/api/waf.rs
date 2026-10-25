@@ -79,8 +79,14 @@ pub struct WafSettingsDto {
     pub xss: bool,
     pub traversal: bool,
     pub scanners: bool,
+    pub rce: bool,
+    pub ssrf: bool,
+    pub xxe: bool,
+    pub log4shell: bool,
+    pub crlf: bool,
     pub challenge_difficulty: u8,
     pub challenge_ttl_secs: u32,
+    pub security_level: String,
 }
 
 impl Default for WafSettingsDto {
@@ -92,8 +98,14 @@ impl Default for WafSettingsDto {
             xss: true,
             traversal: true,
             scanners: true,
+            rce: true,
+            ssrf: true,
+            xxe: true,
+            log4shell: true,
+            crlf: true,
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
+            security_level: "off".into(),
         }
     }
 }
@@ -107,8 +119,14 @@ impl From<repository::WafSettingsRow> for WafSettingsDto {
             xss: r.xss,
             traversal: r.traversal,
             scanners: r.scanners,
+            rce: r.rce,
+            ssrf: r.ssrf,
+            xxe: r.xxe,
+            log4shell: r.log4shell,
+            crlf: r.crlf,
             challenge_difficulty: r.challenge_difficulty.clamp(1, 6) as u8,
             challenge_ttl_secs: r.challenge_ttl_secs.clamp(60, 86_400) as u32,
+            security_level: r.security_level,
         }
     }
 }
@@ -136,8 +154,14 @@ pub struct SettingsRequest {
     pub xss: Option<bool>,
     pub traversal: Option<bool>,
     pub scanners: Option<bool>,
+    pub rce: Option<bool>,
+    pub ssrf: Option<bool>,
+    pub xxe: Option<bool>,
+    pub log4shell: Option<bool>,
+    pub crlf: Option<bool>,
     pub challenge_difficulty: Option<u8>,
     pub challenge_ttl_secs: Option<u32>,
+    pub security_level: Option<String>,
 }
 
 pub async fn put_settings(
@@ -167,6 +191,18 @@ pub async fn put_settings(
         return Err(bad_request("mode must be block or monitor".into()));
     }
 
+    let security_level = req
+        .security_level
+        .as_deref()
+        .unwrap_or(&current.security_level)
+        .trim()
+        .to_ascii_lowercase();
+    if !["off", "low", "medium", "high", "under_attack"].contains(&security_level.as_str()) {
+        return Err(bad_request(
+            "security_level must be off, low, medium, high or under_attack".into(),
+        ));
+    }
+
     let row = repository::upsert_waf_settings(
         &state.pool,
         domain_id,
@@ -176,12 +212,18 @@ pub async fn put_settings(
         req.xss.unwrap_or(current.xss),
         req.traversal.unwrap_or(current.traversal),
         req.scanners.unwrap_or(current.scanners),
+        req.rce.unwrap_or(current.rce),
+        req.ssrf.unwrap_or(current.ssrf),
+        req.xxe.unwrap_or(current.xxe),
+        req.log4shell.unwrap_or(current.log4shell),
+        req.crlf.unwrap_or(current.crlf),
         req.challenge_difficulty
             .unwrap_or(current.challenge_difficulty)
             .clamp(1, 6) as i32,
         req.challenge_ttl_secs
             .unwrap_or(current.challenge_ttl_secs)
             .clamp(60, 86_400) as i32,
+        &security_level,
     )
     .await
     .map_err(|e| {
@@ -195,12 +237,19 @@ pub async fn put_settings(
         "waf.settings",
         &domain_id.to_string(),
         &format!(
-            "enabled={} mode={mode} sqli={} xss={} traversal={} scanners={} challenge={}/{}s",
+            "enabled={} mode={mode} level={} sqli={} xss={} traversal={} scanners={} \
+             rce={} ssrf={} xxe={} log4shell={} crlf={} challenge={}/{}s",
             row.enabled,
+            row.security_level,
             row.sqli,
             row.xss,
             row.traversal,
             row.scanners,
+            row.rce,
+            row.ssrf,
+            row.xxe,
+            row.log4shell,
+            row.crlf,
             row.challenge_difficulty,
             row.challenge_ttl_secs
         ),
@@ -270,9 +319,17 @@ fn validate_rule(req: &WafRuleRequest) -> Result<ValidRule, (StatusCode, Json<Er
         return Err(bad_request("name required".into()));
     }
     let field = req.field.trim().to_ascii_lowercase();
-    if !FIELDS.contains(&field.as_str()) {
+    let header_field = field.strip_prefix("header:").map(|name| {
+        let name = name.trim();
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    });
+    if !FIELDS.contains(&field.as_str()) && header_field != Some(true) {
         return Err(bad_request(format!(
-            "field must be one of {}",
+            "field must be one of {} or header:<name>",
             FIELDS.join(", ")
         )));
     }
@@ -624,6 +681,106 @@ pub struct EventsQuery {
     pub domain: Option<String>,
     pub limit: Option<i64>,
     pub action: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct StatsQuery {
+    pub domain: Option<String>,
+    pub days: Option<i32>,
+}
+
+#[derive(Serialize)]
+pub struct CountDto {
+    pub key: String,
+    pub count: i64,
+}
+
+#[derive(Serialize)]
+pub struct WafStatsResponse {
+    pub days: i32,
+    pub total: i64,
+    pub by_action: Vec<CountDto>,
+    pub by_category: Vec<CountDto>,
+    pub by_day: Vec<CountDto>,
+    pub top_ips: Vec<CountDto>,
+    pub top_rules: Vec<CountDto>,
+    pub top_paths: Vec<CountDto>,
+}
+
+fn to_counts(rows: Vec<(String, i64)>) -> Vec<CountDto> {
+    rows.into_iter()
+        .map(|(key, count)| CountDto { key, count })
+        .collect()
+}
+
+/// Dashboard aggregates for WAF events (project-scoped for non-admins).
+pub async fn stats(
+    State(state): State<AppState>,
+    actor: Actor,
+    Query(q): Query<StatsQuery>,
+) -> Result<Json<WafStatsResponse>, (StatusCode, Json<ErrorBody>)> {
+    let days = q.days.unwrap_or(7).clamp(1, 90);
+    let visible: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
+        None => None,
+        Some(ids) => {
+            let rows = repository::list_domains(&state.pool)
+                .await
+                .unwrap_or_default();
+            Some(
+                rows.into_iter()
+                    .filter(|d| ids.contains(&d.id))
+                    .map(|d| d.name)
+                    .collect(),
+            )
+        }
+    };
+
+    let domain_filter = q.domain.as_deref().filter(|d| !d.is_empty());
+    if let (Some(name), Some(names)) = (domain_filter, &visible) {
+        if !names.contains(name) {
+            return Ok(Json(WafStatsResponse {
+                days,
+                total: 0,
+                by_action: vec![],
+                by_category: vec![],
+                by_day: vec![],
+                top_ips: vec![],
+                top_rules: vec![],
+                top_paths: vec![],
+            }));
+        }
+    }
+    let domains_vec: Option<Vec<String>> = visible.map(|s| s.into_iter().collect());
+
+    let group = |expr: &'static str, limit: i64| {
+        repository::waf_stats_group(
+            &state.pool,
+            days,
+            domain_filter,
+            domains_vec.clone(),
+            expr,
+            limit,
+        )
+    };
+
+    let by_action = group("action", 20).await.map_err(|_| db_error())?;
+    let total = by_action.iter().map(|(_, c)| *c).sum();
+    let by_category = group("category", 20).await.map_err(|_| db_error())?;
+    let by_day = group("day", 90).await.map_err(|_| db_error())?;
+    let top_ips = group("client_ip", 10).await.map_err(|_| db_error())?;
+    let top_rules = group("rule_name", 10).await.map_err(|_| db_error())?;
+    let top_paths = group("path", 10).await.map_err(|_| db_error())?;
+
+    Ok(Json(WafStatsResponse {
+        days,
+        total,
+        by_action: to_counts(by_action),
+        by_category: to_counts(by_category),
+        by_day: to_counts(by_day),
+        top_ips: to_counts(top_ips),
+        top_rules: to_counts(top_rules),
+        top_paths: to_counts(top_paths),
+    }))
 }
 
 pub async fn list_events(

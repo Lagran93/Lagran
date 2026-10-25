@@ -17,7 +17,7 @@ fn main() {
     eprintln!("mock origin listening on 127.0.0.1:{port}");
     for stream in listener.incoming().flatten() {
         thread::spawn(move || {
-            if let Err(e) = handle(stream) {
+            if let Err(e) = handle(stream, port) {
                 eprintln!("mock origin connection error: {e}");
             }
         });
@@ -30,7 +30,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn handle(mut stream: TcpStream) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -177,6 +177,7 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
         "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n",
         payload.len()
     );
+    response.push_str(&format!("X-Origin-Port: {port}\r\n"));
     for (name, value) in extra {
         response.push_str(&format!("{name}: {value}\r\n"));
     }

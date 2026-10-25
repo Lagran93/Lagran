@@ -23,6 +23,9 @@ pub struct DomainDto {
     pub project_id: Option<String>,
     pub rate_limit_rps: u32,
     pub rate_limit_burst: u32,
+    pub backup_origin_host: String,
+    pub backup_origin_port: u16,
+    pub backup_origin_proto: String,
 }
 
 #[derive(Deserialize)]
@@ -63,7 +66,40 @@ pub(crate) fn to_dto(r: repository::DomainRow) -> DomainDto {
         project_id: r.project_id.map(|u| u.to_string()),
         rate_limit_rps: r.rate_limit_rps.max(0) as u32,
         rate_limit_burst: r.rate_limit_burst.max(0) as u32,
+        backup_origin_host: r.backup_origin_host,
+        backup_origin_port: r.backup_origin_port.max(0) as u16,
+        backup_origin_proto: if r.backup_origin_proto.is_empty() {
+            "http".into()
+        } else {
+            r.backup_origin_proto
+        },
     }
+}
+
+/// Validate/normalise the optional backup origin.
+/// Empty host clears it; a missing port defaults by protocol.
+fn normalize_backup(host: &str, port: u16, proto: &str) -> Result<(String, i32, String), String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Ok((String::new(), 0, "http".into()));
+    }
+    if host.len() > 253 {
+        return Err("backup origin host is too long".into());
+    }
+    let proto = proto.trim().to_ascii_lowercase();
+    if proto != "http" && proto != "https" {
+        return Err("backup origin protocol must be http or https".into());
+    }
+    let port = if port == 0 {
+        if proto == "https" {
+            443
+        } else {
+            80
+        }
+    } else {
+        port
+    };
+    Ok((host.to_string(), port as i32, proto))
 }
 
 fn parse_uuid(id: &str) -> Result<Uuid, (StatusCode, Json<ErrorBody>)> {
@@ -214,10 +250,16 @@ pub async fn create(
             repository::set_domain_rate_limit(&state.pool, row.id, rps as i32, burst as i32).await;
     }
     if let Some(ref host) = req.backup_origin_host {
-        if !host.is_empty() {
-            let port = req.backup_origin_port.unwrap_or(80) as i32;
-            let proto = req.backup_origin_proto.as_deref().unwrap_or("http");
-            let _ = repository::set_backup_origin(&state.pool, row.id, host, port, proto).await;
+        let (h, p, pr) = normalize_backup(
+            host,
+            req.backup_origin_port.unwrap_or(0),
+            req.backup_origin_proto.as_deref().unwrap_or("http"),
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        if !h.is_empty() {
+            repository::set_backup_origin(&state.pool, row.id, &h, p, &pr)
+                .await
+                .map_err(|_| db_error())?;
         }
     }
     let _ = repository::insert_audit(
@@ -321,6 +363,11 @@ pub async fn update(
         }
     }
 
+    let before = repository::get_domain(&state.pool, uid)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found(&id))?;
+
     let row = repository::update_domain(
         &state.pool,
         uid,
@@ -337,11 +384,26 @@ pub async fn update(
     })?
     .ok_or_else(|| not_found(&id))?;
 
-    if req.backup_origin_host.is_some() || req.backup_origin_port.is_some() {
-        let host = req.backup_origin_host.as_deref().unwrap_or("");
-        let port = req.backup_origin_port.unwrap_or(0) as i32;
-        let proto = req.backup_origin_proto.as_deref().unwrap_or("http");
-        let _ = repository::set_backup_origin(&state.pool, uid, host, port, proto).await;
+    if req.backup_origin_host.is_some()
+        || req.backup_origin_port.is_some()
+        || req.backup_origin_proto.is_some()
+    {
+        let host = req
+            .backup_origin_host
+            .as_deref()
+            .unwrap_or(&before.backup_origin_host);
+        let proto = req
+            .backup_origin_proto
+            .as_deref()
+            .unwrap_or(&before.backup_origin_proto);
+        let port = req
+            .backup_origin_port
+            .unwrap_or(before.backup_origin_port.max(0) as u16);
+        let (h, p, pr) = normalize_backup(host, port, proto)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        repository::set_backup_origin(&state.pool, uid, &h, p, &pr)
+            .await
+            .map_err(|_| db_error())?;
     }
     if let Some(rps) = req.rate_limit_rps {
         let burst = req.rate_limit_burst.unwrap_or(rps * 2);

@@ -24,6 +24,8 @@ pub struct DomainEntry {
     pub custom_headers: String,
     /// Optional backup origin URL (empty = none)
     pub backup_origin_url: String,
+    /// Redirect plain HTTP requests to HTTPS when enabled
+    pub ssl_enabled: bool,
     /// WAF policy (disabled by default until configured in the console)
     pub waf: WafConfig,
 }
@@ -134,6 +136,7 @@ mod tests {
             origin_timeout_ms: 10_000,
             custom_headers: String::new(),
             backup_origin_url: String::new(),
+            ssl_enabled: false,
             waf: WafConfig::default(),
         }
     }

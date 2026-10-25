@@ -8,7 +8,9 @@ use crate::cache::policy::{CacheRule, RuleSet};
 use crate::config::registry::{DomainEntry, DomainRegistry};
 use crate::config::EdgeConfig;
 use crate::origin::OriginClient;
-use crate::waf::{IpNet, ManagedRules, WafAction, WafConfig, WafField, WafMode, WafOp, WafRule};
+use crate::waf::{
+    IpNet, ManagedRules, SecurityLevel, WafAction, WafConfig, WafField, WafMode, WafOp, WafRule,
+};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -82,6 +84,8 @@ struct DomainCfg {
     #[serde(default)]
     custom_headers: String,
     #[serde(default)]
+    ssl_enabled: bool,
+    #[serde(default)]
     backup_origin: Option<OriginCfg>,
     #[serde(default)]
     waf: Option<WafCfg>,
@@ -113,6 +117,7 @@ impl DomainCfg {
             },
             custom_headers: self.custom_headers,
             backup_origin_url,
+            ssl_enabled: self.ssl_enabled,
             waf: into_waf(self.waf),
         }
     }
@@ -136,6 +141,8 @@ struct WafCfg {
     challenge_difficulty: u8,
     #[serde(default = "default_challenge_ttl")]
     challenge_ttl_secs: u64,
+    #[serde(default)]
+    security_level: String,
 }
 
 fn default_challenge_difficulty() -> u8 {
@@ -156,6 +163,16 @@ struct WafManagedCfg {
     traversal: bool,
     #[serde(default = "default_true")]
     scanners: bool,
+    #[serde(default = "default_true")]
+    rce: bool,
+    #[serde(default = "default_true")]
+    ssrf: bool,
+    #[serde(default = "default_true")]
+    xxe: bool,
+    #[serde(default = "default_true")]
+    log4shell: bool,
+    #[serde(default = "default_true")]
+    crlf: bool,
 }
 
 impl Default for WafManagedCfg {
@@ -165,6 +182,11 @@ impl Default for WafManagedCfg {
             xss: true,
             traversal: true,
             scanners: true,
+            rce: true,
+            ssrf: true,
+            xxe: true,
+            log4shell: true,
+            crlf: true,
         }
     }
 }
@@ -235,12 +257,18 @@ fn into_waf(cfg: Option<WafCfg>) -> WafConfig {
             xss: cfg.managed.xss,
             traversal: cfg.managed.traversal,
             scanners: cfg.managed.scanners,
+            rce: cfg.managed.rce,
+            ssrf: cfg.managed.ssrf,
+            xxe: cfg.managed.xxe,
+            log4shell: cfg.managed.log4shell,
+            crlf: cfg.managed.crlf,
         },
         rules,
         ip_allow: parse_nets(cfg.ip_allow),
         ip_deny: parse_nets(cfg.ip_deny),
         challenge_difficulty: cfg.challenge_difficulty.clamp(1, 6),
         challenge_ttl_secs: cfg.challenge_ttl_secs.clamp(60, 86_400),
+        security_level: SecurityLevel::parse(&cfg.security_level),
     }
 }
 

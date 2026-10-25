@@ -114,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         trust_proxy_headers: config.trust_proxy_headers,
         challenge_secret,
         node_control,
+        https_redirect_port: config.https_redirect_port,
     });
 
     let app = listener::create_router(state);

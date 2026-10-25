@@ -38,6 +38,9 @@ pub struct EdgeConfig {
     pub waf_report_interval_secs: u64,
     /// HMAC secret for challenge nonces / clearance cookies (empty = derive).
     pub challenge_secret: String,
+    /// Port to use in HTTP→HTTPS redirects (None = 443, or derived from the
+    /// HTTPS listener port when it is not 443).
+    pub https_redirect_port: Option<u16>,
 }
 
 impl Default for EdgeConfig {
@@ -53,6 +56,16 @@ impl Default for EdgeConfig {
         let https_listen_addr = std::env::var("EDGE_HTTPS_LISTEN")
             .ok()
             .filter(|s| !s.is_empty());
+        let https_redirect_port = std::env::var("EDGE_HTTPS_REDIRECT_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .or_else(|| {
+                https_listen_addr
+                    .as_deref()
+                    .and_then(|addr| addr.rsplit(':').next())
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .filter(|p| *p != 443)
+            });
 
         Self {
             listen_addr: listen,
@@ -118,6 +131,7 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5),
             challenge_secret: std::env::var("CHALLENGE_SECRET").unwrap_or_default(),
+            https_redirect_port,
         }
     }
 }

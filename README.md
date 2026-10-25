@@ -15,9 +15,14 @@
 - 域名接入与管理：源站/备源、SSL、限流、CORS、防盗链、回源超时、自定义头
 - 缓存规则：路径通配、**请求方法 / 查询串条件**、TTL、优先级、SWR、**动作（cache/bypass/no_store）**、
   **浏览器 TTL 覆盖**、**按规则忽略 Query**、启用/停用与**规则测试器**
+- 域名源站支持主备：备用源站可随时启用/修改/清空，端口留空按协议默认 80/443；
+  主源站不可用时自动回源到备用源站（含 bypass/动态请求）
+- 域名 HTTPS：开启后 HTTP 请求 301/308 跳转到 HTTPS（`EDGE_HTTPS_REDIRECT_PORT` 控制端口）
 - 证书：上传、SNI 下发、开发用自动签发（rcgen + ACME challenge 下发）
 - 节点管理：预注册节点 + 一键生成安装命令（二进制/Docker）、单节点令牌、启用/停用（下发边缘立即 503）、删除吊销、心跳与 CPU/内存/版本
-- WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器）、自定义规则（拦截/放行/记录/**浏览器质询**）、IP 黑白名单、观察/拦截模式、事件日志
+- WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器 / **RCE / SSRF / XXE / Log4Shell / CRLF**）、
+  自定义规则（含**请求头匹配**，拦截/放行/记录/浏览器质询）、IP 黑白名单、观察/拦截模式、
+  **安全级别（低/中/高/攻击中）**、事件日志与**统计概览**
 - 缓存刷新（purge 扇出到在线边缘）、预热任务
 - 统计：总览 / 分域名（24h）、访问日志、操作审计、源站健康
 
@@ -28,6 +33,7 @@
   `no-store`/`private`/`no-cache`/复杂 `Vary` 不写入；SWR + single-flight 合并回源
 - 条件请求（304）、`Age`、`X-Cache` / `X-Cache-Status`、每域名限流、防盗链
 - WAF：托管特征匹配 + 自定义规则 + IP 白/黑名单，支持观察模式；命中后返回 403 拦截页并上报事件
+- WAF 安全级别：低/中/高/攻击中，按 UA 与请求类型自动下发浏览器质询；静态资源不受影响
 - WAF Challenge：规则动作为「质询」时返回 JS 工作量证明页面，通过后签发 HMAC 签名的免质询 Cookie
 - 源站故障（宕机/超时/健康检查失败）且无可用缓存时，返回本地 HTML 提示页
   （502/504/503，`no-store` + `X-Lagran-Error`），不会把裸文本或空响应给访客
@@ -76,9 +82,12 @@ curl -i http://127.0.0.1:8081/            # 第二次 HIT（源站可达时）
 cargo test --workspace          # 单元/契约测试（含 TTL 优先级矩阵）
 cargo clippy --workspace --all-targets
 bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（需 Postgres）
+bash tests/integration/backup-origin.sh # 端到端：备用源站创建/读取/修改/清空与配置下发
+bash tests/integration/failover-https.sh # 端到端：主源站宕机切换备用 + HTTPS 跳转开关
 bash tests/integration/nodes.sh # 端到端：节点预注册→安装命令→单节点令牌→上下线→删除
 bash tests/integration/cache-rules.sh # 端到端：方法/Query 条件、禁用规则、浏览器 TTL、规则测试器
 bash tests/integration/waf.sh   # 端到端：WAF 规则、IP 名单、观察/拦截模式与事件
+bash tests/integration/waf-advanced.sh # 端到端：新托管类别、请求头规则、安全级别与统计
 bash tests/integration/ttl.sh   # 端到端：TTL 优先级（规则→s-maxage→max-age→Expires→默认）
 PGPASS=... bash tests/integration/fresh-db.sh   # 全新库迁移 + demo admin 引导
 ```
@@ -104,6 +113,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | CACHE_CAPACITY | 10000 | 内存缓存条目上限（0=不限） |
 | CACHE_BACKEND | memory | memory / disk / hybrid |
 | TRUST_PROXY_HEADERS | false | 是否信任 `X-Forwarded-For` 作为客户端 IP（WAF 用；仅前置可信代理时开启） |
+| EDGE_HTTPS_REDIRECT_PORT | 空 | 域名开启 HTTPS 后，HTTP→HTTPS 跳转使用的端口；留空取 HTTPS 监听端口，443 时省略 |
 | WAF_REPORT_INTERVAL | 5 | WAF 事件上报间隔（秒），`WAF_REPORT=false` 可关闭 |
 | CHALLENGE_SECRET | 空 | 质询 nonce / 免质询 Cookie 的 HMAC 密钥；多节点部署必须一致，留空用 AGENT_TOKEN 派生或随机 |
 | RATE_LIMIT_RPS / BURST | 0 | 全局默认限流（0=不限） |

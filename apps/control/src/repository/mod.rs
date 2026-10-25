@@ -27,6 +27,12 @@ pub struct DomainRow {
     pub created_at: DateTime<Utc>,
     pub rate_limit_rps: i32,
     pub rate_limit_burst: i32,
+    #[sqlx(default)]
+    pub backup_origin_host: String,
+    #[sqlx(default)]
+    pub backup_origin_port: i32,
+    #[sqlx(default)]
+    pub backup_origin_proto: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -121,7 +127,10 @@ pub async fn list_domains(pool: &PgPool) -> sqlx::Result<Vec<DomainRow>> {
     sqlx::query_as::<_, DomainRow>(
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
-               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
         FROM domains
         ORDER BY created_at DESC
         "#,
@@ -134,7 +143,10 @@ pub async fn get_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<DomainRo
     sqlx::query_as::<_, DomainRow>(
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
-               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
         FROM domains WHERE id = $1
         "#,
     )
@@ -147,7 +159,10 @@ pub async fn get_domain_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Optio
     sqlx::query_as::<_, DomainRow>(
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
-               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
         FROM domains WHERE name = $1
         "#,
     )
@@ -1132,7 +1147,10 @@ pub async fn list_domains_by_project(
     sqlx::query_as::<_, DomainRow>(
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
-               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
         FROM domains WHERE project_id = $1
         ORDER BY created_at DESC
         "#,
@@ -1746,8 +1764,14 @@ pub struct WafSettingsRow {
     pub xss: bool,
     pub traversal: bool,
     pub scanners: bool,
+    pub rce: bool,
+    pub ssrf: bool,
+    pub xxe: bool,
+    pub log4shell: bool,
+    pub crlf: bool,
     pub challenge_difficulty: i32,
     pub challenge_ttl_secs: i32,
+    pub security_level: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1796,7 +1820,8 @@ pub async fn get_waf_settings(
     sqlx::query_as::<_, WafSettingsRow>(
         r#"
         SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
-               challenge_difficulty, challenge_ttl_secs
+               rce, ssrf, xxe, log4shell, crlf,
+               challenge_difficulty, challenge_ttl_secs, security_level
         FROM waf_settings WHERE domain_id = $1
         "#,
     )
@@ -1815,15 +1840,22 @@ pub async fn upsert_waf_settings(
     xss: bool,
     traversal: bool,
     scanners: bool,
+    rce: bool,
+    ssrf: bool,
+    xxe: bool,
+    log4shell: bool,
+    crlf: bool,
     challenge_difficulty: i32,
     challenge_ttl_secs: i32,
+    security_level: &str,
 ) -> sqlx::Result<WafSettingsRow> {
     sqlx::query_as::<_, WafSettingsRow>(
         r#"
         INSERT INTO waf_settings
             (domain_id, enabled, mode, sqli, xss, traversal, scanners,
-             challenge_difficulty, challenge_ttl_secs)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             rce, ssrf, xxe, log4shell, crlf,
+             challenge_difficulty, challenge_ttl_secs, security_level)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         ON CONFLICT (domain_id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
           mode = EXCLUDED.mode,
@@ -1831,11 +1863,18 @@ pub async fn upsert_waf_settings(
           xss = EXCLUDED.xss,
           traversal = EXCLUDED.traversal,
           scanners = EXCLUDED.scanners,
+          rce = EXCLUDED.rce,
+          ssrf = EXCLUDED.ssrf,
+          xxe = EXCLUDED.xxe,
+          log4shell = EXCLUDED.log4shell,
+          crlf = EXCLUDED.crlf,
           challenge_difficulty = EXCLUDED.challenge_difficulty,
           challenge_ttl_secs = EXCLUDED.challenge_ttl_secs,
+          security_level = EXCLUDED.security_level,
           updated_at = NOW()
         RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners,
-                  challenge_difficulty, challenge_ttl_secs
+                  rce, ssrf, xxe, log4shell, crlf,
+                  challenge_difficulty, challenge_ttl_secs, security_level
         "#,
     )
     .bind(domain_id)
@@ -1845,8 +1884,14 @@ pub async fn upsert_waf_settings(
     .bind(xss)
     .bind(traversal)
     .bind(scanners)
+    .bind(rce)
+    .bind(ssrf)
+    .bind(xxe)
+    .bind(log4shell)
+    .bind(crlf)
     .bind(challenge_difficulty)
     .bind(challenge_ttl_secs)
+    .bind(security_level)
     .fetch_one(pool)
     .await
 }
@@ -1855,7 +1900,8 @@ pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSetting
     sqlx::query_as::<_, WafSettingsRow>(
         r#"
         SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
-               challenge_difficulty, challenge_ttl_secs
+               rce, ssrf, xxe, log4shell, crlf,
+               challenge_difficulty, challenge_ttl_secs, security_level
         FROM waf_settings
         "#,
     )
@@ -2099,4 +2145,40 @@ pub async fn list_waf_events(
         .fetch_all(pool)
         .await
     }
+}
+
+/// Aggregated WAF events for the dashboard.
+///
+/// `expr` is validated against a fixed whitelist before being interpolated.
+pub async fn waf_stats_group(
+    pool: &PgPool,
+    days: i32,
+    domain: Option<&str>,
+    domains: Option<Vec<String>>,
+    expr: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<(String, i64)>> {
+    const DAY_EXPR: &str = "to_char(date_trunc('day', ts), 'YYYY-MM-DD')";
+    let (expr, order) = match expr {
+        "action" | "category" | "client_ip" | "rule_name" | "path" => (expr, "ORDER BY 2 DESC"),
+        "day" => (DAY_EXPR, "ORDER BY 1 ASC"),
+        _ => return Ok(Vec::new()),
+    };
+    let sql = format!(
+        r#"
+        SELECT COALESCE(NULLIF({expr}, ''), '(unknown)') AS k, COUNT(*)::bigint AS c
+        FROM waf_events
+        WHERE ts >= NOW() - make_interval(days => $1)
+          AND ($2::text IS NULL OR domain = $2)
+          AND ($3::text[] IS NULL OR domain = ANY($3))
+        GROUP BY 1 {order} LIMIT $4
+        "#
+    );
+    sqlx::query_as::<_, (String, i64)>(&sql)
+        .bind(days)
+        .bind(domain)
+        .bind(domains)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
 }

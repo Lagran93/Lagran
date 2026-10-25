@@ -72,6 +72,8 @@ pub struct AppState {
     /// Set from the heartbeat reply; disabled nodes answer 503 and keep serving
     /// management/health endpoints.
     pub node_control: NodeControl,
+    /// Port used when redirecting HTTP to HTTPS (None = 443).
+    pub https_redirect_port: Option<u16>,
 }
 
 /// Per-request view of the effective domain configuration.
@@ -183,6 +185,46 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     }
 
     let domain_entry = state.domains.get(&host).await;
+
+    // Domain-level HTTPS enforcement: redirect plain HTTP before WAF/cache so
+    // the browser continues over TLS (and secure challenge cookies stick).
+    let is_https = req.extensions().get::<host_util::TlsSni>().is_some()
+        || (state.trust_proxy_headers
+            && headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("https"))
+                .unwrap_or(false));
+    if let Some(ref entry) = domain_entry {
+        if entry.ssl_enabled && !is_https {
+            let status = if method == Method::GET || method == Method::HEAD {
+                StatusCode::MOVED_PERMANENTLY
+            } else {
+                StatusCode::PERMANENT_REDIRECT
+            };
+            log_access(
+                &state.access_log,
+                &method,
+                &host,
+                &path_only,
+                status.as_u16(),
+                start,
+                &client_ip,
+                &user_agent,
+                &referer,
+                0,
+                "HTTPS_REDIRECT",
+            )
+            .await;
+            return https_redirect_response(
+                &host,
+                &path_and_query,
+                status,
+                state.https_redirect_port,
+            );
+        }
+    }
+
     let registry_empty = state.domains.is_empty().await;
 
     if domain_entry.is_none() && !registry_empty {
@@ -675,9 +717,9 @@ async fn bypass_to_origin(
         CacheStatus::Dynamic
     };
 
-    // Fail fast with the same page used by the cache path when the origin is
-    // already known to be down.
-    if !state.origin_health.is_healthy(host).await {
+    // Only fail fast when there is no backup to fall back to.
+    let primary_healthy = state.origin_health.is_healthy(host).await;
+    if !primary_healthy && eff.backup_url.is_empty() {
         log_access(
             &state.access_log,
             method,
@@ -720,56 +762,49 @@ async fn bypass_to_origin(
         }
     };
 
-    let result = tokio::time::timeout(
-        Duration::from_millis(eff.timeout_ms),
-        state.origin.request(
-            &eff.origin_url,
-            method,
-            path_and_query,
-            headers,
-            Some(body),
-            true,
-        ),
-    )
-    .await;
+    let attempt = |url: String| {
+        let origin = state.origin.clone();
+        let method = method.clone();
+        let headers = headers.clone();
+        let path = path_and_query.to_string();
+        let body = body.clone();
+        async move {
+            match tokio::time::timeout(
+                Duration::from_millis(eff.timeout_ms),
+                origin.request(&url, &method, &path, &headers, Some(body), true),
+            )
+            .await
+            {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(FetchError::Failed(e.to_string())),
+                Err(_) => Err(FetchError::Timeout),
+            }
+        }
+    };
+
+    let result = if primary_healthy {
+        match attempt(eff.origin_url.clone()).await {
+            Ok(r) => Ok(r),
+            Err(primary_err) => {
+                if eff.backup_url.is_empty() {
+                    Err(primary_err)
+                } else {
+                    tracing::warn!(
+                        origin = %eff.origin_url,
+                        error = %primary_err,
+                        "primary origin failed, trying backup"
+                    );
+                    attempt(eff.backup_url.clone()).await
+                }
+            }
+        }
+    } else {
+        tracing::warn!(origin = %eff.origin_url, "primary origin unhealthy, using backup");
+        attempt(eff.backup_url.clone()).await
+    };
 
     match result {
-        Err(_) => {
-            log_access(
-                &state.access_log,
-                method,
-                host,
-                path_only,
-                504,
-                start,
-                client_ip,
-                user_agent,
-                referer,
-                0,
-                OriginFailure::Timeout.log_label(),
-            )
-            .await;
-            default_page::origin_error_page(host, path_only, OriginFailure::Timeout)
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, origin = %eff.origin_url, "origin fetch failed");
-            log_access(
-                &state.access_log,
-                method,
-                host,
-                path_only,
-                502,
-                start,
-                client_ip,
-                user_agent,
-                referer,
-                0,
-                OriginFailure::Unreachable.log_label(),
-            )
-            .await;
-            default_page::origin_error_page(host, path_only, OriginFailure::Unreachable)
-        }
-        Ok(Ok(resp)) => {
+        Ok(resp) => {
             let status = resp.status;
             let body_len = resp.body.len() as u64;
             let out = pass_through_response(resp, label.as_str(), &eff.cors, &eff.custom_headers);
@@ -789,6 +824,26 @@ async fn bypass_to_origin(
             )
             .await;
             out
+        }
+        Err(e) => {
+            let failure = e.failure();
+            let code = failure.status().as_u16();
+            tracing::warn!(error = %e, origin = %eff.origin_url, "origin fetch failed");
+            log_access(
+                &state.access_log,
+                method,
+                host,
+                path_only,
+                code,
+                start,
+                client_ip,
+                user_agent,
+                referer,
+                0,
+                failure.log_label(),
+            )
+            .await;
+            default_page::origin_error_page(host, path_only, failure)
         }
     }
 }
@@ -850,7 +905,8 @@ async fn fetch_origin(
     headers: &HeaderMap,
     method: &Method,
 ) -> Result<OriginResponse, FetchError> {
-    if !state.origin_health.is_healthy(host).await {
+    let primary_healthy = state.origin_health.is_healthy(host).await;
+    if !primary_healthy && eff.backup_url.is_empty() {
         return Err(FetchError::Unhealthy);
     }
 
@@ -874,7 +930,13 @@ async fn fetch_origin(
         }
     };
 
-    match attempt(eff.origin_url.clone()).await {
+    let primary = if primary_healthy {
+        attempt(eff.origin_url.clone()).await
+    } else {
+        Err(FetchError::Unhealthy)
+    };
+
+    match primary {
         Ok(r) => Ok(r),
         Err(primary_err) => {
             if eff.backup_url.is_empty() {
@@ -1286,6 +1348,49 @@ fn not_modified_response(etag: &str) -> Response {
     *resp.status_mut() = StatusCode::NOT_MODIFIED;
     *resp.headers_mut() = headers;
     resp
+}
+
+fn host_without_port(host: &str) -> String {
+    let host = host.trim();
+    if host.starts_with('[') {
+        if let Some(end) = host.find(']') {
+            return host[..=end].to_string();
+        }
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name.to_string(),
+        _ => host.to_string(),
+    }
+}
+
+fn https_redirect_response(
+    host: &str,
+    path_and_query: &str,
+    status: StatusCode,
+    port: Option<u16>,
+) -> Response {
+    let mut authority = host_without_port(host);
+    if let Some(p) = port.filter(|p| *p != 443) {
+        authority = format!("{authority}:{p}");
+    }
+    let location = format!("https://{authority}{path_and_query}");
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    match HeaderValue::from_str(&location) {
+        Ok(v) => {
+            headers.insert(header::LOCATION, v);
+        }
+        Err(_) => {
+            headers.insert(header::LOCATION, HeaderValue::from_static("/"));
+        }
+    }
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("x-lagran-redirect"),
+        HeaderValue::from_static("https"),
+    );
+    response
 }
 
 #[cfg(test)]

@@ -60,8 +60,74 @@
           </button>
         </div>
 
+        <!-- 数据概览 -->
+        <div v-if="tab === 'overview'" class="card-body">
+          <div class="stat-grid">
+            <StatCard label="事件总数" :value="stats.total" icon="shield" />
+            <StatCard label="拦截" :value="actionCount('block')" tone="red" icon="alert" />
+            <StatCard label="质询" :value="actionCount('challenge')" tone="orange" icon="zap" />
+            <StatCard
+              label="观察 / 记录"
+              :value="actionCount('monitor') + actionCount('log')"
+              tone="green"
+              icon="activity"
+            />
+          </div>
+
+          <div class="section-label">按天趋势（最近 {{ stats.days }} 天）</div>
+          <div v-if="stats.by_day.length" class="bar-chart">
+            <div
+              v-for="d in stats.by_day"
+              :key="d.key"
+              class="bar-col"
+              :title="`${d.key}: ${d.count}`"
+            >
+              <div class="bar" :style="{ height: barHeight(d.count) }" />
+              <span class="bar-label">{{ d.key.slice(5) }}</span>
+            </div>
+          </div>
+          <div v-else class="text-muted" style="font-size: 13px; padding: 12px 0">
+            最近 {{ stats.days }} 天暂无 WAF 事件。
+          </div>
+
+          <div class="waf-stat-grid">
+            <div class="stat-list">
+              <div class="stat-list-title">按类型</div>
+              <div v-for="c in stats.by_category" :key="c.key" class="stat-list-row">
+                <span>{{ categoryLabel(c.key) }}</span>
+                <b>{{ c.count }}</b>
+              </div>
+              <div v-if="!stats.by_category.length" class="stat-empty">暂无</div>
+            </div>
+            <div class="stat-list">
+              <div class="stat-list-title">Top 客户端 IP</div>
+              <div v-for="c in stats.top_ips" :key="c.key" class="stat-list-row">
+                <span class="mono">{{ c.key }}</span>
+                <b>{{ c.count }}</b>
+              </div>
+              <div v-if="!stats.top_ips.length" class="stat-empty">暂无</div>
+            </div>
+            <div class="stat-list">
+              <div class="stat-list-title">Top 命中规则</div>
+              <div v-for="c in stats.top_rules" :key="c.key" class="stat-list-row">
+                <span>{{ c.key }}</span>
+                <b>{{ c.count }}</b>
+              </div>
+              <div v-if="!stats.top_rules.length" class="stat-empty">暂无</div>
+            </div>
+            <div class="stat-list">
+              <div class="stat-list-title">Top 路径</div>
+              <div v-for="c in stats.top_paths" :key="c.key" class="stat-list-row">
+                <span class="mono truncate" :title="c.key">{{ c.key }}</span>
+                <b>{{ c.count }}</b>
+              </div>
+              <div v-if="!stats.top_paths.length" class="stat-empty">暂无</div>
+            </div>
+          </div>
+        </div>
+
         <!-- 防护设置 -->
-        <div v-if="tab === 'settings'" class="card-body">
+        <div v-else-if="tab === 'settings'" class="card-body">
           <div class="alert" :class="settings.mode === 'block' ? 'alert-warning' : 'alert-info'">
             <AppIcon name="shield" :size="16" class="icon" />
             <span v-if="settings.mode === 'block'">
@@ -105,6 +171,22 @@
               </button>
             </div>
           </div>
+
+          <div class="section-label">安全级别</div>
+          <div class="segmented level-seg">
+            <button
+              v-for="l in securityLevels"
+              :key="l.value"
+              type="button"
+              :class="{ active: settings.security_level === l.value }"
+              @click="settings.security_level = l.value"
+            >
+              {{ l.label }}
+            </button>
+          </div>
+          <p class="text-muted" style="font-size: 12px; margin-top: 8px">
+            {{ levelHint }}
+          </p>
 
           <div class="section-label">托管规则</div>
           <div class="managed-grid">
@@ -373,7 +455,12 @@
               <option value="referer">Referer</option>
               <option value="method">请求方法</option>
               <option value="ip">客户端 IP</option>
+              <option value="header">请求头（自定义）</option>
             </select>
+          </div>
+          <div v-if="ruleForm.field === 'header'" class="field">
+            <label class="field-label">请求头名称 <span class="req">*</span></label>
+            <input v-model="ruleForm.header_name" class="input" placeholder="例如 x-api-key" />
           </div>
           <div class="field">
             <label class="field-label">匹配方式</label>
@@ -448,13 +535,44 @@ const api = useApi()
 const toast = useToast()
 const { ask } = useConfirm()
 
-type Tab = 'settings' | 'rules' | 'ips' | 'events'
+type Tab = 'overview' | 'settings' | 'rules' | 'ips' | 'events'
 
 const domains = ref<any[]>([])
 const domainId = ref('')
-const tab = ref<Tab>('settings')
+const tab = ref<Tab>('overview')
 const loading = ref(false)
 const saving = ref(false)
+
+const stats = ref<any>({
+  days: 7,
+  total: 0,
+  by_action: [],
+  by_category: [],
+  by_day: [],
+  top_ips: [],
+  top_rules: [],
+  top_paths: [],
+})
+const statsLoading = ref(false)
+
+const securityLevels = [
+  { value: 'off', label: '关闭' },
+  { value: 'low', label: '低' },
+  { value: 'medium', label: '中' },
+  { value: 'high', label: '高' },
+  { value: 'under_attack', label: '攻击中' },
+]
+
+const levelHint = computed(() => {
+  const hints: Record<string, string> = {
+    off: '只执行 IP 名单与显式规则，不按安全级别额外质询。',
+    low: '对空 User-Agent 的 GET/HEAD 请求发起质询。',
+    medium: '在低级别基础上，对扫描器 UA 与空 UA 发起质询。',
+    high: '对所有文档类 GET/HEAD（HTML 导航）发起质询，静态资源除外。',
+    under_attack: '对所有 GET/HEAD 发起质询，静态资源除外；适合正在被攻击时临时开启。',
+  }
+  return hints[settings.value.security_level] || hints.off
+})
 
 const settings = ref<any>({
   enabled: false,
@@ -463,6 +581,12 @@ const settings = ref<any>({
   xss: true,
   traversal: true,
   scanners: true,
+  rce: true,
+  ssrf: true,
+  xxe: true,
+  log4shell: true,
+  crlf: true,
+  security_level: 'off',
   challenge_difficulty: 4,
   challenge_ttl_secs: 1800,
 })
@@ -480,6 +604,7 @@ const ruleError = ref('')
 const ruleForm = ref({
   name: '',
   field: 'path',
+  header_name: '',
   operator: 'contains',
   value: '',
   action: 'block',
@@ -496,14 +621,58 @@ const managedRules = [
   { key: 'xss', label: 'XSS 跨站脚本', desc: '\u003cscript\u003e、javascript:、onerror= 等' },
   { key: 'traversal', label: '路径穿越', desc: '路径跳转 ../、/etc/passwd 读取' },
   { key: 'scanners', label: '扫描器与敏感路径', desc: 'sqlmap/nikto UA、/.git/config 等' },
+  { key: 'rce', label: '命令执行 / RCE', desc: ';wget、|bash、powershell、$() 等' },
+  { key: 'ssrf', label: 'SSRF / 云元数据', desc: '169.254.169.254、metadata、gopher:// 等' },
+  { key: 'xxe', label: 'XXE 外部实体', desc: '<!ENTITY、system "、file:///etc 等' },
+  { key: 'log4shell', label: 'Log4Shell', desc: '${jndi:ldap://}、jndi:rmi 等' },
+  { key: 'crlf', label: 'CRLF / 头注入', desc: '路径或查询串中的 \\r\\n、%0d%0a' },
 ]
 
 const tabs = computed(() => [
+  { value: 'overview' as Tab, label: '数据概览' },
   { value: 'settings' as Tab, label: '防护设置' },
   { value: 'rules' as Tab, label: '自定义规则', count: rules.value.length },
   { value: 'ips' as Tab, label: 'IP 黑白名单', count: ips.value.length },
   { value: 'events' as Tab, label: '事件日志' },
 ])
+
+function actionCount(action: string) {
+  const row = (stats.value.by_action || []).find((r: any) => r.key === action)
+  return row ? row.count : 0
+}
+
+const maxDayCount = computed(() => {
+  const rows = stats.value.by_day || []
+  return rows.reduce((m: number, r: any) => Math.max(m, r.count), 0) || 1
+})
+
+function barHeight(count: number) {
+  return `${Math.max(4, Math.round((count / maxDayCount.value) * 100))}%`
+}
+
+async function loadStats() {
+  if (!domainId.value) return
+  statsLoading.value = true
+  try {
+    const name = domains.value.find((d) => d.id === domainId.value)?.name || ''
+    const q = new URLSearchParams({ days: '7' })
+    if (name) q.set('domain', name)
+    stats.value = await api.get<any>(`/api/v1/waf/stats?${q.toString()}`)
+    statsLoading.value = false
+  } catch {
+    stats.value = {
+      days: 7,
+      total: 0,
+      by_action: [],
+      by_category: [],
+      by_day: [],
+      top_ips: [],
+      top_rules: [],
+      top_paths: [],
+    }
+    statsLoading.value = false
+  }
+}
 
 const filteredEvents = computed(() => {
   if (!eventAction.value) return events.value
@@ -511,6 +680,7 @@ const filteredEvents = computed(() => {
 })
 
 function fieldLabel(field: string) {
+  if (field && field.startsWith('header:')) return `请求头 ${field.slice(7)}`
   return (
     {
       path: '路径',
@@ -556,8 +726,14 @@ function categoryLabel(category: string) {
       xss: 'XSS',
       traversal: '路径穿越',
       scanners: '扫描器',
+      rce: '命令执行',
+      ssrf: 'SSRF',
+      xxe: 'XXE',
+      log4shell: 'Log4Shell',
+      crlf: 'CRLF 注入',
       ip_deny: 'IP 黑名单',
       custom: '自定义规则',
+      security_level: '安全级别',
     } as Record<string, string>
   )[category] || category || '—'
 }
@@ -580,6 +756,12 @@ async function loadSettings() {
       xss: !!s.xss,
       traversal: !!s.traversal,
       scanners: !!s.scanners,
+      rce: !!s.rce,
+      ssrf: !!s.ssrf,
+      xxe: !!s.xxe,
+      log4shell: !!s.log4shell,
+      crlf: !!s.crlf,
+      security_level: s.security_level || 'off',
       challenge_difficulty: s.challenge_difficulty || 4,
       challenge_ttl_secs: s.challenge_ttl_secs || 1800,
     }
@@ -591,6 +773,12 @@ async function loadSettings() {
       xss: true,
       traversal: true,
       scanners: true,
+      rce: true,
+      ssrf: true,
+      xxe: true,
+      log4shell: true,
+      crlf: true,
+      security_level: 'off',
       challenge_difficulty: 4,
       challenge_ttl_secs: 1800,
     }
@@ -629,6 +817,7 @@ async function reload() {
     await loadDomains()
     await Promise.all([loadSettings(), loadRules(), loadIps()])
     if (tab.value === 'events') await loadEvents()
+    if (tab.value === 'overview') await loadStats()
   } finally {
     loading.value = false
   }
@@ -640,6 +829,7 @@ async function switchTab(next: Tab) {
   if (next === 'rules') await loadRules()
   if (next === 'ips') await loadIps()
   if (next === 'settings') await loadSettings()
+  if (next === 'overview') await loadStats()
 }
 
 async function saveSettings() {
@@ -654,6 +844,12 @@ async function saveSettings() {
       xss: !!s.xss,
       traversal: !!s.traversal,
       scanners: !!s.scanners,
+      rce: !!s.rce,
+      ssrf: !!s.ssrf,
+      xxe: !!s.xxe,
+      log4shell: !!s.log4shell,
+      crlf: !!s.crlf,
+      security_level: s.security_level || 'off',
       challenge_difficulty: s.challenge_difficulty || 4,
       challenge_ttl_secs: s.challenge_ttl_secs || 1800,
     }
@@ -671,7 +867,8 @@ function openRuleModal(rule?: any) {
   ruleForm.value = rule
     ? {
         name: rule.name,
-        field: rule.field,
+        field: rule.field && rule.field.startsWith('header:') ? 'header' : rule.field,
+        header_name: rule.field && rule.field.startsWith('header:') ? rule.field.slice(7) : '',
         operator: rule.operator,
         value: rule.value,
         action: rule.action,
@@ -681,6 +878,7 @@ function openRuleModal(rule?: any) {
     : {
         name: '',
         field: 'path',
+        header_name: '',
         operator: 'contains',
         value: '',
         action: 'block',
@@ -696,13 +894,22 @@ async function saveRule() {
     ruleError.value = '请填写规则名称与匹配内容'
     return
   }
+  if (ruleForm.value.field === 'header' && !ruleForm.value.header_name.trim()) {
+    ruleError.value = '请填写要匹配的请求头名称'
+    return
+  }
   saving.value = true
   try {
+    const { header_name, ...rest } = ruleForm.value
+    const body = {
+      ...rest,
+      field: ruleForm.value.field === 'header' ? `header:${header_name.trim()}` : ruleForm.value.field,
+    }
     if (editingRule.value) {
-      await api.put(`/api/v1/waf/rules/${editingRule.value.id}`, ruleForm.value)
+      await api.put(`/api/v1/waf/rules/${editingRule.value.id}`, body)
       toast.success('规则已更新')
     } else {
-      await api.post(`/api/v1/domains/${domainId.value}/waf/rules`, ruleForm.value)
+      await api.post(`/api/v1/domains/${domainId.value}/waf/rules`, body)
       toast.success('规则已创建')
     }
     ruleModalOpen.value = false
@@ -796,6 +1003,7 @@ watch(domainId, async (id) => {
   try {
     await Promise.all([loadSettings(), loadRules(), loadIps()])
     if (tab.value === 'events') await loadEvents()
+    if (tab.value === 'overview') await loadStats()
   } finally {
     loading.value = false
   }
@@ -848,6 +1056,97 @@ onMounted(reload)
   margin-left: 4px;
   font-size: 11px;
   color: var(--text-3);
+}
+
+.bar-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 150px;
+  padding: 12px 4px 0;
+  border-bottom: 1px solid var(--divider);
+}
+
+.bar-col {
+  flex: 1;
+  min-width: 8px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+}
+
+.bar {
+  width: 100%;
+  max-width: 28px;
+  background: linear-gradient(180deg, #4096ff, #1677ff);
+  border-radius: 3px 3px 0 0;
+  transition: height 0.2s ease;
+}
+
+.bar-label {
+  font-size: 10px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.waf-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.stat-list {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  min-height: 120px;
+}
+
+.stat-list-title {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-bottom: 8px;
+}
+
+.stat-list-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.stat-list-row b {
+  font-weight: 500;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-empty {
+  font-size: 12px;
+  color: var(--text-4);
+}
+
+.truncate {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.level-seg {
+  flex-wrap: wrap;
+}
+
+@media (max-width: 900px) {
+  .waf-stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .setting-row {

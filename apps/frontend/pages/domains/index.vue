@@ -229,6 +229,10 @@
           <input v-model="editForm.ssl_enabled" type="checkbox" />
           启用 HTTPS（需要有效证书）
         </label>
+        <p class="field-hint" style="margin-top: 4px">
+          开启后该域名的 HTTP 请求会 301/308 跳转到 HTTPS；跳转端口优先取
+          EDGE_HTTPS_REDIRECT_PORT，其次取 HTTPS 监听端口（443 时省略）。
+        </p>
         <p v-if="editError" class="text-danger" style="font-size: 13px">{{ editError }}</p>
       </div>
     </BaseModal>
@@ -443,9 +447,9 @@ function openEdit(d: any) {
     origin_host: d.origin_host,
     origin_port: d.origin_port,
     origin_proto: d.origin_proto,
-    backup_origin_host: '',
-    backup_origin_port: 0,
-    backup_origin_proto: 'http',
+    backup_origin_host: d.backup_origin_host || '',
+    backup_origin_port: d.backup_origin_port || 0,
+    backup_origin_proto: d.backup_origin_proto || 'http',
     ssl_enabled: !!d.ssl_enabled,
   }
   editOpen.value = true
@@ -460,14 +464,19 @@ async function saveOrigin() {
   if (!editDomain.value) return
   submitting.value = true
   try {
+    const backupHost = editForm.value.backup_origin_host.trim()
+    const backupProto = editForm.value.backup_origin_proto || 'http'
+    const backupPort = backupHost
+      ? Number(editForm.value.backup_origin_port) || (backupProto === 'https' ? 443 : 80)
+      : 0
     await api.put(`/api/v1/domains/${editDomain.value.id}`, {
       origin_host: editForm.value.origin_host.trim(),
       origin_port: Number(editForm.value.origin_port) || 80,
       origin_proto: editForm.value.origin_proto,
       ssl_enabled: editForm.value.ssl_enabled,
-      backup_origin_host: editForm.value.backup_origin_host.trim(),
-      backup_origin_port: Number(editForm.value.backup_origin_port) || 0,
-      backup_origin_proto: editForm.value.backup_origin_proto,
+      backup_origin_host: backupHost,
+      backup_origin_port: backupPort,
+      backup_origin_proto: backupProto,
     })
     editOpen.value = false
     toast.success('源站配置已保存')
