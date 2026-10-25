@@ -26,6 +26,7 @@ pub struct UserInfo {
     pub id: String,
     pub email: String,
     pub name: String,
+    pub role: String,
 }
 
 #[derive(Serialize)]
@@ -95,6 +96,7 @@ pub async fn login(
             id: user.id.to_string(),
             email: user.email,
             name: user.name,
+            role: user.role,
         },
     }))
 }
@@ -177,6 +179,7 @@ pub async fn register(
                 id: user.id.to_string(),
                 email: user.email,
                 name: user.name,
+                role: user.role,
             },
         }),
     ))
@@ -218,5 +221,6 @@ pub async fn me(
         id: user.id.to_string(),
         email: user.email,
         name: user.name,
+        role: user.role,
     }))
 }

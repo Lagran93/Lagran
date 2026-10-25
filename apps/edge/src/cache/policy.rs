@@ -1,7 +1,18 @@
-//! Cache key, TTL policy, and cache status labels
+//! Cache key, TTL/RFC-9111 policy, validators and cache status labels.
+//!
+//! Precedence for a response that is otherwise cacheable:
+//!   1. explicit path rule (`ttl_seconds > 0`)
+//!   2. `s-maxage`, then `max-age` from the origin `Cache-Control`
+//!   3. `Expires` - `Date` (or now, when `Date` is absent)
+//!   4. the domain/default TTL
+//!
+//! `no-store`, `private`, `no-cache`, `max-age=0` and non-trivial `Vary`
+//! always prevent storing, regardless of rules.
 
-use axum::http::Request;
+use axum::http::{header, HeaderMap, Method, Request};
+use lagran_cache::CacheEntry;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 /// Standard CDN-style cache status labels
@@ -45,12 +56,37 @@ impl CacheStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleAction {
+    Cache,
+    Bypass,
+    NoStore,
+}
+
+impl RuleAction {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bypass" | "no_cache" => RuleAction::Bypass,
+            "no_store" | "nostore" => RuleAction::NoStore,
+            _ => RuleAction::Cache,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleAction::Cache => "cache",
+            RuleAction::Bypass => "bypass",
+            RuleAction::NoStore => "no_store",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheRule {
     pub path_pattern: String,
     pub ttl_seconds: u64,
     pub priority: i32,
-    /// bypass | cache | no_store
+    /// cache | bypass | no_store
     pub action: String,
     /// stale-while-revalidate seconds
     pub swr_seconds: u64,
@@ -66,6 +102,35 @@ impl CacheRule {
             swr_seconds: 0,
         }
     }
+
+    pub fn action_kind(&self) -> RuleAction {
+        RuleAction::parse(&self.action)
+    }
+}
+
+/// Result of applying the matched path rule before origin headers are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedPolicy {
+    pub action: RuleAction,
+    /// `None` means "derive from origin response headers, then default TTL".
+    pub ttl_override: Option<u64>,
+    pub swr_secs: u64,
+}
+
+impl Default for ResolvedPolicy {
+    fn default() -> Self {
+        Self {
+            action: RuleAction::Cache,
+            ttl_override: None,
+            swr_secs: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheDecision {
+    pub ttl_secs: u64,
+    pub swr_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -86,30 +151,60 @@ impl RuleSet {
     }
 
     pub async fn replace(&self, mut rules: Vec<CacheRule>) {
-        rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
         *self.inner.write().await = rules;
     }
 
+    pub async fn resolve(&self, path: &str) -> Option<ResolvedPolicy> {
+        let rules = self.inner.read().await;
+        match_rule(&rules, path).map(rule_policy)
+    }
+
     pub async fn match_ttl(&self, path: &str) -> Option<u64> {
-        self.match_policy(path).await.map(|p| p.ttl_seconds)
+        self.resolve(path)
+            .await
+            .map(|p| p.ttl_override.unwrap_or(0))
     }
 
     pub async fn match_policy(&self, path: &str) -> Option<MatchedPolicy> {
         let rules = self.inner.read().await;
-        for r in rules.iter() {
-            if path_matches(&r.path_pattern, path) {
-                return Some(MatchedPolicy {
-                    ttl_seconds: r.ttl_seconds,
-                    swr_seconds: r.swr_seconds,
-                    action: r.action.clone(),
-                });
-            }
-        }
-        None
+        match_rule(&rules, path).map(|r| MatchedPolicy {
+            ttl_seconds: r.ttl_seconds,
+            swr_seconds: r.swr_seconds,
+            action: r.action.clone(),
+        })
     }
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
+/// Highest-priority rule matching `path` (ties keep the first configured rule).
+pub fn match_rule<'a>(rules: &'a [CacheRule], path: &str) -> Option<&'a CacheRule> {
+    let mut best: Option<&CacheRule> = None;
+    for r in rules {
+        if !path_matches(&r.path_pattern, path) {
+            continue;
+        }
+        match best {
+            Some(b) if b.priority >= r.priority => {}
+            _ => best = Some(r),
+        }
+    }
+    best
+}
+
+pub fn rule_policy(rule: &CacheRule) -> ResolvedPolicy {
+    ResolvedPolicy {
+        action: rule.action_kind(),
+        ttl_override: (rule.ttl_seconds > 0).then_some(rule.ttl_seconds),
+        swr_secs: rule.swr_seconds,
+    }
+}
+
+/// Resolve the effective policy for `path` from a domain's rule list.
+pub fn resolve_rule_policy(rules: &[CacheRule], path: &str) -> ResolvedPolicy {
+    match_rule(rules, path).map(rule_policy).unwrap_or_default()
+}
+
+pub fn path_matches(pattern: &str, path: &str) -> bool {
     if pattern == "/*" || pattern == "*" {
         return true;
     }
@@ -121,7 +216,168 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
         return path.starts_with(prefix);
     }
-    path == pattern
+    pattern == path
+}
+
+#[derive(Debug, Default)]
+struct CacheControl {
+    no_store: bool,
+    no_cache: bool,
+    private: bool,
+    s_maxage: Option<u64>,
+    max_age: Option<u64>,
+    swr: Option<u64>,
+}
+
+fn parse_cache_control(value: &str) -> CacheControl {
+    let mut cc = CacheControl::default();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (name, val) = match part.split_once('=') {
+            Some((n, v)) => (
+                n.trim().to_ascii_lowercase(),
+                Some(v.trim().trim_matches('"')),
+            ),
+            None => (part.to_ascii_lowercase(), None),
+        };
+        match name.as_str() {
+            "no-store" => cc.no_store = true,
+            "no-cache" => cc.no_cache = true,
+            "private" => cc.private = true,
+            "s-maxage" => cc.s_maxage = val.and_then(|v| v.parse().ok()),
+            "max-age" => cc.max_age = val.and_then(|v| v.parse().ok()),
+            "stale-while-revalidate" => cc.swr = val.and_then(|v| v.parse().ok()),
+            _ => {}
+        }
+    }
+    cc
+}
+
+pub fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// Whether a status code can be stored at all.
+pub fn status_is_cacheable(status: u16) -> bool {
+    matches!(status, 200 | 203 | 204 | 300 | 301 | 308)
+}
+
+/// `Vary` is only safe for us when it solely names `accept-encoding`
+/// (we force identity encoding towards the origin).
+fn vary_allows_storage(vary: Option<&str>) -> bool {
+    match vary {
+        None => true,
+        Some(v) => {
+            let fields: Vec<&str> = v
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            fields.iter().all(|f| {
+                f.eq_ignore_ascii_case("accept-encoding")
+                    || f.eq_ignore_ascii_case("accept-language")
+            })
+        }
+    }
+}
+
+fn expires_ttl(headers: &[(String, String)]) -> Option<u64> {
+    let expires = httpdate::parse_http_date(header_value(headers, "expires")?).ok()?;
+    let now = header_value(headers, "date")
+        .and_then(|d| httpdate::parse_http_date(d).ok())
+        .unwrap_or_else(SystemTime::now);
+    Some(
+        expires
+            .duration_since(now)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+}
+
+/// Decide the TTL for a response, or `None` when it must not be stored.
+pub fn decide_storage(
+    status: u16,
+    headers: &[(String, String)],
+    policy: ResolvedPolicy,
+    default_ttl_secs: u64,
+) -> Option<CacheDecision> {
+    if !status_is_cacheable(status) {
+        return None;
+    }
+    if !vary_allows_storage(header_value(headers, "vary")) {
+        return None;
+    }
+
+    let cc = header_value(headers, "cache-control")
+        .map(parse_cache_control)
+        .unwrap_or_default();
+    if cc.no_store || cc.private || cc.no_cache {
+        return None;
+    }
+
+    let origin_ttl = cc.s_maxage.or(cc.max_age).or_else(|| expires_ttl(headers));
+
+    // Explicit rule TTL wins over the origin; otherwise honour the origin.
+    let ttl = match policy.ttl_override {
+        Some(t) => t,
+        None => origin_ttl.unwrap_or(default_ttl_secs),
+    };
+    if ttl == 0 {
+        return None;
+    }
+
+    let swr = if policy.swr_secs > 0 {
+        policy.swr_secs
+    } else {
+        cc.swr.unwrap_or(0)
+    };
+
+    Some(CacheDecision {
+        ttl_secs: ttl,
+        swr_secs: swr,
+    })
+}
+
+pub fn request_method_cacheable(method: &Method) -> bool {
+    method == Method::GET || method == Method::HEAD
+}
+
+/// Requests whose responses must never be served from / stored in the shared
+/// cache: authenticated or personalised traffic, conditional-range probes, and
+/// explicit `no-cache`/`no-store` from the client.
+pub fn request_bypasses_cache<B>(req: &Request<B>) -> bool {
+    if req.headers().contains_key(header::AUTHORIZATION)
+        || req.headers().contains_key(header::COOKIE)
+        || req.headers().contains_key(header::RANGE)
+    {
+        return true;
+    }
+    if let Some(cc) = req
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+    {
+        let cc = cc.to_ascii_lowercase();
+        if cc.contains("no-store") || cc.contains("no-cache") || cc.contains("max-age=0") {
+            return true;
+        }
+    }
+    if let Some(p) = req
+        .headers()
+        .get(header::PRAGMA)
+        .and_then(|v| v.to_str().ok())
+    {
+        if p.eq_ignore_ascii_case("no-cache") {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn cache_key<B>(req: &Request<B>) -> String {
@@ -129,7 +385,11 @@ pub fn cache_key<B>(req: &Request<B>) -> String {
 }
 
 pub fn cache_key_opts<B>(req: &Request<B>, ignore_query: bool) -> String {
-    let method = req.method().as_str();
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
     let path = if ignore_query {
         req.uri().path().to_string()
     } else {
@@ -138,37 +398,323 @@ pub fn cache_key_opts<B>(req: &Request<B>, ignore_query: bool) -> String {
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string())
     };
-    let host = req
-        .headers()
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
+    cache_key_for(req.method(), host, &path)
+}
+
+/// Stable cache key: `METHOD:host:path[?query]` (host lowercased, port stripped).
+pub fn cache_key_for(method: &Method, host: &str, path: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.split_once(']').map(|(ip, _)| ip))
+        .unwrap_or(&host);
     let host = host.split(':').next().unwrap_or(host);
-    format!("{method}:{host}:{path}")
+    format!("{}:{}:{}", method.as_str(), host, path)
 }
 
-pub fn is_cacheable<B>(req: &Request<B>) -> bool {
-    req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD
+// ---- validators -----------------------------------------------------------
+
+/// FNV-1a 64-bit: stable across processes and Rust releases (unlike DefaultHasher).
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
-/// Respect request Cache-Control: no-cache / no-store
-pub fn request_bypasses_cache<B>(req: &Request<B>) -> bool {
-    if let Some(cc) = req
-        .headers()
-        .get("cache-control")
-        .and_then(|v| v.to_str().ok())
-    {
-        let cc = cc.to_ascii_lowercase();
-        if cc.contains("no-store") || cc.contains("no-cache") || cc.contains("max-age=0") {
+pub fn stable_hash_str(s: &str) -> u64 {
+    fnv1a64(s.as_bytes())
+}
+
+const ETAG_FULL_LIMIT: usize = 64 * 1024;
+
+/// Strong validator over the representation. Large bodies hash their ends plus
+/// the length so hashing stays O(1)-ish per request.
+pub fn compute_etag(entry: &CacheEntry) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let body = &entry.body;
+    let chunk = if body.len() <= ETAG_FULL_LIMIT {
+        &body[..]
+    } else {
+        &body[..32 * 1024]
+    };
+    for b in chunk {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if body.len() > ETAG_FULL_LIMIT {
+        let tail = &body[body.len() - 32 * 1024..];
+        for b in tail {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h ^= entry.status as u64;
+    h ^= (body.len() as u64).rotate_left(17);
+    format!("\"{h:016x}\"")
+}
+
+pub fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    let target = normalize_etag(etag);
+    for candidate in if_none_match.split(',') {
+        let candidate = candidate.trim();
+        if candidate == "*" {
+            return true;
+        }
+        if normalize_etag(candidate) == target {
             return true;
         }
     }
-    if req.headers().contains_key("pragma") {
-        if let Some(p) = req.headers().get("pragma").and_then(|v| v.to_str().ok()) {
-            if p.eq_ignore_ascii_case("no-cache") {
-                return true;
-            }
+    false
+}
+
+fn normalize_etag(s: &str) -> &str {
+    let s = s.trim();
+    s.strip_prefix("W/").unwrap_or(s).trim_matches('"')
+}
+
+// ---- helpers used by the proxy handler ------------------------------------
+
+/// Remove hop-by-hop / connection-managed headers before forwarding either way.
+pub fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// Headers that must not be replayed from a cached response.
+pub fn is_uncacheable_header(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "set-cookie"
+        || n == "set-cookie2"
+        || n == "content-length"
+        || n == "age"
+        || n == "date"
+        || n == "etag"
+        || is_hop_by_hop(&n)
+}
+
+/// Response headers that are dropped when proxying back to the client.
+pub fn strip_response_headers(headers: &mut HeaderMap) {
+    let names: Vec<String> = headers
+        .keys()
+        .filter(|k| {
+            let n = k.as_str().to_ascii_lowercase();
+            is_hop_by_hop(&n) || n == "content-length"
+        })
+        .map(|k| k.as_str().to_string())
+        .collect();
+    for n in names {
+        if let Ok(name) = axum::http::HeaderName::from_bytes(n.as_bytes()) {
+            headers.remove(name);
         }
     }
-    false
+}
+
+pub fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn secs_until_epoch(epoch: u64) -> u64 {
+    epoch.saturating_sub(now_epoch_secs())
+}
+
+pub fn duration_secs(d: Duration) -> u64 {
+    d.as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn rule(path: &str, ttl: u64, priority: i32, action: &str, swr: u64) -> CacheRule {
+        CacheRule {
+            path_pattern: path.into(),
+            ttl_seconds: ttl,
+            priority,
+            action: action.into(),
+            swr_seconds: swr,
+        }
+    }
+
+    #[test]
+    fn path_matching_variants() {
+        assert!(path_matches("/*", "/anything"));
+        assert!(path_matches("/static/*", "/static/a.js"));
+        assert!(path_matches("/static/*", "/static"));
+        assert!(path_matches("/img*", "/img/x.png"));
+        assert!(path_matches("/imag*", "/images/x.png"));
+        assert!(!path_matches("/img*", "/other"));
+        assert!(path_matches("/exact", "/exact"));
+        assert!(!path_matches("/exact", "/exact2"));
+    }
+
+    #[test]
+    fn rule_priority_and_action() {
+        let rules = vec![
+            rule("/*", 60, 0, "cache", 0),
+            rule("/api/*", 0, 10, "bypass", 0),
+        ];
+        let p = resolve_rules(&rules, "/api/users");
+        assert_eq!(p.action, RuleAction::Bypass);
+        assert_eq!(p.ttl_override, None);
+
+        let p = resolve_rules(&rules, "/img/a.png");
+        assert_eq!(p.action, RuleAction::Cache);
+        assert_eq!(p.ttl_override, Some(60));
+    }
+
+    fn resolve_rules(rules: &[CacheRule], path: &str) -> ResolvedPolicy {
+        match_rule(rules, path).map(rule_policy).unwrap_or_default()
+    }
+
+    fn hdrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn origin_max_age_used_when_no_rule() {
+        let d = decide_storage(
+            200,
+            &hdrs(&[(
+                "Cache-Control",
+                "public, max-age=120, stale-while-revalidate=30",
+            )]),
+            ResolvedPolicy::default(),
+            60,
+        )
+        .unwrap();
+        assert_eq!(d.ttl_secs, 120);
+        assert_eq!(d.swr_secs, 30);
+    }
+
+    #[test]
+    fn s_maxage_wins_over_max_age() {
+        let d = decide_storage(
+            200,
+            &hdrs(&[("cache-control", "max-age=10, s-maxage=300")]),
+            ResolvedPolicy::default(),
+            60,
+        )
+        .unwrap();
+        assert_eq!(d.ttl_secs, 300);
+    }
+
+    #[test]
+    fn rule_ttl_overrides_origin() {
+        let policy = ResolvedPolicy {
+            action: RuleAction::Cache,
+            ttl_override: Some(5),
+            swr_secs: 10,
+        };
+        let d =
+            decide_storage(200, &hdrs(&[("cache-control", "max-age=600")]), policy, 60).unwrap();
+        assert_eq!(d.ttl_secs, 5);
+        assert_eq!(d.swr_secs, 10);
+    }
+
+    #[test]
+    fn no_store_private_no_cache_block_storage() {
+        let policy = ResolvedPolicy::default();
+        for cc in ["no-store", "private", "no-cache", "max-age=0"] {
+            assert!(
+                decide_storage(200, &hdrs(&[("cache-control", cc)]), policy, 60).is_none(),
+                "{cc} must not be cached"
+            );
+        }
+    }
+
+    #[test]
+    fn vary_blocks_unless_encoding_only() {
+        let policy = ResolvedPolicy::default();
+        assert!(decide_storage(200, &hdrs(&[("vary", "Accept-Encoding")]), policy, 60).is_some());
+        assert!(decide_storage(200, &hdrs(&[("vary", "User-Agent")]), policy, 60).is_none());
+    }
+
+    #[test]
+    fn expires_is_used_as_fallback() {
+        let expires = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(90));
+        let d = decide_storage(
+            200,
+            &hdrs(&[("expires", &expires)]),
+            ResolvedPolicy::default(),
+            60,
+        )
+        .unwrap();
+        assert!(d.ttl_secs >= 85 && d.ttl_secs <= 90, "got {}", d.ttl_secs);
+    }
+
+    #[test]
+    fn uncacheable_status_and_empty_ttl() {
+        assert!(decide_storage(404, &[], ResolvedPolicy::default(), 60).is_none());
+        assert!(decide_storage(200, &[], ResolvedPolicy::default(), 0).is_none());
+    }
+
+    #[test]
+    fn etag_stability_and_matching() {
+        let e1 = CacheEntry::new(200, vec![], Bytes::from_static(b"hello world"));
+        let e2 = CacheEntry::new(200, vec![], Bytes::from_static(b"hello world"));
+        assert_eq!(compute_etag(&e1), compute_etag(&e2));
+        let tag = compute_etag(&e1);
+        assert!(etag_matches(&tag, &tag));
+        assert!(etag_matches(&format!("W/{tag}"), &tag));
+        assert!(etag_matches(&format!("\"other\", {tag}"), &tag));
+        assert!(etag_matches("*", &tag));
+        assert!(!etag_matches("\"nope\"", &tag));
+    }
+
+    #[test]
+    fn request_cacheability_rules() {
+        let plain = Request::builder()
+            .uri("http://cdn.test/a.js")
+            .body(())
+            .unwrap();
+        assert!(request_method_cacheable(plain.method()));
+        assert!(!request_bypasses_cache(&plain));
+
+        for (name, value) in [
+            ("authorization", "Bearer x"),
+            ("cookie", "sid=1"),
+            ("range", "bytes=0-10"),
+            ("cache-control", "no-store"),
+        ] {
+            let req = Request::builder()
+                .uri("http://cdn.test/a.js")
+                .header(name, value)
+                .body(())
+                .unwrap();
+            assert!(request_bypasses_cache(&req), "{name} should bypass");
+        }
+    }
+
+    #[test]
+    fn cache_key_normalizes_host_and_includes_method() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://CDN.Example:8080/a/b?x=1")
+            .header("host", "CDN.Example:8080")
+            .body(())
+            .unwrap();
+        assert_eq!(cache_key(&req), "GET:cdn.example:/a/b?x=1");
+        assert_eq!(cache_key_opts(&req, true), "GET:cdn.example:/a/b");
+    }
 }

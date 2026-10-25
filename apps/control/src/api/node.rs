@@ -1,10 +1,13 @@
 //! Edge node management
+
 use crate::middleware::agent_auth::AgentAuth;
+use crate::middleware::authz::Actor;
 
 use crate::repository;
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -37,9 +40,26 @@ pub struct HeartbeatResponse {
     pub message: String,
 }
 
-pub async fn list(State(state): State<AppState>) -> Json<Vec<NodeDto>> {
+#[derive(Serialize)]
+pub struct ErrorBody {
+    pub error: String,
+}
+
+/// Node inventory (including agent URLs) is infrastructure data: admin only.
+pub async fn list(
+    State(state): State<AppState>,
+    actor: Actor,
+) -> Result<Json<Vec<NodeDto>>, (StatusCode, Json<ErrorBody>)> {
+    if !actor.admin() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "admin only".into(),
+            }),
+        ));
+    }
     match repository::list_nodes(&state.pool).await {
-        Ok(rows) => Json(
+        Ok(rows) => Ok(Json(
             rows.into_iter()
                 .map(|r| NodeDto {
                     id: r.id.to_string(),
@@ -51,10 +71,10 @@ pub async fn list(State(state): State<AppState>) -> Json<Vec<NodeDto>> {
                     agent_url: r.agent_url,
                 })
                 .collect(),
-        ),
+        )),
         Err(e) => {
             tracing::error!(error = %e, "list nodes");
-            Json(vec![])
+            Ok(Json(vec![]))
         }
     }
 }

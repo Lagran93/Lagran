@@ -1,6 +1,6 @@
 //! Certificate auto-issuance (dev: rcgen; challenge fan-out to edges)
 
-use crate::middleware::AuthUser;
+use crate::middleware::authz::Actor;
 use crate::repository;
 use crate::state::AppState;
 use axum::{
@@ -52,7 +52,7 @@ fn http_client() -> &'static Client<HttpConnector, Full<Bytes>> {
 
 pub async fn issue(
     State(state): State<AppState>,
-    _user: AuthUser,
+    actor: Actor,
     Json(req): Json<IssueRequest>,
 ) -> Result<Json<IssueResponse>, (StatusCode, Json<ErrorBody>)> {
     if req.domain_name.is_empty() {
@@ -60,6 +60,17 @@ pub async fn issue(
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
                 error: "domain_name required".into(),
+            }),
+        ));
+    }
+    if !actor
+        .can_write_domain_name(&state, req.domain_name.trim())
+        .await
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "forbidden".into(),
             }),
         ));
     }
@@ -131,7 +142,16 @@ pub async fn issue(
                 "cert_pem": cert_pem,
                 "key_pem": key_pem,
             });
-            if request_json(http_client(), "POST", &url, &body, &state.config.agent_token).await.is_ok() {
+            if request_json(
+                http_client(),
+                "POST",
+                &url,
+                &body,
+                &state.config.agent_token,
+            )
+            .await
+            .is_ok()
+            {
                 edges_pushed += 1;
             }
         }

@@ -1,6 +1,6 @@
 //! Cache warm / prefetch tasks
 
-use crate::middleware::AuthUser;
+use crate::middleware::authz::Actor;
 use crate::repository;
 use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, Json};
@@ -33,9 +33,18 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+fn forbidden() -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            error: "forbidden".into(),
+        }),
+    )
+}
+
 pub async fn create(
     State(state): State<AppState>,
-    user: AuthUser,
+    actor: Actor,
     Json(req): Json<PrefetchRequest>,
 ) -> Result<Json<PrefetchResponse>, (StatusCode, Json<ErrorBody>)> {
     if req.domain.is_empty() || req.paths.is_empty() {
@@ -45,6 +54,9 @@ pub async fn create(
                 error: "domain and paths required".into(),
             }),
         ));
+    }
+    if !actor.can_write_domain_name(&state, &req.domain).await {
+        return Err(forbidden());
     }
     let mut ids = Vec::new();
     for path in &req.paths {
@@ -60,7 +72,7 @@ pub async fn create(
     }
     let _ = repository::insert_audit(
         &state.pool,
-        &user.0.email,
+        &actor.email,
         "prefetch",
         &req.domain,
         &format!("{} paths", ids.len()),
@@ -73,15 +85,32 @@ pub async fn create(
     }))
 }
 
-pub async fn list(
-    State(state): State<AppState>,
-    _user: AuthUser,
-) -> Json<Vec<PrefetchTaskDto>> {
+pub async fn list(State(state): State<AppState>, actor: Actor) -> Json<Vec<PrefetchTaskDto>> {
     let rows = repository::list_prefetch(&state.pool, 50)
         .await
         .unwrap_or_default();
+    let visible = actor.visible_domain_ids(&state).await;
+    let visible_names: Option<std::collections::HashSet<String>> = match visible {
+        None => None,
+        Some(ids) => {
+            let rows = repository::list_domains(&state.pool)
+                .await
+                .unwrap_or_default();
+            Some(
+                rows.into_iter()
+                    .filter(|d| ids.contains(&d.id))
+                    .map(|d| d.name)
+                    .collect(),
+            )
+        }
+    };
+
     Json(
         rows.into_iter()
+            .filter(|(_, domain, _, _, _)| match &visible_names {
+                None => true,
+                Some(names) => names.contains(domain),
+            })
             .map(|(id, domain, url_path, status, message)| PrefetchTaskDto {
                 id: id.to_string(),
                 domain,

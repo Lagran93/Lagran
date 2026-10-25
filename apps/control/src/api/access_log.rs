@@ -1,7 +1,7 @@
-//! Visitor access logs
+//! Visitor access logs (agent ingest + tenant-filtered read)
 
 use crate::middleware::agent_auth::AgentAuth;
-use crate::middleware::AuthUser;
+use crate::middleware::authz::Actor;
 use crate::repository;
 use crate::state::AppState;
 use axum::{
@@ -9,6 +9,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Deserialize)]
 pub struct AccessEntryIn {
@@ -91,15 +92,43 @@ pub async fn report(
 
 pub async fn list(
     State(state): State<AppState>,
-    _user: AuthUser,
+    actor: Actor,
     Query(q): Query<ListQuery>,
 ) -> Json<Vec<AccessLogDto>> {
+    // Non-admins only see hosts that belong to their projects.
+    let visible_hosts: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
+        None => None,
+        Some(ids) => {
+            let rows = repository::list_domains(&state.pool)
+                .await
+                .unwrap_or_default();
+            Some(
+                rows.into_iter()
+                    .filter(|d| ids.contains(&d.id))
+                    .map(|d| d.name)
+                    .collect(),
+            )
+        }
+    };
+
+    if let Some(ref hosts) = visible_hosts {
+        if let Some(ref h) = q.host {
+            if !hosts.contains(h) {
+                return Json(vec![]);
+            }
+        }
+    }
+
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let rows = repository::list_access_logs(&state.pool, q.host.as_deref(), limit)
         .await
         .unwrap_or_default();
     Json(
         rows.into_iter()
+            .filter(|r| match &visible_hosts {
+                None => true,
+                Some(hosts) => hosts.contains(&r.host),
+            })
             .map(|r| AccessLogDto {
                 id: r.id,
                 ts: r.ts.to_rfc3339(),

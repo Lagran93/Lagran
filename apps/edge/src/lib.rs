@@ -6,3 +6,4 @@ pub mod config;
 pub mod metrics;
 pub mod origin;
 pub mod server;
+pub mod waf;

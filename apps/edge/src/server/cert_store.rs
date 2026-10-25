@@ -1,6 +1,6 @@
 //! Hot-reloadable multi-cert store with SNI resolution + disk persistence
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::CertificateDer;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
@@ -90,7 +90,7 @@ impl CertStore {
             // name from filename: example.com.crt → example.com
             // also support wildcard files written as _star_.example.com
             let name = stem.replace("_star_", "*");
-            match self.upsert_memory(&[name.clone()], &cert_pem, &key_pem) {
+            match self.upsert_memory(std::slice::from_ref(&name), &cert_pem, &key_pem) {
                 Ok(()) => {
                     tracing::info!(server_name = %name, "cert loaded from disk");
                     count += 1;
@@ -199,7 +199,6 @@ fn parse_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, 
         .map_err(|e| format!("parse key: {e}"))?
         .ok_or_else(|| "no private key in PEM".to_string())?;
 
-    let key = PrivateKeyDer::from(key);
     let provider = rustls::crypto::ring::default_provider();
     let signing_key = provider
         .key_provider
@@ -207,4 +206,10 @@ fn parse_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, 
         .map_err(|e| format!("load private key: {e}"))?;
 
     Ok(CertifiedKey::new(certs, signing_key))
+}
+
+impl Default for CertStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }

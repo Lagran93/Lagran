@@ -1,17 +1,18 @@
 //! Sync all accelerated domains + rules from control plane
+//!
+//! Runs every 15s, sends the agent token, and follows the control plane's
+//! aggregate version so unchanged config is not re-applied.
 
+use crate::agent::ControlClient;
 use crate::cache::policy::{CacheRule, RuleSet};
 use crate::config::registry::{DomainEntry, DomainRegistry};
 use crate::config::EdgeConfig;
 use crate::origin::OriginClient;
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::Request;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use crate::waf::{IpNet, ManagedRules, WafAction, WafConfig, WafField, WafMode, WafOp, WafRule};
 use serde::Deserialize;
 use std::time::Duration;
+
+const SYNC_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Deserialize)]
 struct OriginCfg {
@@ -29,6 +30,18 @@ struct RuleCfg {
     action: Option<String>,
     #[serde(default)]
     swr_seconds: Option<u64>,
+}
+
+impl RuleCfg {
+    fn into_rule(self) -> CacheRule {
+        CacheRule {
+            path_pattern: self.path_pattern,
+            ttl_seconds: self.ttl_seconds,
+            priority: self.priority,
+            action: self.action.unwrap_or_else(|| "cache".into()),
+            swr_seconds: self.swr_seconds.unwrap_or(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,7 +68,158 @@ struct DomainCfg {
     custom_headers: String,
     #[serde(default)]
     backup_origin: Option<OriginCfg>,
+    #[serde(default)]
+    waf: Option<WafCfg>,
     version: String,
+}
+
+impl DomainCfg {
+    fn into_entry(self) -> DomainEntry {
+        let origin_url = format_origin(&self.origin);
+        let backup_origin_url = self
+            .backup_origin
+            .as_ref()
+            .map(format_origin)
+            .unwrap_or_default();
+        DomainEntry {
+            domain: self.domain,
+            origin_url,
+            rules: self.rules.into_iter().map(RuleCfg::into_rule).collect(),
+            version: self.version,
+            rate_limit_rps: self.rate_limit_rps,
+            rate_limit_burst: self.rate_limit_burst,
+            ignore_query_string: self.ignore_query_string,
+            cors_origins: self.cors_origins,
+            hotlink_allow_referers: self.hotlink_allow_referers,
+            origin_timeout_ms: if self.origin_timeout_ms == 0 {
+                10_000
+            } else {
+                self.origin_timeout_ms
+            },
+            custom_headers: self.custom_headers,
+            backup_origin_url,
+            waf: into_waf(self.waf),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct WafCfg {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    managed: WafManagedCfg,
+    #[serde(default)]
+    rules: Vec<WafRuleCfg>,
+    #[serde(default)]
+    ip_allow: Vec<String>,
+    #[serde(default)]
+    ip_deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WafManagedCfg {
+    #[serde(default = "default_true")]
+    sqli: bool,
+    #[serde(default = "default_true")]
+    xss: bool,
+    #[serde(default = "default_true")]
+    traversal: bool,
+    #[serde(default = "default_true")]
+    scanners: bool,
+}
+
+impl Default for WafManagedCfg {
+    fn default() -> Self {
+        Self {
+            sqli: true,
+            xss: true,
+            traversal: true,
+            scanners: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct WafRuleCfg {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    field: String,
+    #[serde(default)]
+    operator: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn into_waf(cfg: Option<WafCfg>) -> WafConfig {
+    let Some(cfg) = cfg else {
+        return WafConfig::default();
+    };
+    let rules = cfg
+        .rules
+        .into_iter()
+        .filter_map(|r| {
+            let field = WafField::parse(&r.field)?;
+            let op = WafOp::parse(&r.operator)?;
+            let action = match r.action.trim().to_ascii_lowercase().as_str() {
+                "allow" => WafAction::Allow,
+                "log" => WafAction::Log,
+                _ => WafAction::Block,
+            };
+            Some(WafRule {
+                name: if r.name.is_empty() {
+                    "custom rule".into()
+                } else {
+                    r.name
+                },
+                field,
+                op,
+                value: r.value.to_ascii_lowercase(),
+                action,
+                priority: r.priority,
+                enabled: r.enabled,
+            })
+        })
+        .collect();
+
+    WafConfig {
+        enabled: cfg.enabled,
+        mode: if cfg.mode.eq_ignore_ascii_case("monitor") {
+            WafMode::Monitor
+        } else {
+            WafMode::Block
+        },
+        managed: ManagedRules {
+            sqli: cfg.managed.sqli,
+            xss: cfg.managed.xss,
+            traversal: cfg.managed.traversal,
+            scanners: cfg.managed.scanners,
+        },
+        rules,
+        ip_allow: parse_nets(cfg.ip_allow),
+        ip_deny: parse_nets(cfg.ip_deny),
+    }
+}
+
+fn parse_nets(entries: Vec<String>) -> Vec<IpNet> {
+    entries.iter().filter_map(|s| IpNet::parse(s)).collect()
+}
+
+fn format_origin(o: &OriginCfg) -> String {
+    format!("{}://{}:{}", o.protocol, o.host, o.port)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,70 +230,39 @@ struct AllConfig {
 
 pub fn spawn_config_sync(
     config: EdgeConfig,
+    control: ControlClient,
     origin: OriginClient,
     rules: RuleSet,
     registry: DomainRegistry,
 ) {
     tokio::spawn(async move {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        let client: Client<HttpConnector, Full<Bytes>> =
-            Client::builder(TokioExecutor::new()).build(connector);
-
-        let url = format!(
-            "{}/api/v1/config",
-            config.control_url.trim_end_matches('/')
-        );
-        tracing::info!(%url, "domain registry sync started");
-
+        tracing::info!(url = %control.endpoint("/api/v1/config"), "domain registry sync started");
         let mut last_version = String::new();
+
         loop {
-            match fetch_all(&client, &url).await {
+            match control.get_json::<AllConfig>("/api/v1/config").await {
                 Ok(cfg) => {
                     if cfg.version != last_version {
-                        let mut entries = Vec::new();
-                        let mut global_rules = Vec::new();
-                        for d in cfg.domains {
-                            let origin_url = format!(
-                                "{}://{}:{}",
-                                d.origin.protocol, d.origin.host, d.origin.port
-                            );
-                            let mapped: Vec<CacheRule> = d
-                                .rules
-                                .iter()
-                                .map(|r| CacheRule {
-                                    path_pattern: r.path_pattern.clone(),
-                                    ttl_seconds: r.ttl_seconds,
-                                    priority: r.priority,
-                                    action: r.action.clone().unwrap_or_else(|| "cache".into()),
-                                    swr_seconds: r.swr_seconds.unwrap_or(0),
-                                })
-                                .collect();
-                            global_rules.extend(mapped.clone());
-                            entries.push(DomainEntry {
-                                domain: d.domain.clone(),
-                                origin_url: origin_url.clone(),
-                                rules: mapped,
-                                version: d.version,
-                                rate_limit_rps: d.rate_limit_rps,
-                                rate_limit_burst: d.rate_limit_burst,
-                                ignore_query_string: d.ignore_query_string,
-                                cors_origins: d.cors_origins.clone(),
-                                hotlink_allow_referers: d.hotlink_allow_referers.clone(),
-                                origin_timeout_ms: if d.origin_timeout_ms == 0 { 10000 } else { d.origin_timeout_ms },
-                                custom_headers: d.custom_headers.clone(),
-                                backup_origin_url: d.backup_origin.as_ref().map(|o| {
-                                    format!("{}://{}:{}", o.protocol, o.host, o.port)
-                                }).unwrap_or_default(),
-                            });
-                        }
+                        let entries: Vec<DomainEntry> =
+                            cfg.domains.into_iter().map(DomainCfg::into_entry).collect();
                         let n = entries.len();
-                        registry.replace_all(entries, cfg.version.clone()).await;
-                        rules.replace(global_rules).await;
+                        registry
+                            .replace_all(entries.clone(), cfg.version.clone())
+                            .await;
+                        // Global rule set is only a legacy single-domain fallback,
+                        // so keep the union but never use it for onboarded hosts.
+                        rules
+                            .replace(
+                                entries
+                                    .iter()
+                                    .flat_map(|e| e.rules.iter().cloned())
+                                    .collect(),
+                            )
+                            .await;
 
                         if !config.domain.is_empty() {
                             if let Some(d) = registry.get(&config.domain).await {
-                                origin.set_base_url(d.origin_url).await;
+                                origin.set_base_url(d.origin_url.clone()).await;
                             }
                         }
 
@@ -140,101 +273,21 @@ pub fn spawn_config_sync(
                 Err(e) => tracing::warn!(error = %e, "config sync failed"),
             }
 
-            // Single-domain fallback if EDGE_DOMAIN set and registry empty
-            if !config.domain.is_empty() && registry.len().await == 0 {
-                let single = format!(
-                    "{}/api/v1/config/{}",
-                    config.control_url.trim_end_matches('/'),
-                    config.domain
-                );
-                if let Ok(d) = fetch_one(&client, &single).await {
-                    let origin_url =
-                        format!("{}://{}:{}", d.origin.protocol, d.origin.host, d.origin.port);
-                    origin.set_base_url(origin_url.clone()).await;
-                    let mapped: Vec<CacheRule> = d
-                        .rules
-                        .into_iter()
-                        .map(|r| CacheRule {
-                            path_pattern: r.path_pattern,
-                            ttl_seconds: r.ttl_seconds,
-                            priority: r.priority,
-                            action: r.action.unwrap_or_else(|| "cache".into()),
-                            swr_seconds: r.swr_seconds.unwrap_or(0),
-                        })
-                        .collect();
-                    rules.replace(mapped.clone()).await;
-                    registry
-                        .upsert(DomainEntry {
-                            domain: d.domain,
-                            origin_url,
-                            rules: mapped,
-                            version: d.version,
-                            rate_limit_rps: d.rate_limit_rps,
-                            rate_limit_burst: d.rate_limit_burst,
-                                ignore_query_string: d.ignore_query_string,
-                                cors_origins: d.cors_origins.clone(),
-                                hotlink_allow_referers: d.hotlink_allow_referers.clone(),
-                                origin_timeout_ms: if d.origin_timeout_ms == 0 { 10000 } else { d.origin_timeout_ms },
-                                custom_headers: d.custom_headers.clone(),
-                                backup_origin_url: d.backup_origin.as_ref().map(|o| {
-                                    format!("{}://{}:{}", o.protocol, o.host, o.port)
-                                }).unwrap_or_default(),
-                        })
-                        .await;
+            // Single-domain fallback if EDGE_DOMAIN is set and the registry is empty.
+            if !config.domain.is_empty() && registry.is_empty().await {
+                let path = format!("/api/v1/config/{}", config.domain);
+                match control.get_json::<DomainCfg>(&path).await {
+                    Ok(d) => {
+                        let entry = d.into_entry();
+                        origin.set_base_url(entry.origin_url.clone()).await;
+                        rules.replace(entry.rules.clone()).await;
+                        registry.upsert(entry).await;
+                    }
+                    Err(e) => tracing::debug!(error = %e, "single-domain config fetch failed"),
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            tokio::time::sleep(SYNC_INTERVAL).await;
         }
     });
-}
-
-async fn fetch_all(
-    client: &Client<HttpConnector, Full<Bytes>>,
-    url: &str,
-) -> Result<AllConfig, String> {
-    let req = Request::builder()
-        .method("GET")
-        .uri(url)
-        .body(Full::new(Bytes::new()))
-        .map_err(|e| e.to_string())?;
-    let resp = client.request(req).await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body = resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| e.to_string())?
-        .to_bytes();
-    if !status.is_success() {
-        return Err(format!(
-            "HTTP {}: {}",
-            status,
-            String::from_utf8_lossy(&body)
-        ));
-    }
-    serde_json::from_slice(&body).map_err(|e| e.to_string())
-}
-
-async fn fetch_one(
-    client: &Client<HttpConnector, Full<Bytes>>,
-    url: &str,
-) -> Result<DomainCfg, String> {
-    let req = Request::builder()
-        .method("GET")
-        .uri(url)
-        .body(Full::new(Bytes::new()))
-        .map_err(|e| e.to_string())?;
-    let resp = client.request(req).await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body = resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| e.to_string())?
-        .to_bytes();
-    if !status.is_success() {
-        return Err(format!("HTTP {status}"));
-    }
-    serde_json::from_slice(&body).map_err(|e| e.to_string())
 }

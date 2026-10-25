@@ -8,21 +8,22 @@ pub mod cert;
 pub mod config;
 pub mod domain;
 pub mod health;
+pub mod health_origin;
 pub mod metrics;
 pub mod node;
 pub mod prefetch;
 pub mod project;
 pub mod purge;
-pub mod health_origin;
 pub mod rule;
 pub mod stats;
+pub mod waf;
 
 use crate::state::AppState;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde_json::json;
@@ -46,34 +47,58 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/auth/register", post(auth::register))
                 .route("/auth/me", get(auth::me))
                 .route("/projects", get(project::list).post(project::create))
-                .route(
-                    "/projects/:id",
-                    get(project::get).delete(project::delete),
-                )
+                .route("/projects/:id", get(project::get).delete(project::delete))
                 .route("/projects/:id/domains", get(project::list_domains))
+                .route(
+                    "/projects/:id/members",
+                    get(project::list_members).post(project::add_member),
+                )
+                .route(
+                    "/projects/:id/members/:user_id",
+                    delete(project::remove_member),
+                )
                 .route("/domains", get(domain::list).post(domain::create))
                 .route("/origin-health", get(health_origin::list))
                 .route("/origin-health/report", post(health_origin::report))
                 .route(
                     "/domains/:id",
-                    get(domain::get)
-                        .put(domain::update)
-                        .delete(domain::delete),
+                    get(domain::get).put(domain::update).delete(domain::delete),
                 )
-                .route("/domains/:id/settings", get(domain::get_settings).put(domain::put_settings))
+                .route(
+                    "/domains/:id/settings",
+                    get(domain::get_settings).put(domain::put_settings),
+                )
                 .route("/domains/:id/status", post(domain::set_status))
                 .route("/rules", get(rule::list).post(rule::create))
-                .route("/rules/:id", axum::routing::delete(rule::delete))
+                .route("/rules/:id", delete(rule::delete))
+                .route(
+                    "/domains/:id/waf",
+                    get(waf::get_settings).put(waf::put_settings),
+                )
+                .route(
+                    "/domains/:id/waf/rules",
+                    get(waf::list_rules).post(waf::create_rule),
+                )
+                .route(
+                    "/waf/rules/:id",
+                    put(waf::update_rule).delete(waf::delete_rule),
+                )
+                .route(
+                    "/domains/:id/waf/ips",
+                    get(waf::list_ips).post(waf::create_ip),
+                )
+                .route("/waf/ips/:id", delete(waf::delete_ip))
+                .route(
+                    "/waf/events",
+                    get(waf::list_events).post(waf::report_events),
+                )
                 .route("/nodes", get(node::list))
                 .route("/nodes/heartbeat", post(node::heartbeat))
                 .route("/nodes/:id/heartbeat", post(node::heartbeat_by_path))
                 .route("/metrics/report", post(metrics::report))
                 .route("/certs", get(cert::list).post(cert::create))
                 .route("/certs/issue", post(acme::issue))
-                .route(
-                    "/certs/:id",
-                    get(cert::get).delete(cert::delete),
-                )
+                .route("/certs/:id", get(cert::get).delete(cert::delete))
                 .route("/certs/by-domain/:domain", get(cert::edge_get))
                 .route("/certs/edge-sync", get(cert::edge_list_active))
                 .route("/purge", post(purge::purge))

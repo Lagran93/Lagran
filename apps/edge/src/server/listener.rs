@@ -52,9 +52,7 @@ async fn put_challenge_authed(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ChallengeBody>,
 ) -> StatusCode {
-    state
-        .challenges
-        .put(&body.token, &body.key_authorization);
+    state.challenges.put(&body.token, &body.key_authorization);
     tracing::info!(token = %body.token, "ACME challenge installed");
     StatusCode::NO_CONTENT
 }
@@ -87,10 +85,11 @@ async fn load_cert_authed(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LoadCertBody>,
 ) -> impl IntoResponse {
-    match state
-        .certs
-        .upsert(&body.names, body.cert_pem.as_bytes(), body.key_pem.as_bytes())
-    {
+    match state.certs.upsert(
+        &body.names,
+        body.cert_pem.as_bytes(),
+        body.key_pem.as_bytes(),
+    ) {
         Ok(()) => {
             tracing::info!(names = ?body.names, "cert hot-loaded");
             (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()

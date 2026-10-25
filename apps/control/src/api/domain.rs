@@ -1,6 +1,6 @@
-//! Domain management — RESTful handlers
+//! Domain management — RESTful handlers with project-scoped authorization.
 
-use crate::middleware::AuthUser;
+use crate::middleware::authz::Actor;
 use crate::repository;
 use crate::state::AppState;
 use axum::{
@@ -51,7 +51,7 @@ pub struct DeleteResponse {
     pub id: String,
 }
 
-fn to_dto(r: repository::DomainRow) -> DomainDto {
+pub(crate) fn to_dto(r: repository::DomainRow) -> DomainDto {
     DomainDto {
         id: r.id.to_string(),
         name: r.name,
@@ -61,8 +61,8 @@ fn to_dto(r: repository::DomainRow) -> DomainDto {
         ssl_enabled: r.ssl_enabled,
         status: r.status,
         project_id: r.project_id.map(|u| u.to_string()),
-        rate_limit_rps: 0,
-        rate_limit_burst: 0,
+        rate_limit_rps: r.rate_limit_rps.max(0) as u32,
+        rate_limit_burst: r.rate_limit_burst.max(0) as u32,
     }
 }
 
@@ -77,27 +77,66 @@ fn parse_uuid(id: &str) -> Result<Uuid, (StatusCode, Json<ErrorBody>)> {
     })
 }
 
+fn db_error() -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: "database error".into(),
+        }),
+    )
+}
+
+fn forbidden() -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            error: "forbidden".into(),
+        }),
+    )
+}
+
+fn not_found(id: &str) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorBody {
+            error: format!("domain not found: {id}"),
+        }),
+    )
+}
+
 pub async fn list(
     State(state): State<AppState>,
-    _user: AuthUser,
+    actor: Actor,
 ) -> Result<Json<Vec<DomainDto>>, (StatusCode, Json<ErrorBody>)> {
     let rows = repository::list_domains(&state.pool).await.map_err(|e| {
         tracing::error!(error = %e, "list domains");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: "database error".into(),
-            }),
-        )
+        db_error()
     })?;
-    Ok(Json(rows.into_iter().map(to_dto).collect()))
+    let visible = actor.visible_domain_ids(&state).await;
+    Ok(Json(
+        rows.into_iter()
+            .filter(|d| match &visible {
+                None => true,
+                Some(ids) => ids.contains(&d.id),
+            })
+            .map(to_dto)
+            .collect(),
+    ))
 }
 
 pub async fn create(
     State(state): State<AppState>,
-    _user: AuthUser,
+    actor: Actor,
     Json(req): Json<CreateDomainRequest>,
 ) -> Result<(StatusCode, Json<DomainDto>), (StatusCode, Json<ErrorBody>)> {
+    if req.name.trim().is_empty() || req.origin_host.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "name and origin_host required".into(),
+            }),
+        ));
+    }
     let port = req.origin_port.unwrap_or(80) as i32;
     let proto = req.origin_proto.unwrap_or_else(|| {
         if req.ssl_enabled.unwrap_or(false) {
@@ -108,21 +147,41 @@ pub async fn create(
     });
     let ssl = req.ssl_enabled.unwrap_or(proto == "https");
 
-    let project_id = match req.project_id.as_deref() {
-        Some(s) if !s.is_empty() => Some(uuid::Uuid::parse_str(s).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorBody {
-                    error: "invalid project_id".into(),
-                }),
-            )
-        })?),
-        _ => None,
+    // Tenancy: admins may leave a domain unassigned (global); everyone else's
+    // domains always live in a project they can write. When no project is
+    // chosen we lazily create the user's personal project.
+    let project_id = match req.project_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => {
+            let pid = Uuid::parse_str(s).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: "invalid project_id".into(),
+                    }),
+                )
+            })?;
+            if !actor.can_write_project(&state, pid).await {
+                return Err(forbidden());
+            }
+            Some(pid)
+        }
+        None => {
+            if actor.admin() {
+                None
+            } else {
+                Some(
+                    repository::ensure_personal_project(&state.pool, actor.id)
+                        .await
+                        .map_err(|_| db_error())?,
+                )
+            }
+        }
     };
+
     let row = repository::create_domain_with_project(
         &state.pool,
-        &req.name,
-        &req.origin_host,
+        req.name.trim(),
+        req.origin_host.trim(),
         port,
         &proto,
         ssl,
@@ -130,8 +189,13 @@ pub async fn create(
     )
     .await
     .map_err(|e| {
-        tracing::error!(error = %e, "create domain");
-        let msg = if e.to_string().contains("duplicate") || e.to_string().contains("unique") {
+        let msg = e.to_string();
+        if msg.contains("duplicate") || msg.contains("unique") {
+            tracing::warn!(name = %req.name, "domain already exists");
+        } else {
+            tracing::error!(error = %msg, "create domain");
+        }
+        let error = if msg.contains("duplicate") || msg.contains("unique") {
             "domain already exists"
         } else {
             "database error"
@@ -139,15 +203,15 @@ pub async fn create(
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
-                error: msg.into(),
+                error: error.into(),
             }),
         )
     })?;
 
-    if let (Some(rps), Some(burst)) = (req.rate_limit_rps, req.rate_limit_burst) {
-        let _ = repository::set_domain_rate_limit(&state.pool, row.id, rps as i32, burst as i32).await;
-    } else if let Some(rps) = req.rate_limit_rps {
-        let _ = repository::set_domain_rate_limit(&state.pool, row.id, rps as i32, rps as i32 * 2).await;
+    if let Some(rps) = req.rate_limit_rps {
+        let burst = req.rate_limit_burst.unwrap_or(rps * 2);
+        let _ =
+            repository::set_domain_rate_limit(&state.pool, row.id, rps as i32, burst as i32).await;
     }
     if let Some(ref host) = req.backup_origin_host {
         if !host.is_empty() {
@@ -156,86 +220,68 @@ pub async fn create(
             let _ = repository::set_backup_origin(&state.pool, row.id, host, port, proto).await;
         }
     }
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "domain.create",
+        &row.name,
+        &format!("{proto}://{}:{port}", row.origin_host),
+    )
+    .await;
+
+    // Re-read so the response carries rate limits just written.
+    let row = repository::get_domain(&state.pool, row.id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(row);
     Ok((StatusCode::CREATED, Json(to_dto(row))))
 }
 
-/// GET /api/v1/domains/{id}
 pub async fn get(
     State(state): State<AppState>,
-    _user: AuthUser,
+    actor: Actor,
     Path(id): Path<String>,
 ) -> Result<Json<DomainDto>, (StatusCode, Json<ErrorBody>)> {
     let uid = parse_uuid(&id)?;
+    if !actor.can_read_domain(&state, uid).await {
+        return Err(not_found(&id));
+    }
     let row = repository::get_domain(&state.pool, uid)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "get domain");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: "database error".into(),
-                }),
-            )
+            db_error()
         })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: format!("domain not found: {id}"),
-                }),
-            )
-        })?;
+        .ok_or_else(|| not_found(&id))?;
     Ok(Json(to_dto(row)))
 }
 
-/// DELETE /api/v1/domains/{id}
 pub async fn delete(
     State(state): State<AppState>,
-    _user: AuthUser,
+    actor: Actor,
     Path(id): Path<String>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, Json<ErrorBody>)> {
-    tracing::info!(%id, "DELETE /api/v1/domains/{{id}}");
     let uid = parse_uuid(&id)?;
-
-    if repository::get_domain(&state.pool, uid)
+    let row = repository::get_domain(&state.pool, uid)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: format!("database error: {e}"),
-                }),
-            )
-        })?
-        .is_none()
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: format!("domain not found: {id}"),
-            }),
-        ));
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found(&id))?;
+    if !actor.can_write_domain(&state, uid).await {
+        return Err(forbidden());
     }
 
     repository::delete_domain(&state.pool, uid)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, %id, "delete domain");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: format!("database error: {e}"),
-                }),
-            )
+            db_error()
         })?;
-
+    let _ =
+        repository::insert_audit(&state.pool, &actor.email, "domain.delete", &row.name, "").await;
     tracing::info!(%id, "domain deleted ok");
-    Ok(Json(DeleteResponse {
-        success: true,
-        id,
-    }))
+    Ok(Json(DeleteResponse { success: true, id }))
 }
-
 
 #[derive(Deserialize)]
 pub struct UpdateDomainRequest {
@@ -255,11 +301,26 @@ pub struct UpdateDomainRequest {
 /// PUT /api/v1/domains/{id}
 pub async fn update(
     State(state): State<AppState>,
-    _user: AuthUser,
+    actor: Actor,
     Path(id): Path<String>,
     Json(req): Json<UpdateDomainRequest>,
 ) -> Result<Json<DomainDto>, (StatusCode, Json<ErrorBody>)> {
     let uid = parse_uuid(&id)?;
+    if !actor.can_write_domain(&state, uid).await {
+        return Err(forbidden());
+    }
+    if let Some(ref status) = req.status {
+        let s = status.trim().to_lowercase();
+        if s != "active" && s != "disabled" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "status must be active or disabled".into(),
+                }),
+            ));
+        }
+    }
+
     let row = repository::update_domain(
         &state.pool,
         uid,
@@ -272,47 +333,57 @@ pub async fn update(
     .await
     .map_err(|e| {
         tracing::error!(error = %e, "update domain");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: "database error".into(),
-            }),
-        )
+        db_error()
     })?
-    .ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: format!("domain not found: {id}"),
-            }),
-        )
-    })?;
+    .ok_or_else(|| not_found(&id))?;
+
     if req.backup_origin_host.is_some() || req.backup_origin_port.is_some() {
         let host = req.backup_origin_host.as_deref().unwrap_or("");
         let port = req.backup_origin_port.unwrap_or(0) as i32;
         let proto = req.backup_origin_proto.as_deref().unwrap_or("http");
         let _ = repository::set_backup_origin(&state.pool, uid, host, port, proto).await;
     }
-    // project_id: Some("") or null-ish clears; Some(uuid) assigns
+    if let Some(rps) = req.rate_limit_rps {
+        let burst = req.rate_limit_burst.unwrap_or(rps * 2);
+        let _ = repository::set_domain_rate_limit(&state.pool, uid, rps as i32, burst as i32).await;
+    }
+
+    // project_id: Some("") clears (admin only), Some(uuid) moves the domain.
     if let Some(ref pid) = req.project_id {
-        let project_id = if pid.is_empty() {
+        let target = if pid.is_empty() {
+            if !actor.admin() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: "only an admin can unassign a domain".into(),
+                    }),
+                ));
+            }
             None
         } else {
-            Some(Uuid::parse_str(pid).map_err(|_| {
+            let parsed = Uuid::parse_str(pid).map_err(|_| {
                 (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorBody {
                         error: "invalid project_id".into(),
                     }),
                 )
-            })?)
+            })?;
+            if !actor.can_write_project(&state, parsed).await {
+                return Err(forbidden());
+            }
+            Some(parsed)
         };
-        let _ = repository::assign_domain_project(&state.pool, uid, project_id).await;
-        // re-fetch for response
-        if let Ok(Some(r)) = repository::get_domain(&state.pool, uid).await {
-            return Ok(Json(to_dto(r)));
-        }
+        let _ = repository::assign_domain_project(&state.pool, uid, target).await;
     }
+
+    let row = repository::get_domain(&state.pool, uid)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(row);
+    let _ =
+        repository::insert_audit(&state.pool, &actor.email, "domain.update", &row.name, "").await;
     Ok(Json(to_dto(row)))
 }
 
@@ -324,7 +395,7 @@ pub struct StatusRequest {
 /// POST /api/v1/domains/{id}/status
 pub async fn set_status(
     State(state): State<AppState>,
-    user: AuthUser,
+    actor: Actor,
     Path(id): Path<String>,
     Json(req): Json<StatusRequest>,
 ) -> Result<Json<DomainDto>, (StatusCode, Json<ErrorBody>)> {
@@ -338,27 +409,19 @@ pub async fn set_status(
         ));
     }
     let uid = parse_uuid(&id)?;
+    if !actor.can_write_domain(&state, uid).await {
+        return Err(forbidden());
+    }
     let row = repository::set_domain_status(&state.pool, uid, &status)
         .await
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: format!("database error: {e}"),
-                }),
-            )
+            tracing::error!(error = %e, "set domain status");
+            db_error()
         })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: format!("domain not found: {id}"),
-                }),
-            )
-        })?;
+        .ok_or_else(|| not_found(&id))?;
     let _ = repository::insert_audit(
         &state.pool,
-        &user.0.email,
+        &actor.email,
         "domain.status",
         &row.name,
         &status,
@@ -389,48 +452,8 @@ pub struct SettingsDto {
     pub rate_limit_burst: u32,
 }
 
-/// GET /api/v1/domains/{id}/settings  — id can be uuid or domain name
-pub async fn get_settings(
-    State(state): State<AppState>,
-    _user: AuthUser,
-    Path(id): Path<String>,
-) -> Result<Json<SettingsDto>, (StatusCode, Json<ErrorBody>)> {
-    let name = if let Ok(uid) = Uuid::parse_str(&id) {
-        repository::get_domain(&state.pool, uid)
-            .await
-            .ok()
-            .flatten()
-            .map(|d| d.name)
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorBody {
-                        error: "not found".into(),
-                    }),
-                )
-            })?
-    } else {
-        id.clone()
-    };
-    let s = repository::get_domain_settings(&state.pool, &name)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: "database error".into(),
-                }),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: "not found".into(),
-                }),
-            )
-        })?;
-    Ok(Json(SettingsDto {
+fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
+    SettingsDto {
         ignore_query_string: s.ignore_query_string,
         cors_origins: s.cors_origins,
         hotlink_allow_referers: s.hotlink_allow_referers,
@@ -438,17 +461,49 @@ pub async fn get_settings(
         custom_headers: s.custom_headers,
         rate_limit_rps: s.rate_limit_rps.max(0) as u32,
         rate_limit_burst: s.rate_limit_burst.max(0) as u32,
-    }))
+    }
+}
+
+async fn resolve_domain(
+    state: &AppState,
+    id: &str,
+) -> Result<repository::DomainRow, (StatusCode, Json<ErrorBody>)> {
+    let row = if let Ok(uid) = Uuid::parse_str(id) {
+        repository::get_domain(&state.pool, uid).await
+    } else {
+        repository::get_domain_by_name(&state.pool, id).await
+    };
+    row.map_err(|_| db_error())?.ok_or_else(|| not_found(id))
+}
+
+/// GET /api/v1/domains/{id}/settings — id can be uuid or domain name
+pub async fn get_settings(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> Result<Json<SettingsDto>, (StatusCode, Json<ErrorBody>)> {
+    let domain = resolve_domain(&state, &id).await?;
+    if !actor.can_read_domain(&state, domain.id).await {
+        return Err(forbidden());
+    }
+    let s = repository::get_domain_settings(&state.pool, &domain.name)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found(&id))?;
+    Ok(Json(settings_dto(s)))
 }
 
 /// PUT /api/v1/domains/{id}/settings
 pub async fn put_settings(
     State(state): State<AppState>,
-    user: AuthUser,
+    actor: Actor,
     Path(id): Path<String>,
     Json(req): Json<SettingsRequest>,
 ) -> Result<Json<SettingsDto>, (StatusCode, Json<ErrorBody>)> {
     let uid = parse_uuid(&id)?;
+    if !actor.can_write_domain(&state, uid).await {
+        return Err(forbidden());
+    }
     let n = repository::update_domain_settings(
         &state.pool,
         uid,
@@ -462,67 +517,28 @@ pub async fn put_settings(
     )
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: format!("database error: {e}"),
-            }),
-        )
+        tracing::error!(error = %e, "update domain settings");
+        db_error()
     })?;
     if n == 0 {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: "not found".into(),
-            }),
-        ));
+        return Err(not_found(&id));
     }
-    let _ = repository::insert_audit(
-        &state.pool,
-        &user.0.email,
-        "domain.settings",
-        &id,
-        "updated",
-    )
-    .await;
-    // re-read settings
     let row = repository::get_domain(&state.pool, uid)
         .await
         .ok()
         .flatten()
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: "not found".into(),
-                }),
-            )
-        })?;
+        .ok_or_else(|| not_found(&id))?;
     let s = repository::get_domain_settings(&state.pool, &row.name)
         .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: "database error".into(),
-                }),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: "not found".into(),
-                }),
-            )
-        })?;
-    Ok(Json(SettingsDto {
-        ignore_query_string: s.ignore_query_string,
-        cors_origins: s.cors_origins,
-        hotlink_allow_referers: s.hotlink_allow_referers,
-        origin_timeout_ms: s.origin_timeout_ms.max(0) as u32,
-        custom_headers: s.custom_headers,
-        rate_limit_rps: s.rate_limit_rps.max(0) as u32,
-        rate_limit_burst: s.rate_limit_burst.max(0) as u32,
-    }))
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found(&id))?;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "domain.settings",
+        &row.name,
+        "updated",
+    )
+    .await;
+    Ok(Json(settings_dto(s)))
 }

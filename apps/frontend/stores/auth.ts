@@ -4,6 +4,7 @@ export interface AuthUser {
   id: string
   email: string
   name: string
+  role?: 'admin' | 'user' | string
 }
 
 const TOKEN_KEY = 'lagran_token'
@@ -17,6 +18,7 @@ export const useAuthStore = defineStore('auth', {
   }),
   getters: {
     isAuthenticated: (s) => !!s.token,
+    isAdmin: (s) => s.user?.role === 'admin',
   },
   actions: {
     hydrate() {
@@ -33,6 +35,19 @@ export const useAuthStore = defineStore('auth', {
       if (import.meta.client) {
         localStorage.setItem(TOKEN_KEY, token)
         localStorage.setItem(USER_KEY, JSON.stringify(user))
+      }
+    },
+    /** Refresh the profile (and therefore the role) from the API. */
+    async refresh() {
+      if (!this.token) return
+      try {
+        const config = useRuntimeConfig()
+        const me = await $fetch<AuthUser>(`${config.public.apiBase}/api/v1/auth/me`, {
+          headers: { Authorization: `Bearer ${this.token}` },
+        })
+        this.setSession(this.token, me)
+      } catch {
+        // Token expired/invalid: the route middleware will redirect on next nav.
       }
     },
     logout() {

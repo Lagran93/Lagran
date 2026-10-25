@@ -3,6 +3,7 @@
 use crate::server::cert_store::CertStore;
 use crate::server::host_util::TlsSni;
 use anyhow::{anyhow, Context, Result};
+use axum::extract::ConnectInfo;
 use axum::http::header::HOST;
 use axum::http::HeaderValue;
 use axum::Router;
@@ -63,6 +64,8 @@ pub async fn serve_https(addr: SocketAddr, app: Router, store: Arc<CertStore>) -
                     let mut app = app.clone();
                     let sni = sni.clone();
                     async move {
+                        // Expose the peer address to handlers (used for WAF IP ACLs).
+                        req.extensions_mut().insert(ConnectInfo(peer));
                         if let Some(ref name) = sni {
                             req.extensions_mut().insert(TlsSni(name.clone()));
                             // If Host is missing or is a bare IP, set Host from SNI
@@ -73,8 +76,7 @@ pub async fn serve_https(addr: SocketAddr, app: Router, store: Arc<CertStore>) -
                                 .and_then(|v| v.to_str().ok())
                                 .map(|h| {
                                     let h = h.trim();
-                                    h.is_empty()
-                                        || crate::config::registry::is_ip_host(h)
+                                    h.is_empty() || crate::config::registry::is_ip_host(h)
                                 })
                                 .unwrap_or(true);
                             if host_is_bad {
@@ -97,8 +99,11 @@ pub async fn serve_https(addr: SocketAddr, app: Router, store: Arc<CertStore>) -
 pub async fn serve_http(addr: SocketAddr, app: Router) -> Result<()> {
     tracing::info!(%addr, "HTTP listening");
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow!("http server error: {e}"))?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| anyhow!("http server error: {e}"))?;
     Ok(())
 }

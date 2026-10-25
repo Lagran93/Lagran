@@ -1,9 +1,9 @@
 //! Cache purge — accept request and fan-out to online edge agents
 
-use crate::middleware::AuthUser;
+use crate::middleware::authz::Actor;
 use crate::repository;
 use crate::state::AppState;
-use axum::{extract::State, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
@@ -41,6 +41,11 @@ pub struct PurgeResponse {
 }
 
 #[derive(Serialize)]
+pub struct ErrorBody {
+    pub error: String,
+}
+
+#[derive(Serialize)]
 struct EdgePurgeBody {
     domain: String,
     urls: Vec<String>,
@@ -66,11 +71,22 @@ fn http_client() -> &'static Client<HttpConnector, Full<Bytes>> {
 
 pub async fn purge(
     State(state): State<AppState>,
-    user: AuthUser,
+    actor: Actor,
     Json(req): Json<PurgeRequest>,
-) -> Json<PurgeResponse> {
+) -> Result<Json<PurgeResponse>, (StatusCode, Json<ErrorBody>)> {
+    // Purging affects one tenant's cache: require write access to that domain.
+    // A global `purge_all` without a domain is admin-only.
+    if req.domain.trim().is_empty() {
+        if !actor.admin() {
+            return Err(forbidden());
+        }
+    } else if !actor.can_write_domain_name(&state, req.domain.trim()).await {
+        return Err(forbidden());
+    }
+
     tracing::info!(
         domain = %req.domain,
+        actor = %actor.email,
         urls = ?req.urls,
         prefixes = ?req.prefixes,
         "purge requested"
@@ -80,22 +96,22 @@ pub async fn purge(
         Ok(n) => n,
         Err(e) => {
             tracing::error!(error = %e, "list nodes for purge");
-            return Json(PurgeResponse {
+            return Ok(Json(PurgeResponse {
                 success: false,
                 message: format!("database error: {e}"),
                 purged_count: 0,
                 nodes: vec![],
-            });
+            }));
         }
     };
 
     if nodes.is_empty() {
-        return Json(PurgeResponse {
+        return Ok(Json(PurgeResponse {
             success: true,
             message: "no online edge agents with agent_url; nothing dispatched".into(),
             purged_count: 0,
             nodes: vec![],
-        });
+        }));
     }
 
     let body = EdgePurgeBody {
@@ -112,11 +128,9 @@ pub async fn purge(
     let mut any_fail = false;
 
     for node in nodes {
-        let url = format!(
-            "{}/__lagran/purge",
-            node.agent_url.trim_end_matches('/')
-        );
-        let result = dispatch_one(client, &url, body_bytes.clone(), &state.config.agent_token).await;
+        let url = format!("{}/__lagran/purge", node.agent_url.trim_end_matches('/'));
+        let result =
+            dispatch_one(client, &url, body_bytes.clone(), &state.config.agent_token).await;
         match result {
             Ok(reply) => {
                 total += reply.purged_count;
@@ -145,10 +159,16 @@ pub async fn purge(
         }
     }
 
-    let detail = format!("domain={} total={} nodes={}", req.domain, total, results.len());
-    let _ = repository::insert_audit(&state.pool, &user.0.email, "purge", &req.domain, &detail).await;
+    let detail = format!(
+        "domain={} total={} nodes={}",
+        req.domain,
+        total,
+        results.len()
+    );
+    let _ =
+        repository::insert_audit(&state.pool, &actor.email, "purge", &req.domain, &detail).await;
 
-    Json(PurgeResponse {
+    Ok(Json(PurgeResponse {
         success: !any_fail,
         message: if any_fail {
             "purge completed with some failures".into()
@@ -157,7 +177,16 @@ pub async fn purge(
         },
         purged_count: total,
         nodes: results,
-    })
+    }))
+}
+
+fn forbidden() -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            error: "forbidden".into(),
+        }),
+    )
 }
 
 async fn dispatch_one(

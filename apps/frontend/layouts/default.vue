@@ -1,174 +1,212 @@
+<script setup lang="ts">
+interface MenuItem {
+  label: string
+  to: string
+  icon: string
+  admin?: boolean
+}
+
+interface MenuGroup {
+  title: string
+  items: MenuItem[]
+}
+
+const MENU: MenuGroup[] = [
+  {
+    title: '概览',
+    items: [{ label: '仪表盘', to: '/', icon: 'dashboard' }],
+  },
+  {
+    title: '加速服务',
+    items: [
+      { label: '域名管理', to: '/domains', icon: 'domain' },
+      { label: '缓存规则', to: '/rules', icon: 'rules' },
+      { label: 'WAF 防护', to: '/waf', icon: 'shield' },
+      { label: '证书管理', to: '/certs', icon: 'cert' },
+      { label: '缓存刷新', to: '/purge', icon: 'purge' },
+    ],
+  },
+  {
+    title: '运维监控',
+    items: [
+      { label: '边缘节点', to: '/nodes', icon: 'node', admin: true },
+      { label: '统计分析', to: '/stats', icon: 'stats' },
+      { label: '访问日志', to: '/access-logs', icon: 'logs' },
+      { label: '操作审计', to: '/audit', icon: 'audit', admin: true },
+    ],
+  },
+  {
+    title: '系统',
+    items: [
+      { label: '项目管理', to: '/projects', icon: 'project' },
+      { label: '系统设置', to: '/settings', icon: 'settings' },
+    ],
+  },
+]
+
+const route = useRoute()
+const auth = useAuthStore()
+
+const sidebarOpen = ref(false)
+const userMenuOpen = ref(false)
+
+const groups = computed<MenuGroup[]>(() =>
+  MENU.map(group => ({
+    ...group,
+    items: group.items.filter(item => !item.admin || auth.isAdmin),
+  })).filter(group => group.items.length > 0),
+)
+
+function isActive(to: string): boolean {
+  if (to === '/') return route.path === '/'
+  return route.path === to || route.path.startsWith(`${to}/`)
+}
+
+const current = computed<{ group: string; label: string }>(() => {
+  if (route.path === '/') return { group: '概览', label: '仪表盘' }
+  if (route.path.startsWith('/domains/')) return { group: '加速服务', label: '域名详情' }
+  for (const group of MENU) {
+    for (const item of group.items) {
+      if (isActive(item.to)) return { group: group.title, label: item.label }
+    }
+  }
+  return { group: '控制台', label: '页面' }
+})
+
+useHead(() => ({ title: `${current.value.label} · Lagran CDN 控制台` }))
+
+const displayName = computed(() => auth.user?.name || auth.user?.email || '未登录')
+const initial = computed(() => (displayName.value || 'L').slice(0, 1).toUpperCase())
+
+function closeSidebar() {
+  sidebarOpen.value = false
+}
+
+function logout() {
+  auth.logout()
+  userMenuOpen.value = false
+  navigateTo('/login')
+}
+
+watch(
+  () => route.path,
+  () => {
+    sidebarOpen.value = false
+    userMenuOpen.value = false
+  },
+)
+
+onMounted(async () => {
+  auth.hydrate()
+  await auth.refresh()
+})
+</script>
+
 <template>
-  <div class="layout">
-    <aside class="sidebar">
-      <div class="brand">
-        <NuxtLink to="/">Lagran CDN</NuxtLink>
+  <div class="app-shell">
+    <aside class="sidebar" :class="{ open: sidebarOpen }">
+      <div class="sidebar-brand">
+        <div class="brand-mark">L</div>
+        <div class="brand-text">
+          <span class="brand-name">Lagran CDN</span>
+          <span class="brand-sub">管理控制台</span>
+        </div>
       </div>
-      <nav>
-        <NuxtLink to="/">仪表盘</NuxtLink>
-        <NuxtLink to="/projects">项目</NuxtLink>
-        <NuxtLink to="/domains">域名</NuxtLink>
-        <NuxtLink to="/rules">缓存规则</NuxtLink>
-        <NuxtLink to="/nodes">边缘节点</NuxtLink>
-        <NuxtLink to="/purge">缓存刷新</NuxtLink>
-        <NuxtLink to="/stats">统计分析</NuxtLink>
-        <NuxtLink to="/access-logs">访问日志</NuxtLink>
-        <NuxtLink to="/audit">操作审计</NuxtLink>
-        <NuxtLink to="/certs">证书</NuxtLink>
-        <NuxtLink to="/settings">设置</NuxtLink>
+
+      <nav class="sidebar-nav">
+        <div v-for="group in groups" :key="group.title" class="menu-group">
+          <div class="menu-title">{{ group.title }}</div>
+          <NuxtLink
+            v-for="item in group.items"
+            :key="item.to"
+            :to="item.to"
+            class="menu-item"
+            :class="{ active: isActive(item.to) }"
+            @click="closeSidebar"
+          >
+            <AppIcon :name="item.icon" :size="18" class="icon" />
+            <span>{{ item.label }}</span>
+          </NuxtLink>
+        </div>
       </nav>
-      <div class="sidebar-footer">
-        <div v-if="auth.user" class="user">{{ auth.user.name || auth.user.email }}</div>
-        <a href="#" @click.prevent="onLogout">退出登录</a>
+
+      <div class="sidebar-foot">
+        <span class="dot" style="background: var(--success)" />
+        <span>控制面已连接 · v0.1.0</span>
       </div>
     </aside>
+
+    <div v-if="sidebarOpen" class="sidebar-mask" @click="closeSidebar" />
+
     <div class="main">
       <header class="topbar">
-        <span class="page-title">{{ pageTitle }}</span>
+        <button
+          class="btn btn-icon btn-default topbar-menu-btn"
+          type="button"
+          aria-label="打开导航"
+          @click="sidebarOpen = !sidebarOpen"
+        >
+          <AppIcon name="menu" :size="18" />
+        </button>
+
+        <div class="crumbs">
+          <span>控制台</span>
+          <AppIcon name="chevron-right" :size="12" class="sep" />
+          <span>{{ current.group }}</span>
+          <AppIcon name="chevron-right" :size="12" class="sep" />
+          <span class="current">{{ current.label }}</span>
+        </div>
+
+        <div class="topbar-right">
+          <span class="env-chip">
+            <span class="env-dot" />
+            服务运行中
+          </span>
+
+          <div class="user-chip" @click.stop="userMenuOpen = !userMenuOpen">
+            <span class="avatar">{{ initial }}</span>
+            <span class="user-name">{{ displayName }}</span>
+            <AppIcon name="chevron-down" :size="14" />
+          </div>
+
+          <div v-if="userMenuOpen" class="user-dropdown" @click.stop>
+            <div class="dropdown-head">
+              <div class="dropdown-name">
+                {{ displayName }}
+                <span class="tag" :class="auth.isAdmin ? 'tag-info' : 'tag-neutral'" style="margin-left: 6px">
+                  {{ auth.isAdmin ? '管理员' : '普通用户' }}
+                </span>
+              </div>
+              <div class="dropdown-mail">{{ auth.user?.email }}</div>
+            </div>
+            <div class="dropdown-item" @click="navigateTo('/settings')">
+              <AppIcon name="settings" :size="16" />
+              个人设置
+            </div>
+            <div class="dropdown-item danger" @click="logout">
+              <AppIcon name="logout" :size="16" />
+              退出登录
+            </div>
+          </div>
+        </div>
       </header>
+
+      <div v-if="userMenuOpen" class="dropdown-backdrop" @click="userMenuOpen = false" />
+
       <main class="content">
         <slot />
       </main>
     </div>
+
+    <ToastHost />
+    <ConfirmHost />
   </div>
 </template>
 
-<script setup lang="ts">
-const route = useRoute()
-const auth = useAuthStore()
-
-onMounted(() => auth.hydrate())
-
-const pageTitle = computed(() => {
-  const map: Record<string, string> = {
-    '/': '仪表盘',
-    '/projects': '项目管理',
-    '/domains': '域名管理',
-    '/rules': '缓存规则',
-    '/nodes': '边缘节点',
-    '/purge': '缓存刷新',
-    '/stats': '统计分析',
-    '/access-logs': '访问日志',
-    '/audit': '操作审计',
-    '/certs': '证书管理',
-    '/settings': '系统设置',
-  }
-  return map[route.path] || 'Lagran CDN'
-})
-
-function onLogout() {
-  auth.logout()
-  navigateTo('/login')
-}
-</script>
-
-<style>
-:root {
-  --sidebar-w: 220px;
-  --bg: #0f172a;
-  --sidebar-bg: #1e293b;
-  --border: #334155;
-  --text: #e2e8f0;
-  --muted: #94a3b8;
-  --accent: #38bdf8;
-  --card: #1e293b;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-}
-a { color: inherit; text-decoration: none; }
-.layout { display: flex; min-height: 100vh; }
-.sidebar {
-  width: var(--sidebar-w);
-  background: var(--sidebar-bg);
-  border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  padding: 1rem 0;
+<style scoped>
+.dropdown-backdrop {
   position: fixed;
-  height: 100vh;
+  inset: 0;
+  z-index: 10;
 }
-.brand {
-  padding: 0.5rem 1.25rem 1.5rem;
-  font-weight: 700;
-  font-size: 1.15rem;
-  color: var(--accent);
-}
-.sidebar nav {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  flex: 1;
-}
-.sidebar nav a {
-  padding: 0.6rem 1.25rem;
-  color: var(--muted);
-  border-left: 3px solid transparent;
-}
-.sidebar nav a:hover { color: var(--text); background: rgba(255,255,255,0.03); }
-.sidebar nav a.router-link-active {
-  color: var(--accent);
-  border-left-color: var(--accent);
-  background: rgba(56, 189, 248, 0.08);
-}
-.sidebar-footer {
-  padding: 1rem 1.25rem;
-  border-top: 1px solid var(--border);
-  font-size: 0.875rem;
-  color: var(--muted);
-}
-.sidebar-footer .user {
-  margin-bottom: 0.5rem;
-  color: var(--text);
-  font-size: 0.8rem;
-}
-.main {
-  margin-left: var(--sidebar-w);
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-}
-.topbar {
-  padding: 1rem 1.75rem;
-  border-bottom: 1px solid var(--border);
-  background: var(--sidebar-bg);
-}
-.page-title { font-weight: 600; font-size: 1.05rem; }
-.content { padding: 1.75rem; flex: 1; }
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 1.25rem;
-}
-.grid { display: grid; gap: 1rem; }
-.grid-4 { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
-.stat-value { font-size: 1.75rem; font-weight: 700; color: var(--accent); }
-.stat-label { font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); }
-th { color: var(--muted); font-weight: 500; font-size: 0.85rem; }
-.btn {
-  display: inline-block;
-  padding: 0.5rem 1rem;
-  background: var(--accent);
-  color: #0f172a;
-  border: none;
-  border-radius: 6px;
-  font-weight: 600;
-  cursor: pointer;
-  font-size: 0.9rem;
-}
-.btn:hover { filter: brightness(1.1); }
-.btn-ghost {
-  background: transparent;
-  color: var(--muted);
-  border: 1px solid var(--border);
-}
-.muted { color: var(--muted); }
-.empty { text-align: center; padding: 3rem; color: var(--muted); }
 </style>

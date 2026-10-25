@@ -1,9 +1,9 @@
-//! Operation audit log
+//! Operation audit log (admin only)
 
-use crate::middleware::AuthUser;
+use crate::middleware::authz::Actor;
 use crate::repository;
 use crate::state::AppState;
-use axum::{extract::State, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -16,14 +16,27 @@ pub struct AuditDto {
     pub created_at: String,
 }
 
+#[derive(Serialize)]
+pub struct ErrorBody {
+    pub error: String,
+}
+
 pub async fn list(
     State(state): State<AppState>,
-    _user: AuthUser,
-) -> Json<Vec<AuditDto>> {
+    actor: Actor,
+) -> Result<Json<Vec<AuditDto>>, (StatusCode, Json<ErrorBody>)> {
+    if !actor.admin() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "admin only".into(),
+            }),
+        ));
+    }
     let rows = repository::list_audit(&state.pool, 100)
         .await
         .unwrap_or_default();
-    Json(
+    Ok(Json(
         rows.into_iter()
             .map(|r| AuditDto {
                 id: r.id.to_string(),
@@ -34,5 +47,5 @@ pub async fn list(
                 created_at: r.created_at.to_rfc3339(),
             })
             .collect(),
-    )
+    ))
 }

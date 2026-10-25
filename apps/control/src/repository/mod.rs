@@ -10,6 +10,7 @@ pub struct UserRow {
     pub email: String,
     pub password_hash: String,
     pub name: String,
+    pub role: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -24,6 +25,8 @@ pub struct DomainRow {
     pub ssl_enabled: bool,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    pub rate_limit_rps: i32,
+    pub rate_limit_burst: i32,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -44,11 +47,13 @@ pub struct CacheRuleRow {
     pub path_pattern: String,
     pub ttl_seconds: i64,
     pub priority: i32,
+    pub action: String,
+    pub swr_seconds: i64,
 }
 
 pub async fn find_user_by_email(pool: &PgPool, email: &str) -> sqlx::Result<Option<UserRow>> {
     sqlx::query_as::<_, UserRow>(
-        "SELECT id, email, password_hash, name, created_at FROM users WHERE email = $1",
+        "SELECT id, email, password_hash, name, role, created_at FROM users WHERE email = $1",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -57,7 +62,7 @@ pub async fn find_user_by_email(pool: &PgPool, email: &str) -> sqlx::Result<Opti
 
 pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<UserRow>> {
     sqlx::query_as::<_, UserRow>(
-        "SELECT id, email, password_hash, name, created_at FROM users WHERE id = $1",
+        "SELECT id, email, password_hash, name, role, created_at FROM users WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -74,7 +79,7 @@ pub async fn create_user(
         r#"
         INSERT INTO users (email, password_hash, name)
         VALUES ($1, $2, $3)
-        RETURNING id, email, password_hash, name, created_at
+        RETURNING id, email, password_hash, name, role, created_at
         "#,
     )
     .bind(email)
@@ -88,7 +93,7 @@ pub async fn list_domains(pool: &PgPool) -> sqlx::Result<Vec<DomainRow>> {
     sqlx::query_as::<_, DomainRow>(
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
-               ssl_enabled, status, created_at
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
         FROM domains
         ORDER BY created_at DESC
         "#,
@@ -101,7 +106,7 @@ pub async fn get_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<DomainRo
     sqlx::query_as::<_, DomainRow>(
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
-               ssl_enabled, status, created_at
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
         FROM domains WHERE id = $1
         "#,
     )
@@ -114,7 +119,7 @@ pub async fn get_domain_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Optio
     sqlx::query_as::<_, DomainRow>(
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
-               ssl_enabled, status, created_at
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
         FROM domains WHERE name = $1
         "#,
     )
@@ -136,7 +141,7 @@ pub async fn create_domain(
         INSERT INTO domains (name, origin_host, origin_port, origin_proto, ssl_enabled, status)
         VALUES ($1, $2, $3, $4, $5, 'active')
         RETURNING id, project_id, name, origin_host, origin_port, origin_proto,
-                  ssl_enabled, status, created_at
+                  ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
         "#,
     )
     .bind(name)
@@ -230,10 +235,13 @@ pub async fn upsert_node_heartbeat(
     }
 }
 
-pub async fn list_rules_for_domain(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<CacheRuleRow>> {
+pub async fn list_rules_for_domain(
+    pool: &PgPool,
+    domain_id: Uuid,
+) -> sqlx::Result<Vec<CacheRuleRow>> {
     sqlx::query_as::<_, CacheRuleRow>(
         r#"
-        SELECT id, domain_id, path_pattern, ttl_seconds, priority
+        SELECT id, domain_id, path_pattern, ttl_seconds, priority, action, swr_seconds
         FROM cache_rules
         WHERE domain_id = $1
         ORDER BY priority DESC
@@ -252,6 +260,11 @@ pub async fn ensure_demo_user(pool: &PgPool) -> anyhow::Result<()> {
         create_user(pool, "demo@lagran.dev", &hash, "Demo User").await?;
         tracing::info!("seeded demo user demo@lagran.dev / demo123");
     }
+    // Fresh databases seed the demo user *after* migrations ran, so the
+    // migration's admin promotion would miss it; enforce it here.
+    sqlx::query("UPDATE users SET role = 'admin' WHERE email = 'demo@lagran.dev'")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -298,7 +311,7 @@ pub async fn update_domain(
             ssl_enabled = $5, status = $6, updated_at = NOW()
         WHERE id = $1
         RETURNING id, project_id, name, origin_host, origin_port, origin_proto,
-                  ssl_enabled, status, created_at
+                  ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
         "#,
     )
     .bind(id)
@@ -320,11 +333,14 @@ pub async fn list_all_rules(pool: &PgPool) -> sqlx::Result<Vec<(CacheRuleRow, St
         path_pattern: String,
         ttl_seconds: i64,
         priority: i32,
+        action: String,
+        swr_seconds: i64,
         domain_name: String,
     }
     let rows = sqlx::query_as::<_, Row>(
         r#"
-        SELECT r.id, r.domain_id, r.path_pattern, r.ttl_seconds, r.priority, d.name AS domain_name
+        SELECT r.id, r.domain_id, r.path_pattern, r.ttl_seconds, r.priority,
+               r.action, r.swr_seconds, d.name AS domain_name
         FROM cache_rules r
         JOIN domains d ON d.id = r.domain_id
         ORDER BY r.priority DESC, r.path_pattern
@@ -342,6 +358,8 @@ pub async fn list_all_rules(pool: &PgPool) -> sqlx::Result<Vec<(CacheRuleRow, St
                     path_pattern: r.path_pattern,
                     ttl_seconds: r.ttl_seconds,
                     priority: r.priority,
+                    action: r.action,
+                    swr_seconds: r.swr_seconds,
                 },
                 r.domain_name,
             )
@@ -355,19 +373,35 @@ pub async fn create_rule(
     path_pattern: &str,
     ttl_seconds: i64,
     priority: i32,
+    action: &str,
+    swr_seconds: i64,
 ) -> sqlx::Result<CacheRuleRow> {
     sqlx::query_as::<_, CacheRuleRow>(
         r#"
-        INSERT INTO cache_rules (domain_id, path_pattern, ttl_seconds, priority)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, domain_id, path_pattern, ttl_seconds, priority
+        INSERT INTO cache_rules (domain_id, path_pattern, ttl_seconds, priority, action, swr_seconds)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, domain_id, path_pattern, ttl_seconds, priority, action, swr_seconds
         "#,
     )
     .bind(domain_id)
     .bind(path_pattern)
     .bind(ttl_seconds)
     .bind(priority)
+    .bind(action)
+    .bind(swr_seconds)
     .fetch_one(pool)
+    .await
+}
+
+pub async fn get_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<CacheRuleRow>> {
+    sqlx::query_as::<_, CacheRuleRow>(
+        r#"
+        SELECT id, domain_id, path_pattern, ttl_seconds, priority, action, swr_seconds
+        FROM cache_rules WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
     .await
 }
 
@@ -403,11 +437,9 @@ pub async fn count_domains(pool: &PgPool) -> sqlx::Result<i64> {
 }
 
 pub async fn count_online_nodes(pool: &PgPool) -> sqlx::Result<i64> {
-    let (n,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM edge_nodes WHERE status = 'online'",
-    )
-    .fetch_one(pool)
-    .await?;
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM edge_nodes WHERE status = 'online'")
+        .fetch_one(pool)
+        .await?;
     Ok(n)
 }
 
@@ -479,6 +511,63 @@ pub async fn sum_metrics(pool: &PgPool) -> sqlx::Result<(i64, i64, i64, i64)> {
         s.misses.unwrap_or(0),
         s.bytes.unwrap_or(0),
     ))
+}
+
+pub async fn sum_metrics_for(
+    pool: &PgPool,
+    hosts: &[String],
+) -> sqlx::Result<(i64, i64, i64, i64)> {
+    #[derive(sqlx::FromRow)]
+    struct S {
+        requests: Option<i64>,
+        hits: Option<i64>,
+        misses: Option<i64>,
+        bytes: Option<i64>,
+    }
+    let s = sqlx::query_as::<_, S>(
+        r#"
+        SELECT
+            COALESCE(SUM(requests), 0)::bigint AS requests,
+            COALESCE(SUM(cache_hits), 0)::bigint AS hits,
+            COALESCE(SUM(cache_misses), 0)::bigint AS misses,
+            COALESCE(SUM(bytes_sent), 0)::bigint AS bytes
+        FROM edge_metrics
+        WHERE reported_at > NOW() - INTERVAL '24 hours'
+          AND domain = ANY($1)
+        "#,
+    )
+    .bind(hosts)
+    .fetch_one(pool)
+    .await?;
+    Ok((
+        s.requests.unwrap_or(0),
+        s.hits.unwrap_or(0),
+        s.misses.unwrap_or(0),
+        s.bytes.unwrap_or(0),
+    ))
+}
+
+pub async fn metrics_by_domain_for(
+    pool: &PgPool,
+    hosts: &[String],
+) -> sqlx::Result<Vec<(String, i64, i64, i64, i64)>> {
+    sqlx::query_as(
+        r#"
+        SELECT COALESCE(NULLIF(domain, ''), '(unknown)') AS domain,
+               COALESCE(SUM(requests), 0)::bigint,
+               COALESCE(SUM(cache_hits), 0)::bigint,
+               COALESCE(SUM(cache_misses), 0)::bigint,
+               COALESCE(SUM(bytes_sent), 0)::bigint
+        FROM edge_metrics
+        WHERE reported_at > NOW() - INTERVAL '24 hours'
+          AND domain = ANY($1)
+        GROUP BY 1
+        ORDER BY 2 DESC
+        "#,
+    )
+    .bind(hosts)
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn list_certs(pool: &PgPool) -> sqlx::Result<Vec<CertRow>> {
@@ -618,7 +707,6 @@ pub async fn get_acme_challenge(pool: &PgPool, token: &str) -> sqlx::Result<Opti
     Ok(row.map(|r| r.0))
 }
 
-
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AuditRow {
     pub id: Uuid,
@@ -676,7 +764,7 @@ pub async fn set_domain_status(
         UPDATE domains SET status = $2, updated_at = NOW()
         WHERE id = $1
         RETURNING id, project_id, name, origin_host, origin_port, origin_proto,
-                  ssl_enabled, status, created_at
+                  ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
         "#,
     )
     .bind(id)
@@ -797,7 +885,7 @@ pub async fn list_domains_by_project(
     sqlx::query_as::<_, DomainRow>(
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
-               ssl_enabled, status, created_at
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
         FROM domains WHERE project_id = $1
         ORDER BY created_at DESC
         "#,
@@ -866,16 +954,12 @@ pub async fn list_origin_health(pool: &PgPool) -> sqlx::Result<Vec<OriginHealthR
     .await
 }
 
-pub async fn get_domain_rate_limit(
-    pool: &PgPool,
-    name: &str,
-) -> sqlx::Result<Option<(i32, i32)>> {
-    let row: Option<(i32, i32)> = sqlx::query_as(
-        "SELECT rate_limit_rps, rate_limit_burst FROM domains WHERE name = $1",
-    )
-    .bind(name)
-    .fetch_optional(pool)
-    .await?;
+pub async fn get_domain_rate_limit(pool: &PgPool, name: &str) -> sqlx::Result<Option<(i32, i32)>> {
+    let row: Option<(i32, i32)> =
+        sqlx::query_as("SELECT rate_limit_rps, rate_limit_burst FROM domains WHERE name = $1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
     Ok(row)
 }
 
@@ -910,7 +994,7 @@ pub async fn create_domain_with_project(
         INSERT INTO domains (name, origin_host, origin_port, origin_proto, ssl_enabled, status, project_id)
         VALUES ($1, $2, $3, $4, $5, 'active', $6)
         RETURNING id, project_id, name, origin_host, origin_port, origin_proto,
-                  ssl_enabled, status, created_at
+                  ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
         "#,
     )
     .bind(name)
@@ -950,6 +1034,7 @@ pub async fn get_domain_settings(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_domain_settings(
     pool: &PgPool,
     id: Uuid,
@@ -1000,11 +1085,7 @@ pub async fn update_domain_settings(
     Ok(r.rows_affected())
 }
 
-pub async fn create_prefetch(
-    pool: &PgPool,
-    domain: &str,
-    url_path: &str,
-) -> sqlx::Result<Uuid> {
+pub async fn create_prefetch(pool: &PgPool, domain: &str, url_path: &str) -> sqlx::Result<Uuid> {
     let (id,): (Uuid,) = sqlx::query_as(
         r#"
         INSERT INTO prefetch_tasks (domain, url_path, status)
@@ -1019,7 +1100,10 @@ pub async fn create_prefetch(
     Ok(id)
 }
 
-pub async fn list_prefetch(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<(Uuid, String, String, String, String)>> {
+pub async fn list_prefetch(
+    pool: &PgPool,
+    limit: i64,
+) -> sqlx::Result<Vec<(Uuid, String, String, String, String)>> {
     sqlx::query_as(
         r#"
         SELECT id, domain, url_path, status, message
@@ -1110,6 +1194,7 @@ pub struct AccessLogRow {
     pub referer: String,
 }
 
+#[allow(clippy::type_complexity)]
 pub async fn insert_access_logs_batch(
     pool: &PgPool,
     entries: &[(
@@ -1186,6 +1271,564 @@ pub async fn list_access_logs(
             FROM access_logs
             ORDER BY ts DESC
             LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Roles & tenancy
+// ---------------------------------------------------------------------------
+
+/// Global role (`admin` | `user`) for a user; `None` when the user is gone.
+pub async fn get_user_role(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// Effective role of `user_id` inside `project_id`:
+/// `owner` | `admin` | `member`, or `None` when the user has no access.
+pub async fn project_role(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> sqlx::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT CASE WHEN p.owner_id = $2 THEN 'owner' ELSE COALESCE(m.role, '') END
+        FROM projects p
+        LEFT JOIN project_members m ON m.project_id = p.id AND m.user_id = $2
+        WHERE p.id = $1
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0).filter(|role| !role.is_empty()))
+}
+
+/// Project a domain belongs to. `None` = domain missing, `Some(None)` = no project.
+pub async fn domain_project(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Option<Option<Uuid>>> {
+    let row: Option<(Option<Uuid>,)> =
+        sqlx::query_as("SELECT project_id FROM domains WHERE id = $1")
+            .bind(domain_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// All domain ids readable by a non-admin user (via project ownership/membership).
+pub async fn domains_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<Uuid>> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT d.id
+        FROM domains d
+        JOIN projects p ON p.id = d.project_id
+        LEFT JOIN project_members m ON m.project_id = p.id AND m.user_id = $1
+        WHERE p.owner_id = $1 OR m.user_id IS NOT NULL
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+/// The per-user "Default" project, created on first use.
+pub async fn ensure_personal_project(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Uuid> {
+    let existing: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM projects WHERE owner_id = $1 AND name = 'Default' LIMIT 1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+    let row = create_project(pool, "Default", user_id).await?;
+    Ok(row.id)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MemberRow {
+    pub user_id: Uuid,
+    pub email: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn list_project_members(pool: &PgPool, project_id: Uuid) -> sqlx::Result<Vec<MemberRow>> {
+    sqlx::query_as::<_, MemberRow>(
+        r#"
+        SELECT u.id AS user_id, u.email, u.name, m.role, m.created_at
+        FROM project_members m
+        JOIN users u ON u.id = m.user_id
+        WHERE m.project_id = $1
+        ORDER BY m.role, u.email
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn upsert_project_member(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO project_members (project_id, user_id, role)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .bind(role)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn remove_project_member(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2 AND role <> 'owner'",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+// ---------------------------------------------------------------------------
+// Bulk config delivery (one round-trip per table instead of per domain)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DomainFullRow {
+    pub id: Uuid,
+    pub name: String,
+    pub origin_host: String,
+    pub origin_port: i32,
+    pub origin_proto: String,
+    pub ssl_enabled: bool,
+    pub status: String,
+    pub rate_limit_rps: i32,
+    pub rate_limit_burst: i32,
+    pub ignore_query_string: bool,
+    pub cors_origins: String,
+    pub hotlink_allow_referers: String,
+    pub origin_timeout_ms: i32,
+    pub custom_headers: String,
+    pub backup_origin_host: String,
+    pub backup_origin_port: i32,
+    pub backup_origin_proto: String,
+}
+
+pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>> {
+    sqlx::query_as::<_, DomainFullRow>(
+        r#"
+        SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
+               rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
+               hotlink_allow_referers, origin_timeout_ms, custom_headers,
+               backup_origin_host, backup_origin_port, backup_origin_proto
+        FROM domains
+        ORDER BY name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_domain_full_by_name(
+    pool: &PgPool,
+    name: &str,
+) -> sqlx::Result<Option<DomainFullRow>> {
+    sqlx::query_as::<_, DomainFullRow>(
+        r#"
+        SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
+               rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
+               hotlink_allow_referers, origin_timeout_ms, custom_headers,
+               backup_origin_host, backup_origin_port, backup_origin_proto
+        FROM domains WHERE name = $1
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_rules_flat(pool: &PgPool) -> sqlx::Result<Vec<CacheRuleRow>> {
+    sqlx::query_as::<_, CacheRuleRow>(
+        r#"
+        SELECT id, domain_id, path_pattern, ttl_seconds, priority, action, swr_seconds
+        FROM cache_rules
+        ORDER BY domain_id, priority DESC, path_pattern
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// WAF
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafSettingsRow {
+    pub domain_id: Uuid,
+    pub enabled: bool,
+    pub mode: String,
+    pub sqli: bool,
+    pub xss: bool,
+    pub traversal: bool,
+    pub scanners: bool,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafRuleRow {
+    pub id: Uuid,
+    pub domain_id: Uuid,
+    pub name: String,
+    pub field: String,
+    pub operator: String,
+    pub value: String,
+    pub action: String,
+    pub priority: i32,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafIpRow {
+    pub id: Uuid,
+    pub domain_id: Uuid,
+    pub kind: String,
+    pub ip: String,
+    pub note: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafEventRow {
+    pub id: i64,
+    pub ts: DateTime<Utc>,
+    pub domain: String,
+    pub node_id: String,
+    pub client_ip: String,
+    pub method: String,
+    pub path: String,
+    pub action: String,
+    pub category: String,
+    pub rule_name: String,
+    pub mode: String,
+}
+
+pub async fn get_waf_settings(
+    pool: &PgPool,
+    domain_id: Uuid,
+) -> sqlx::Result<Option<WafSettingsRow>> {
+    sqlx::query_as::<_, WafSettingsRow>(
+        r#"
+        SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners
+        FROM waf_settings WHERE domain_id = $1
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_optional(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_waf_settings(
+    pool: &PgPool,
+    domain_id: Uuid,
+    enabled: bool,
+    mode: &str,
+    sqli: bool,
+    xss: bool,
+    traversal: bool,
+    scanners: bool,
+) -> sqlx::Result<WafSettingsRow> {
+    sqlx::query_as::<_, WafSettingsRow>(
+        r#"
+        INSERT INTO waf_settings (domain_id, enabled, mode, sqli, xss, traversal, scanners)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (domain_id) DO UPDATE SET
+          enabled = EXCLUDED.enabled,
+          mode = EXCLUDED.mode,
+          sqli = EXCLUDED.sqli,
+          xss = EXCLUDED.xss,
+          traversal = EXCLUDED.traversal,
+          scanners = EXCLUDED.scanners,
+          updated_at = NOW()
+        RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners
+        "#,
+    )
+    .bind(domain_id)
+    .bind(enabled)
+    .bind(mode)
+    .bind(sqli)
+    .bind(xss)
+    .bind(traversal)
+    .bind(scanners)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSettingsRow>> {
+    sqlx::query_as::<_, WafSettingsRow>(
+        "SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners FROM waf_settings",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_waf_rules(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<WafRuleRow>> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        FROM waf_rules WHERE domain_id = $1
+        ORDER BY priority DESC, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_waf_rules_all(pool: &PgPool) -> sqlx::Result<Vec<WafRuleRow>> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        FROM waf_rules ORDER BY domain_id, priority DESC, created_at
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_waf_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<WafRuleRow>> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        FROM waf_rules WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_waf_rule(
+    pool: &PgPool,
+    domain_id: Uuid,
+    name: &str,
+    field: &str,
+    operator: &str,
+    value: &str,
+    action: &str,
+    priority: i32,
+    enabled: bool,
+) -> sqlx::Result<WafRuleRow> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        INSERT INTO waf_rules (domain_id, name, field, operator, value, action, priority, enabled)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .bind(name)
+    .bind(field)
+    .bind(operator)
+    .bind(value)
+    .bind(action)
+    .bind(priority)
+    .bind(enabled)
+    .fetch_one(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_waf_rule(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+    field: &str,
+    operator: &str,
+    value: &str,
+    action: &str,
+    priority: i32,
+    enabled: bool,
+) -> sqlx::Result<Option<WafRuleRow>> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        UPDATE waf_rules SET
+          name = $2, field = $3, operator = $4, value = $5,
+          action = $6, priority = $7, enabled = $8
+        WHERE id = $1
+        RETURNING id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(field)
+    .bind(operator)
+    .bind(value)
+    .bind(action)
+    .bind(priority)
+    .bind(enabled)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_waf_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM waf_rules WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn list_waf_ips(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<WafIpRow>> {
+    sqlx::query_as::<_, WafIpRow>(
+        r#"
+        SELECT id, domain_id, kind, ip, note, created_at
+        FROM waf_ip_rules WHERE domain_id = $1
+        ORDER BY kind, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_waf_ips_all(pool: &PgPool) -> sqlx::Result<Vec<WafIpRow>> {
+    sqlx::query_as::<_, WafIpRow>(
+        "SELECT id, domain_id, kind, ip, note, created_at FROM waf_ip_rules ORDER BY domain_id, kind",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_waf_ip(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<WafIpRow>> {
+    sqlx::query_as::<_, WafIpRow>(
+        "SELECT id, domain_id, kind, ip, note, created_at FROM waf_ip_rules WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn create_waf_ip(
+    pool: &PgPool,
+    domain_id: Uuid,
+    kind: &str,
+    ip: &str,
+    note: &str,
+) -> sqlx::Result<WafIpRow> {
+    sqlx::query_as::<_, WafIpRow>(
+        r#"
+        INSERT INTO waf_ip_rules (domain_id, kind, ip, note)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, domain_id, kind, ip, note, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(ip)
+    .bind(note)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn delete_waf_ip(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM waf_ip_rules WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+#[derive(Debug, Clone)]
+pub struct WafEventInput {
+    pub domain: String,
+    pub node_id: String,
+    pub client_ip: String,
+    pub method: String,
+    pub path: String,
+    pub action: String,
+    pub category: String,
+    pub rule_name: String,
+    pub mode: String,
+}
+
+pub async fn insert_waf_events_batch(pool: &PgPool, events: &[WafEventInput]) -> sqlx::Result<u64> {
+    let mut n = 0u64;
+    for e in events {
+        let r = sqlx::query(
+            r#"
+            INSERT INTO waf_events
+              (domain, node_id, client_ip, method, path, action, category, rule_name, mode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
+        )
+        .bind(&e.domain)
+        .bind(&e.node_id)
+        .bind(&e.client_ip)
+        .bind(&e.method)
+        .bind(&e.path)
+        .bind(&e.action)
+        .bind(&e.category)
+        .bind(&e.rule_name)
+        .bind(&e.mode)
+        .execute(pool)
+        .await?;
+        n += r.rows_affected();
+    }
+    Ok(n)
+}
+
+pub async fn list_waf_events(
+    pool: &PgPool,
+    domain: Option<&str>,
+    limit: i64,
+) -> sqlx::Result<Vec<WafEventRow>> {
+    if let Some(domain) = domain.filter(|d| !d.is_empty()) {
+        sqlx::query_as::<_, WafEventRow>(
+            r#"
+            SELECT id, ts, domain, node_id, client_ip, method, path, action, category, rule_name, mode
+            FROM waf_events WHERE domain = $1
+            ORDER BY ts DESC LIMIT $2
+            "#,
+        )
+        .bind(domain)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_as::<_, WafEventRow>(
+            r#"
+            SELECT id, ts, domain, node_id, client_ip, method, path, action, category, rule_name, mode
+            FROM waf_events
+            ORDER BY ts DESC LIMIT $1
             "#,
         )
         .bind(limit)

@@ -1,5 +1,10 @@
-//! Config delivery for edge nodes
+//! Config delivery for edge nodes (agent token required).
+//!
+//! The bulk endpoint is called by every edge every 15s, so it builds the whole
+//! document from three queries (domains, rules, nothing else) instead of the
+//! previous per-domain N+1 lookups.
 
+use crate::middleware::agent_auth::AgentAuth;
 use crate::repository;
 use crate::state::AppState;
 use axum::{
@@ -9,7 +14,9 @@ use axum::{
 };
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use uuid::Uuid;
 
 #[derive(Serialize)]
 pub struct OriginConfig {
@@ -18,11 +25,42 @@ pub struct OriginConfig {
     pub protocol: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct CacheRuleConfig {
     pub path_pattern: String,
     pub ttl_seconds: u64,
     pub priority: i32,
+    pub action: String,
+    pub swr_seconds: u64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct WafManagedOut {
+    pub sqli: bool,
+    pub xss: bool,
+    pub traversal: bool,
+    pub scanners: bool,
+}
+
+#[derive(Serialize, Clone)]
+pub struct WafRuleOut {
+    pub name: String,
+    pub field: String,
+    pub operator: String,
+    pub value: String,
+    pub action: String,
+    pub priority: i32,
+    pub enabled: bool,
+}
+
+#[derive(Serialize, Clone)]
+pub struct WafConfigOut {
+    pub enabled: bool,
+    pub mode: String,
+    pub managed: WafManagedOut,
+    pub rules: Vec<WafRuleOut>,
+    pub ip_allow: Vec<String>,
+    pub ip_deny: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -39,6 +77,7 @@ pub struct DomainConfigResponse {
     pub origin_timeout_ms: u32,
     pub custom_headers: String,
     pub backup_origin: Option<OriginConfig>,
+    pub waf: Option<WafConfigOut>,
     pub version: String,
 }
 
@@ -53,165 +92,259 @@ pub struct ErrorBody {
     pub error: String,
 }
 
-fn hash_settings(
-    rps: u32,
-    burst: u32,
-    ignore_q: bool,
-    cors: &str,
-    hotlink: &str,
-    timeout: u32,
-    headers: &str,
-    backup: &Option<OriginConfig>,
-    rules: &[CacheRuleConfig],
-    origin: &OriginConfig,
-    status: &str,
-) -> u64 {
+fn rule_configs(rows: Vec<repository::CacheRuleRow>) -> Vec<CacheRuleConfig> {
+    rows.into_iter()
+        .map(|r| CacheRuleConfig {
+            path_pattern: r.path_pattern,
+            ttl_seconds: r.ttl_seconds.max(0) as u64,
+            priority: r.priority,
+            action: r.action,
+            swr_seconds: r.swr_seconds.max(0) as u64,
+        })
+        .collect()
+}
+
+fn origin_config(row: &repository::DomainFullRow) -> OriginConfig {
+    OriginConfig {
+        host: row.origin_host.clone(),
+        port: row.origin_port as u16,
+        protocol: row.origin_proto.clone(),
+    }
+}
+
+fn backup_config(row: &repository::DomainFullRow) -> Option<OriginConfig> {
+    if row.backup_origin_host.is_empty() || row.backup_origin_port <= 0 {
+        return None;
+    }
+    Some(OriginConfig {
+        host: row.backup_origin_host.clone(),
+        port: row.backup_origin_port as u16,
+        protocol: row.backup_origin_proto.clone(),
+    })
+}
+
+fn waf_config_from(
+    settings: repository::WafSettingsRow,
+    rules: Vec<repository::WafRuleRow>,
+    ips: Vec<repository::WafIpRow>,
+) -> WafConfigOut {
+    let mut ip_allow = Vec::new();
+    let mut ip_deny = Vec::new();
+    for ip in ips {
+        if ip.kind == "allow" {
+            ip_allow.push(ip.ip);
+        } else {
+            ip_deny.push(ip.ip);
+        }
+    }
+    WafConfigOut {
+        enabled: settings.enabled,
+        mode: settings.mode,
+        managed: WafManagedOut {
+            sqli: settings.sqli,
+            xss: settings.xss,
+            traversal: settings.traversal,
+            scanners: settings.scanners,
+        },
+        rules: rules
+            .into_iter()
+            .map(|r| WafRuleOut {
+                name: r.name,
+                field: r.field,
+                operator: r.operator,
+                value: r.value,
+                action: r.action,
+                priority: r.priority,
+                enabled: r.enabled,
+            })
+            .collect(),
+        ip_allow,
+        ip_deny,
+    }
+}
+
+fn build(
+    row: &repository::DomainFullRow,
+    rules: Vec<CacheRuleConfig>,
+    waf: Option<WafConfigOut>,
+) -> DomainConfigResponse {
+    let origin = origin_config(row);
+    let backup = backup_config(row);
+    let timeout = if row.origin_timeout_ms <= 0 {
+        10_000
+    } else {
+        row.origin_timeout_ms as u32
+    };
+    let rps = row.rate_limit_rps.max(0) as u32;
+    let burst = row.rate_limit_burst.max(0) as u32;
+
     let mut h = DefaultHasher::new();
     rps.hash(&mut h);
     burst.hash(&mut h);
-    ignore_q.hash(&mut h);
-    cors.hash(&mut h);
-    hotlink.hash(&mut h);
+    row.ignore_query_string.hash(&mut h);
+    row.cors_origins.hash(&mut h);
+    row.hotlink_allow_referers.hash(&mut h);
     timeout.hash(&mut h);
-    headers.hash(&mut h);
-    status.hash(&mut h);
+    row.custom_headers.hash(&mut h);
+    row.status.hash(&mut h);
     origin.host.hash(&mut h);
     origin.port.hash(&mut h);
     origin.protocol.hash(&mut h);
-    if let Some(b) = backup {
+    if let Some(ref b) = backup {
         b.host.hash(&mut h);
         b.port.hash(&mut h);
         b.protocol.hash(&mut h);
     }
-    for r in rules {
+    for r in &rules {
         r.path_pattern.hash(&mut h);
         r.ttl_seconds.hash(&mut h);
         r.priority.hash(&mut h);
+        r.action.hash(&mut h);
+        r.swr_seconds.hash(&mut h);
     }
-    h.finish()
-}
+    match &waf {
+        Some(w) => {
+            w.enabled.hash(&mut h);
+            w.mode.hash(&mut h);
+            w.managed.sqli.hash(&mut h);
+            w.managed.xss.hash(&mut h);
+            w.managed.traversal.hash(&mut h);
+            w.managed.scanners.hash(&mut h);
+            for r in &w.rules {
+                r.name.hash(&mut h);
+                r.field.hash(&mut h);
+                r.operator.hash(&mut h);
+                r.value.hash(&mut h);
+                r.action.hash(&mut h);
+                r.priority.hash(&mut h);
+                r.enabled.hash(&mut h);
+            }
+            for ip in &w.ip_allow {
+                ip.hash(&mut h);
+            }
+            for ip in &w.ip_deny {
+                ip.hash(&mut h);
+            }
+        }
+        None => "waf-none".hash(&mut h),
+    }
 
-async fn build_domain_cfg(
-    pool: &sqlx::PgPool,
-    row: repository::DomainRow,
-) -> DomainConfigResponse {
-    let rules_raw = repository::list_rules_for_domain(pool, row.id)
-        .await
-        .unwrap_or_default();
-    let rules: Vec<CacheRuleConfig> = rules_raw
-        .into_iter()
-        .map(|r| CacheRuleConfig {
-            path_pattern: r.path_pattern,
-            ttl_seconds: r.ttl_seconds as u64,
-            priority: r.priority,
-        })
-        .collect();
-    let settings = repository::get_domain_settings(pool, &row.name)
-        .await
-        .ok()
-        .flatten();
-    let (rps, burst, ignore_q, cors, hotlink, timeout, headers) = match settings {
-        Some(s) => (
-            s.rate_limit_rps.max(0) as u32,
-            s.rate_limit_burst.max(0) as u32,
-            s.ignore_query_string,
-            s.cors_origins,
-            s.hotlink_allow_referers,
-            s.origin_timeout_ms.max(1000) as u32,
-            s.custom_headers,
-        ),
-        None => (0, 0, false, String::new(), String::new(), 10000, String::new()),
-    };
-    let backup = repository::get_backup_origin(pool, &row.name)
-        .await
-        .ok()
-        .flatten()
-        .map(|(h, p, proto)| OriginConfig {
-            host: h,
-            port: p as u16,
-            protocol: proto,
-        });
-    let origin = OriginConfig {
-        host: row.origin_host,
-        port: row.origin_port as u16,
-        protocol: row.origin_proto,
-    };
-    let sh = hash_settings(
-        rps,
-        burst,
-        ignore_q,
-        &cors,
-        &hotlink,
-        timeout,
-        &headers,
-        &backup,
-        &rules,
-        &origin,
-        &row.status,
-    );
     DomainConfigResponse {
-        domain: row.name,
+        domain: row.name.clone(),
         origin,
         rules,
-        status: row.status,
+        status: row.status.clone(),
         rate_limit_rps: rps,
         rate_limit_burst: burst,
-        ignore_query_string: ignore_q,
-        cors_origins: cors,
-        hotlink_allow_referers: hotlink,
+        ignore_query_string: row.ignore_query_string,
+        cors_origins: row.cors_origins.clone(),
+        hotlink_allow_referers: row.hotlink_allow_referers.clone(),
         origin_timeout_ms: timeout,
-        custom_headers: headers,
+        custom_headers: row.custom_headers.clone(),
         backup_origin: backup,
-        version: format!("{}-{:x}", row.id, sh),
+        waf,
+        version: format!("{}-{:x}", row.id, h.finish()),
     }
 }
 
 pub async fn get_domain_config(
     State(state): State<AppState>,
+    _agent: AgentAuth,
     Path(domain): Path<String>,
 ) -> Result<Json<DomainConfigResponse>, (StatusCode, Json<ErrorBody>)> {
-    let row = repository::get_domain_by_name(&state.pool, &domain)
+    let row = repository::get_domain_full_by_name(&state.pool, &domain)
         .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: "database error".into(),
-                }),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: "domain not found".into(),
-                }),
-            )
-        })?;
-    Ok(Json(build_domain_cfg(&state.pool, row).await))
+        .map_err(|_| db_error())?
+        .ok_or_else(not_found)?;
+    let rules = repository::list_rules_for_domain(&state.pool, row.id)
+        .await
+        .unwrap_or_default();
+    let waf = match repository::get_waf_settings(&state.pool, row.id)
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(settings) => {
+            let waf_rules = repository::list_waf_rules(&state.pool, row.id)
+                .await
+                .unwrap_or_default();
+            let waf_ips = repository::list_waf_ips(&state.pool, row.id)
+                .await
+                .unwrap_or_default();
+            Some(waf_config_from(settings, waf_rules, waf_ips))
+        }
+        None => None,
+    };
+    Ok(Json(build(&row, rule_configs(rules), waf)))
 }
 
 pub async fn list_all_configs(
     State(state): State<AppState>,
+    _agent: AgentAuth,
 ) -> Result<Json<AllDomainsConfigResponse>, (StatusCode, Json<ErrorBody>)> {
-    let rows = repository::list_domains(&state.pool).await.map_err(|e| {
-        tracing::error!(error = %e, "list domains for config");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: "database error".into(),
-            }),
-        )
-    })?;
+    let rows = repository::list_domains_full(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list domains for config");
+            db_error()
+        })?;
+    let all_rules = repository::list_rules_flat(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list rules for config");
+            db_error()
+        })?;
 
-    let mut domains = Vec::new();
-    let mut version_parts = Vec::new();
+    let mut by_domain: HashMap<Uuid, Vec<repository::CacheRuleRow>> = HashMap::new();
+    for r in all_rules {
+        by_domain.entry(r.domain_id).or_default().push(r);
+    }
+
+    let waf_settings = repository::list_waf_settings_all(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list waf settings for config");
+            db_error()
+        })?;
+    let waf_rules = repository::list_waf_rules_all(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list waf rules for config");
+            db_error()
+        })?;
+    let waf_ips = repository::list_waf_ips_all(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list waf ips for config");
+            db_error()
+        })?;
+
+    let mut waf_settings_by: HashMap<Uuid, repository::WafSettingsRow> =
+        waf_settings.into_iter().map(|s| (s.domain_id, s)).collect();
+    let mut waf_rules_by: HashMap<Uuid, Vec<repository::WafRuleRow>> = HashMap::new();
+    for r in waf_rules {
+        waf_rules_by.entry(r.domain_id).or_default().push(r);
+    }
+    let mut waf_ips_by: HashMap<Uuid, Vec<repository::WafIpRow>> = HashMap::new();
+    for ip in waf_ips {
+        waf_ips_by.entry(ip.domain_id).or_default().push(ip);
+    }
+
+    let mut domains = Vec::with_capacity(rows.len());
+    let mut version_parts = Vec::with_capacity(rows.len());
     for row in rows {
         if row.status == "disabled" || row.status == "deleted" {
             continue;
         }
-        let cfg = build_domain_cfg(&state.pool, row).await;
-        // Aggregate version includes full per-domain content hash
+        let rules = by_domain.remove(&row.id).unwrap_or_default();
+        let waf = waf_settings_by.remove(&row.id).map(|settings| {
+            waf_config_from(
+                settings,
+                waf_rules_by.remove(&row.id).unwrap_or_default(),
+                waf_ips_by.remove(&row.id).unwrap_or_default(),
+            )
+        });
+        let cfg = build(&row, rule_configs(rules), waf);
         version_parts.push(cfg.version.clone());
         domains.push(cfg);
     }
@@ -223,4 +356,22 @@ pub async fn list_all_configs(
     };
 
     Ok(Json(AllDomainsConfigResponse { domains, version }))
+}
+
+fn db_error() -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: "database error".into(),
+        }),
+    )
+}
+
+fn not_found() -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorBody {
+            error: "domain not found".into(),
+        }),
+    )
 }

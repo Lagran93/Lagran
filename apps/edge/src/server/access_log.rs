@@ -1,11 +1,16 @@
-//! Structured visitor access log: file + ring buffer + optional control report
+//! Structured visitor access log: file + ring buffer + optional control report.
+//!
+//! Request handlers never touch the file system: records go through an
+//! unbounded channel to a single writer task, which keeps the hot path free of
+//! lock contention and file I/O.
 
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AccessRecord {
@@ -25,16 +30,20 @@ pub struct AccessRecord {
 
 #[derive(Clone)]
 pub struct AccessLog {
-    file: Arc<Mutex<Option<tokio::fs::File>>>,
+    tx: mpsc::UnboundedSender<AccessRecord>,
     /// Recent entries for local query / batch report
     buffer: Arc<Mutex<VecDeque<AccessRecord>>>,
     buffer_cap: usize,
-    json_lines: bool,
     node_id: String,
 }
 
 impl AccessLog {
-    pub async fn open(path: Option<&str>, node_id: &str, buffer_cap: usize, json_lines: bool) -> Self {
+    pub async fn open(
+        path: Option<&str>,
+        node_id: &str,
+        buffer_cap: usize,
+        json_lines: bool,
+    ) -> Self {
         let file = if let Some(p) = path.filter(|s| !s.is_empty()) {
             let path = PathBuf::from(p);
             if let Some(parent) = path.parent() {
@@ -58,15 +67,62 @@ impl AccessLog {
         } else {
             None
         };
+
+        let buffer_cap = buffer_cap.clamp(100, 50_000);
+        let buffer = Arc::new(Mutex::new(VecDeque::with_capacity(buffer_cap.min(10_000))));
+        let (tx, mut rx) = mpsc::unbounded_channel::<AccessRecord>();
+
+        {
+            let buffer = buffer.clone();
+            tokio::spawn(async move {
+                let mut file = file;
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        maybe = rx.recv() => {
+                            let Some(rec) = maybe else { break };
+                            if let Some(f) = file.as_mut() {
+                                let payload = if json_lines {
+                                    serde_json::to_string(&rec)
+                                        .unwrap_or_else(|_| combined_line(&rec))
+                                } else {
+                                    combined_line(&rec)
+                                };
+                                if let Err(e) = f.write_all(payload.as_bytes()).await {
+                                    tracing::warn!(error = %e, "access log write failed");
+                                } else if let Err(e) = f.write_all(b"\n").await {
+                                    tracing::warn!(error = %e, "access log write failed");
+                                }
+                            }
+                            let mut buf = buffer.lock().await;
+                            if buf.len() >= buffer_cap {
+                                buf.pop_front();
+                            }
+                            buf.push_back(rec);
+                        }
+                        _ = tick.tick() => {
+                            if let Some(f) = file.as_mut() {
+                                let _ = f.flush().await;
+                            }
+                        }
+                    }
+                }
+                if let Some(f) = file.as_mut() {
+                    let _ = f.flush().await;
+                }
+            });
+        }
+
         Self {
-            file: Arc::new(Mutex::new(file)),
-            buffer: Arc::new(Mutex::new(VecDeque::with_capacity(buffer_cap.min(10_000)))),
-            buffer_cap: buffer_cap.max(100).min(50_000),
-            json_lines,
+            tx,
+            buffer,
+            buffer_cap,
             node_id: node_id.to_string(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         client_ip: &str,
@@ -97,22 +153,8 @@ impl AccessLog {
         }
     }
 
+    /// Enqueue a record; returns immediately. The writer task owns the file.
     pub async fn write(&self, rec: AccessRecord) {
-        // Combined-like text line
-        let line = format!(
-            "{ts} {ip} \"{method} {host}{path}\" status={status} bytes={bytes} cache={cache} {ms}ms ua=\"{ua}\" ref=\"{ref}\"",
-            ts = rec.ts,
-            ip = rec.client_ip,
-            method = rec.method,
-            host = rec.host,
-            path = rec.path,
-            status = rec.status,
-            bytes = rec.bytes,
-            cache = rec.cache_status,
-            ms = rec.latency_ms,
-            ua = rec.user_agent.replace('"', "'"),
-            ref = rec.referer.replace('"', "'"),
-        );
         tracing::info!(
             target: "access",
             client_ip = %rec.client_ip,
@@ -123,38 +165,21 @@ impl AccessLog {
             bytes = rec.bytes,
             latency_ms = rec.latency_ms,
             cache = %rec.cache_status,
-            "{line}"
+            "{}", combined_line(&rec)
         );
-
-        let mut guard = self.file.lock().await;
-        if let Some(f) = guard.as_mut() {
-            let payload = if self.json_lines {
-                match serde_json::to_string(&rec) {
-                    Ok(s) => s,
-                    Err(_) => line.clone(),
-                }
-            } else {
-                line.clone()
-            };
-            let _ = f.write_all(payload.as_bytes()).await;
-            let _ = f.write_all(b"\n").await;
+        if self.tx.send(rec).is_err() {
+            tracing::warn!("access log writer stopped; record dropped");
         }
-        drop(guard);
-
-        let mut buf = self.buffer.lock().await;
-        if buf.len() >= self.buffer_cap {
-            buf.pop_front();
-        }
-        buf.push_back(rec);
     }
 
-    /// Drain up to `limit` records for reporting (does not remove if report fails — caller decides)
+    /// Recent records, newest first (does not remove them).
     pub async fn snapshot(&self, limit: usize) -> Vec<AccessRecord> {
         let buf = self.buffer.lock().await;
         let n = limit.min(buf.len());
         buf.iter().rev().take(n).cloned().collect()
     }
 
+    /// Drain up to `limit` oldest records for reporting.
     pub async fn drain(&self, limit: usize) -> Vec<AccessRecord> {
         let mut buf = self.buffer.lock().await;
         let n = limit.min(buf.len());
@@ -166,6 +191,27 @@ impl AccessLog {
         }
         out
     }
+
+    pub fn capacity(&self) -> usize {
+        self.buffer_cap
+    }
+}
+
+fn combined_line(rec: &AccessRecord) -> String {
+    format!(
+        "{ts} {ip} \"{method} {host}{path}\" status={status} bytes={bytes} cache={cache} {ms}ms ua=\"{ua}\" ref=\"{ref}\"",
+        ts = rec.ts,
+        ip = rec.client_ip,
+        method = rec.method,
+        host = rec.host,
+        path = rec.path,
+        status = rec.status,
+        bytes = rec.bytes,
+        cache = rec.cache_status,
+        ms = rec.latency_ms,
+        ua = rec.user_agent.replace('"', "'"),
+        ref = rec.referer.replace('"', "'"),
+    )
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -177,14 +223,11 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn chrono_like_now() -> String {
-    // RFC3339-ish without chrono dep on edge if not present — use system time
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // simple ISO-ish UTC approximation is ok; prefer format via time crate if available
-    // Use humantime-free: seconds since epoch as fallback readable
     format_unix(secs)
 }
 
@@ -193,7 +236,6 @@ fn format_unix(secs: u64) -> String {
     const DAY: u64 = 86400;
     const HOUR: u64 = 3600;
     const MIN: u64 = 60;
-    // days from 1970-01-01
     let days = secs / DAY;
     let rem = secs % DAY;
     let h = rem / HOUR;
@@ -216,4 +258,41 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_format_is_iso_utc() {
+        // 2026-10-25T00:00:00Z
+        assert_eq!(format_unix(1_792_886_400), "2026-10-25T00:00:00Z");
+    }
+
+    #[test]
+    fn truncation_keeps_char_boundaries() {
+        assert_eq!(truncate("abcdef", 3), "abc…");
+        assert_eq!(truncate("ab", 3), "ab");
+    }
+
+    #[tokio::test]
+    async fn records_reach_ring_buffer() {
+        let log = AccessLog::open(None, "n1", 100, false).await;
+        log.write(log.record(
+            "1.2.3.4", "GET", "a.test", "/x", 200, 10, 5, "HIT", "ua", "",
+        ))
+        .await;
+        // The writer task applies the record asynchronously.
+        for _ in 0..50 {
+            if !log.snapshot(1).await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let rows = log.snapshot(10).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].host, "a.test");
+        assert_eq!(log.capacity(), 100);
+    }
 }

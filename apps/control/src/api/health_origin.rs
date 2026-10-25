@@ -1,11 +1,12 @@
-//! Origin health status (from edge probes)
+//! Origin health status (from edge probes), scoped to the caller's domains.
 
 use crate::middleware::agent_auth::AgentAuth;
-use crate::middleware::AuthUser;
+use crate::middleware::authz::Actor;
 use crate::repository;
 use crate::state::AppState;
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Serialize)]
 pub struct OriginHealthDto {
@@ -32,15 +33,33 @@ pub struct ReportAck {
     pub accepted: bool,
 }
 
-pub async fn list(
-    State(state): State<AppState>,
-    _user: AuthUser,
-) -> Json<Vec<OriginHealthDto>> {
+pub async fn list(State(state): State<AppState>, actor: Actor) -> Json<Vec<OriginHealthDto>> {
     let rows = repository::list_origin_health(&state.pool)
         .await
         .unwrap_or_default();
+
+    let visible_names: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
+        None => None,
+        Some(ids) => {
+            let domains = repository::list_domains(&state.pool)
+                .await
+                .unwrap_or_default();
+            Some(
+                domains
+                    .into_iter()
+                    .filter(|d| ids.contains(&d.id))
+                    .map(|d| d.name)
+                    .collect(),
+            )
+        }
+    };
+
     Json(
         rows.into_iter()
+            .filter(|r| match &visible_names {
+                None => true,
+                Some(names) => names.contains(&r.domain_name),
+            })
             .map(|r| OriginHealthDto {
                 domain_name: r.domain_name,
                 origin_url: r.origin_url,

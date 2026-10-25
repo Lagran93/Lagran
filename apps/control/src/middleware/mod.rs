@@ -1,6 +1,7 @@
 //! Auth middleware / extractors
 
 pub mod agent_auth;
+pub mod authz;
 
 use crate::state::AppState;
 use crate::utils::{decode_token, Claims};

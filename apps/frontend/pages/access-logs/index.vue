@@ -1,85 +1,195 @@
 <template>
-  <div>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.25rem;gap:1rem;flex-wrap:wrap;">
-      <p class="muted" style="margin:0;">访客访问日志（边缘上报汇总）</p>
-      <div style="display:flex;gap:0.5rem;align-items:center;">
-        <input v-model="host" placeholder="按域名筛选" style="width:180px;" />
-        <button class="btn" @click="load">刷新</button>
+  <div class="page">
+    <div class="page-head">
+      <div>
+        <div class="page-title">访问日志</div>
+        <div class="page-desc">边缘节点批量上报的访客请求明细，默认展示最近 200 条</div>
+      </div>
+      <div class="page-actions">
+        <button class="btn btn-default" type="button" :disabled="loading" @click="load">
+          <AppIcon name="refresh" :size="15" />
+          刷新
+        </button>
       </div>
     </div>
+
     <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th>时间</th>
-            <th>节点</th>
-            <th>客户端 IP</th>
-            <th>方法</th>
-            <th>域名</th>
-            <th>路径</th>
-            <th>状态</th>
-            <th>缓存</th>
-            <th>字节</th>
-            <th>耗时</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="r in rows" :key="r.id">
-            <td class="muted">{{ r.ts?.slice(0, 19).replace('T', ' ') }}</td>
-            <td>{{ r.node_id }}</td>
-            <td>{{ r.client_ip }}</td>
-            <td>{{ r.method }}</td>
-            <td>{{ r.host }}</td>
-            <td class="path">{{ r.path }}</td>
-            <td><span :class="['badge', statusClass(r.status)]">{{ r.status }}</span></td>
-            <td>{{ r.cache_status }}</td>
-            <td>{{ r.bytes }}</td>
-            <td>{{ r.latency_ms }}ms</td>
-          </tr>
-          <tr v-if="!rows.length">
-            <td colspan="10" class="empty">暂无日志（边缘 ACCESS_LOG_REPORT=true 时约 30s 上报一次）</td>
-          </tr>
-        </tbody>
-      </table>
+      <div class="filter-bar">
+        <input
+          v-model="host"
+          class="input"
+          placeholder="按域名筛选，如 cdn.example.com"
+          style="min-width: 240px"
+          @keyup.enter="load"
+        />
+        <select v-model="statusClass" class="select">
+          <option value="">全部状态码</option>
+          <option value="2xx">2xx 成功</option>
+          <option value="3xx">3xx 跳转</option>
+          <option value="4xx">4xx 客户端错误</option>
+          <option value="5xx">5xx 服务端错误</option>
+        </select>
+        <select v-model.number="limit" class="select">
+          <option :value="100">最近 100 条</option>
+          <option :value="200">最近 200 条</option>
+          <option :value="500">最近 500 条</option>
+        </select>
+        <button class="btn btn-default" type="button" @click="load">查询</button>
+        <span class="spacer" />
+        <span class="text-muted" style="font-size: 13px">{{ filtered.length }} 条记录</span>
+      </div>
+
+      <div v-if="filtered.length" class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>节点</th>
+              <th>客户端 IP</th>
+              <th>方法</th>
+              <th>域名</th>
+              <th style="min-width: 220px">路径</th>
+              <th>状态</th>
+              <th>缓存</th>
+              <th class="num">大小</th>
+              <th class="num">耗时</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in paged" :key="r.id">
+              <td class="text-muted nowrap">{{ formatDateTime(r.ts) }}</td>
+              <td class="text-2">{{ r.node_id }}</td>
+              <td class="mono">{{ r.client_ip }}</td>
+              <td>
+                <span class="method" :class="r.method?.toLowerCase()">{{ r.method }}</span>
+              </td>
+              <td class="text-2">{{ r.host }}</td>
+              <td>
+                <div class="mono path-cell" :title="r.path">{{ r.path }}</div>
+              </td>
+              <td>
+                <StatusTag :tone="statusTone(r.status)">{{ r.status }}</StatusTag>
+              </td>
+              <td>
+                <StatusTag :status="r.cache_status">{{ r.cache_status }}</StatusTag>
+              </td>
+              <td class="num text-2">{{ formatBytes(r.bytes) }}</td>
+              <td class="num" :class="r.latency_ms > 1000 ? 'text-danger' : 'text-2'">
+                {{ r.latency_ms }} ms
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div v-else-if="loading" class="card-body">
+        <div class="skeleton" style="height: 34px; width: 100%" />
+      </div>
+
+      <EmptyState
+        v-else
+        icon="logs"
+        title="暂无访问日志"
+        text="边缘端开启 ACCESS_LOG_REPORT=true 后，约 30 秒上报一次批量日志。"
+      />
+
+      <div v-if="filtered.length > pageSize" class="table-footer">
+        <AppPagination v-model:page="page" :total="filtered.length" :page-size="pageSize" />
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 const api = useApi()
+
 const rows = ref<any[]>([])
 const host = ref('')
+const statusClass = ref('')
+const limit = ref(200)
+const loading = ref(false)
+const page = ref(1)
+const pageSize = 20
 
-async function load() {
-  try {
-    const q = host.value.trim()
-      ? `?host=${encodeURIComponent(host.value.trim())}&limit=200`
-      : '?limit=200'
-    rows.value = await api.get(`/api/v1/access-logs${q}`)
-  } catch {
-    rows.value = []
-  }
+const filtered = computed(() => {
+  return rows.value.filter((r) => {
+    if (!statusClass.value) return true
+    const bucket = `${Math.floor(Number(r.status) / 100)}xx`
+    return bucket === statusClass.value
+  })
+})
+
+const paged = computed(() => {
+  const start = (page.value - 1) * pageSize
+  return filtered.value.slice(start, start + pageSize)
+})
+
+watch([statusClass, limit], () => {
+  page.value = 1
+})
+
+function statusTone(status: number) {
+  if (status >= 500) return 'danger'
+  if (status >= 400) return 'warning'
+  if (status >= 300) return 'info'
+  return 'success'
 }
 
-function statusClass(s: number) {
-  if (s >= 500) return 'err'
-  if (s >= 400) return 'warn'
-  if (s >= 300) return 'redir'
-  return 'ok'
+async function load() {
+  loading.value = true
+  page.value = 1
+  try {
+    const q = host.value.trim()
+      ? `?host=${encodeURIComponent(host.value.trim())}&limit=${limit.value}`
+      : `?limit=${limit.value}`
+    rows.value = (await api.get<any[]>(`/api/v1/access-logs${q}`)) || []
+  } catch {
+    rows.value = []
+  } finally {
+    loading.value = false
+  }
 }
 
 onMounted(load)
 </script>
 
 <style scoped>
-input {
-  padding: 0.4rem 0.6rem; border: 1px solid #334155; border-radius: 6px;
-  background: #0f172a; color: #e2e8f0;
+.method {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #f2f3f5;
+  color: var(--text-2);
 }
-.path { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.badge { padding: 0.1rem 0.4rem; border-radius: 999px; font-size: 0.75rem; }
-.badge.ok { background: rgba(34,197,94,.2); color: #4ade80; }
-.badge.warn { background: rgba(251,191,36,.2); color: #fbbf24; }
-.badge.err { background: rgba(248,113,113,.2); color: #f87171; }
-.badge.redir { background: rgba(56,189,248,.2); color: #38bdf8; }
+
+.method.get {
+  background: var(--brand-bg);
+  color: var(--brand);
+}
+
+.method.post {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.method.delete {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.method.put,
+.method.patch {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.path-cell {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+}
 </style>
