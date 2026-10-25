@@ -17,6 +17,10 @@
           <AppIcon name="refresh" :size="15" />
           刷新
         </button>
+        <button class="btn btn-default" type="button" @click="openSchedule">
+          <AppIcon name="globe" :size="15" />
+          调度测试
+        </button>
         <button class="btn btn-primary" type="button" @click="openCreate">
           <AppIcon name="plus" :size="15" />
           添加节点
@@ -53,7 +57,7 @@
           <thead>
             <tr>
               <th style="min-width: 190px">节点</th>
-              <th>区域</th>
+              <th>区域 / 线路</th>
               <th>状态</th>
               <th class="num">版本</th>
               <th style="min-width: 150px">资源</th>
@@ -68,7 +72,13 @@
                 <div class="cell-main">{{ n.name }}</div>
                 <div class="cell-sub mono">{{ n.id.slice(0, 8) }}</div>
               </td>
-              <td>{{ n.region || '默认区域' }}</td>
+              <td>
+                <div>{{ n.region || '默认区域' }}</div>
+                <div class="cell-sub">
+                  {{ [n.province, n.city, n.isp].filter(Boolean).join(' · ') || '未设置线路' }}
+                </div>
+                <div class="cell-sub mono">{{ n.public_ip || '未设置公网 IP' }}</div>
+              </td>
               <td>
                 <StatusTag :tone="statusTone(n.status)" dot>
                   {{ statusLabel(n.status) }}
@@ -174,8 +184,25 @@
             <input v-model="form.region" class="input" placeholder="例如 香港 / cn-hongkong" />
           </div>
           <div class="field">
-            <label class="field-label">节点 IP（可选）</label>
-            <input v-model="form.ip" class="input" placeholder="公网 IP，便于识别" />
+            <label class="field-label">公网 IP</label>
+            <input v-model="form.public_ip" class="input" placeholder="DNS 调度返回的 IP" />
+          </div>
+          <div class="field">
+            <label class="field-label">省份</label>
+            <input v-model="form.province" class="input" placeholder="例如 广东" />
+          </div>
+          <div class="field">
+            <label class="field-label">城市</label>
+            <input v-model="form.city" class="input" placeholder="例如 深圳" />
+          </div>
+          <div class="field">
+            <label class="field-label">运营商</label>
+            <input v-model="form.isp" class="input" placeholder="电信 / 联通 / 移动 / BGP" />
+          </div>
+          <div class="field">
+            <label class="field-label">调度权重</label>
+            <input v-model.number="form.weight" class="input" type="number" min="0" max="1000" />
+            <span class="field-hint">数值越大越优先，默认 100。</span>
           </div>
           <div class="field span-2">
             <label class="field-label">Agent 地址</label>
@@ -300,6 +327,24 @@
             <div class="detail-value">{{ detail.node.version || '—' }}</div>
           </div>
           <div class="detail-item">
+            <div class="detail-label">公网 IP</div>
+            <div class="detail-value mono">{{ detail.node.public_ip || '未配置' }}</div>
+          </div>
+          <div class="detail-item">
+            <div class="detail-label">省份 / 城市</div>
+            <div class="detail-value">
+              {{ [detail.node.province, detail.node.city].filter(Boolean).join(' / ') || '未配置' }}
+            </div>
+          </div>
+          <div class="detail-item">
+            <div class="detail-label">运营商</div>
+            <div class="detail-value">{{ detail.node.isp || '未配置' }}</div>
+          </div>
+          <div class="detail-item">
+            <div class="detail-label">调度权重</div>
+            <div class="detail-value">{{ detail.node.weight ?? 100 }}</div>
+          </div>
+          <div class="detail-item">
             <div class="detail-label">节点 IP</div>
             <div class="detail-value mono">{{ detail.node.ip || '—' }}</div>
           </div>
@@ -351,6 +396,99 @@
         </div>
       </div>
     </BaseDrawer>
+    <!-- 调度测试 -->
+    <BaseModal v-model="schedOpen" title="调度测试" width="720px" hide-footer>
+      <div class="form-col">
+        <div class="form-grid">
+          <div class="field span-2">
+            <label class="field-label">域名（可选）</label>
+            <input v-model="schedForm.domain" class="input" placeholder="cdn.example.com" />
+          </div>
+          <div class="field">
+            <label class="field-label">客户端 IP</label>
+            <input v-model="schedForm.ip" class="input" placeholder="例如 203.0.113.9" />
+            <span class="field-hint">用于匹配 GEOIP_JSON_PATH 的 CIDR 表。</span>
+          </div>
+          <div class="field">
+            <label class="field-label">省份覆盖</label>
+            <input v-model="schedForm.province" class="input" placeholder="例如 广东" />
+          </div>
+          <div class="field">
+            <label class="field-label">运营商覆盖</label>
+            <input v-model="schedForm.isp" class="input" placeholder="电信 / 联通 / 移动" />
+          </div>
+          <div class="field">
+            <label class="field-label">城市覆盖</label>
+            <input v-model="schedForm.city" class="input" placeholder="可选" />
+          </div>
+        </div>
+
+        <div class="flex-between">
+          <span class="text-muted" style="font-size: 12px">
+            仅在线且填写了公网 IP 的节点参与调度；省份/运营商覆盖优先于 IP 解析。
+          </span>
+          <button class="btn btn-primary" type="button" :disabled="schedLoading" @click="runSchedule">
+            {{ schedLoading ? '测试中…' : '开始测试' }}
+          </button>
+        </div>
+
+        <template v-if="schedResult">
+          <div class="alert alert-info" style="margin-top: 4px">
+            <AppIcon name="info" :size="16" class="icon" />
+            <span>
+              客户端：{{ schedResult.client.province || '未知省份' }} /
+              {{ schedResult.client.isp || '未知运营商' }} · TTL {{ schedResult.ttl }}s ·
+              {{ schedResult.note }}
+            </span>
+          </div>
+          <div class="sched-pick">
+            <div class="sched-card primary">
+              <div class="sched-label">主节点</div>
+              <div class="sched-name">{{ schedResult.primary?.name || '无可用节点' }}</div>
+              <div class="mono">{{ schedResult.primary?.public_ip || '—' }}</div>
+              <div class="cell-sub">
+                {{ [schedResult.primary?.province, schedResult.primary?.isp].filter(Boolean).join(' · ') || '未设置线路' }}
+              </div>
+            </div>
+            <div class="sched-card">
+              <div class="sched-label">备用节点</div>
+              <div class="sched-name">{{ schedResult.backup?.name || '无' }}</div>
+              <div class="mono">{{ schedResult.backup?.public_ip || '—' }}</div>
+              <div class="cell-sub">
+                {{ [schedResult.backup?.province, schedResult.backup?.isp].filter(Boolean).join(' · ') || '—' }}
+              </div>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>候选节点</th>
+                  <th>省份 / 运营商</th>
+                  <th class="num">权重</th>
+                  <th class="num">得分</th>
+                  <th>原因</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="c in schedResult.candidates" :key="c.name">
+                  <td class="mono">{{ c.name }}</td>
+                  <td>{{ [c.province, c.isp].filter(Boolean).join(' · ') || '—' }}</td>
+                  <td class="num">{{ c.weight }}</td>
+                  <td class="num">{{ c.score }}</td>
+                  <td class="text-2" style="font-size: 12px">{{ c.reason }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="flex-between">
+            <span />
+            <button class="btn btn-default" type="button" @click="schedOpen = false">关闭</button>
+          </div>
+        </template>
+      </div>
+    </BaseModal>
   </div>
 </template>
 
@@ -374,7 +512,22 @@ const lastUpdated = ref('')
 const formOpen = ref(false)
 const editing = ref<any>(null)
 const formError = ref('')
-const form = ref({ name: '', region: '', ip: '', agent_url: '' })
+const form = ref({
+  name: '',
+  region: '',
+  ip: '',
+  agent_url: '',
+  public_ip: '',
+  province: '',
+  city: '',
+  isp: '',
+  weight: 100,
+})
+
+const schedOpen = ref(false)
+const schedLoading = ref(false)
+const schedResult = ref<any>(null)
+const schedForm = ref({ domain: '', ip: '', province: '', isp: '', city: '' })
 
 const installOpen = ref(false)
 const installTab = ref<'binary' | 'docker'>('binary')
@@ -442,7 +595,17 @@ async function load() {
 function openCreate() {
   editing.value = null
   formError.value = ''
-  form.value = { name: '', region: '', ip: '', agent_url: '' }
+  form.value = {
+    name: '',
+    region: '',
+    ip: '',
+    agent_url: '',
+    public_ip: '',
+    province: '',
+    city: '',
+    isp: '',
+    weight: 100,
+  }
   formOpen.value = true
 }
 
@@ -454,8 +617,36 @@ function openEdit(node: any) {
     region: node.region || '',
     ip: node.ip || '',
     agent_url: node.agent_url || '',
+    public_ip: node.public_ip || '',
+    province: node.province || '',
+    city: node.city || '',
+    isp: node.isp || '',
+    weight: node.weight ?? 100,
   }
   formOpen.value = true
+}
+
+function openSchedule() {
+  schedResult.value = null
+  schedForm.value = { domain: '', ip: '', province: '', isp: '', city: '' }
+  schedOpen.value = true
+}
+
+async function runSchedule() {
+  schedLoading.value = true
+  try {
+    schedResult.value = await api.post('/api/v1/schedule/test', {
+      domain: schedForm.value.domain.trim(),
+      ip: schedForm.value.ip.trim(),
+      province: schedForm.value.province.trim(),
+      isp: schedForm.value.isp.trim(),
+      city: schedForm.value.city.trim(),
+    })
+  } catch (e: any) {
+    toast.error(e?.data?.error || '调度测试失败')
+  } finally {
+    schedLoading.value = false
+  }
 }
 
 async function submitForm() {
@@ -466,20 +657,25 @@ async function submitForm() {
   }
   saving.value = true
   try {
+    const payload = {
+      region: form.value.region.trim(),
+      agent_url: form.value.agent_url.trim(),
+      public_ip: form.value.public_ip.trim(),
+      province: form.value.province.trim(),
+      city: form.value.city.trim(),
+      isp: form.value.isp.trim(),
+      weight: Number(form.value.weight) || 100,
+    }
     if (editing.value) {
-      await api.put(`/api/v1/nodes/${editing.value.id}`, {
-        region: form.value.region.trim(),
-        agent_url: form.value.agent_url.trim(),
-      })
+      await api.put(`/api/v1/nodes/${editing.value.id}`, payload)
       formOpen.value = false
       toast.success('节点信息已更新')
       await load()
     } else {
       const res = await api.post<CreatedNode>('/api/v1/nodes', {
         name: form.value.name.trim(),
-        region: form.value.region.trim(),
         ip: form.value.ip.trim(),
-        agent_url: form.value.agent_url.trim(),
+        ...payload,
       })
       formOpen.value = false
       created.value = res
@@ -689,6 +885,36 @@ onUnmounted(() => {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px 18px;
+}
+
+.sched-pick {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.sched-card {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fafbfc;
+}
+
+.sched-card.primary {
+  border-color: #bedaff;
+  background: var(--brand-bg);
+}
+
+.sched-label {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.sched-name {
+  margin-top: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
 }
 
 .detail-item.span-2 {

@@ -17,6 +17,8 @@ pub struct EdgeConfig {
     pub disk_cache_max_bytes: u64,
     pub node_id: String,
     pub region: String,
+    /// Public IP reported to the control plane for GeoDNS scheduling.
+    pub public_ip: String,
     pub control_url: String,
     pub agent_url: String,
     pub heartbeat_interval_secs: u64,
@@ -91,6 +93,7 @@ impl Default for EdgeConfig {
                 .unwrap_or(1_073_741_824), // 1 GiB
             node_id: std::env::var("NODE_ID").unwrap_or_else(|_| "edge-001".into()),
             region: std::env::var("NODE_REGION").unwrap_or_else(|_| "local".into()),
+            public_ip: std::env::var("PUBLIC_IP").unwrap_or_default(),
             control_url: std::env::var("CONTROL_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
             agent_url,

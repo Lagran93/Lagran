@@ -94,6 +94,8 @@ pub fn create_router(state: AppState) -> Router {
                     get(waf::list_events).post(waf::report_events),
                 )
                 .route("/waf/stats", get(waf::stats))
+                .route("/schedule", get(crate::scheduler::resolve_agent))
+                .route("/schedule/test", post(crate::scheduler::test))
                 .route("/nodes", get(node::list).post(node::create))
                 .route(
                     "/nodes/:id",

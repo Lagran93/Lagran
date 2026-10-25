@@ -80,6 +80,7 @@ pub fn spawn_heartbeat(config: EdgeConfig, control: ControlClient, node_control:
                 "region": config.region,
                 "ip": config.listen_addr,
                 "agent_url": config.agent_url,
+                "public_ip": config.public_ip,
                 "version": env!("CARGO_PKG_VERSION"),
                 "cpu_usage": cpu_usage(),
                 "memory_usage": memory_usage(),

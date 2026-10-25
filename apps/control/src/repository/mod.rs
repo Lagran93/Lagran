@@ -50,6 +50,20 @@ pub struct NodeRow {
     pub active_connections: Option<i64>,
     pub version: String,
     pub created_at: DateTime<Utc>,
+    #[sqlx(default)]
+    pub public_ip: String,
+    #[sqlx(default)]
+    pub isp: String,
+    #[sqlx(default)]
+    pub country: String,
+    #[sqlx(default)]
+    pub province: String,
+    #[sqlx(default)]
+    pub city: String,
+    #[sqlx(default)]
+    pub weight: i32,
+    #[sqlx(default)]
+    pub max_bandwidth_mbps: i32,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -210,7 +224,14 @@ pub async fn list_nodes(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
                cpu_usage, memory_usage, active_connections,
-               COALESCE(version, '') AS version, created_at
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
         FROM edge_nodes
         ORDER BY name
         "#,
@@ -225,7 +246,14 @@ pub async fn get_node(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<NodeRow>> 
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
                cpu_usage, memory_usage, active_connections,
-               COALESCE(version, '') AS version, created_at
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
         FROM edge_nodes WHERE id = $1
         "#,
     )
@@ -240,7 +268,14 @@ pub async fn get_node_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
                cpu_usage, memory_usage, active_connections,
-               COALESCE(version, '') AS version, created_at
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
         FROM edge_nodes WHERE name = $1
         "#,
     )
@@ -255,7 +290,14 @@ pub async fn list_online_nodes_with_agent(pool: &PgPool) -> sqlx::Result<Vec<Nod
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
                cpu_usage, memory_usage, active_connections,
-               COALESCE(version, '') AS version, created_at
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
         FROM edge_nodes
         WHERE status = 'online' AND COALESCE(agent_url, '') <> ''
         ORDER BY name
@@ -281,7 +323,14 @@ pub async fn create_node(
         RETURNING id, name, region, ip, status, last_heartbeat,
                   COALESCE(agent_url, '') AS agent_url, auth_token,
                   cpu_usage, memory_usage, active_connections,
-                  COALESCE(version, '') AS version, created_at
+                  COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
         "#,
     )
     .bind(name)
@@ -308,7 +357,14 @@ pub async fn update_node(
         RETURNING id, name, region, ip, status, last_heartbeat,
                   COALESCE(agent_url, '') AS agent_url, auth_token,
                   cpu_usage, memory_usage, active_connections,
-                  COALESCE(version, '') AS version, created_at
+                  COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
         "#,
     )
     .bind(id)
@@ -317,6 +373,59 @@ pub async fn update_node(
     .bind(agent_url)
     .fetch_optional(pool)
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_node_meta(
+    pool: &PgPool,
+    id: Uuid,
+    public_ip: &str,
+    isp: &str,
+    country: &str,
+    province: &str,
+    city: &str,
+    weight: i32,
+    max_bandwidth_mbps: i32,
+) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        UPDATE edge_nodes SET
+            public_ip = $2, isp = $3, country = $4, province = $5,
+            city = $6, weight = $7, max_bandwidth_mbps = $8,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, region, ip, status, last_heartbeat,
+                  COALESCE(agent_url, '') AS agent_url, auth_token,
+                  cpu_usage, memory_usage, active_connections,
+                  COALESCE(version, '') AS version, created_at,
+                  COALESCE(public_ip, '') AS public_ip,
+                  COALESCE(isp, '') AS isp,
+                  COALESCE(country, 'CN') AS country,
+                  COALESCE(province, '') AS province,
+                  COALESCE(city, '') AS city,
+                  COALESCE(weight, 100) AS weight,
+                  COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+        "#,
+    )
+    .bind(id)
+    .bind(public_ip)
+    .bind(isp)
+    .bind(country)
+    .bind(province)
+    .bind(city)
+    .bind(weight)
+    .bind(max_bandwidth_mbps)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn set_node_public_ip(pool: &PgPool, id: Uuid, public_ip: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE edge_nodes SET public_ip = $2 WHERE id = $1")
+        .bind(id)
+        .bind(public_ip)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn set_node_status(
@@ -332,7 +441,14 @@ pub async fn set_node_status(
         RETURNING id, name, region, ip, status, last_heartbeat,
                   COALESCE(agent_url, '') AS agent_url, auth_token,
                   cpu_usage, memory_usage, active_connections,
-                  COALESCE(version, '') AS version, created_at
+                  COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
         "#,
     )
     .bind(id)
@@ -378,7 +494,14 @@ pub async fn upsert_node_heartbeat(
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
                cpu_usage, memory_usage, active_connections,
-               COALESCE(version, '') AS version, created_at
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
         FROM edge_nodes WHERE name = $1
         "#,
     )
@@ -406,7 +529,14 @@ pub async fn upsert_node_heartbeat(
             RETURNING id, name, region, ip, status, last_heartbeat,
                       COALESCE(agent_url, '') AS agent_url, auth_token,
                       cpu_usage, memory_usage, active_connections,
-                      COALESCE(version, '') AS version, created_at
+                      COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
             "#,
         )
         .bind(node.id)
@@ -429,7 +559,14 @@ pub async fn upsert_node_heartbeat(
             RETURNING id, name, region, ip, status, last_heartbeat,
                       COALESCE(agent_url, '') AS agent_url, auth_token,
                       cpu_usage, memory_usage, active_connections,
-                      COALESCE(version, '') AS version, created_at
+                      COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
             "#,
         )
         .bind(node_key)

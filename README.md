@@ -20,6 +20,8 @@
 - 域名 HTTPS：开启后 HTTP 请求 301/308 跳转到 HTTPS（`EDGE_HTTPS_REDIRECT_PORT` 控制端口）
 - 证书：上传、SNI 下发、开发用自动签发（rcgen + ACME challenge 下发）
 - 节点管理：预注册节点 + 一键生成安装命令（二进制/Docker）、单节点令牌、启用/停用（下发边缘立即 503）、删除吊销、心跳与 CPU/内存/版本
+- 节点调度（Geo/ISP Phase 1）：节点公网 IP / 省份 / 城市 / 运营商 / 权重，`/api/v1/schedule` 按客户端 IP 与
+  GeoIP CIDR 表打分返回主备节点；附 PowerDNS pipe backend 接入示例
 - WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器 / **RCE / SSRF / XXE / Log4Shell / CRLF**）、
   自定义规则（含**请求头匹配**，拦截/放行/记录/浏览器质询）、IP 黑白名单、观察/拦截模式、
   **安全级别（低/中/高/攻击中）**、事件日志与**统计概览**
@@ -84,6 +86,7 @@ cargo clippy --workspace --all-targets
 bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（需 Postgres）
 bash tests/integration/backup-origin.sh # 端到端：备用源站创建/读取/修改/清空与配置下发
 bash tests/integration/failover-https.sh # 端到端：主源站宕机切换备用 + HTTPS 跳转开关
+bash tests/integration/schedule.sh # 端到端：节点 Geo/ISP 元数据、调度打分、admin 测试与 PowerDNS 示例
 bash tests/integration/nodes.sh # 端到端：节点预注册→安装命令→单节点令牌→上下线→删除
 bash tests/integration/cache-rules.sh # 端到端：方法/Query 条件、禁用规则、浏览器 TTL、规则测试器
 bash tests/integration/waf.sh   # 端到端：WAF 规则、IP 名单、观察/拦截模式与事件
@@ -105,6 +108,8 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | JWT_EXPIRE_HOURS | 72 | Token 有效期（兼容 JWT_EXPIRES_SECS） |
 | AGENT_TOKEN | 空 | 边缘 ↔ 控制面共享密钥；配置/证书接口要求携带 |
 | CONTROL_PUBLIC_URL | 空 | 控制面公网地址，用于生成节点安装命令；留空按请求 Host 推导 |
+| GEOIP_JSON_PATH | ./data/geoip.json | 调度用 CIDR → 国家/省/市/运营商 JSON 表；缺失时按权重/负载调度 |
+| SCHEDULE_TTL | 30 | `/api/v1/schedule` 返回的 DNS TTL（秒） |
 | EDGE_LISTEN | 0.0.0.0:8081 | 边缘 HTTP 监听 |
 | EDGE_HTTPS_LISTEN | 空 | 边缘 HTTPS 监听（需证书） |
 | ORIGIN_URL | https://example.com | 默认源站（未接入域名时兜底） |
@@ -114,6 +119,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | CACHE_BACKEND | memory | memory / disk / hybrid |
 | TRUST_PROXY_HEADERS | false | 是否信任 `X-Forwarded-For` 作为客户端 IP（WAF 用；仅前置可信代理时开启） |
 | EDGE_HTTPS_REDIRECT_PORT | 空 | 域名开启 HTTPS 后，HTTP→HTTPS 跳转使用的端口；留空取 HTTPS 监听端口，443 时省略 |
+| PUBLIC_IP | 空 | 节点公网 IP，随心跳上报给控制面用于 GeoDNS 调度 |
 | WAF_REPORT_INTERVAL | 5 | WAF 事件上报间隔（秒），`WAF_REPORT=false` 可关闭 |
 | CHALLENGE_SECRET | 空 | 质询 nonce / 免质询 Cookie 的 HMAC 密钥；多节点部署必须一致，留空用 AGENT_TOKEN 派生或随机 |
 | RATE_LIMIT_RPS / BURST | 0 | 全局默认限流（0=不限） |

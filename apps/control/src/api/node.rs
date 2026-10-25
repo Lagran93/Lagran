@@ -28,6 +28,13 @@ pub struct NodeDto {
     pub active_connections: Option<i64>,
     pub created_at: String,
     pub has_token: bool,
+    pub public_ip: String,
+    pub isp: String,
+    pub country: String,
+    pub province: String,
+    pub city: String,
+    pub weight: i32,
+    pub max_bandwidth_mbps: i32,
 }
 
 fn to_dto(r: repository::NodeRow) -> NodeDto {
@@ -45,6 +52,17 @@ fn to_dto(r: repository::NodeRow) -> NodeDto {
         active_connections: r.active_connections,
         created_at: r.created_at.to_rfc3339(),
         has_token: !r.auth_token.is_empty(),
+        public_ip: r.public_ip,
+        isp: r.isp,
+        country: if r.country.is_empty() {
+            "CN".into()
+        } else {
+            r.country
+        },
+        province: r.province,
+        city: r.city,
+        weight: r.weight,
+        max_bandwidth_mbps: r.max_bandwidth_mbps,
     }
 }
 
@@ -75,6 +93,13 @@ pub struct CreateNodeRequest {
     pub region: Option<String>,
     pub ip: Option<String>,
     pub agent_url: Option<String>,
+    pub public_ip: Option<String>,
+    pub isp: Option<String>,
+    pub country: Option<String>,
+    pub province: Option<String>,
+    pub city: Option<String>,
+    pub weight: Option<i32>,
+    pub max_bandwidth_mbps: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +107,13 @@ pub struct UpdateNodeRequest {
     pub name: Option<String>,
     pub region: Option<String>,
     pub agent_url: Option<String>,
+    pub public_ip: Option<String>,
+    pub isp: Option<String>,
+    pub country: Option<String>,
+    pub province: Option<String>,
+    pub city: Option<String>,
+    pub weight: Option<i32>,
+    pub max_bandwidth_mbps: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -99,6 +131,7 @@ pub struct HeartbeatRequest {
     pub memory_usage: Option<f64>,
     pub active_connections: Option<u64>,
     pub version: Option<String>,
+    pub public_ip: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -172,6 +205,7 @@ fn install_commands(
     base: &str,
     name: &str,
     region: &str,
+    public_ip: &str,
     agent_url: &str,
     token: &str,
 ) -> InstallCommands {
@@ -187,6 +221,7 @@ fn install_commands(
 export CONTROL_URL={base}
 export NODE_ID={name}
 export NODE_REGION={region}
+export PUBLIC_IP={public_ip}
 export AGENT_URL={agent_url}
 export AGENT_TOKEN={token}
 export EDGE_LISTEN=0.0.0.0:8081
@@ -201,6 +236,7 @@ export CACHE_BACKEND=memory
   -e CONTROL_URL={base} \
   -e NODE_ID={name} \
   -e NODE_REGION={region} \
+  -e PUBLIC_IP={public_ip} \
   -e AGENT_URL={agent_url} \
   -e AGENT_TOKEN={token} \
   -e EDGE_LISTEN=0.0.0.0:8081 \
@@ -274,6 +310,21 @@ pub async fn create(
         db_error()
     })?;
 
+    let row = repository::update_node_meta(
+        &state.pool,
+        row.id,
+        req.public_ip.as_deref().unwrap_or(""),
+        req.isp.as_deref().unwrap_or(""),
+        req.country.as_deref().unwrap_or("CN"),
+        req.province.as_deref().unwrap_or(""),
+        req.city.as_deref().unwrap_or(""),
+        req.weight.unwrap_or(100).clamp(0, 1000),
+        req.max_bandwidth_mbps.unwrap_or(0).max(0),
+    )
+    .await
+    .map_err(|_| db_error())?
+    .unwrap_or(row);
+
     let _ = repository::insert_audit(
         &state.pool,
         &actor.email,
@@ -283,7 +334,7 @@ pub async fn create(
     )
     .await;
 
-    let commands = install_commands(&base, name, &region, &agent_url, &token);
+    let commands = install_commands(&base, name, &region, &row.public_ip, &agent_url, &token);
     Ok((
         StatusCode::CREATED,
         Json(CreateNodeResponse {
@@ -318,6 +369,7 @@ pub async fn detail(
         &base,
         &row.name,
         &row.region,
+        &row.public_ip,
         &row.agent_url,
         &row.auth_token,
     );
@@ -395,12 +447,35 @@ pub async fn update(
             )
         })?;
 
+    let _ = repository::update_node_meta(
+        &state.pool,
+        node_id,
+        req.public_ip.as_deref().unwrap_or(&current.public_ip),
+        req.isp.as_deref().unwrap_or(&current.isp),
+        req.country.as_deref().unwrap_or(&current.country),
+        req.province.as_deref().unwrap_or(&current.province),
+        req.city.as_deref().unwrap_or(&current.city),
+        req.weight.unwrap_or(current.weight).clamp(0, 1000),
+        req.max_bandwidth_mbps
+            .unwrap_or(current.max_bandwidth_mbps)
+            .max(0),
+    )
+    .await;
+    let row = repository::get_node(&state.pool, node_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(row);
+
     let _ = repository::insert_audit(
         &state.pool,
         &actor.email,
         "node.update",
         &row.name,
-        &format!("region={} agent_url={}", row.region, row.agent_url),
+        &format!(
+            "region={} agent_url={} province={} isp={}",
+            row.region, row.agent_url, row.province, row.isp
+        ),
     )
     .await;
     Ok(Json(to_dto(row)))
@@ -515,6 +590,9 @@ async fn apply_heartbeat(
     {
         Ok(row) => {
             let enabled = row.status != "disabled";
+            if let Some(public_ip) = req.public_ip.as_deref().filter(|s| !s.is_empty()) {
+                let _ = repository::set_node_public_ip(&state.pool, row.id, public_ip).await;
+            }
             tracing::info!(
                 node = %node_id,
                 status = %row.status,

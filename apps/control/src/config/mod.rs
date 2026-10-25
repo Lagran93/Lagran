@@ -17,6 +17,10 @@ pub struct AppConfig {
     /// Public base URL of the control plane (used in node install commands).
     /// Empty = derive from the incoming request Host header.
     pub public_url: String,
+    /// CIDR → geo JSON used by the scheduler (empty / missing = weights only).
+    pub geoip_json_path: String,
+    /// TTL returned by the scheduling API (seconds).
+    pub schedule_ttl: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +43,13 @@ impl Default for AppConfig {
                 .or_else(|_| std::env::var("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
             public_url: std::env::var("CONTROL_PUBLIC_URL").unwrap_or_default(),
+            geoip_json_path: std::env::var("GEOIP_JSON_PATH")
+                .unwrap_or_else(|_| "./data/geoip.json".into()),
+            schedule_ttl: std::env::var("SCHEDULE_TTL")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30)
+                .clamp(5, 3600),
         }
     }
 }
