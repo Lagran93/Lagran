@@ -38,6 +38,12 @@ pub struct NodeRow {
     pub status: String,
     pub last_heartbeat: Option<DateTime<Utc>>,
     pub agent_url: String,
+    pub auth_token: String,
+    pub cpu_usage: Option<f64>,
+    pub memory_usage: Option<f64>,
+    pub active_connections: Option<i64>,
+    pub version: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -164,7 +170,10 @@ pub async fn delete_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
 pub async fn list_nodes(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
     sqlx::query_as::<_, NodeRow>(
         r#"
-        SELECT id, name, region, ip, status, last_heartbeat, COALESCE(agent_url, '') as agent_url
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at
         FROM edge_nodes
         ORDER BY name
         "#,
@@ -173,10 +182,43 @@ pub async fn list_nodes(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
     .await
 }
 
+pub async fn get_node(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at
+        FROM edge_nodes WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_node_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at
+        FROM edge_nodes WHERE name = $1
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn list_online_nodes_with_agent(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
     sqlx::query_as::<_, NodeRow>(
         r#"
-        SELECT id, name, region, ip, status, last_heartbeat, COALESCE(agent_url, '') as agent_url
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at
         FROM edge_nodes
         WHERE status = 'online' AND COALESCE(agent_url, '') <> ''
         ORDER BY name
@@ -186,16 +228,120 @@ pub async fn list_online_nodes_with_agent(pool: &PgPool) -> sqlx::Result<Vec<Nod
     .await
 }
 
+/// Pre-register a node. It stays `pending` until the first heartbeat arrives.
+pub async fn create_node(
+    pool: &PgPool,
+    name: &str,
+    region: &str,
+    ip: &str,
+    agent_url: &str,
+    auth_token: &str,
+) -> sqlx::Result<NodeRow> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        INSERT INTO edge_nodes (name, region, ip, agent_url, status, auth_token)
+        VALUES ($1, $2, $3, $4, 'pending', $5)
+        RETURNING id, name, region, ip, status, last_heartbeat,
+                  COALESCE(agent_url, '') AS agent_url, auth_token,
+                  cpu_usage, memory_usage, active_connections,
+                  COALESCE(version, '') AS version, created_at
+        "#,
+    )
+    .bind(name)
+    .bind(region)
+    .bind(ip)
+    .bind(agent_url)
+    .bind(auth_token)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_node(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+    region: &str,
+    agent_url: &str,
+) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        UPDATE edge_nodes
+        SET name = $2, region = $3, agent_url = $4, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, region, ip, status, last_heartbeat,
+                  COALESCE(agent_url, '') AS agent_url, auth_token,
+                  cpu_usage, memory_usage, active_connections,
+                  COALESCE(version, '') AS version, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(region)
+    .bind(agent_url)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn set_node_status(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        UPDATE edge_nodes
+        SET status = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, region, ip, status, last_heartbeat,
+                  COALESCE(agent_url, '') AS agent_url, auth_token,
+                  cpu_usage, memory_usage, active_connections,
+                  COALESCE(version, '') AS version, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(status)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_node(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM edge_nodes WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn node_token_exists(pool: &PgPool, token: &str) -> sqlx::Result<bool> {
+    if token.is_empty() {
+        return Ok(false);
+    }
+    let row: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM edge_nodes WHERE auth_token = $1 LIMIT 1")
+            .bind(token)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_node_heartbeat(
     pool: &PgPool,
     node_key: &str,
     region: &str,
     ip: &str,
     agent_url: &str,
+    cpu_usage: Option<f64>,
+    memory_usage: Option<f64>,
+    active_connections: Option<i64>,
+    version: &str,
 ) -> sqlx::Result<NodeRow> {
     let existing = sqlx::query_as::<_, NodeRow>(
         r#"
-        SELECT id, name, region, ip, status, last_heartbeat, COALESCE(agent_url, '') as agent_url
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at
         FROM edge_nodes WHERE name = $1
         "#,
     )
@@ -204,32 +350,59 @@ pub async fn upsert_node_heartbeat(
     .await?;
 
     if let Some(node) = existing {
+        // A disabled node keeps its status: it still reports telemetry but the
+        // edge stops serving traffic until an admin enables it again.
         sqlx::query_as::<_, NodeRow>(
             r#"
             UPDATE edge_nodes
-            SET region = $2, ip = $3, agent_url = $4, status = 'online', last_heartbeat = NOW()
+            SET region = CASE WHEN region = '' THEN $2 ELSE region END,
+                ip = $3,
+                agent_url = CASE WHEN COALESCE(agent_url, '') = '' THEN $4 ELSE agent_url END,
+                status = CASE WHEN status = 'disabled' THEN 'disabled' ELSE 'online' END,
+                last_heartbeat = NOW(),
+                cpu_usage = $5,
+                memory_usage = $6,
+                active_connections = $7,
+                version = $8,
+                updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, region, ip, status, last_heartbeat, COALESCE(agent_url, '') as agent_url
+            RETURNING id, name, region, ip, status, last_heartbeat,
+                      COALESCE(agent_url, '') AS agent_url, auth_token,
+                      cpu_usage, memory_usage, active_connections,
+                      COALESCE(version, '') AS version, created_at
             "#,
         )
         .bind(node.id)
         .bind(region)
         .bind(ip)
         .bind(agent_url)
+        .bind(cpu_usage)
+        .bind(memory_usage)
+        .bind(active_connections)
+        .bind(version)
         .fetch_one(pool)
         .await
     } else {
         sqlx::query_as::<_, NodeRow>(
             r#"
-            INSERT INTO edge_nodes (name, region, ip, agent_url, status, last_heartbeat)
-            VALUES ($1, $2, $3, $4, 'online', NOW())
-            RETURNING id, name, region, ip, status, last_heartbeat, COALESCE(agent_url, '') as agent_url
+            INSERT INTO edge_nodes
+                (name, region, ip, agent_url, status, last_heartbeat, version,
+                 cpu_usage, memory_usage, active_connections)
+            VALUES ($1, $2, $3, $4, 'online', NOW(), $5, $6, $7, $8)
+            RETURNING id, name, region, ip, status, last_heartbeat,
+                      COALESCE(agent_url, '') AS agent_url, auth_token,
+                      cpu_usage, memory_usage, active_connections,
+                      COALESCE(version, '') AS version, created_at
             "#,
         )
         .bind(node_key)
         .bind(region)
         .bind(ip)
         .bind(agent_url)
+        .bind(version)
+        .bind(cpu_usage)
+        .bind(memory_usage)
+        .bind(active_connections)
         .fetch_one(pool)
         .await
     }

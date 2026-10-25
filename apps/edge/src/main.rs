@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
     let origin_health_map = origin_health::OriginHealthMap::new();
     let domains = DomainRegistry::new();
     let control = agent::ControlClient::new(&config);
+    let node_control = agent::NodeControl::new();
     let waf_log = edge::server::waf_log::WafLog::new(&config.node_id, 2000);
     let challenge_secret = if !config.challenge_secret.is_empty() {
         config.challenge_secret.clone()
@@ -70,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
         random_secret()
     };
 
-    agent::spawn_heartbeat(config.clone(), control.clone());
+    agent::spawn_heartbeat(config.clone(), control.clone(), node_control.clone());
     config_sync::spawn_config_sync(
         config.clone(),
         control.clone(),
@@ -112,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         waf_log,
         trust_proxy_headers: config.trust_proxy_headers,
         challenge_secret,
+        node_control,
     });
 
     let app = listener::create_router(state);

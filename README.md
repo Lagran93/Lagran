@@ -15,6 +15,7 @@
 - 域名接入与管理：源站/备源、SSL、限流、CORS、防盗链、回源超时、自定义头
 - 缓存规则：路径匹配、TTL、优先级、**动作（cache/bypass/no_store）**、**SWR**
 - 证书：上传、SNI 下发、开发用自动签发（rcgen + ACME challenge 下发）
+- 节点管理：预注册节点 + 一键生成安装命令（二进制/Docker）、单节点令牌、启用/停用（下发边缘立即 503）、删除吊销、心跳与 CPU/内存/版本
 - WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器）、自定义规则（拦截/放行/记录/**浏览器质询**）、IP 黑白名单、观察/拦截模式、事件日志
 - 缓存刷新（purge 扇出到在线边缘）、预热任务
 - 统计：总览 / 分域名（24h）、访问日志、操作审计、源站健康
@@ -35,7 +36,7 @@
 
 ### 前端 (`apps/frontend`)
 - 浅色管理控制台（Ant Design 风格、主色 `#1677ff`）：分组侧边栏 + 面包屑 + 表格/筛选/分页
-- 仪表盘 / 项目（含成员管理）/ 域名 / 域名详情 / 规则 / WAF 防护 / 节点 / 刷新 / 统计 / 访问日志 / 审计 / 证书 / 设置
+- 仪表盘 / 项目（含成员管理）/ 域名 / 域名详情 / 规则 / WAF 防护 / 节点管理（安装、启停、删除）/ 刷新 / 统计 / 访问日志 / 审计 / 证书 / 设置
 - SPA 模式，登录态存 localStorage；管理员额外可见「边缘节点」「操作审计」
 
 ## 快速启动
@@ -74,6 +75,7 @@ curl -i http://127.0.0.1:8081/            # 第二次 HIT（源站可达时）
 cargo test --workspace          # 单元/契约测试（含 TTL 优先级矩阵）
 cargo clippy --workspace --all-targets
 bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（需 Postgres）
+bash tests/integration/nodes.sh # 端到端：节点预注册→安装命令→单节点令牌→上下线→删除
 bash tests/integration/waf.sh   # 端到端：WAF 规则、IP 名单、观察/拦截模式与事件
 bash tests/integration/ttl.sh   # 端到端：TTL 优先级（规则→s-maxage→max-age→Expires→默认）
 PGPASS=... bash tests/integration/fresh-db.sh   # 全新库迁移 + demo admin 引导
@@ -91,6 +93,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | JWT_SECRET | lagran-dev-secret-change-me | JWT 签名密钥，生产必须修改 |
 | JWT_EXPIRE_HOURS | 72 | Token 有效期（兼容 JWT_EXPIRES_SECS） |
 | AGENT_TOKEN | 空 | 边缘 ↔ 控制面共享密钥；配置/证书接口要求携带 |
+| CONTROL_PUBLIC_URL | 空 | 控制面公网地址，用于生成节点安装命令；留空按请求 Host 推导 |
 | EDGE_LISTEN | 0.0.0.0:8081 | 边缘 HTTP 监听 |
 | EDGE_HTTPS_LISTEN | 空 | 边缘 HTTPS 监听（需证书） |
 | ORIGIN_URL | https://example.com | 默认源站（未接入域名时兜底） |

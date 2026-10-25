@@ -173,6 +173,31 @@ pub fn waf_blocked_page(host: &str, path: &str, rule: &str, category: &str) -> R
     response
 }
 
+/// Page returned while an admin has disabled this edge node.
+pub fn node_disabled_page(host: &str) -> Response {
+    let host_esc = html_escape(host);
+    let body = format!(
+        r#"<h1>节点已停用</h1>
+    <p>当前边缘节点已被管理员停用，暂不对外提供服务。</p>
+    <p>请求信息：域名 <code>{host_esc}</code></p>
+    <p>如果你是访客：请稍后重试，或联系站点管理员确认节点状态。</p>
+    <p>如果你是管理员：可在控制台「边缘节点」中重新启用该节点；停用期间节点仍会上报心跳，但不再代理流量。</p>"#
+    );
+
+    let mut response = render_page(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "节点维护",
+        "节点已停用",
+        &body,
+        "NODE_DISABLED",
+        true,
+    );
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
 /// Page for a Host that has not been onboarded to this edge.
 pub fn unknown_domain_page(host: &str) -> Response {
     let host_esc = html_escape(host);

@@ -123,6 +123,24 @@ impl ControlClient {
         .await
         .map(|_| ())
     }
+
+    /// POST and decode the JSON reply (used by the heartbeat agent).
+    pub async fn post_json_for<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, String> {
+        let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+        let reply = self
+            .send(
+                "POST",
+                path,
+                Some(Bytes::from(bytes)),
+                Some("application/json"),
+            )
+            .await?;
+        serde_json::from_slice(&reply).map_err(|e| format!("invalid JSON from {path}: {e}"))
+    }
 }
 
 #[cfg(test)]

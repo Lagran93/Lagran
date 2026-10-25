@@ -1,5 +1,9 @@
-//! Validate X-Lagran-Agent-Token for edge → control APIs
+//! Validate X-Lagran-Agent-Token for edge → control APIs.
+//!
+//! Accepts either the global `AGENT_TOKEN` or a per-node token generated when
+//! the node was pre-registered (deleting the node revokes its token).
 
+use crate::repository;
 use crate::state::AppState;
 use axum::{
     async_trait,
@@ -42,10 +46,15 @@ impl FromRequestParts<AppState> for AgentAuth {
             .or_else(|| parts.headers.get("X-Lagran-Agent-Token"))
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if got == expected {
-            Ok(AgentAuth)
-        } else {
-            Err(AgentAuthError)
+        if !expected.is_empty() && got == expected {
+            return Ok(AgentAuth);
         }
+        if repository::node_token_exists(&state.pool, got)
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(AgentAuth);
+        }
+        Err(AgentAuthError)
     }
 }

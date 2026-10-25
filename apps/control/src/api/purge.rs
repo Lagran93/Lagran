@@ -129,8 +129,12 @@ pub async fn purge(
 
     for node in nodes {
         let url = format!("{}/__lagran/purge", node.agent_url.trim_end_matches('/'));
-        let result =
-            dispatch_one(client, &url, body_bytes.clone(), &state.config.agent_token).await;
+        let token = if node.auth_token.is_empty() {
+            state.config.agent_token.clone()
+        } else {
+            node.auth_token.clone()
+        };
+        let result = dispatch_one(client, &url, body_bytes.clone(), &token).await;
         match result {
             Ok(reply) => {
                 total += reply.purged_count;

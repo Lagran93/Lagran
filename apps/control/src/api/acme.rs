@@ -93,7 +93,18 @@ pub async fn issue(
             "token": token,
             "key_authorization": key_auth,
         });
-        let _ = request_json(http_client(), "PUT", &url, &body, &state.config.agent_token).await;
+        let _ = request_json(
+            http_client(),
+            "PUT",
+            &url,
+            &body,
+            if node.auth_token.is_empty() {
+                &state.config.agent_token
+            } else {
+                &node.auth_token
+            },
+        )
+        .await;
     }
 
     let (cert_pem, key_pem) = issue_dev_cert(&domain).map_err(|e| {
@@ -142,15 +153,14 @@ pub async fn issue(
                 "cert_pem": cert_pem,
                 "key_pem": key_pem,
             });
-            if request_json(
-                http_client(),
-                "POST",
-                &url,
-                &body,
-                &state.config.agent_token,
-            )
-            .await
-            .is_ok()
+            let token = if node.auth_token.is_empty() {
+                &state.config.agent_token
+            } else {
+                &node.auth_token
+            };
+            if request_json(http_client(), "POST", &url, &body, token)
+                .await
+                .is_ok()
             {
                 edges_pushed += 1;
             }

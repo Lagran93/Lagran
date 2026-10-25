@@ -10,6 +10,7 @@
 //!   `Expires`, then the domain/default TTL.
 
 use crate::agent::origin_health::OriginHealthMap;
+use crate::agent::NodeControl;
 use crate::cache::policy::{
     cache_key_for, compute_etag, decide_storage, etag_matches, is_uncacheable_header,
     request_bypasses_cache, request_method_cacheable, resolve_rule_policy, strip_response_headers,
@@ -68,6 +69,9 @@ pub struct AppState {
     pub trust_proxy_headers: bool,
     /// HMAC secret for challenge nonces and clearance cookies.
     pub challenge_secret: String,
+    /// Set from the heartbeat reply; disabled nodes answer 503 and keep serving
+    /// management/health endpoints.
+    pub node_control: NodeControl,
 }
 
 /// Per-request view of the effective domain configuration.
@@ -157,6 +161,26 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+
+    // A node disabled from the console stops serving traffic but keeps its
+    // management endpoints (health, heartbeat, purge) reachable.
+    if !state.node_control.is_serving() {
+        log_access(
+            &state.access_log,
+            &method,
+            &host,
+            &path_only,
+            503,
+            start,
+            &client_ip,
+            &user_agent,
+            &referer,
+            0,
+            "NODE_DISABLED",
+        )
+        .await;
+        return default_page::node_disabled_page(&host);
+    }
 
     let domain_entry = state.domains.get(&host).await;
     let registry_empty = state.domains.is_empty().await;

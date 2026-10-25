@@ -92,7 +92,12 @@ pub fn create_router(state: AppState) -> Router {
                     "/waf/events",
                     get(waf::list_events).post(waf::report_events),
                 )
-                .route("/nodes", get(node::list))
+                .route("/nodes", get(node::list).post(node::create))
+                .route(
+                    "/nodes/:id",
+                    get(node::detail).put(node::update).delete(node::delete),
+                )
+                .route("/nodes/:id/status", post(node::set_status))
                 .route("/nodes/heartbeat", post(node::heartbeat))
                 .route("/nodes/:id/heartbeat", post(node::heartbeat_by_path))
                 .route("/metrics/report", post(metrics::report))
