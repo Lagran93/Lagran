@@ -74,6 +74,14 @@ check "GET /nodes as admin" "$CODE" "200"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$CONTROL_PORT/api/v1/config")
 check "edge config requires agent token" "$CODE" "401"
 
+echo "== pre-register smoke edge =="
+EDGE_NODE_NAME="smoke-edge-$$"
+EDGE_NODE=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" -H "$AUTH" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"$EDGE_NODE_NAME\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
+EDGE_NODE_TOKEN=$(printf '%s' "$EDGE_NODE" | jq -r '.token // empty')
+check "edge node token created" "$([[ -n "$EDGE_NODE_TOKEN" ]] && echo yes)" "yes"
+
 echo "== create smoke domain =="
 CREATE=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" -H "$AUTH" \
   -H 'content-type: application/json' \
@@ -126,7 +134,8 @@ rm -rf "$CACHE_DIR"
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
 AGENT_URL="http://127.0.0.1:$EDGE_PORT" \
-NODE_ID="smoke-edge-$$" \
+AGENT_TOKEN="$EDGE_NODE_TOKEN" \
+NODE_ID="$EDGE_NODE_NAME" \
 CACHE_BACKEND="${CACHE_BACKEND:-disk}" \
 DISK_CACHE_DIR="$CACHE_DIR" \
 ./target/debug/lagran-edge >"$LOG_DIR/edge.log" 2>&1 &

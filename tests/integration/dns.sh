@@ -49,7 +49,7 @@ cat >"$GEO_FILE" <<'JSON'
 JSON
 
 echo "== control =="
-CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN= GEOIP_JSON_PATH="$GEO_FILE" \
+CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN=test-global-token GEOIP_JSON_PATH="$GEO_FILE" \
 DNS_TEST_SERVER="127.0.0.1:$DNS_PORT" \
   ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
 CONTROL_PID=$!
@@ -62,27 +62,39 @@ TOKEN=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/login" \
   -d '{"email":"demo@lagran.dev","password":"demo123"}' | jq -r '.token // empty')
 [[ -n "$TOKEN" ]] || { echo "login failed"; exit 1; }
 
+# Remove nodes left by an earlier failed run (the stale-cache test stops
+# control before cleanup can delete them).
+for name in dns-gd dns-bj; do
+  old_id=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
+    | jq -r --arg n "$name" '.[] | select(.name == $n) | .id' | head -1)
+  [[ -n "$old_id" ]] && api -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/$old_id" >/dev/null
+done
+
 create_node() {
   local name=$1 public_ip=$2 province=$3 city=$4 isp=$5
-  api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
-    -d "{\"name\":\"$name\",\"region\":\"$province\",\"public_ip\":\"$public_ip\",\"province\":\"$province\",\"city\":\"$city\",\"isp\":\"$isp\",\"weight\":100,\"agent_url\":\"http://127.0.0.1:19000\"}" \
-    | jq -r '.node.id'
+  local resp id token
+  resp=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
+    -d "{\"name\":\"$name\",\"region\":\"$province\",\"public_ip\":\"$public_ip\",\"province\":\"$province\",\"city\":\"$city\",\"isp\":\"$isp\",\"weight\":100,\"agent_url\":\"http://127.0.0.1:19000\"}")
+  id=$(printf '%s' "$resp" | jq -r '.node.id')
+  token=$(printf '%s' "$resp" | jq -r '.token')
+  printf '%s|%s\n' "$id" "$token"
 }
 beat() {
   curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/heartbeat" \
     -H 'content-type: application/json' \
+    -H "x-lagran-agent-token: $3" \
     -d "{\"node_id\":\"$1\",\"region\":\"test\",\"ip\":\"127.0.0.1\",\"agent_url\":\"http://127.0.0.1:19000\",\"public_ip\":\"$2\",\"version\":\"0.1.0\"}" >/dev/null
 }
 
-GD=$(create_node "dns-gd" "203.0.113.10" "广东" "深圳" "电信")
-BJ=$(create_node "dns-bj" "203.0.113.12" "北京" "北京" "电信")
+IFS='|' read -r GD GD_TOKEN <<< "$(create_node "dns-gd" "203.0.113.10" "广东" "深圳" "电信")"
+IFS='|' read -r BJ BJ_TOKEN <<< "$(create_node "dns-bj" "203.0.113.12" "北京" "北京" "电信")"
 NODE_IDS+=("$GD" "$BJ")
-beat "dns-gd" "203.0.113.10"
-beat "dns-bj" "203.0.113.12"
+beat "dns-gd" "203.0.113.10" "$GD_TOKEN"
+beat "dns-bj" "203.0.113.12" "$BJ_TOKEN"
 
 echo "== authoritative DNS =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
-AGENT_TOKEN= \
+AGENT_TOKEN=test-global-token \
 DNS_LISTEN="127.0.0.1:$DNS_PORT" \
 DNS_ZONE="edge.lagran.net" \
 DNS_NS_NAME="ns1.edge.lagran.net,ns2.edge.lagran.net" \

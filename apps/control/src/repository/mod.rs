@@ -477,6 +477,19 @@ pub async fn node_token_exists(pool: &PgPool, token: &str) -> sqlx::Result<bool>
     Ok(row.is_some())
 }
 
+/// Resolve a per-node token to the node name it belongs to.
+pub async fn node_name_for_token(pool: &PgPool, token: &str) -> sqlx::Result<Option<String>> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM edge_nodes WHERE auth_token = $1 LIMIT 1")
+            .bind(token)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_node_heartbeat(
     pool: &PgPool,
@@ -509,11 +522,11 @@ pub async fn upsert_node_heartbeat(
     .fetch_optional(pool)
     .await?;
 
-    if let Some(node) = existing {
-        // A disabled node keeps its status: it still reports telemetry but the
-        // edge stops serving traffic until an admin enables it again.
-        sqlx::query_as::<_, NodeRow>(
-            r#"
+    let node = existing.ok_or(sqlx::Error::RowNotFound)?;
+    // A disabled node keeps its status: it still reports telemetry but the
+    // edge stops serving traffic until an admin enables it again.
+    sqlx::query_as::<_, NodeRow>(
+        r#"
             UPDATE edge_nodes
             SET region = CASE WHEN region = '' THEN $2 ELSE region END,
                 ip = $3,
@@ -538,48 +551,17 @@ pub async fn upsert_node_heartbeat(
                COALESCE(weight, 100) AS weight,
                COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
             "#,
-        )
-        .bind(node.id)
-        .bind(region)
-        .bind(ip)
-        .bind(agent_url)
-        .bind(cpu_usage)
-        .bind(memory_usage)
-        .bind(active_connections)
-        .bind(version)
-        .fetch_one(pool)
-        .await
-    } else {
-        sqlx::query_as::<_, NodeRow>(
-            r#"
-            INSERT INTO edge_nodes
-                (name, region, ip, agent_url, status, last_heartbeat, version,
-                 cpu_usage, memory_usage, active_connections)
-            VALUES ($1, $2, $3, $4, 'online', NOW(), $5, $6, $7, $8)
-            RETURNING id, name, region, ip, status, last_heartbeat,
-                      COALESCE(agent_url, '') AS agent_url, auth_token,
-                      cpu_usage, memory_usage, active_connections,
-                      COALESCE(version, '') AS version, created_at,
-               COALESCE(public_ip, '') AS public_ip,
-               COALESCE(isp, '') AS isp,
-               COALESCE(country, 'CN') AS country,
-               COALESCE(province, '') AS province,
-               COALESCE(city, '') AS city,
-               COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
-            "#,
-        )
-        .bind(node_key)
-        .bind(region)
-        .bind(ip)
-        .bind(agent_url)
-        .bind(version)
-        .bind(cpu_usage)
-        .bind(memory_usage)
-        .bind(active_connections)
-        .fetch_one(pool)
-        .await
-    }
+    )
+    .bind(node.id)
+    .bind(region)
+    .bind(ip)
+    .bind(agent_url)
+    .bind(cpu_usage)
+    .bind(memory_usage)
+    .bind(active_connections)
+    .bind(version)
+    .fetch_one(pool)
+    .await
 }
 
 pub async fn list_rules_for_domain(

@@ -2,7 +2,9 @@
 
 高性能、可自托管的 CDN 系统。
 
-> 完整部署步骤见 [docs/deployment.md](docs/deployment.md)。
+> 完整部署步骤见 [docs/deployment.md](docs/deployment.md)。  
+> GeoDNS 边缘节点调度流程见 [docs/geodns.md](docs/geodns.md)。  
+> 本地编译、上传并重启服务的脚本见 [deployed.sh](deployed.sh)。
 
 - **控制端（Control Plane）**：Rust + Axum + PostgreSQL（sqlx）
 - **边缘端（Edge Plane）**：Rust 反向代理 + 内存/磁盘缓存
@@ -111,7 +113,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | CONTROL_BIND | 0.0.0.0:8080 | 控制面监听（兼容 CONTROL_HOST/CONTROL_PORT） |
 | JWT_SECRET | lagran-dev-secret-change-me | JWT 签名密钥，生产必须修改 |
 | JWT_EXPIRE_HOURS | 72 | Token 有效期（兼容 JWT_EXPIRES_SECS） |
-| AGENT_TOKEN | 空 | 边缘 ↔ 控制面共享密钥；配置/证书接口要求携带 |
+| AGENT_TOKEN | 空 | 全局 token：DNS `/schedule` 使用；边缘配置/心跳必须使用节点 `auth_token` |
 | CONTROL_PUBLIC_URL | 空 | 控制面公网地址，用于生成节点安装命令；留空按请求 Host 推导 |
 | GEOIP_JSON_PATH | ./data/geoip.json | 调度用 CIDR → 国家/省/市/运营商 JSON 表；缺失时按权重/负载调度 |
 | SCHEDULE_TTL | 30 | `/api/v1/schedule` 返回的 DNS TTL（秒） |

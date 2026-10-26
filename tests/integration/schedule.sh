@@ -57,29 +57,40 @@ TOKEN=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/login" \
   -d '{"email":"demo@lagran.dev","password":"demo123"}' | jq -r '.token // empty')
 [[ -n "$TOKEN" ]] || { echo "login failed"; exit 1; }
 
+# Remove nodes left by an earlier failed run.
+for name in gd-telecom gd-unicom bj-telecom gd-telecom-low; do
+  old_id=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
+    | jq -r --arg n "$name" '.[] | select(.name == $n) | .id' | head -1)
+  [[ -n "$old_id" ]] && api -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/$old_id" >/dev/null
+done
+
 create_node() {
   local name=$1 public_ip=$2 province=$3 city=$4 isp=$5 weight=$6
-  api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
-    -d "{\"name\":\"$name\",\"region\":\"$province\",\"public_ip\":\"$public_ip\",\"province\":\"$province\",\"city\":\"$city\",\"isp\":\"$isp\",\"weight\":$weight,\"agent_url\":\"http://127.0.0.1:19000\"}" \
-    | jq -r '.node.id'
+  local resp id token
+  resp=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
+    -d "{\"name\":\"$name\",\"region\":\"$province\",\"public_ip\":\"$public_ip\",\"province\":\"$province\",\"city\":\"$city\",\"isp\":\"$isp\",\"weight\":$weight,\"agent_url\":\"http://127.0.0.1:19000\"}")
+  id=$(printf '%s' "$resp" | jq -r '.node.id')
+  token=$(printf '%s' "$resp" | jq -r '.token')
+  printf '%s|%s\n' "$id" "$token"
 }
 beat() {
   local name=$1 public_ip=$2
   curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/heartbeat" \
     -H 'content-type: application/json' \
+    -H "x-lagran-agent-token: $3" \
     -d "{\"node_id\":\"$name\",\"region\":\"test\",\"ip\":\"127.0.0.1\",\"agent_url\":\"http://127.0.0.1:19000\",\"public_ip\":\"$public_ip\",\"version\":\"0.1.0\"}" >/dev/null
 }
 
-GD_TELECOM=$(create_node "gd-telecom" "203.0.113.10" "广东" "深圳" "电信" 100)
-GD_UNICOM=$(create_node "gd-unicom" "203.0.113.11" "广东" "广州" "联通" 100)
-BJ_TELECOM=$(create_node "bj-telecom" "203.0.113.12" "北京" "北京" "电信" 100)
-GD_LOW=$(create_node "gd-telecom-low" "203.0.113.13" "广东" "深圳" "电信" 10)
+IFS='|' read -r GD_TELECOM GD_TELECOM_TOKEN <<< "$(create_node "gd-telecom" "203.0.113.10" "广东" "深圳" "电信" 100)"
+IFS='|' read -r GD_UNICOM GD_UNICOM_TOKEN <<< "$(create_node "gd-unicom" "203.0.113.11" "广东" "广州" "联通" 100)"
+IFS='|' read -r BJ_TELECOM BJ_TELECOM_TOKEN <<< "$(create_node "bj-telecom" "203.0.113.12" "北京" "北京" "电信" 100)"
+IFS='|' read -r GD_LOW GD_LOW_TOKEN <<< "$(create_node "gd-telecom-low" "203.0.113.13" "广东" "深圳" "电信" 10)"
 NODE_IDS+=("$GD_TELECOM" "$GD_UNICOM" "$BJ_TELECOM" "$GD_LOW")
 
-beat "gd-telecom" "203.0.113.10"
-beat "gd-unicom" "203.0.113.11"
-beat "bj-telecom" "203.0.113.12"
-beat "gd-telecom-low" "203.0.113.13"
+beat "gd-telecom" "203.0.113.10" "$GD_TELECOM_TOKEN"
+beat "gd-unicom" "203.0.113.11" "$GD_UNICOM_TOKEN"
+beat "bj-telecom" "203.0.113.12" "$BJ_TELECOM_TOKEN"
+beat "gd-telecom-low" "203.0.113.13" "$GD_LOW_TOKEN"
 
 echo "== node metadata =="
 LIST=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes")

@@ -322,7 +322,7 @@ pub async fn resolve(state: &AppState, req: ScheduleRequest) -> ScheduleResponse
 
 pub async fn resolve_agent(
     State(state): State<AppState>,
-    _agent: crate::middleware::agent_auth::AgentAuth,
+    _agent: crate::middleware::agent_auth::ScheduleAuth,
     axum::extract::Query(req): axum::extract::Query<ScheduleRequest>,
 ) -> Json<ScheduleResponse> {
     Json(resolve(&state, req).await)

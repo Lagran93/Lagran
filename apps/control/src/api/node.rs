@@ -544,24 +544,39 @@ pub async fn delete(
 
 pub async fn heartbeat(
     State(state): State<AppState>,
-    _agent: AgentAuth,
+    agent: AgentAuth,
     Json(req): Json<HeartbeatRequest>,
-) -> Json<HeartbeatResponse> {
+) -> Result<Json<HeartbeatResponse>, (StatusCode, Json<serde_json::Value>)> {
     let node_id = req
         .node_id
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "edge-unknown".into());
-    apply_heartbeat(&state, &node_id, &req).await
+    if node_id != agent.node_name {
+        return Err(node_mismatch());
+    }
+    Ok(apply_heartbeat(&state, &node_id, &req).await)
 }
 
 pub async fn heartbeat_by_path(
     State(state): State<AppState>,
-    _agent: AgentAuth,
+    agent: AgentAuth,
     Path(id): Path<String>,
     Json(req): Json<HeartbeatRequest>,
-) -> Json<HeartbeatResponse> {
-    apply_heartbeat(&state, &id, &req).await
+) -> Result<Json<HeartbeatResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if id != agent.node_name {
+        return Err(node_mismatch());
+    }
+    Ok(apply_heartbeat(&state, &id, &req).await)
+}
+
+fn node_mismatch() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "node_id does not match the agent token"
+        })),
+    )
 }
 
 async fn apply_heartbeat(

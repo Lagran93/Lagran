@@ -109,6 +109,39 @@ else
 fi
 contains "node list flags token presence" "$LIST" '"has_token":true'
 
+echo "== unregistered / cross-node heartbeat is rejected =="
+BEFORE_COUNT=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" | jq 'length')
+
+GLOBAL_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/heartbeat" \
+  -H 'content-type: application/json' \
+  -H 'x-lagran-agent-token: global-secret' \
+  -d "{\"node_id\":\"$NODE_NAME\"}")
+check "global token cannot heartbeat as edge" "$GLOBAL_CODE" "401"
+
+GLOBAL_CFG=$(curl -s -o /dev/null -w '%{http_code}' \
+  "http://127.0.0.1:$CONTROL_PORT/api/v1/config" \
+  -H 'x-lagran-agent-token: global-secret')
+check "global token cannot fetch edge config" "$GLOBAL_CFG" "401"
+
+CROSS_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/heartbeat" \
+  -H 'content-type: application/json' \
+  -H "x-lagran-agent-token: $NODE_TOKEN" \
+  -d '{"node_id":"another-node"}')
+check "node token cannot heartbeat as another node" "$CROSS_CODE" "403"
+
+UNREG_NAME="unregistered-$$"
+UNREG_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/heartbeat" \
+  -H 'content-type: application/json' \
+  -H "x-lagran-agent-token: $NODE_TOKEN" \
+  -d "{\"node_id\":\"$UNREG_NAME\"}")
+check "unregistered node is rejected" "$UNREG_CODE" "403"
+
+AFTER_COUNT=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" | jq 'length')
+check "heartbeat does not auto-create nodes" "$AFTER_COUNT" "$BEFORE_COUNT"
+
 echo "== start edge with per-node token (global token differs) =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 NODE_ID="$NODE_NAME" \
