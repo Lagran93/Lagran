@@ -165,6 +165,10 @@ ETAG=$(printf '%s' "$H2" | awk 'tolower($1)=="etag:" {print $2}' | tr -d '\r')
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" -H "If-None-Match: $ETAG" "http://127.0.0.1:$EDGE_PORT/cached")
 check "conditional request returns 304" "$CODE" "304"
 
+RANGE_HDR=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" -H 'Range: bytes=0-3' "http://127.0.0.1:$EDGE_PORT/cached")
+contains "range request is served 206/partial" "$RANGE_HDR" "206 Partial Content"
+contains "range request carries content-range" "$(printf '%s' "$RANGE_HDR" | tr '[:upper:]' '[:lower:]')" "content-range:"
+
 H3=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/nostore")
 H4=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/nostore")
 contains "no-store first MISS" "$H3" "x-cache: MISS"

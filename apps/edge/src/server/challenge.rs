@@ -262,6 +262,51 @@ pub async fn verify(
     response
 }
 
+/// Direct verification used by the native Pingora path.
+pub async fn verify_direct(
+    state: &Arc<AppState>,
+    host: &str,
+    headers: &HeaderMap,
+    n: &str,
+    a: &str,
+    next: Option<&str>,
+    secure: bool,
+) -> Response {
+    let entry = state.domains.get(host).await;
+    let (difficulty, ttl) = match entry {
+        Some(entry) => (
+            entry.waf.challenge_difficulty.clamp(1, 6),
+            entry.waf.challenge_ttl_secs,
+        ),
+        None => (4, 1800),
+    };
+    if !verify_nonce(host, n, &state.challenge_secret) {
+        return error_page("验证已过期", "质询已过期，请返回原页面刷新后重试。");
+    }
+    if !pow_ok(n, a, difficulty) {
+        return error_page("验证未通过", "工作量证明不正确，请返回原页面重试。");
+    }
+
+    let (value, ttl) = clearance_value(host, ttl, &state.challenge_secret);
+    let mut cookie =
+        format!("{CLEARANCE_COOKIE}={value}; Path=/; Max-Age={ttl}; HttpOnly; SameSite=Lax");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    let next = safe_next(next.unwrap_or("/"));
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    let out = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&next) {
+        out.insert(header::LOCATION, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&cookie) {
+        out.insert(header::SET_COOKIE, v);
+    }
+    out.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let _ = headers;
+    response
+}
+
 fn error_page(title: &str, message: &str) -> Response {
     let html = format!(
         r#"<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8" />

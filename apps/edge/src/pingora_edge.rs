@@ -1,37 +1,50 @@
-//! Pingora public listener + in-process data plane.
+//! Pingora public listener + native data plane.
 //!
-//! Pingora owns the public HTTP/HTTPS listeners, HTTP/1.1+HTTP/2 protocol
-//! handling, TLS termination and connection management. Normal requests are
-//! handed to the existing Lagran engine **in-process** through
-//! `handler::proxy_handler`; there is no loopback hop. Only rare control
-//! endpoints (health/challenge/ACME/admin) and WebSocket upgrades use a
-//! loopback Axum router for compatibility.
+//! Pingora owns public HTTP/HTTPS, HTTP/1.1+HTTP/2, TLS and connection
+//! management. Cacheable GET/HEAD requests use `pingora-cache` with the
+//! existing `SharedCache` as storage and `upstream_peer` for direct origin
+//! access. Requests that need the legacy engine (WAF/CC/rate-limit/hotlink,
+//! bypass/dynamic traffic, disk/hybrid cache, control endpoints and
+//! WebSocket) are handed to the in-process handler.
 
+use crate::cache::policy::{
+    cache_key_for, decide_storage, fnv1a64, resolve_rule_policy, ResolvedPolicy, RuleAction,
+};
+use crate::config::registry::DomainEntry;
 use crate::config::EdgeConfig;
 use crate::server::cert_store::CertStore;
-use crate::server::handler::{proxy_handler, AppState};
+use crate::server::challenge;
+use crate::server::default_page::{self, OriginFailure};
+use crate::server::handler::{
+    apply_browser_ttl, apply_cors_and_custom, apply_security_headers, log_access,
+    policy_browser_ttl, preflight_cacheable, proxy_handler, AppState,
+};
+use crate::server::native_cache::{leak_storage, NativeStorage, META_HEADER};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{Method, Request, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
 use pingora::http::ResponseHeader;
 use pingora::listeners::tls::TlsSettings;
 use pingora::listeners::{TlsAccept, TlsAcceptCallbacks};
 use pingora::protocols::tls::TlsRef;
-use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
+use pingora::proxy::{http_proxy_service, FailToProxy, ProxyHttp, Session};
 use pingora::server::Server;
 use pingora::tls::{ext, pkey::PKey, ssl, x509::X509};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::Result;
+use pingora_cache::lock::CacheLock;
+use pingora_cache::{
+    CacheKey, CacheMeta, CacheOptionOverrides, CachePhase, NoCacheReason, RespCacheable,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
-/// Keep in sync with `handler::MAX_PROXY_BODY`.
 const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;
 
-/// SNI captured after the TLS handshake and exposed through Pingora's digest.
 #[derive(Debug)]
 struct Sni(String);
 
@@ -82,26 +95,712 @@ impl TlsAccept for CertCallback {
     }
 }
 
+#[derive(Clone)]
+struct NativePlan {
+    domain: Arc<DomainEntry>,
+    key: String,
+    origin_host: String,
+    origin_port: u16,
+    origin_tls: bool,
+    backup_url: String,
+    timeout_ms: u64,
+    policy: ResolvedPolicy,
+    cors: String,
+    custom: String,
+    cacheable: bool,
+    is_head: bool,
+    is_websocket: bool,
+    label: &'static str,
+}
+
+struct ReqCtx {
+    plan: Option<NativePlan>,
+    host: String,
+    path: String,
+    method: Method,
+    client_ip: String,
+    user_agent: String,
+    referer: String,
+    start: Instant,
+    cache_label: &'static str,
+    status: u16,
+    attempt: u8,
+    head_body: BytesMut,
+    head_headers: Option<ResponseHeader>,
+    head_status: u16,
+}
+
+impl Default for ReqCtx {
+    fn default() -> Self {
+        Self {
+            plan: None,
+            host: String::new(),
+            path: String::new(),
+            method: Method::GET,
+            client_ip: String::new(),
+            user_agent: String::new(),
+            referer: String::new(),
+            start: Instant::now(),
+            cache_label: "MISS",
+            status: 0,
+            attempt: 0,
+            head_body: BytesMut::new(),
+            head_headers: None,
+            head_status: 0,
+        }
+    }
+}
+
 struct DataPlaneProxy {
-    /// Loopback Axum fallback for control endpoints and WebSocket upgrades.
     upstream: SocketAddr,
     trust_proxy: bool,
     state: Arc<AppState>,
+    native_cache: bool,
+    storage: Option<&'static NativeStorage>,
+    cache_lock: &'static CacheLock,
 }
 
 #[async_trait]
 impl ProxyHttp for DataPlaneProxy {
-    type CTX = ();
+    type CTX = ReqCtx;
 
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self) -> Self::CTX {
+        ReqCtx::default()
+    }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         prepare_proxy_headers(session, self.trust_proxy)?;
+
+        let req = session.req_header();
+        ctx.host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
+        ctx.path = req.uri.path().to_string();
+        ctx.method = req.method.clone();
+        ctx.client_ip = req
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        ctx.user_agent = req
+            .headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        ctx.referer = req
+            .headers
+            .get("referer")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let path = ctx.path.clone();
+        let is_https = session
+            .req_header()
+            .headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("https"))
+            .unwrap_or(false);
+        if path == "/__lagran/health" {
+            write_plain(
+                session,
+                200,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"ok"),
+            )
+            .await;
+            return Ok(true);
+        }
+        if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+            let token = percent_decode(token);
+            if let Some(key_auth) = self.state.challenges.get(&token) {
+                write_plain(
+                    session,
+                    200,
+                    "text/plain; charset=utf-8",
+                    Bytes::from(key_auth),
+                )
+                .await;
+            } else {
+                write_plain(
+                    session,
+                    404,
+                    "text/plain; charset=utf-8",
+                    Bytes::from_static(b"not found"),
+                )
+                .await;
+            }
+            return Ok(true);
+        }
+        if path == "/__lagran/challenge/verify" {
+            let query = session.req_header().uri.query().unwrap_or("");
+            let n = query_param(query, "n").unwrap_or_default();
+            let a = query_param(query, "a").unwrap_or_default();
+            let next = query_param(query, "next");
+            let headers = session.req_header().headers.clone();
+            let resp = challenge::verify_direct(
+                &self.state,
+                &ctx.host,
+                &headers,
+                &n,
+                &a,
+                next.as_deref(),
+                is_https,
+            )
+            .await;
+            write_axum_response(session, resp, false).await;
+            return Ok(true);
+        }
 
         if needs_loopback(session) {
             return Ok(false);
         }
 
+        if let Some(plan) = self.native_plan(session).await {
+            let path_and_query = session
+                .req_header()
+                .uri
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let is_https = session
+                .req_header()
+                .headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("https"))
+                .unwrap_or(false);
+            let headers = session.req_header().headers.clone();
+            if let Some(resp) = preflight_cacheable(
+                &self.state,
+                &plan.domain,
+                &ctx.method,
+                &ctx.host,
+                &ctx.path,
+                &path_and_query,
+                &headers,
+                &ctx.client_ip,
+                is_https,
+                ctx.start,
+            )
+            .await
+            {
+                write_axum_response(session, resp, false).await;
+                return Ok(true);
+            }
+            if plan.is_head && self.serve_head_cache(session, &plan, ctx).await {
+                return Ok(true);
+            }
+            // Chrome sends max-age=0 on reload; keep the cached entry eligible
+            // so If-None-Match can produce a 304/revalidated response.
+            session.req_header_mut().remove_header("cache-control");
+            session.req_header_mut().remove_header("pragma");
+            ctx.plan = Some(plan);
+            return Ok(false);
+        }
+
+        self.handle_in_process(session).await
+    }
+
+    fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
+        if ctx.plan.as_ref().is_some_and(|p| p.cacheable) {
+            if let Some(storage) = self.storage {
+                let mut overrides = CacheOptionOverrides::default();
+                overrides.wait_timeout = Some(Duration::from_secs(5));
+                overrides.max_lock_retries = Some(1);
+                session
+                    .cache
+                    .enable(storage, None, None, Some(self.cache_lock), Some(overrides));
+            }
+        }
+        Ok(())
+    }
+
+    fn cache_key_callback(&self, _session: &Session, ctx: &mut Self::CTX) -> Result<CacheKey> {
+        let key = ctx
+            .plan
+            .as_ref()
+            .map(|p| p.key.as_str())
+            .unwrap_or_default();
+        Ok(CacheKey::new(key.as_bytes(), ""))
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        let Some(plan) = ctx.plan.as_ref() else {
+            return Ok(Box::new(HttpPeer::new(
+                self.upstream,
+                false,
+                "lagran-internal".to_string(),
+            )));
+        };
+        let url = if ctx.attempt > 0 && !plan.backup_url.is_empty() {
+            plan.backup_url.as_str()
+        } else {
+            // For the primary peer these cached values are already parsed.
+            return self.peer_for(
+                &plan.origin_host,
+                plan.origin_port,
+                plan.origin_tls,
+                plan.timeout_ms,
+            );
+        };
+        let (host, port, tls) = parse_origin(url)
+            .ok_or_else(|| pingora::Error::new_str("invalid backup origin URL"))?;
+        self.peer_for(&host, port, tls, plan.timeout_ms)
+    }
+
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        e: Box<pingora::Error>,
+    ) -> Box<pingora::Error> {
+        let mut e = e;
+        if ctx.attempt == 0 {
+            if let Some(plan) = ctx.plan.as_ref() {
+                if !plan.backup_url.is_empty() {
+                    ctx.attempt = 1;
+                    e.set_retry(true);
+                }
+            }
+        }
+        e
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut pingora::http::RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if let Some(plan) = ctx.plan.as_ref() {
+            upstream_request.insert_header("host", plan.origin_host.as_str())?;
+            if plan.cacheable || plan.is_head {
+                for name in [
+                    "authorization",
+                    "cookie",
+                    "range",
+                    "if-none-match",
+                    "if-modified-since",
+                    "accept-encoding",
+                ] {
+                    upstream_request.remove_header(name);
+                }
+                upstream_request.insert_header("accept-encoding", "identity")?;
+            }
+            if plan.is_head {
+                upstream_request.set_method(Method::GET);
+            }
+        }
+        Ok(())
+    }
+
+    async fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if let Some(plan) = ctx.plan.as_ref() {
+            if !upstream_response.headers.contains_key("etag") {
+                let etag = format!("\"{:x}\"", fnv1a64(plan.key.as_bytes()));
+                upstream_response.insert_header("etag", etag)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        resp: &ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<RespCacheable> {
+        let Some(plan) = ctx.plan.as_ref() else {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "legacy path",
+            )));
+        };
+        if !plan.cacheable {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "dynamic request",
+            )));
+        }
+        if resp.headers.contains_key("set-cookie") {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "set-cookie",
+            )));
+        }
+        let headers = header_vec(&resp.headers);
+        let Some(decision) = decide_storage(
+            resp.status.as_u16(),
+            &headers,
+            plan.policy,
+            self.state.default_ttl_secs,
+        ) else {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "cache policy",
+            )));
+        };
+        let now = SystemTime::now();
+        let meta = CacheMeta::new(
+            now + Duration::from_secs(decision.ttl_secs),
+            now,
+            decision.swr_secs.min(u32::MAX as u64) as u32,
+            0,
+            resp.clone(),
+        );
+        Ok(RespCacheable::Cacheable(meta))
+    }
+
+    async fn response_filter(
+        &self,
+        session: &mut Session,
+        response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let Some(plan) = ctx.plan.as_ref() else {
+            return Ok(());
+        };
+        let mut label = if plan.is_websocket {
+            "WS"
+        } else if plan.cacheable {
+            cache_label(session.cache.phase())
+        } else {
+            plan.label
+        };
+        if plan.cacheable
+            && response.status == 304
+            && session.req_header().headers.contains_key("if-none-match")
+        {
+            label = "REVALIDATED";
+        }
+        ctx.cache_label = label;
+        ctx.status = response.status.as_u16();
+        response.remove_header(META_HEADER);
+        response.insert_header("x-cache", label)?;
+        response.insert_header("x-cache-status", label)?;
+        response.insert_header("x-powered-by", "lagran-edge")?;
+        if (plan.cacheable || plan.is_head) && !response.headers.contains_key("etag") {
+            let etag = format!("\"{:x}\"", fnv1a64(plan.key.as_bytes()));
+            response.insert_header("etag", etag)?;
+        }
+
+        let mut headers = response.headers.clone();
+        if plan.cacheable || plan.is_head {
+            apply_browser_ttl(&mut headers, policy_browser_ttl(&plan.policy));
+        }
+        apply_security_headers(&mut headers);
+        apply_cors_and_custom(&mut headers, &plan.cors, &plan.custom);
+        for (name, value) in headers.iter() {
+            response.insert_header(name.clone(), value.clone())?;
+        }
+        if plan.is_head {
+            ctx.head_headers = Some(response.clone());
+            ctx.head_status = response.status.as_u16();
+        }
+        Ok(())
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        if ctx.plan.as_ref().is_some_and(|p| p.is_head) {
+            if let Some(chunk) = body.take() {
+                ctx.head_body.extend_from_slice(&chunk);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn logging(
+        &self,
+        session: &mut Session,
+        _e: Option<&pingora::Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        let Some(plan) = ctx.plan.as_ref() else {
+            return;
+        };
+        let status = session
+            .response_written()
+            .map(|r| r.status.as_u16())
+            .unwrap_or(ctx.status);
+        let bytes = session.body_bytes_sent() as u64;
+        let label = ctx.cache_label;
+        if plan.is_head && ctx.head_status == 200 && !ctx.head_body.is_empty() {
+            if let Some(headers) = ctx.head_headers.as_ref() {
+                let hdrs = header_vec(&headers.headers);
+                if let Some(decision) = decide_storage(
+                    ctx.head_status,
+                    &hdrs,
+                    plan.policy,
+                    self.state.default_ttl_secs,
+                ) {
+                    if ctx.head_body.len() <= 8 * 1024 * 1024 {
+                        let entry = crate::cache::CacheEntry {
+                            status: ctx.head_status,
+                            headers: hdrs,
+                            body: ctx.head_body.clone().freeze(),
+                            stored_at_epoch_secs: SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
+                        };
+                        self.state
+                            .cache
+                            .set_with_swr(&plan.key, entry, decision.ttl_secs, decision.swr_secs)
+                            .await;
+                    }
+                }
+            }
+        }
+        log_access(
+            &self.state.access_log,
+            &ctx.method,
+            &ctx.host,
+            &ctx.path,
+            status,
+            ctx.start,
+            &ctx.client_ip,
+            &ctx.user_agent,
+            &ctx.referer,
+            bytes,
+            label,
+        )
+        .await;
+        match label {
+            "HIT" => self.state.metrics.record_hit(&ctx.host, bytes).await,
+            "MISS" | "REVALIDATED" => self.state.metrics.record_miss(&ctx.host, bytes).await,
+            _ => self.state.metrics.record_bypass(&ctx.host, bytes).await,
+        }
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        _e: &pingora::Error,
+        ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        let code = if ctx.plan.is_some() {
+            let page =
+                default_page::origin_error_page(&ctx.host, &ctx.path, OriginFailure::Unreachable);
+            write_axum_response(session, page, ctx.method == Method::HEAD).await;
+            502
+        } else {
+            502
+        };
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
+    }
+}
+
+impl DataPlaneProxy {
+    async fn native_plan(&self, session: &Session) -> Option<NativePlan> {
+        if !self.native_cache || self.storage.is_none() {
+            return None;
+        }
+        let req = session.req_header();
+        // HEAD currently stays on the legacy engine: Pingora's downstream
+        // HEAD accounting conflicts with the cached GET body on this version.
+        if req.method == Method::HEAD {
+            return None;
+        }
+        let host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
+        if host.is_empty() {
+            return None;
+        }
+        if !self.state.node_control.is_serving() {
+            return None;
+        }
+        let domain = self.state.domains.get(&host).await?;
+        let path = req.uri.path().to_string();
+        let policy = resolve_rule_policy(
+            &domain.rules,
+            &path,
+            req.method.as_str(),
+            req.uri.query().unwrap_or(""),
+        );
+        let is_head = req.method == Method::HEAD;
+        let is_websocket = is_websocket_upgrade(&req.headers);
+        let cacheable = req.method == Method::GET
+            && policy.action == RuleAction::Cache
+            && !is_websocket
+            && !request_bypasses(&req.headers, policy.ignore_cookie);
+        let label = if cacheable || is_head {
+            "MISS"
+        } else if policy.action == RuleAction::Bypass || req.method == Method::GET {
+            "BYPASS"
+        } else {
+            "DYNAMIC"
+        };
+        let (origin_host, origin_port, origin_tls) = parse_origin(&domain.origin_url)?;
+        let ignore_query = policy.ignore_query.unwrap_or(domain.ignore_query_string);
+        let lookup_path = if ignore_query {
+            path
+        } else {
+            req.uri
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string())
+        };
+        let key = cache_key_for(&req.method, &host, &lookup_path);
+        Some(NativePlan {
+            domain: domain.clone(),
+            key,
+            origin_host,
+            origin_port,
+            origin_tls,
+            backup_url: domain.backup_origin_url.clone(),
+            timeout_ms: u64::from(if domain.origin_timeout_ms == 0 {
+                10_000
+            } else {
+                domain.origin_timeout_ms
+            }),
+            policy,
+            cors: domain.cors_origins.clone(),
+            custom: domain.custom_headers.clone(),
+            cacheable,
+            is_head,
+            is_websocket,
+            label,
+        })
+    }
+
+    async fn serve_head_cache(
+        &self,
+        session: &mut Session,
+        plan: &NativePlan,
+        ctx: &ReqCtx,
+    ) -> bool {
+        let entry = match self.state.cache.get_result(&plan.key).await {
+            crate::cache::CacheGetResult::Hit(entry) => (entry, "HIT"),
+            crate::cache::CacheGetResult::Stale(entry) => (entry, "STALE"),
+            _ => return false,
+        };
+        let (entry, label) = entry;
+        let etag = entry
+            .header("etag")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("\"{:x}\"", fnv1a64(plan.key.as_bytes())));
+        let inm = session
+            .req_header()
+            .headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok());
+        let not_modified = inm.is_some_and(|v| {
+            v.split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == etag || candidate == "*")
+        });
+        let status = if not_modified { 304 } else { entry.status };
+        let len = if not_modified { 0 } else { entry.body.len() };
+        let mut headers = HeaderMap::new();
+        for (name, value) in &entry.headers {
+            if name.eq_ignore_ascii_case(META_HEADER)
+                || name.eq_ignore_ascii_case("content-length")
+                || is_hop_by_hop(name)
+            {
+                continue;
+            }
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+        headers.insert(
+            HeaderName::from_static("x-cache"),
+            HeaderValue::from_static(if not_modified { "REVALIDATED" } else { label }),
+        );
+        headers.insert(
+            HeaderName::from_static("x-cache-status"),
+            HeaderValue::from_static(if not_modified { "REVALIDATED" } else { label }),
+        );
+        headers.insert(
+            HeaderName::from_static("age"),
+            HeaderValue::from_str(&entry.age_secs().to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("0")),
+        );
+        headers.insert(
+            HeaderName::from_static("x-powered-by"),
+            HeaderValue::from_static("lagran-edge"),
+        );
+        if let Ok(value) = HeaderValue::from_str(&etag) {
+            headers.insert(HeaderName::from_static("etag"), value);
+        }
+        apply_browser_ttl(&mut headers, policy_browser_ttl(&plan.policy));
+        apply_security_headers(&mut headers);
+        apply_cors_and_custom(&mut headers, &plan.cors, &plan.custom);
+        headers.insert(
+            HeaderName::from_static("content-length"),
+            HeaderValue::from_str(&len.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("0")),
+        );
+
+        let Ok(mut response) = ResponseHeader::build(status, Some(0)) else {
+            return false;
+        };
+        for (name, value) in headers.iter() {
+            if response.append_header(name.clone(), value.clone()).is_err() {
+                return false;
+            }
+        }
+        let _ = response.remove_header("content-length");
+        let _ = response.insert_header("content-length", len.to_string());
+        if session
+            .write_response_header(Box::new(response), true)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let cache_label = if not_modified { "REVALIDATED" } else { label };
+        log_access(
+            &self.state.access_log,
+            &ctx.method,
+            &ctx.host,
+            &ctx.path,
+            status,
+            ctx.start,
+            &ctx.client_ip,
+            &ctx.user_agent,
+            &ctx.referer,
+            0,
+            cache_label,
+        )
+        .await;
+        if cache_label == "HIT" {
+            self.state.metrics.record_hit(&ctx.host, 0).await;
+        } else {
+            self.state.metrics.record_miss(&ctx.host, 0).await;
+        }
+        true
+    }
+
+    fn peer_for(&self, host: &str, port: u16, tls: bool, timeout_ms: u64) -> Result<Box<HttpPeer>> {
+        let mut peer = HttpPeer::new((host, port), tls, host.to_string());
+        peer.options.connection_timeout = Some(Duration::from_millis(timeout_ms));
+        peer.options.read_timeout = Some(Duration::from_millis(timeout_ms));
+        Ok(Box::new(peer))
+    }
+
+    async fn handle_in_process(&self, session: &mut Session) -> Result<bool> {
         let req_header = session.req_header();
         let method: Method = req_header.method.clone();
         let is_head = method == Method::HEAD;
@@ -142,86 +841,199 @@ impl ProxyHttp for DataPlaneProxy {
         }
 
         let resp = proxy_handler(State(self.state.clone()), axum_req).await;
-        let (parts, body) = resp.into_parts();
-        let bytes = match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                tracing::warn!(error = %e, "collect engine response failed");
-                session
-                    .respond_error_with_body(502, Bytes::from_static(b"engine response error"))
-                    .await?;
-                return Ok(true);
-            }
-        };
-
-        let head_content_length = parts
-            .headers
-            .get(axum::http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("0")
-            .to_string();
-        let bytes = if is_head { Bytes::new() } else { bytes };
-        let end_of_stream = bytes.is_empty();
-        let mut response = ResponseHeader::build(parts.status.as_u16(), Some(bytes.len()))?;
-        for (name, value) in parts.headers.iter() {
-            if is_hop_by_hop(name.as_str()) || name == axum::http::header::CONTENT_LENGTH {
-                continue;
-            }
-            response.append_header(name.clone(), value.clone())?;
-        }
-        if is_head || end_of_stream {
-            // HEAD has no body, and a bodyless 200 must still carry a length or
-            // clients wait for connection close.
-            response.insert_header(
-                "content-length",
-                if is_head {
-                    head_content_length.as_str()
-                } else {
-                    "0"
-                },
-            )?;
-        }
-        session
-            .write_response_header(Box::new(response), end_of_stream)
-            .await?;
-        if !end_of_stream {
-            session.write_response_body(Some(bytes), true).await?;
-        }
+        write_axum_response(session, resp, is_head).await;
         Ok(true)
-    }
-
-    async fn upstream_peer(
-        &self,
-        _session: &mut Session,
-        _ctx: &mut Self::CTX,
-    ) -> Result<Box<HttpPeer>> {
-        Ok(Box::new(HttpPeer::new(
-            self.upstream,
-            false,
-            "lagran-internal".to_string(),
-        )))
     }
 }
 
-fn needs_loopback(session: &Session) -> bool {
-    let req = session.req_header();
-    let path = req.uri.path();
-    if path.starts_with("/__lagran/") || path.starts_with("/.well-known/acme-challenge/") {
+async fn write_plain(session: &mut Session, status: u16, content_type: &str, body: Bytes) {
+    let Ok(mut response) = ResponseHeader::build(status, Some(body.len())) else {
+        return;
+    };
+    let _ = response.insert_header("content-type", content_type);
+    let _ = response.insert_header("content-length", body.len().to_string());
+    let _ = session
+        .write_response_header(Box::new(response), body.is_empty())
+        .await;
+    if !body.is_empty() {
+        let _ = session.write_response_body(Some(body), true).await;
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &input[i + 1..i + 3];
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v as char);
+                    i += 3;
+                    continue;
+                }
+                out.push('%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(' ');
+                i += 1;
+            }
+            b => {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (percent_decode(k) == name).then(|| percent_decode(v))
+    })
+}
+
+async fn write_axum_response(session: &mut Session, resp: axum::response::Response, is_head: bool) {
+    let (parts, body) = resp.into_parts();
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            tracing::warn!(error = %e, "collect engine response failed");
+            let _ = session
+                .respond_error_with_body(502, Bytes::from_static(b"engine response error"))
+                .await;
+            return;
+        }
+    };
+    let head_content_length = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("0")
+        .to_string();
+    let bytes = if is_head { Bytes::new() } else { bytes };
+    let end_of_stream = bytes.is_empty();
+    let Ok(mut response) = ResponseHeader::build(parts.status.as_u16(), Some(bytes.len())) else {
+        return;
+    };
+    for (name, value) in parts.headers.iter() {
+        if is_hop_by_hop(name.as_str()) || name == axum::http::header::CONTENT_LENGTH {
+            continue;
+        }
+        if response.append_header(name.clone(), value.clone()).is_err() {
+            return;
+        }
+    }
+    if is_head || end_of_stream {
+        let value = if is_head {
+            head_content_length.as_str()
+        } else {
+            "0"
+        };
+        if response.insert_header("content-length", value).is_err() {
+            return;
+        }
+    }
+    let _ = session
+        .write_response_header(Box::new(response), end_of_stream)
+        .await;
+    if !end_of_stream {
+        let _ = session.write_response_body(Some(bytes), true).await;
+    }
+}
+
+fn request_bypasses(headers: &HeaderMap, ignore_cookie: bool) -> bool {
+    if headers.contains_key("authorization") || (!ignore_cookie && headers.contains_key("cookie")) {
         return true;
     }
-    let upgrade = req
-        .headers
+    if let Some(cc) = headers.get("cache-control").and_then(|v| v.to_str().ok()) {
+        let cc = cc.to_ascii_lowercase();
+        if cc.contains("no-store") || cc.contains("no-cache") {
+            return true;
+        }
+    }
+    headers
+        .get("pragma")
+        .and_then(|v| v.to_str().ok())
+        .map(|p| p.eq_ignore_ascii_case("no-cache"))
+        .unwrap_or(false)
+}
+
+fn request_host(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return String::new();
+    };
+    let raw = raw.trim();
+    if raw.starts_with('[') {
+        return raw
+            .split_once(']')
+            .map(|(h, _)| format!("{h}]"))
+            .unwrap_or_else(|| raw.to_string())
+            .to_ascii_lowercase();
+    }
+    raw.split(':').next().unwrap_or(raw).to_ascii_lowercase()
+}
+
+fn parse_origin(url: &str) -> Option<(String, u16, bool)> {
+    let uri: Uri = url.parse().ok()?;
+    let scheme = uri.scheme_str()?;
+    let tls = scheme.eq_ignore_ascii_case("https");
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = uri.host()?.to_string();
+    let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    // Reject origin base paths; they are still served by the legacy engine.
+    let path = uri.path();
+    if !path.is_empty() && path != "/" {
+        return None;
+    }
+    Some((host, port, tls))
+}
+
+fn header_vec(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+fn cache_label(phase: CachePhase) -> &'static str {
+    match phase {
+        CachePhase::Hit => "HIT",
+        CachePhase::Miss => "MISS",
+        CachePhase::Stale | CachePhase::StaleUpdating => "STALE",
+        CachePhase::Revalidated => "REVALIDATED",
+        CachePhase::Bypass => "BYPASS",
+        _ => "MISS",
+    }
+}
+
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    let upgrade = headers
         .get("upgrade")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
-    let connection_upgrade = req
-        .headers
+    let connection_upgrade = headers
         .get("connection")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_ascii_lowercase().contains("upgrade"))
         .unwrap_or(false);
     upgrade || connection_upgrade
+}
+
+fn needs_loopback(session: &Session) -> bool {
+    // Health/ACME/challenge verify are answered directly by Pingora. Remaining
+    // /__lagran routes are management/admin compatibility endpoints.
+    session.req_header().uri.path().starts_with("/__lagran/")
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -240,8 +1052,6 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// Add trusted client addressing before either the in-process engine or the
-/// loopback control router sees the request.
 fn prepare_proxy_headers(session: &mut Session, trust_proxy: bool) -> Result<()> {
     let client_ip = session
         .client_addr()
@@ -296,12 +1106,16 @@ pub fn run(
     let mut server = Server::new(Some(opt))?;
     server.bootstrap();
 
+    let storage = Some(leak_storage(state.cache.clone()));
+    let cache_lock: &'static CacheLock = Box::leak(CacheLock::new_boxed(Duration::from_secs(10)));
     let proxy = DataPlaneProxy {
         upstream,
         trust_proxy: config.trust_proxy_headers,
         state,
+        native_cache: storage.is_some(),
+        storage,
+        cache_lock,
     };
-    // Fail fast with a useful error instead of Pingora's listener panic.
     match std::net::TcpListener::bind(&config.listen_addr) {
         Ok(probe) => drop(probe),
         Err(e) => anyhow::bail!("cannot bind EDGE_LISTEN {}: {e}", config.listen_addr),
@@ -310,8 +1124,6 @@ pub fn run(
     service.add_tcp(&config.listen_addr);
 
     if let Some(ref https) = config.https_listen_addr {
-        // Do not add an HTTPS listener that cannot bind; Pingora treats a bind
-        // failure as fatal for the whole service, which would also kill HTTP.
         match std::net::TcpListener::bind(https) {
             Ok(probe) => drop(probe),
             Err(e) => {

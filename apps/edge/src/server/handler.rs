@@ -17,7 +17,7 @@ use crate::cache::policy::{
     CacheStatus, ResolvedPolicy, RuleAction, RuleSet,
 };
 use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
-use crate::config::registry::DomainRegistry;
+use crate::config::registry::{DomainEntry, DomainRegistry};
 use crate::metrics::EdgeMetrics;
 use crate::origin::{OriginClient, OriginResponse};
 use crate::server::access_log::AccessLog;
@@ -1160,7 +1160,7 @@ async fn serve_cached(
     )
 }
 
-fn policy_browser_ttl(policy: &ResolvedPolicy) -> Option<u64> {
+pub(crate) fn policy_browser_ttl(policy: &ResolvedPolicy) -> Option<u64> {
     if policy.action == RuleAction::Cache {
         policy.browser_ttl_secs
     } else {
@@ -1168,7 +1168,7 @@ fn policy_browser_ttl(policy: &ResolvedPolicy) -> Option<u64> {
     }
 }
 
-fn apply_browser_ttl(headers: &mut HeaderMap, ttl: Option<u64>) {
+pub(crate) fn apply_browser_ttl(headers: &mut HeaderMap, ttl: Option<u64>) {
     let Some(ttl) = ttl.filter(|t| *t > 0) else {
         return;
     };
@@ -1234,7 +1234,308 @@ fn headers_vec(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-fn hotlink_allowed(allowed_list: &str, referer: &str) -> bool {
+/// Preflight for the native Pingora cache path: HTTPS redirect, CC, rate-limit,
+/// WAF and hotlink checks. Returns a response when the request must not reach
+/// cache/origin. This mirrors the corresponding part of `proxy_handler`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn preflight_cacheable(
+    state: &Arc<AppState>,
+    domain: &DomainEntry,
+    method: &Method,
+    host: &str,
+    path_only: &str,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    client_ip: &str,
+    is_https: bool,
+    start: Instant,
+) -> Option<Response> {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let client_ip_addr: Option<IpAddr> = client_ip.parse().ok();
+
+    if domain.ssl_enabled && !is_https {
+        let status = if *method == Method::GET || *method == Method::HEAD {
+            StatusCode::MOVED_PERMANENTLY
+        } else {
+            StatusCode::PERMANENT_REDIRECT
+        };
+        log_access(
+            &state.access_log,
+            method,
+            host,
+            path_only,
+            status.as_u16(),
+            start,
+            client_ip,
+            &user_agent,
+            &referer,
+            0,
+            "HTTPS_REDIRECT",
+        )
+        .await;
+        return Some(https_redirect_response(
+            host,
+            path_and_query,
+            status,
+            state.https_redirect_port,
+        ));
+    }
+
+    if let Some(ip) = client_ip_addr {
+        let decision = state.cc.check(host, ip, &domain.cc).await;
+        if decision != CcDecision::Allow {
+            let banned = decision.is_banned();
+            let action = if domain.cc.mode == CcMode::Monitor {
+                "log"
+            } else if banned {
+                "cc-ban"
+            } else {
+                "cc-limit"
+            };
+            state
+                .waf_log
+                .push(
+                    host,
+                    client_ip,
+                    method.as_str(),
+                    path_and_query,
+                    action,
+                    "cc",
+                    if banned {
+                        "cc-auto-ban"
+                    } else {
+                        "cc-rate-limit"
+                    },
+                    if domain.cc.mode == CcMode::Block {
+                        "block"
+                    } else {
+                        "monitor"
+                    },
+                )
+                .await;
+            if domain.cc.mode == CcMode::Block {
+                if let CcDecision::Banned {
+                    newly_banned: true, ..
+                } = decision
+                {
+                    let control = state.control.clone();
+                    let cc = state.cc.clone();
+                    let report_host = host.to_string();
+                    let report_ip = ip;
+                    let seconds = domain.cc.ban_seconds;
+                    tokio::spawn(async move {
+                        let body = serde_json::json!({
+                            "domain": report_host,
+                            "ip": report_ip.to_string(),
+                            "seconds": seconds,
+                            "reason": "cc-auto-ban"
+                        });
+                        match control.post_json("/api/v1/cc/bans", &body).await {
+                            Ok(()) => cc.mark_reported(&report_host, report_ip).await,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "report shared CC ban failed")
+                            }
+                        }
+                    });
+                }
+                log_access(
+                    &state.access_log,
+                    method,
+                    host,
+                    path_only,
+                    429,
+                    start,
+                    client_ip,
+                    &user_agent,
+                    &referer,
+                    0,
+                    if banned { "CC-BAN" } else { "CC" },
+                )
+                .await;
+                return Some(cc_too_many(decision.retry_after(), banned));
+            }
+        }
+    }
+
+    let rl_key = if host.is_empty() { "default" } else { host };
+    if !state
+        .rate_limiter
+        .check(rl_key, domain.rate_limit_rps, domain.rate_limit_burst)
+        .await
+    {
+        log_access(
+            &state.access_log,
+            method,
+            host,
+            path_only,
+            429,
+            start,
+            client_ip,
+            &user_agent,
+            &referer,
+            0,
+            CacheStatus::None.as_str(),
+        )
+        .await;
+        return Some(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "1")],
+                "Too Many Requests",
+            )
+                .into_response(),
+        );
+    }
+
+    if domain.waf.enabled {
+        let waf_request = WafRequest {
+            method: method.as_str(),
+            path: path_only,
+            query: url_query(path_and_query),
+            user_agent: &user_agent,
+            referer: &referer,
+            ip: client_ip_addr,
+            headers,
+        };
+        if let Some(verdict) = waf_evaluate(&domain.waf, &waf_request) {
+            if verdict.action != WafAction::Allow {
+                let mode_is_block = domain.waf.mode == WafMode::Block;
+                let challenge_capable = challenge_accepts_html(method, headers);
+                let cleared = challenge::has_clearance(
+                    headers,
+                    host,
+                    domain.waf.challenge_ttl_secs,
+                    &state.challenge_secret,
+                );
+                let challenge_needed = verdict.action == WafAction::Challenge
+                    && mode_is_block
+                    && challenge_capable
+                    && !cleared;
+                let challenge_skipped =
+                    verdict.action == WafAction::Challenge && mode_is_block && !challenge_capable;
+                let blocked = mode_is_block && verdict.is_block();
+
+                if challenge_needed
+                    || blocked
+                    || challenge_skipped
+                    || verdict.action == WafAction::Log
+                    || !mode_is_block
+                {
+                    let action = if blocked {
+                        "block"
+                    } else if challenge_needed {
+                        "challenge"
+                    } else if challenge_skipped {
+                        "skip-challenge"
+                    } else if verdict.action == WafAction::Log {
+                        "log"
+                    } else {
+                        "monitor"
+                    };
+                    let mode = if mode_is_block { "block" } else { "monitor" };
+                    state
+                        .waf_log
+                        .push(
+                            host,
+                            client_ip,
+                            method.as_str(),
+                            path_and_query,
+                            action,
+                            &verdict.category,
+                            &verdict.rule_name,
+                            mode,
+                        )
+                        .await;
+
+                    if challenge_needed {
+                        log_access(
+                            &state.access_log,
+                            method,
+                            host,
+                            path_only,
+                            403,
+                            start,
+                            client_ip,
+                            &user_agent,
+                            &referer,
+                            0,
+                            "CHALLENGE",
+                        )
+                        .await;
+                        let nonce = challenge::issue_nonce(host, &state.challenge_secret);
+                        return Some(challenge::page(
+                            host,
+                            &nonce,
+                            path_and_query,
+                            domain.waf.challenge_difficulty,
+                            is_https,
+                        ));
+                    }
+
+                    if blocked {
+                        log_access(
+                            &state.access_log,
+                            method,
+                            host,
+                            path_only,
+                            403,
+                            start,
+                            client_ip,
+                            &user_agent,
+                            &referer,
+                            0,
+                            "WAF",
+                        )
+                        .await;
+                        return Some(default_page::waf_blocked_page(
+                            host,
+                            path_only,
+                            &verdict.rule_name,
+                            &verdict.category,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if !domain.hotlink_allow_referers.is_empty()
+        && !hotlink_allowed(&domain.hotlink_allow_referers, &referer)
+    {
+        log_access(
+            &state.access_log,
+            method,
+            host,
+            path_only,
+            403,
+            start,
+            client_ip,
+            &user_agent,
+            &referer,
+            0,
+            CacheStatus::None.as_str(),
+        )
+        .await;
+        return Some((StatusCode::FORBIDDEN, "Hotlink Forbidden").into_response());
+    }
+
+    None
+}
+
+fn url_query(path_and_query: &str) -> &str {
+    path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("")
+}
+
+pub(crate) fn hotlink_allowed(allowed_list: &str, referer: &str) -> bool {
     allowed_list
         .split(',')
         .map(str::trim)
@@ -1244,7 +1545,7 @@ fn hotlink_allowed(allowed_list: &str, referer: &str) -> bool {
 
 /// JS challenges require a top-level HTML document navigation. JSON/XHR
 /// requests (login, fetch, API calls) cannot execute the challenge page.
-fn challenge_accepts_html(method: &Method, headers: &HeaderMap) -> bool {
+pub(crate) fn challenge_accepts_html(method: &Method, headers: &HeaderMap) -> bool {
     if method != Method::GET && method != Method::HEAD {
         return false;
     }
@@ -1272,7 +1573,7 @@ fn header_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn log_access(
+pub(crate) async fn log_access(
     log: &AccessLog,
     method: &Method,
     host: &str,
@@ -1301,7 +1602,7 @@ async fn log_access(
     log.write(rec).await;
 }
 
-fn apply_security_headers(headers: &mut HeaderMap) {
+pub(crate) fn apply_security_headers(headers: &mut HeaderMap) {
     headers.insert(
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
@@ -1316,7 +1617,7 @@ fn apply_security_headers(headers: &mut HeaderMap) {
     );
 }
 
-fn apply_cors_and_custom(headers: &mut HeaderMap, cors: &str, custom: &str) {
+pub(crate) fn apply_cors_and_custom(headers: &mut HeaderMap, cors: &str, custom: &str) {
     if !cors.is_empty() {
         let origin = if cors.trim() == "*" {
             "*"
@@ -1361,7 +1662,7 @@ fn entry_to_response(
     let status = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
     let mut headers = HeaderMap::new();
     for (k, v) in &entry.headers {
-        if is_uncacheable_header(k) {
+        if is_uncacheable_header(k) || k.eq_ignore_ascii_case("x-lagran-pingora-meta") {
             continue;
         }
         if let (Ok(name), Ok(val)) = (
@@ -1443,7 +1744,7 @@ fn pass_through_response(
     out
 }
 
-fn cc_too_many(retry_after: u64, banned: bool) -> Response {
+pub(crate) fn cc_too_many(retry_after: u64, banned: bool) -> Response {
     let mut resp = (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").into_response();
     let headers = resp.headers_mut();
     if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
@@ -1483,7 +1784,7 @@ fn host_without_port(host: &str) -> String {
     }
 }
 
-fn https_redirect_response(
+pub(crate) fn https_redirect_response(
     host: &str,
     path_and_query: &str,
     status: StatusCode,
