@@ -113,7 +113,9 @@ async fn main() -> anyhow::Result<()> {
         agent_token: config.agent_token.clone(),
         inflight: Inflight::default(),
         waf_log,
-        trust_proxy_headers: config.trust_proxy_headers,
+        // Pingora overwrites X-Forwarded-For/Proto with the real downstream
+        // peer, and the engine is bound only to loopback.
+        trust_proxy_headers: true,
         challenge_secret,
         node_control,
         https_redirect_port: config.https_redirect_port,
@@ -128,60 +130,58 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let app = if admin_listen.is_some() {
+    // The existing cache/WAF/CC engine stays on a loopback-only Axum listener.
+    // Pingora owns the public listener and forwards every data-plane request to
+    // this private upstream. When EDGE_ADMIN_LISTEN is unset, management also
+    // stays on the data listener for backward compatibility.
+    let internal_app = if admin_listen.is_some() {
         listener::create_data_router(state.clone())
     } else {
         listener::create_router(state.clone())
     };
-
-    let admin_handle = if let Some(admin) = admin_listen {
-        let admin_addr: SocketAddr = admin.parse()?;
-        let admin_app = listener::create_admin_router(state.clone());
-        tracing::info!(admin = %admin_addr, "edge management listener started");
-        Some(tokio::spawn(async move {
-            if let Err(e) = tls::serve_http(admin_addr, admin_app).await {
-                tracing::error!(error = %e, "management listener stopped");
-            }
-        }))
-    } else {
-        None
-    };
-
-    let http_addr: SocketAddr = config.listen_addr.parse()?;
-    let http_app = app.clone();
-    let http_handle = tokio::spawn(async move {
-        if let Err(e) = tls::serve_http(http_addr, http_app).await {
-            tracing::error!(error = %e, "HTTP stopped");
+    let internal_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let internal_addr = internal_listener.local_addr()?;
+    tracing::info!(addr = %internal_addr, "internal data-plane engine listening");
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(
+            internal_listener,
+            internal_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
+            tracing::error!(error = %e, "internal data-plane listener stopped");
         }
     });
 
-    let https_handle = if let Some(ref https) = config.https_listen_addr {
-        let https_addr: SocketAddr = https.parse()?;
-        let https_app = app.clone();
-        let store = cert_store.clone();
-        Some(tokio::spawn(async move {
-            for _ in 0..60 {
-                if !store.is_empty() {
-                    break;
-                }
-                tracing::info!("waiting for certificate (disk empty; syncing from control)…");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    if let Some(admin) = admin_listen {
+        let admin_addr: SocketAddr = admin.parse()?;
+        let admin_app = listener::create_admin_router(state.clone());
+        tracing::info!(admin = %admin_addr, "edge management listener started");
+        tokio::spawn(async move {
+            if let Err(e) = tls::serve_http(admin_addr, admin_app).await {
+                tracing::error!(error = %e, "management listener stopped");
             }
-            if let Err(e) = tls::serve_https(https_addr, https_app, store).await {
-                tracing::error!(error = %e, "HTTPS stopped");
-            }
-        }))
-    } else {
-        None
-    };
+        });
+    }
 
-    http_handle.await.ok();
-    if let Some(h) = https_handle {
-        h.await.ok();
-    }
-    if let Some(h) = admin_handle {
-        h.await.ok();
-    }
+    let pingora_config = config.clone();
+    let pingora_certs = cert_store.clone();
+    std::thread::Builder::new()
+        .name("lagran-pingora".into())
+        .spawn(move || {
+            if let Err(e) = edge::pingora_edge::run(
+                pingora_config,
+                SocketAddr::from(([127, 0, 0, 1], internal_addr.port())),
+                pingora_certs,
+            ) {
+                tracing::error!(error = %e, "Pingora listener stopped");
+                std::process::exit(1);
+            }
+        })?;
+
+    // Keep the Tokio runtime alive for the internal engine and background
+    // agents; Pingora runs its own runtime on the spawned thread.
+    std::future::pending::<()>().await;
     Ok(())
 }
 

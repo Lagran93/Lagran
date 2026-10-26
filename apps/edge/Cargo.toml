@@ -16,6 +16,10 @@ path = "src/lib.rs"
 [dependencies]
 lagran-cache = { workspace = true }
 
+pingora = { version = "0.9.0", features = ["proxy", "openssl"] }
+# Static build friendliness (including musl): link a vendored OpenSSL.
+openssl = { version = "0.10", features = ["vendored"] }
+
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

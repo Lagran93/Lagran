@@ -172,7 +172,7 @@ CODE=$(request "/search?q=union%20select" -H 'X-Forwarded-For: 198.51.100.7')
 check "allow-listed IP bypasses WAF" "$CODE" "200"
 
 echo "== browser challenge =="
-CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.1')
+CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.1' -H 'Accept: text/html')
 check "challenge rule returns interstitial" "$CODE" "403"
 contains "challenge page marker" "$(cat "$LOG_DIR/body")" "正在进行安全验证"
 contains "challenge response header" "$(cat "$LOG_DIR/headers")" "x-lagran-challenge:"
@@ -206,7 +206,7 @@ CODE=$(curl -s -o "$LOG_DIR/body" -b "$LOG_DIR/challenge.jar" -w '%{http_code}' 
   -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/challenge-me")
 check "clearance cookie passes the challenge" "$CODE" "200"
 
-CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.2')
+CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.2' -H 'Accept: text/html')
 check "a different client is still challenged" "$CODE" "403"
 
 echo "== events (block) =="

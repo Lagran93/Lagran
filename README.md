@@ -37,6 +37,8 @@
 - 统计：总览 / 分域名（24h）、访问日志、操作审计、源站健康
 
 ### 边缘端 (`apps/edge`)
+- **Pingora 公共网络层**：HTTP/1.1 + HTTP/2、HTTP/HTTPS 监听、SNI 动态证书、连接管理；
+  缓存/WAF/CC 引擎在同一进程的 loopback 数据面运行，保持原有功能
 - 多域名反向代理（按 Host/SNI 路由）+ 主备源站
 - 缓存：`memory`（DashMap + LRU）/ `disk`（文件缓存，按 mtime 淘汰）/ `hybrid`
 - 缓存语义：规则 TTL → `Cache-Control`(`s-maxage`/`max-age`) → `Expires` → 默认 TTL；
@@ -123,15 +125,15 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | ACME_DIRECTORY_URL | Let's Encrypt 生产 | ACME v2 目录地址 |
 | ACME_STAGING_DIRECTORY_URL | Let's Encrypt Staging | Staging 目录地址 |
 | ACME_CONTACT_EMAIL | 空 | ACME 账户联系邮箱 |
-| EDGE_LISTEN | 0.0.0.0:8081 | 边缘数据面 HTTP 监听 |
+| EDGE_LISTEN | 0.0.0.0:8081 | Pingora 公共数据面 HTTP 监听 |
 | EDGE_ADMIN_LISTEN | 空 | 管理面监听；设置后 purge/证书/ACME 与管理接口走独立端口（推荐） |
-| EDGE_HTTPS_LISTEN | 空 | 边缘 HTTPS 监听（需证书） |
+| EDGE_HTTPS_LISTEN | 空 | Pingora 公共 HTTPS 监听（需证书） |
 | ORIGIN_URL | https://example.com | 默认源站（未接入域名时兜底） |
 | CONTROL_URL | http://127.0.0.1:8080 | 控制面地址，支持 https |
 | CACHE_TTL | 60 | 未命中规则时的默认 TTL |
 | CACHE_CAPACITY | 10000 | 内存缓存条目上限（0=不限） |
 | CACHE_BACKEND | memory | memory / disk / hybrid |
-| TRUST_PROXY_HEADERS | false | 是否信任 `X-Forwarded-For` 作为客户端 IP（WAF 用；仅前置可信代理时开启） |
+| TRUST_PROXY_HEADERS | false | 是否信任前置代理的 `X-Forwarded-For`；false 时 Pingora 用真实对端 IP 覆盖伪造值 |
 | EDGE_HTTPS_REDIRECT_PORT | 空 | 域名开启 HTTPS 后，HTTP→HTTPS 跳转使用的端口；留空取 HTTPS 监听端口，443 时省略 |
 | PUBLIC_IP | 空 | 节点公网 IP，随心跳上报给控制面用于 GeoDNS 调度 |
 | DNS_LISTEN | 0.0.0.0:53 | 权威 DNS 监听地址（UDP/TCP 同端口） |

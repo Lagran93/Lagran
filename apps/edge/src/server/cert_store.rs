@@ -17,6 +17,9 @@ pub struct CertStore {
 struct StoreInner {
     by_name: HashMap<String, Arc<CertifiedKey>>,
     default: Option<Arc<CertifiedKey>>,
+    /// Original PEM material for the Pingora/OpenSSL listener.
+    pem: HashMap<String, (Vec<u8>, Vec<u8>)>,
+    pem_default: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl CertStore {
@@ -130,10 +133,12 @@ impl CertStore {
         let mut w = self.inner.write().map_err(|e| e.to_string())?;
         for n in names {
             let key = n.to_lowercase();
-            w.by_name.insert(key, ck.clone());
+            w.by_name.insert(key.clone(), ck.clone());
+            w.pem.insert(key, (cert_pem.to_vec(), key_pem.to_vec()));
         }
         if w.default.is_none() {
             w.default = Some(ck);
+            w.pem_default = Some((cert_pem.to_vec(), key_pem.to_vec()));
         }
         Ok(())
     }
@@ -153,6 +158,22 @@ impl CertStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Raw PEM certificate/key for the OpenSSL-based Pingora TLS listener.
+    /// Exact SNI first, then `*.example.com`, then the first/default cert.
+    pub fn pem_for(&self, name: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        let guard = self.inner.read().ok()?;
+        let key = name.trim().trim_end_matches('.').to_lowercase();
+        if let Some(v) = guard.pem.get(&key) {
+            return Some(v.clone());
+        }
+        if let Some((_, rest)) = key.split_once('.') {
+            if let Some(v) = guard.pem.get(&format!("*.{rest}")) {
+                return Some(v.clone());
+            }
+        }
+        guard.pem_default.clone()
     }
 
     pub fn resolver(self: &Arc<Self>) -> Arc<DynResolver> {

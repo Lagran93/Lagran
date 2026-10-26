@@ -15,7 +15,9 @@ license = "MIT"
 repository = "https://github.com/your-org/lagran"
 
 [workspace.dependencies]
-tokio = { version = "1.36", features = ["full"] }
+# Pingora 0.9 uses tokio's BufStream with zero capacity; tokio 1.54 added an
+# assert that breaks it. Pin until Pingora supports the newer behavior.
+tokio = { version = "=1.53.1", features = ["full"] }
 async-trait = "0.1"
 
 axum = { version = "0.7", features = ["macros"] }
