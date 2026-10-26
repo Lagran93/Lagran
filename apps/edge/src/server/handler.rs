@@ -350,25 +350,28 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             if let Some(verdict) = waf_evaluate(&entry.waf, &waf_request) {
                 if verdict.action != WafAction::Allow {
                     let mode_is_block = entry.waf.mode == WafMode::Block;
-                    let challenge_method = method == Method::GET || method == Method::HEAD;
+                    // A JS challenge only works for a top-level document
+                    // navigation. XHR/fetch/API calls (e.g. POST /login) must
+                    // not be turned into a 403 challenge page.
+                    let challenge_capable = challenge_accepts_html(&method, &headers);
                     let cleared = challenge::has_clearance(
                         &headers,
                         &host,
                         entry.waf.challenge_ttl_secs,
                         &state.challenge_secret,
                     );
-                    // A challenge only makes sense for a document navigation;
-                    // non-GET requests in block mode are rejected outright.
                     let challenge_needed = verdict.action == WafAction::Challenge
                         && mode_is_block
-                        && challenge_method
+                        && challenge_capable
                         && !cleared;
-                    let blocked = mode_is_block
-                        && (verdict.is_block()
-                            || (verdict.action == WafAction::Challenge && !challenge_method));
+                    let challenge_skipped = verdict.action == WafAction::Challenge
+                        && mode_is_block
+                        && !challenge_capable;
+                    let blocked = mode_is_block && verdict.is_block();
 
                     if challenge_needed
                         || blocked
+                        || challenge_skipped
                         || verdict.action == WafAction::Log
                         || !mode_is_block
                     {
@@ -376,6 +379,8 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                             "block"
                         } else if challenge_needed {
                             "challenge"
+                        } else if challenge_skipped {
+                            "skip-challenge"
                         } else if verdict.action == WafAction::Log {
                             "log"
                         } else {
@@ -1149,6 +1154,19 @@ fn hotlink_allowed(allowed_list: &str, referer: &str) -> bool {
         .any(|pat| pat == "*" || (!referer.is_empty() && referer.contains(pat)))
 }
 
+/// JS challenges require a top-level HTML document navigation. JSON/XHR
+/// requests (login, fetch, API calls) cannot execute the challenge page.
+fn challenge_accepts_html(method: &Method, headers: &HeaderMap) -> bool {
+    if method != Method::GET && method != Method::HEAD {
+        return false;
+    }
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
+}
+
 fn header_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         if let Some(first) = xff.split(',').next() {
@@ -1397,6 +1415,30 @@ fn https_redirect_response(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[test]
+    fn challenge_only_for_html_document_navigation() {
+        let html = Request::builder()
+            .method("GET")
+            .header("accept", "text/html,application/xhtml+xml")
+            .body(())
+            .unwrap();
+        assert!(challenge_accepts_html(html.method(), html.headers()));
+
+        let api = Request::builder()
+            .method("POST")
+            .header("accept", "application/json")
+            .body(())
+            .unwrap();
+        assert!(!challenge_accepts_html(api.method(), api.headers()));
+
+        let fetch = Request::builder()
+            .method("GET")
+            .header("accept", "*/*")
+            .body(())
+            .unwrap();
+        assert!(!challenge_accepts_html(fetch.method(), fetch.headers()));
+    }
 
     #[test]
     fn hotlink_rules() {

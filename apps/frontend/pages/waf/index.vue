@@ -231,7 +231,8 @@
             </div>
           </div>
           <p class="text-muted" style="font-size: 12px; margin-top: 8px">
-            规则动作选择「质询」时生效；仅对 GET/HEAD 导航返回质询页，其他方法按拦截处理。
+            规则动作选择「质询」时生效；仅对 GET/HEAD 且 Accept 包含 text/html 的文档导航返回质询页。
+            API / XHR / POST 等非文档请求会跳过质询直接放行，如需限制请使用 block 规则或限流。
           </p>
 
           <div class="flex-between mt-24">
