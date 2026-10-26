@@ -159,7 +159,7 @@ H1=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/c
 contains "first /cached is MISS" "$H1" "x-cache: MISS"
 H2=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
 contains "second /cached is HIT" "$H2" "x-cache: HIT"
-contains "hit carries Age" "$H2" "age:"
+contains "hit carries Age" "$(printf '%s' "$H2" | tr '[:upper:]' '[:lower:]')" "age:"
 
 ETAG=$(printf '%s' "$H2" | awk 'tolower($1)=="etag:" {print $2}' | tr -d '\r')
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" -H "If-None-Match: $ETAG" "http://127.0.0.1:$EDGE_PORT/cached")

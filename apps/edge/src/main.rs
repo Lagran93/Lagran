@@ -166,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pingora_config = config.clone();
     let pingora_certs = cert_store.clone();
+    let pingora_state = state.clone();
     std::thread::Builder::new()
         .name("lagran-pingora".into())
         .spawn(move || {
@@ -173,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
                 pingora_config,
                 SocketAddr::from(([127, 0, 0, 1], internal_addr.port())),
                 pingora_certs,
+                pingora_state,
             ) {
                 tracing::error!(error = %e, "Pingora listener stopped");
                 std::process::exit(1);
