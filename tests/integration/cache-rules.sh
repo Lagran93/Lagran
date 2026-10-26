@@ -58,7 +58,7 @@ fi
 PIDS+=($!)
 
 echo "== start control =="
-CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN= ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
+CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN=test-global ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null && break; sleep 0.5; done
 curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null || { echo "control did not start"; exit 1; }
@@ -73,10 +73,17 @@ api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" \
 DOMAIN_ID=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" | jq -r --arg n "$DOMAIN" '.[] | select(.name == $n) | .id')
 [[ -n "$DOMAIN_ID" ]] || { echo "domain creation failed"; exit 1; }
 
+NODE_NAME="rules-edge-$$"
+NODE_RESP=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
+  -d "{\"name\":\"$NODE_NAME\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
+NODE_TOKEN=$(printf '%s' "$NODE_RESP" | jq -r '.token // empty')
+[[ -n "$NODE_TOKEN" ]] || { echo "node creation failed"; exit 1; }
+
 echo "== create rules =="
 mk_rule() { api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules" -d "$1"; }
 
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/method/*\",\"action\":\"bypass\",\"match_methods\":\"GET\",\"priority\":10,\"note\":\"GET bypass\"}" >/dev/null
+mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"match_type\":\"regex\",\"path_pattern\":\"\\\\.(css|js)$\",\"action\":\"cache\",\"ttl_seconds\":600,\"browser_ttl_seconds\":600,\"priority\":20,\"note\":\"regex suffix\"}" >/dev/null
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/q/*\",\"action\":\"bypass\",\"match_query\":\"debug=1\",\"priority\":10}" >/dev/null
 RULE_OFF=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/off/*\",\"action\":\"bypass\",\"enabled\":false,\"priority\":10}" | jq -r '.id')
 RULE_BROWSER=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/browser/*\",\"action\":\"cache\",\"ttl_seconds\":60,\"browser_ttl_seconds\":3600,\"priority\":10}" | jq -r '.id')
@@ -89,7 +96,8 @@ check "unsupported method rejected" "$BAD" "400"
 
 echo "== start edge =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
-NODE_ID="rules-edge-$$" \
+NODE_ID="$NODE_NAME" \
+AGENT_TOKEN="$NODE_TOKEN" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
 CACHE_TTL=60 \
 CACHE_BACKEND=memory \
@@ -121,6 +129,26 @@ get "/q/x?other=1" >/dev/null
 check "other query cached (miss)" "$(hdr x-cache)" "MISS"
 get "/q/x?other=1" >/dev/null
 check "other query cached (hit)" "$(hdr x-cache)" "HIT"
+
+echo "== regex suffix rule =="
+get "/assets/app.css" >/dev/null
+check "css regex rule first miss" "$(hdr x-cache)" "MISS"
+get "/assets/app.css" >/dev/null
+check "css regex rule second hit" "$(hdr x-cache)" "HIT"
+contains "css regex rule TTL applied" "$(hdr cache-control)" "max-age=600"
+get "/assets/app.js" >/dev/null
+check "js regex rule miss" "$(hdr x-cache)" "MISS"
+get "/assets/app.js" >/dev/null
+check "js regex rule hit" "$(hdr x-cache)" "HIT"
+get "/assets/app.html" >/dev/null
+if [[ "$(hdr cache-control)" == *"max-age=600"* ]]; then
+  fail "html should not match css/js regex"
+else
+  pass "html does not match css/js regex"
+fi
+TEST=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules/test" \
+  -d "{\"domain_id\":\"$DOMAIN_ID\",\"path\":\"/assets/app.js\"}")
+check "tester matches regex suffix" "$(printf '%s' "$TEST" | jq -r '.matched.note')" "regex suffix"
 
 echo "== disabled rule =="
 get "/off/x" >/dev/null

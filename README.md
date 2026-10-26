@@ -17,8 +17,8 @@
 - 注册 / 登录（bcrypt + JWT）、`GET /api/v1/auth/me`（含角色）
 - 项目与成员（多租户）：`/api/v1/projects`、`/projects/{id}/members`
 - 域名接入与管理：源站/备源、SSL、限流、CORS、防盗链、回源超时、自定义头
-- 缓存规则：路径通配、**请求方法 / 查询串条件**、TTL、优先级、SWR、**动作（cache/bypass/no_store）**、
-  **浏览器 TTL 覆盖**、**按规则忽略 Query**、启用/停用与**规则测试器**
+- 缓存规则：路径通配 / **正则匹配（按 .css/.js 等后缀）**、**请求方法 / 查询串条件**、TTL、优先级、SWR、
+  **动作（cache/bypass/no_store）**、**浏览器 TTL 覆盖**、**按规则忽略 Query**、启用/停用与**规则测试器**
 - 域名源站支持主备：备用源站可随时启用/修改/清空，端口留空按协议默认 80/443；
   主源站不可用时自动回源到备用源站（含 bypass/动态请求）
 - 域名 HTTPS：开启后 HTTP 请求 301/308 跳转到 HTTPS（`EDGE_HTTPS_REDIRECT_PORT` 控制端口）
@@ -120,7 +120,8 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | ACME_DIRECTORY_URL | Let's Encrypt 生产 | ACME v2 目录地址 |
 | ACME_STAGING_DIRECTORY_URL | Let's Encrypt Staging | Staging 目录地址 |
 | ACME_CONTACT_EMAIL | 空 | ACME 账户联系邮箱 |
-| EDGE_LISTEN | 0.0.0.0:8081 | 边缘 HTTP 监听 |
+| EDGE_LISTEN | 0.0.0.0:8081 | 边缘数据面 HTTP 监听 |
+| EDGE_ADMIN_LISTEN | 空 | 管理面监听；设置后 purge/证书/ACME 与管理接口走独立端口（推荐） |
 | EDGE_HTTPS_LISTEN | 空 | 边缘 HTTPS 监听（需证书） |
 | ORIGIN_URL | https://example.com | 默认源站（未接入域名时兜底） |
 | CONTROL_URL | http://127.0.0.1:8080 | 控制面地址，支持 https |

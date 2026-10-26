@@ -117,7 +117,31 @@ async fn main() -> anyhow::Result<()> {
         https_redirect_port: config.https_redirect_port,
     });
 
-    let app = listener::create_router(state);
+    let admin_listen = config.admin_listen_addr.clone();
+    if let Some(ref admin) = admin_listen {
+        if admin == &config.listen_addr {
+            anyhow::bail!("EDGE_ADMIN_LISTEN must differ from EDGE_LISTEN");
+        }
+    }
+
+    let app = if admin_listen.is_some() {
+        listener::create_data_router(state.clone())
+    } else {
+        listener::create_router(state.clone())
+    };
+
+    let admin_handle = if let Some(admin) = admin_listen {
+        let admin_addr: SocketAddr = admin.parse()?;
+        let admin_app = listener::create_admin_router(state.clone());
+        tracing::info!(admin = %admin_addr, "edge management listener started");
+        Some(tokio::spawn(async move {
+            if let Err(e) = tls::serve_http(admin_addr, admin_app).await {
+                tracing::error!(error = %e, "management listener stopped");
+            }
+        }))
+    } else {
+        None
+    };
 
     let http_addr: SocketAddr = config.listen_addr.parse()?;
     let http_app = app.clone();
@@ -149,6 +173,9 @@ async fn main() -> anyhow::Result<()> {
 
     http_handle.await.ok();
     if let Some(h) = https_handle {
+        h.await.ok();
+    }
+    if let Some(h) = admin_handle {
         h.await.ok();
     }
     Ok(())

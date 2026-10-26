@@ -99,6 +99,14 @@ contains "binary command carries control url" "$(printf '%s' "$CREATE" | jq -r '
   "CONTROL_URL=http://127.0.0.1:$CONTROL_PORT"
 contains "binary command carries node id" "$(printf '%s' "$CREATE" | jq -r '.commands.binary')" \
   "NODE_ID=$NODE_NAME"
+contains "binary command carries admin listener" "$(printf '%s' "$CREATE" | jq -r '.commands.binary')" \
+  "EDGE_ADMIN_LISTEN=0.0.0.0:8081"
+contains "binary command uses data port 80" "$(printf '%s' "$CREATE" | jq -r '.commands.binary')" \
+  "EDGE_LISTEN=0.0.0.0:80"
+contains "docker command publishes data port" "$(printf '%s' "$CREATE" | jq -r '.commands.docker')" \
+  "-p 80:80"
+contains "docker command publishes admin port" "$(printf '%s' "$CREATE" | jq -r '.commands.docker')" \
+  "-p 8081:8081"
 contains "docker command carries token" "$(printf '%s' "$CREATE" | jq -r '.commands.docker')" "$NODE_TOKEN"
 
 LIST=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes")

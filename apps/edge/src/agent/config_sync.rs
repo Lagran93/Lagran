@@ -26,6 +26,8 @@ struct OriginCfg {
 #[derive(Debug, Clone, Deserialize)]
 struct RuleCfg {
     path_pattern: String,
+    #[serde(default = "default_glob")]
+    match_type: String,
     ttl_seconds: u64,
     priority: i32,
     #[serde(default)]
@@ -46,8 +48,21 @@ struct RuleCfg {
 
 impl RuleCfg {
     fn into_rule(self) -> CacheRule {
+        let regex = if self.match_type.eq_ignore_ascii_case("regex") {
+            match regex::Regex::new(&self.path_pattern) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    tracing::warn!(pattern = %self.path_pattern, error = %e, "invalid cache rule regex; rule disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         CacheRule {
             path_pattern: self.path_pattern,
+            match_type: self.match_type,
+            regex,
             ttl_seconds: self.ttl_seconds,
             priority: self.priority,
             action: self.action.unwrap_or_else(|| "cache".into()),
@@ -193,6 +208,10 @@ impl Default for WafManagedCfg {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_glob() -> String {
+    "glob".into()
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

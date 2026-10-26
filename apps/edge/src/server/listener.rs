@@ -15,16 +15,43 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
-pub fn create_router(state: Arc<AppState>) -> Router {
+fn data_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/__lagran/health", get(health))
         .route("/__lagran/challenge/verify", get(challenge::verify))
+        .route("/.well-known/acme-challenge/:token", get(acme_challenge))
+}
+
+fn management_routes() -> Router<Arc<AppState>> {
+    Router::new()
         .route("/__lagran/purge", post(purge_authed))
         .route("/__lagran/acme/challenge", put(put_challenge_authed))
-        .route("/.well-known/acme-challenge/:token", get(acme_challenge))
         .route("/__lagran/certs/load", post(load_cert_authed))
         .route("/__lagran/access-logs", get(list_access_logs))
+}
+
+/// Legacy combined listener: data plane + management on the same port.
+pub fn create_router(state: Arc<AppState>) -> Router {
+    data_routes()
+        .merge(management_routes())
         .fallback(proxy_handler)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// Data/HTTP listener: CDN traffic, WAF challenge verify and ACME HTTP-01 only.
+pub fn create_data_router(state: Arc<AppState>) -> Router {
+    data_routes()
+        .fallback(proxy_handler)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// Control-plane management listener: purge/cert/challenge/access-log endpoints.
+/// This listener must not be exposed to CDN clients.
+pub fn create_admin_router(state: Arc<AppState>) -> Router {
+    management_routes()
+        .route("/__lagran/health", get(health))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

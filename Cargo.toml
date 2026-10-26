@@ -53,6 +53,7 @@ http = "1"
 # Edge helpers (WebSocket handshake, HTTP-date parsing)
 base64 = "0.22"
 httpdate = "1"
+regex = "1"
 ring = "0.17"
 webpki-roots = "1"
 

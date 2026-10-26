@@ -216,8 +216,8 @@
               placeholder="http://1.2.3.4:8081"
             />
             <span class="field-hint">
-              控制面回调该节点的地址（下发刷新、证书、ACME），必须是控制面能访问到的 URL。
-              留空可稍后再填。
+              控制面回调该节点的管理面地址（EDGE_ADMIN_LISTEN，如 8081），用于下发刷新、证书、ACME；
+              不要填 CDN 数据端口 80/443。留空可稍后再填。
             </span>
           </div>
         </div>

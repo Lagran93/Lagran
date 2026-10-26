@@ -48,7 +48,7 @@ fi
 "$MOCK_BIN" "$ORIGIN_PORT" >"$LOG_DIR/origin.log" 2>&1 &
 ORIGIN_PID=$!
 PIDS+=($!)
-CONTROL_BIND="127.0.0.1:$CONTROL_PORT" ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
+CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN=test-global ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
 PIDS+=($!)
 
 for _ in $(seq 1 60); do
@@ -76,6 +76,13 @@ if [[ -z "$DOMAIN_ID" ]]; then
 fi
 [[ -n "$DOMAIN_ID" ]] || { echo "could not create/find $DOMAIN"; exit 1; }
 
+NODE_NAME="ttl-edge-$$"
+NODE_RESP=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" -H "$AUTH" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"$NODE_NAME\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
+NODE_TOKEN=$(printf '%s' "$NODE_RESP" | jq -r '.token // empty')
+[[ -n "$NODE_TOKEN" ]] || { echo "node creation failed"; exit 1; }
+
 # Re-runs may already have the domain: force this run's mock origin onto it.
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID" -H "$AUTH" \
   -H 'content-type: application/json' \
@@ -93,7 +100,8 @@ echo "== start edge (CACHE_TTL=$DEFAULT_TTL) =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
 AGENT_URL="http://127.0.0.1:$EDGE_PORT" \
-NODE_ID="ttl-edge-$$" \
+AGENT_TOKEN="$NODE_TOKEN" \
+NODE_ID="$NODE_NAME" \
 CACHE_BACKEND=memory \
 CACHE_TTL="$DEFAULT_TTL" \
 ./target/debug/lagran-edge >"$LOG_DIR/edge.log" 2>&1 &

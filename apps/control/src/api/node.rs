@@ -224,7 +224,8 @@ export NODE_REGION={region}
 export PUBLIC_IP={public_ip}
 export AGENT_URL={agent_url}
 export AGENT_TOKEN={token}
-export EDGE_LISTEN=0.0.0.0:8081
+export EDGE_LISTEN=0.0.0.0:80
+export EDGE_ADMIN_LISTEN=0.0.0.0:8081
 export CACHE_BACKEND=memory
 
 ./lagran-edge"#
@@ -232,6 +233,7 @@ export CACHE_BACKEND=memory
 
     let docker = format!(
         r#"docker run -d --name lagran-edge-{name} --restart=always \
+  -p 80:80 \
   -p 8081:8081 \
   -e CONTROL_URL={base} \
   -e NODE_ID={name} \
@@ -239,7 +241,8 @@ export CACHE_BACKEND=memory
   -e PUBLIC_IP={public_ip} \
   -e AGENT_URL={agent_url} \
   -e AGENT_TOKEN={token} \
-  -e EDGE_LISTEN=0.0.0.0:8081 \
+  -e EDGE_LISTEN=0.0.0.0:80 \
+  -e EDGE_ADMIN_LISTEN=0.0.0.0:8081 \
   -e CACHE_BACKEND=memory \
   -v /var/lib/lagran/cache:/data/cache \
   -e DISK_CACHE_DIR=/data/cache \

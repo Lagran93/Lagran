@@ -125,6 +125,7 @@
               <td>
                 <div class="mono cell-main">{{ r.path_pattern }}</div>
                 <div class="cond-row">
+                  <span v-if="r.match_type === 'regex'" class="cond-chip warn">正则</span>
                   <span v-if="r.match_methods" class="cond-chip">{{ r.match_methods.replaceAll(',', ' / ') }}</span>
                   <span v-else class="cond-chip muted">全部方法</span>
                   <span v-if="r.match_query" class="cond-chip">query 含 {{ r.match_query }}</span>
@@ -218,9 +219,28 @@
           </div>
 
           <div class="field span-2">
-            <label class="field-label">路径匹配 <span class="req">*</span></label>
-            <input v-model="form.path_pattern" class="input" placeholder="/static/*" />
-            <span class="field-hint">支持 `/static/*` 前缀和 `/img*` 通配；`/*` 匹配全部路径。</span>
+            <label class="field-label">匹配方式</label>
+            <select v-model="form.match_type" class="select">
+              <option value="glob">通配符（glob）</option>
+              <option value="regex">正则表达式（regex）</option>
+            </select>
+            <span class="field-hint">
+              通配符使用 `/static/*`、`/img*`；正则用于按后缀匹配，例如 `\.(css|js)$`。
+            </span>
+          </div>
+
+          <div class="field span-2">
+            <label class="field-label">路径 / 正则 <span class="req">*</span></label>
+            <input
+              v-model="form.path_pattern"
+              class="input"
+              :placeholder="form.match_type === 'regex' ? '\\.(css|js)$' : '/static/*'"
+            />
+            <span class="field-hint">
+              {{ form.match_type === 'regex'
+                ? 'Rust regex 语法；例如 `\\.(css|js)$` 匹配所有 CSS/JS 文件，`^/assets/` 匹配目录前缀。'
+                : '支持 `/static/*` 前缀和 `/img*` 通配；`/*` 匹配全部路径。' }}
+            </span>
           </div>
 
           <div class="field span-2">
@@ -346,6 +366,7 @@ const error = ref('')
 const form = ref({
   domain_id: '',
   path_pattern: '/*',
+  match_type: 'glob',
   action: 'cache',
   ttl_seconds: 60,
   swr_seconds: 0,
@@ -366,6 +387,7 @@ const actionOptions = [
 ]
 
 const presets = [
+  { label: 'CSS/JS 后缀 7 天', path: '\\.(css|js)$', matchType: 'regex', ttl: 604800, swr: 86400, browser: 604800, methods: ['GET', 'HEAD'] },
   { label: '静态资源 7 天', path: '/static/*', ttl: 604800, swr: 86400, browser: 604800, methods: ['GET', 'HEAD'] },
   { label: '图片 30 天', path: '/images/*', ttl: 2592000, swr: 86400, browser: 2592000, methods: ['GET', 'HEAD'] },
   { label: 'HTML 5 分钟', path: '/', ttl: 300, swr: 60, browser: 300, methods: ['GET', 'HEAD'] },
@@ -425,6 +447,7 @@ function toggleMethod(method: string) {
 
 function applyPreset(preset: any) {
   form.value.path_pattern = preset.path
+  form.value.match_type = preset.matchType || 'glob'
   form.value.action = preset.bypass ? 'bypass' : 'cache'
   form.value.ttl_seconds = preset.ttl || 60
   form.value.swr_seconds = preset.swr || 0
@@ -456,6 +479,7 @@ function openCreate() {
   form.value = {
     domain_id: domainFilter.value || domains.value[0]?.id || '',
     path_pattern: '/*',
+    match_type: 'glob',
     action: 'cache',
     ttl_seconds: 60,
     swr_seconds: 0,
@@ -476,6 +500,7 @@ function openEdit(rule: any) {
   form.value = {
     domain_id: rule.domain_id,
     path_pattern: rule.path_pattern,
+    match_type: rule.match_type || 'glob',
     action: rule.action,
     ttl_seconds: rule.ttl_seconds,
     swr_seconds: rule.swr_seconds,
@@ -493,6 +518,7 @@ function openEdit(rule: any) {
 function payload() {
   return {
     path_pattern: form.value.path_pattern.trim(),
+    match_type: form.value.match_type,
     action: form.value.action,
     ttl_seconds: Number(form.value.ttl_seconds) || 0,
     swr_seconds: Number(form.value.swr_seconds) || 0,

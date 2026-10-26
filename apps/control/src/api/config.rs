@@ -28,6 +28,7 @@ pub struct OriginConfig {
 #[derive(Serialize, Clone)]
 pub struct CacheRuleConfig {
     pub path_pattern: String,
+    pub match_type: String,
     pub ttl_seconds: u64,
     pub priority: i32,
     pub action: String,
@@ -110,6 +111,7 @@ fn rule_configs(rows: Vec<repository::CacheRuleRow>) -> Vec<CacheRuleConfig> {
     rows.into_iter()
         .map(|r| CacheRuleConfig {
             path_pattern: r.path_pattern,
+            match_type: r.match_type,
             ttl_seconds: r.ttl_seconds.max(0) as u64,
             priority: r.priority,
             action: r.action,
@@ -225,6 +227,7 @@ fn build(
     }
     for r in &rules {
         r.path_pattern.hash(&mut h);
+        r.match_type.hash(&mut h);
         r.ttl_seconds.hash(&mut h);
         r.priority.hash(&mut h);
         r.action.hash(&mut h);

@@ -9,6 +9,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -21,6 +22,8 @@ pub struct RuleDto {
     pub domain_id: String,
     pub domain_name: String,
     pub path_pattern: String,
+    /// glob | regex
+    pub match_type: String,
     pub ttl_seconds: u64,
     pub priority: i32,
     pub action: String,
@@ -40,6 +43,7 @@ impl RuleDto {
             domain_id: r.domain_id.to_string(),
             domain_name: domain_name.to_string(),
             path_pattern: r.path_pattern,
+            match_type: r.match_type,
             ttl_seconds: r.ttl_seconds.max(0) as u64,
             priority: r.priority,
             action: r.action,
@@ -57,6 +61,8 @@ impl RuleDto {
 #[derive(Deserialize)]
 pub struct RulePayload {
     pub path_pattern: Option<String>,
+    /// glob | regex
+    pub match_type: Option<String>,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
     pub priority: Option<i32>,
@@ -94,6 +100,7 @@ pub struct ErrorBody {
 
 struct Normalized {
     path_pattern: String,
+    match_type: String,
     ttl_seconds: i64,
     priority: i32,
     action: String,
@@ -106,10 +113,17 @@ struct Normalized {
     note: String,
 }
 
-fn normalize_path(path: &str) -> Result<String, String> {
+fn normalize_path(path: &str, match_type: &str) -> Result<String, String> {
     let path = path.trim();
     if path.is_empty() {
         return Err("path_pattern required".into());
+    }
+    if match_type == "regex" {
+        if path.len() > 512 {
+            return Err("regex is too long".into());
+        }
+        Regex::new(path).map_err(|e| format!("invalid regex: {e}"))?;
+        return Ok(path.to_string());
     }
     if !path.starts_with('/') && path != "*" {
         return Err("path_pattern must start with /".into());
@@ -118,6 +132,17 @@ fn normalize_path(path: &str) -> Result<String, String> {
         return Err("path_pattern is too long".into());
     }
     Ok(path.to_string())
+}
+
+fn normalize_match_type(raw: &str) -> Result<String, String> {
+    let match_type = raw.trim().to_ascii_lowercase();
+    if match_type.is_empty() {
+        return Ok("glob".into());
+    }
+    if match_type != "glob" && match_type != "regex" {
+        return Err("match_type must be glob or regex".into());
+    }
+    Ok(match_type)
 }
 
 fn normalize_methods(raw: &str) -> Result<String, String> {
@@ -141,6 +166,7 @@ fn normalize_methods(raw: &str) -> Result<String, String> {
 fn normalize(
     payload: &RulePayload,
     path_pattern: &str,
+    match_type: &str,
     action: &str,
     ttl: u64,
     swr: u64,
@@ -152,7 +178,8 @@ fn normalize(
     ignore_query: Option<bool>,
     note: &str,
 ) -> Result<Normalized, String> {
-    let path_pattern = normalize_path(path_pattern)?;
+    let match_type = normalize_match_type(match_type)?;
+    let path_pattern = normalize_path(path_pattern, &match_type)?;
     let action = action.trim().to_ascii_lowercase();
     if !ACTIONS.contains(&action.as_str()) {
         return Err("action must be cache, bypass or no_store".into());
@@ -183,6 +210,7 @@ fn normalize(
     }
     Ok(Normalized {
         path_pattern,
+        match_type,
         ttl_seconds: ttl_seconds as i64,
         priority: payload.priority.unwrap_or(priority),
         action,
@@ -234,6 +262,7 @@ pub async fn create(
     let normalized = normalize(
         &req.rule,
         req.rule.path_pattern.as_deref().unwrap_or(""),
+        req.rule.match_type.as_deref().unwrap_or("glob"),
         req.rule.action.as_deref().unwrap_or("cache"),
         req.rule.ttl_seconds.unwrap_or(0),
         req.rule.swr_seconds.unwrap_or(0),
@@ -249,6 +278,7 @@ pub async fn create(
 
     let input = repository::RuleInput {
         path_pattern: &normalized.path_pattern,
+        match_type: &normalized.match_type,
         ttl_seconds: normalized.ttl_seconds,
         priority: normalized.priority,
         action: &normalized.action,
@@ -322,6 +352,7 @@ pub async fn update(
     let normalized = normalize(
         &req,
         path,
+        req.match_type.as_deref().unwrap_or(&current.match_type),
         action,
         ttl,
         swr,
@@ -337,6 +368,7 @@ pub async fn update(
 
     let input = repository::RuleInput {
         path_pattern: &normalized.path_pattern,
+        match_type: &normalized.match_type,
         ttl_seconds: normalized.ttl_seconds,
         priority: normalized.priority,
         action: &normalized.action,
@@ -455,6 +487,16 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     pattern == path
 }
 
+fn rule_path_matches(rule: &repository::CacheRuleRow, path: &str) -> bool {
+    if rule.match_type.eq_ignore_ascii_case("regex") {
+        Regex::new(&rule.path_pattern)
+            .map(|re| re.is_match(path))
+            .unwrap_or(false)
+    } else {
+        path_matches(&rule.path_pattern, path)
+    }
+}
+
 fn pick<'a>(
     rows: &'a [repository::CacheRuleRow],
     path: &str,
@@ -464,7 +506,7 @@ fn pick<'a>(
     let mut best: Option<&repository::CacheRuleRow> = None;
     for r in rows {
         if !r.enabled
-            || !path_matches(&r.path_pattern, path)
+            || !rule_path_matches(r, path)
             || !method_matches(&r.match_methods, method)
             || !query_matches(&r.match_query, query)
         {
@@ -588,6 +630,7 @@ mod tests {
             id: Uuid::nil(),
             domain_id: Uuid::nil(),
             path_pattern: pattern.into(),
+            match_type: "glob".into(),
             ttl_seconds: 60,
             priority,
             action: "cache".into(),

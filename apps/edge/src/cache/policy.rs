@@ -11,6 +11,7 @@
 
 use axum::http::{header, HeaderMap, Method, Request};
 use lagran_cache::CacheEntry;
+use regex::Regex;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -84,6 +85,10 @@ impl RuleAction {
 #[derive(Debug, Clone)]
 pub struct CacheRule {
     pub path_pattern: String,
+    /// glob | regex
+    pub match_type: String,
+    /// Compiled regex for `match_type = regex`; invalid regex is ignored.
+    pub regex: Option<Regex>,
     pub ttl_seconds: u64,
     pub priority: i32,
     /// cache | bypass | no_store
@@ -105,6 +110,8 @@ impl CacheRule {
     pub fn simple(path: String, ttl: u64, priority: i32) -> Self {
         Self {
             path_pattern: path,
+            match_type: "glob".into(),
+            regex: None,
             ttl_seconds: ttl,
             priority,
             action: "cache".into(),
@@ -230,9 +237,20 @@ pub fn match_rule<'a>(
 }
 
 pub fn request_matches_rule(rule: &CacheRule, path: &str, method: &str, query: &str) -> bool {
-    path_matches(&rule.path_pattern, path)
+    rule_path_matches(rule, path)
         && method_matches_rule(&rule.match_methods, method)
         && query_matches_rule(&rule.match_query, query)
+}
+
+fn rule_path_matches(rule: &CacheRule, path: &str) -> bool {
+    if rule.match_type.eq_ignore_ascii_case("regex") {
+        rule.regex
+            .as_ref()
+            .map(|re| re.is_match(path))
+            .unwrap_or(false)
+    } else {
+        path_matches(&rule.path_pattern, path)
+    }
 }
 
 fn method_matches_rule(csv: &str, method: &str) -> bool {
@@ -616,6 +634,8 @@ mod tests {
     fn rule(path: &str, ttl: u64, priority: i32, action: &str, swr: u64) -> CacheRule {
         CacheRule {
             path_pattern: path.into(),
+            match_type: "glob".into(),
+            regex: None,
             ttl_seconds: ttl,
             priority,
             action: action.into(),
@@ -639,6 +659,8 @@ mod tests {
     ) -> CacheRule {
         CacheRule {
             path_pattern: path.into(),
+            match_type: "glob".into(),
+            regex: None,
             ttl_seconds: 60,
             priority,
             action: "cache".into(),
@@ -661,6 +683,17 @@ mod tests {
         assert!(!path_matches("/img*", "/other"));
         assert!(path_matches("/exact", "/exact"));
         assert!(!path_matches("/exact", "/exact2"));
+    }
+
+    #[test]
+    fn regex_rule_matches_file_suffix() {
+        let mut r = rule("/", 86400, 100, "cache", 0);
+        r.match_type = "regex".into();
+        r.regex = Some(Regex::new(r"\.(css|js)$").unwrap());
+        assert!(request_matches_rule(&r, "/assets/app.js", "GET", ""));
+        assert!(request_matches_rule(&r, "/style.css", "GET", ""));
+        assert!(!request_matches_rule(&r, "/index.html", "GET", ""));
+        assert!(!request_matches_rule(&r, "/app.js.map", "GET", ""));
     }
 
     #[test]

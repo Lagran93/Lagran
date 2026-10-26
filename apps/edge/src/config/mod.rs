@@ -7,6 +7,9 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct EdgeConfig {
     pub listen_addr: String,
+    /// Optional isolated listener for control-plane management endpoints.
+    /// When unset, management stays on `listen_addr` for compatibility.
+    pub admin_listen_addr: Option<String>,
     pub https_listen_addr: Option<String>,
     pub origin_url: String,
     pub default_ttl_secs: u64,
@@ -48,11 +51,15 @@ pub struct EdgeConfig {
 impl Default for EdgeConfig {
     fn default() -> Self {
         let listen = std::env::var("EDGE_LISTEN").unwrap_or_else(|_| "0.0.0.0:8081".into());
+        let admin_listen_addr = std::env::var("EDGE_ADMIN_LISTEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let agent_url = std::env::var("AGENT_URL").unwrap_or_else(|_| {
-            if let Some(port) = listen.rsplit(':').next() {
+            let agent_listen = admin_listen_addr.as_deref().unwrap_or(&listen);
+            if let Some(port) = agent_listen.rsplit(':').next() {
                 format!("http://127.0.0.1:{port}")
             } else {
-                format!("http://{listen}")
+                format!("http://{agent_listen}")
             }
         });
         let https_listen_addr = std::env::var("EDGE_HTTPS_LISTEN")
@@ -71,6 +78,7 @@ impl Default for EdgeConfig {
 
         Self {
             listen_addr: listen,
+            admin_listen_addr,
             https_listen_addr,
             origin_url: std::env::var("ORIGIN_URL")
                 .unwrap_or_else(|_| "https://example.com".into()),
