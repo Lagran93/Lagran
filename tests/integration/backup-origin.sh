@@ -17,6 +17,7 @@ PIDS=()
 FAILED=0
 TOKEN=""
 DOMAIN_ID=""
+NODE_ID=""
 
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=$((FAILED + 1)); }
@@ -25,6 +26,10 @@ check() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1 (got '$2', want '
 cleanup() {
   if [[ -n "$TOKEN" && -n "$DOMAIN_ID" ]]; then
     curl -s -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID" \
+      -H "authorization: Bearer $TOKEN" >/dev/null 2>&1
+  fi
+  if [[ -n "$TOKEN" && -n "$NODE_ID" ]]; then
+    curl -s -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/$NODE_ID" \
       -H "authorization: Bearer $TOKEN" >/dev/null 2>&1
   fi
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null; done
@@ -44,6 +49,15 @@ TOKEN=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/login" \
   -H 'content-type: application/json' \
   -d '{"email":"demo@lagran.dev","password":"demo123"}' | jq -r '.token // empty')
 [[ -n "$TOKEN" ]] || { echo "login failed"; exit 1; }
+
+NODE_NAME="backup-node-$$"
+NODE=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d "{\"name\":\"$NODE_NAME\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:1\"}")
+NODE_ID=$(printf '%s' "$NODE" | jq -r '.id // empty')
+NODE_TOKEN=$(printf '%s' "$NODE" | jq -r '.token // empty')
+[[ -n "$NODE_TOKEN" ]] || { echo "node token failed: $NODE"; exit 1; }
+AGENT=(-H "x-lagran-agent-token: $NODE_TOKEN")
 
 echo "== create with backup origin =="
 CREATE=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" \
@@ -82,7 +96,7 @@ CODE=$(curl -s -o "$LOG_DIR/err" -w '%{http_code}' -X PUT \
 check "ftp backup proto rejected" "$CODE" "400"
 
 echo "== config delivery =="
-CONFIG=$(curl -s "http://127.0.0.1:$CONTROL_PORT/api/v1/config/$DOMAIN")
+CONFIG=$(curl -s "${AGENT[@]}" "http://127.0.0.1:$CONTROL_PORT/api/v1/config/$DOMAIN")
 check "config carries backup origin" "$(printf '%s' "$CONFIG" | jq -r '.backup_origin.host')" "backup4.example.com"
 check "config backup port" "$(printf '%s' "$CONFIG" | jq -r '.backup_origin.port')" "80"
 
@@ -91,7 +105,7 @@ UPD=$(api -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID" \
   -d '{"backup_origin_host":""}')
 check "clear returns empty host" "$(printf '%s' "$UPD" | jq -r '.backup_origin_host')" ""
 check "clear resets port" "$(printf '%s' "$UPD" | jq -r '.backup_origin_port')" "0"
-CONFIG=$(curl -s "http://127.0.0.1:$CONTROL_PORT/api/v1/config/$DOMAIN")
+CONFIG=$(curl -s "${AGENT[@]}" "http://127.0.0.1:$CONTROL_PORT/api/v1/config/$DOMAIN")
 check "config omits backup origin after clear" "$(printf '%s' "$CONFIG" | jq -r '.backup_origin')" "null"
 
 echo

@@ -134,25 +134,6 @@ async fn main() -> anyhow::Result<()> {
     // Pingora owns the public listener and forwards every data-plane request to
     // this private upstream. When EDGE_ADMIN_LISTEN is unset, management also
     // stays on the data listener for backward compatibility.
-    let internal_app = if admin_listen.is_some() {
-        listener::create_data_router(state.clone())
-    } else {
-        listener::create_router(state.clone())
-    };
-    let internal_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
-    let internal_addr = internal_listener.local_addr()?;
-    tracing::info!(addr = %internal_addr, "internal data-plane engine listening");
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(
-            internal_listener,
-            internal_app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        {
-            tracing::error!(error = %e, "internal data-plane listener stopped");
-        }
-    });
-
     if let Some(admin) = admin_listen {
         let admin_addr: SocketAddr = admin.parse()?;
         let admin_app = listener::create_admin_router(state.clone());
@@ -170,19 +151,14 @@ async fn main() -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("lagran-pingora".into())
         .spawn(move || {
-            if let Err(e) = edge::pingora_edge::run(
-                pingora_config,
-                SocketAddr::from(([127, 0, 0, 1], internal_addr.port())),
-                pingora_certs,
-                pingora_state,
-            ) {
+            if let Err(e) = edge::pingora_edge::run(pingora_config, pingora_certs, pingora_state) {
                 tracing::error!(error = %e, "Pingora listener stopped");
                 std::process::exit(1);
             }
         })?;
 
-    // Keep the Tokio runtime alive for the internal engine and background
-    // agents; Pingora runs its own runtime on the spawned thread.
+    // Keep the Tokio runtime alive for background agents and the optional
+    // admin listener; Pingora runs its own runtime on the spawned thread.
     std::future::pending::<()>().await;
     Ok(())
 }

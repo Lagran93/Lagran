@@ -20,10 +20,12 @@ use crate::server::handler::{
     policy_browser_ttl, preflight_cacheable, proxy_handler, AppState,
 };
 use crate::server::native_cache::{leak_storage, NativeStorage, META_HEADER};
+use crate::server::purge;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
+use axum::Json;
 use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
 use pingora::http::ResponseHeader;
@@ -39,7 +41,7 @@ use pingora_cache::lock::CacheLock;
 use pingora_cache::{
     CacheKey, CacheMeta, CacheOptionOverrides, CachePhase, NoCacheReason, RespCacheable,
 };
-use std::net::SocketAddr;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -152,12 +154,12 @@ impl Default for ReqCtx {
 }
 
 struct DataPlaneProxy {
-    upstream: SocketAddr,
     trust_proxy: bool,
     state: Arc<AppState>,
     native_cache: bool,
     storage: Option<&'static NativeStorage>,
     cache_lock: &'static CacheLock,
+    management_on_data: bool,
 }
 
 #[async_trait]
@@ -255,8 +257,18 @@ impl ProxyHttp for DataPlaneProxy {
             return Ok(true);
         }
 
-        if needs_loopback(session) {
-            return Ok(false);
+        if path.starts_with("/__lagran/") {
+            if !self.management_on_data {
+                write_plain(
+                    session,
+                    405,
+                    "text/plain; charset=utf-8",
+                    Bytes::from_static(b"management port required"),
+                )
+                .await;
+                return Ok(true);
+            }
+            return self.handle_management(session, &path).await;
         }
 
         if let Some(plan) = self.native_plan(session).await {
@@ -333,13 +345,10 @@ impl ProxyHttp for DataPlaneProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let Some(plan) = ctx.plan.as_ref() else {
-            return Ok(Box::new(HttpPeer::new(
-                self.upstream,
-                false,
-                "lagran-internal".to_string(),
-            )));
-        };
+        let plan = ctx
+            .plan
+            .as_ref()
+            .ok_or_else(|| pingora::Error::new_str("native plan missing"))?;
         let url = if ctx.attempt > 0 && !plan.backup_url.is_empty() {
             plan.backup_url.as_str()
         } else {
@@ -504,6 +513,11 @@ impl ProxyHttp for DataPlaneProxy {
             response.insert_header(name.clone(), value.clone())?;
         }
         if plan.is_head {
+            // HEAD carries no downstream body. Keeping the origin GET's
+            // Content-Length makes Pingora's H1 encoder wait for bytes that
+            // will never be written; use zero so the header completes.
+            let _ = response.remove_header("transfer-encoding");
+            let _ = response.insert_header("content-length", "0");
             ctx.head_headers = Some(response.clone());
             ctx.head_status = response.status.as_u16();
         }
@@ -615,11 +629,6 @@ impl DataPlaneProxy {
             return None;
         }
         let req = session.req_header();
-        // HEAD currently stays on the legacy engine: Pingora's downstream
-        // HEAD accounting conflicts with the cached GET body on this version.
-        if req.method == Method::HEAD {
-            return None;
-        }
         let host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
         if host.is_empty() {
             return None;
@@ -679,6 +688,121 @@ impl DataPlaneProxy {
             is_websocket,
             label,
         })
+    }
+
+    async fn handle_management(&self, session: &mut Session, path: &str) -> Result<bool> {
+        let method = session.req_header().method.clone();
+        let expected = self.state.agent_token.as_str();
+        let got = session
+            .req_header()
+            .headers
+            .get("x-lagran-agent-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !expected.is_empty() && got != expected {
+            write_plain(
+                session,
+                401,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"unauthorized agent"),
+            )
+            .await;
+            return Ok(true);
+        }
+        match (method.as_str(), path) {
+            ("POST", "/__lagran/purge") => {
+                let body = read_body(session, 1024 * 1024).await?;
+                let req: purge::EdgePurgeRequest = match serde_json::from_slice(&body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        write_plain(
+                            session,
+                            400,
+                            "text/plain; charset=utf-8",
+                            Bytes::from_static(b"bad request"),
+                        )
+                        .await;
+                        return Ok(true);
+                    }
+                };
+                let Json(resp) = purge::purge_handler(State(self.state.clone()), Json(req)).await;
+                write_json(session, 200, &resp).await;
+            }
+            ("PUT", "/__lagran/acme/challenge") => {
+                let body = read_body(session, 1024 * 1024).await?;
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+                    write_plain(
+                        session,
+                        400,
+                        "text/plain; charset=utf-8",
+                        Bytes::from_static(b"bad request"),
+                    )
+                    .await;
+                    return Ok(true);
+                };
+                if let (Some(token), Some(key)) = (
+                    value.get("token").and_then(|v| v.as_str()),
+                    value.get("key_authorization").and_then(|v| v.as_str()),
+                ) {
+                    self.state.challenges.put(token, key);
+                    write_plain(session, 204, "text/plain; charset=utf-8", Bytes::new()).await;
+                } else {
+                    write_plain(
+                        session,
+                        400,
+                        "text/plain; charset=utf-8",
+                        Bytes::from_static(b"bad request"),
+                    )
+                    .await;
+                }
+            }
+            ("POST", "/__lagran/certs/load") => {
+                let body = read_body(session, 16 * 1024 * 1024).await?;
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+                    write_plain(
+                        session,
+                        400,
+                        "text/plain; charset=utf-8",
+                        Bytes::from_static(b"bad request"),
+                    )
+                    .await;
+                    return Ok(true);
+                };
+                let names: Vec<String> = value
+                    .get("names")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cert = value.get("cert_pem").and_then(|v| v.as_str()).unwrap_or("");
+                let key = value.get("key_pem").and_then(|v| v.as_str()).unwrap_or("");
+                match self
+                    .state
+                    .certs
+                    .upsert(&names, cert.as_bytes(), key.as_bytes())
+                {
+                    Ok(()) => write_json(session, 200, &serde_json::json!({"ok": true})).await,
+                    Err(e) => write_json(session, 400, &serde_json::json!({"error": e})).await,
+                }
+            }
+            ("GET", "/__lagran/access-logs") => {
+                let entries = self.state.access_log.snapshot(200).await;
+                write_json(session, 200, &serde_json::json!({ "entries": entries })).await;
+            }
+            _ => {
+                write_plain(
+                    session,
+                    404,
+                    "text/plain; charset=utf-8",
+                    Bytes::from_static(b"not found"),
+                )
+                .await;
+            }
+        }
+        Ok(true)
     }
 
     async fn serve_head_cache(
@@ -762,7 +886,7 @@ impl DataPlaneProxy {
             }
         }
         let _ = response.remove_header("content-length");
-        let _ = response.insert_header("content-length", len.to_string());
+        let _ = response.insert_header("content-length", "0");
         if session
             .write_response_header(Box::new(response), true)
             .await
@@ -844,6 +968,22 @@ impl DataPlaneProxy {
         write_axum_response(session, resp, is_head).await;
         Ok(true)
     }
+}
+
+async fn read_body(session: &mut Session, limit: usize) -> Result<Bytes> {
+    let mut out = BytesMut::new();
+    while let Some(chunk) = session.read_request_body().await? {
+        if out.len() + chunk.len() > limit {
+            return Err(pingora::Error::new_str("request body too large"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out.freeze())
+}
+
+async fn write_json<T: serde::Serialize>(session: &mut Session, status: u16, value: &T) {
+    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    write_plain(session, status, "application/json", Bytes::from(body)).await;
 }
 
 async fn write_plain(session: &mut Session, status: u16, content_type: &str, body: Bytes) {
@@ -1030,12 +1170,6 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     upgrade || connection_upgrade
 }
 
-fn needs_loopback(session: &Session) -> bool {
-    // Health/ACME/challenge verify are answered directly by Pingora. Remaining
-    // /__lagran routes are management/admin compatibility endpoints.
-    session.req_header().uri.path().starts_with("/__lagran/")
-}
-
 fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name,
@@ -1096,12 +1230,7 @@ fn prepare_proxy_headers(session: &mut Session, trust_proxy: bool) -> Result<()>
 }
 
 /// Run the Pingora public listener. `upstream` is the loopback fallback router.
-pub fn run(
-    config: EdgeConfig,
-    upstream: SocketAddr,
-    certs: Arc<CertStore>,
-    state: Arc<AppState>,
-) -> anyhow::Result<()> {
+pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> anyhow::Result<()> {
     let opt = pingora::server::configuration::Opt::parse_args();
     let mut server = Server::new(Some(opt))?;
     server.bootstrap();
@@ -1109,12 +1238,12 @@ pub fn run(
     let storage = Some(leak_storage(state.cache.clone()));
     let cache_lock: &'static CacheLock = Box::leak(CacheLock::new_boxed(Duration::from_secs(10)));
     let proxy = DataPlaneProxy {
-        upstream,
         trust_proxy: config.trust_proxy_headers,
         state,
         native_cache: storage.is_some(),
         storage,
         cache_lock,
+        management_on_data: config.admin_listen_addr.is_none(),
     };
     match std::net::TcpListener::bind(&config.listen_addr) {
         Ok(probe) => drop(probe),
@@ -1128,7 +1257,7 @@ pub fn run(
             Ok(probe) => drop(probe),
             Err(e) => {
                 tracing::error!(listen = %https, error = %e, "HTTPS listener unavailable; continuing with HTTP only");
-                tracing::info!(listen = %config.listen_addr, upstream = %upstream, "Pingora HTTP listener");
+                tracing::info!(listen = %config.listen_addr, "Pingora HTTP listener");
                 server.add_service(service);
                 server.run_forever();
             }
@@ -1140,7 +1269,7 @@ pub fn run(
         service.add_tls_with_settings(https, None, tls);
         tracing::info!(listen = %https, "Pingora HTTPS listener");
     }
-    tracing::info!(listen = %config.listen_addr, upstream = %upstream, "Pingora HTTP listener");
+    tracing::info!(listen = %config.listen_addr, "Pingora HTTP listener");
 
     server.add_service(service);
     server.run_forever();
