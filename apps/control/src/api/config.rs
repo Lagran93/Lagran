@@ -78,6 +78,17 @@ pub struct WafConfigOut {
     pub security_level: String,
 }
 
+#[derive(Serialize, Clone)]
+pub struct CcConfigOut {
+    pub enabled: bool,
+    pub rps: u32,
+    pub burst: u32,
+    pub ban_after: u32,
+    pub ban_seconds: u64,
+    pub mode: String,
+    pub allow_ips: String,
+}
+
 #[derive(Serialize)]
 pub struct DomainConfigResponse {
     pub domain: String,
@@ -94,6 +105,7 @@ pub struct DomainConfigResponse {
     pub custom_headers: String,
     pub backup_origin: Option<OriginConfig>,
     pub waf: Option<WafConfigOut>,
+    pub cc: CcConfigOut,
     pub version: String,
 }
 
@@ -208,10 +220,30 @@ fn build(
     };
     let rps = row.rate_limit_rps.max(0) as u32;
     let burst = row.rate_limit_burst.max(0) as u32;
+    let cc = CcConfigOut {
+        enabled: row.cc_enabled,
+        rps: row.cc_rps.max(0) as u32,
+        burst: row.cc_burst.max(0) as u32,
+        ban_after: row.cc_ban_after.max(0) as u32,
+        ban_seconds: row.cc_ban_seconds.max(0) as u64,
+        mode: if row.cc_mode.is_empty() {
+            "block".into()
+        } else {
+            row.cc_mode.clone()
+        },
+        allow_ips: row.cc_allow_ips.clone(),
+    };
 
     let mut h = DefaultHasher::new();
     rps.hash(&mut h);
     burst.hash(&mut h);
+    cc.enabled.hash(&mut h);
+    cc.rps.hash(&mut h);
+    cc.burst.hash(&mut h);
+    cc.ban_after.hash(&mut h);
+    cc.ban_seconds.hash(&mut h);
+    cc.mode.hash(&mut h);
+    cc.allow_ips.hash(&mut h);
     row.ignore_query_string.hash(&mut h);
     row.cors_origins.hash(&mut h);
     row.hotlink_allow_referers.hash(&mut h);
@@ -291,6 +323,7 @@ fn build(
         custom_headers: row.custom_headers.clone(),
         backup_origin: backup,
         waf,
+        cc,
         version: format!("{}-{:x}", row.id, h.finish()),
     }
 }

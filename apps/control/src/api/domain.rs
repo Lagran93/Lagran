@@ -501,6 +501,13 @@ pub struct SettingsRequest {
     pub custom_headers: Option<String>,
     pub rate_limit_rps: Option<u32>,
     pub rate_limit_burst: Option<u32>,
+    pub cc_enabled: Option<bool>,
+    pub cc_rps: Option<u32>,
+    pub cc_burst: Option<u32>,
+    pub cc_ban_after: Option<u32>,
+    pub cc_ban_seconds: Option<u32>,
+    pub cc_mode: Option<String>,
+    pub cc_allow_ips: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -512,6 +519,13 @@ pub struct SettingsDto {
     pub custom_headers: String,
     pub rate_limit_rps: u32,
     pub rate_limit_burst: u32,
+    pub cc_enabled: bool,
+    pub cc_rps: u32,
+    pub cc_burst: u32,
+    pub cc_ban_after: u32,
+    pub cc_ban_seconds: u32,
+    pub cc_mode: String,
+    pub cc_allow_ips: String,
 }
 
 fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
@@ -523,6 +537,17 @@ fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
         custom_headers: s.custom_headers,
         rate_limit_rps: s.rate_limit_rps.max(0) as u32,
         rate_limit_burst: s.rate_limit_burst.max(0) as u32,
+        cc_enabled: s.cc_enabled,
+        cc_rps: s.cc_rps.max(0) as u32,
+        cc_burst: s.cc_burst.max(0) as u32,
+        cc_ban_after: s.cc_ban_after.max(0) as u32,
+        cc_ban_seconds: s.cc_ban_seconds.max(0) as u32,
+        cc_mode: if s.cc_mode.is_empty() {
+            "block".into()
+        } else {
+            s.cc_mode
+        },
+        cc_allow_ips: s.cc_allow_ips,
     }
 }
 
@@ -566,6 +591,22 @@ pub async fn put_settings(
     if !actor.can_write_domain(&state, uid).await {
         return Err(forbidden());
     }
+    let cc_mode = match req
+        .cc_mode
+        .as_deref()
+        .map(|m| m.trim().to_ascii_lowercase())
+    {
+        Some(mode) if mode == "block" || mode == "monitor" => Some(mode),
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "cc_mode must be block or monitor".into(),
+                }),
+            ))
+        }
+        None => None,
+    };
     let n = repository::update_domain_settings(
         &state.pool,
         uid,
@@ -576,6 +617,13 @@ pub async fn put_settings(
         req.custom_headers.as_deref(),
         req.rate_limit_rps.map(|v| v as i32),
         req.rate_limit_burst.map(|v| v as i32),
+        req.cc_enabled,
+        req.cc_rps.map(|v| v.min(1_000_000) as i32),
+        req.cc_burst.map(|v| v.min(1_000_000) as i32),
+        req.cc_ban_after.map(|v| v.min(10_000) as i32),
+        req.cc_ban_seconds.map(|v| v.clamp(1, 86_400) as i32),
+        cc_mode.as_deref(),
+        req.cc_allow_ips.as_deref(),
     )
     .await
     .map_err(|e| {

@@ -10,7 +10,7 @@
 //!   `Expires`, then the domain/default TTL.
 
 use crate::agent::origin_health::OriginHealthMap;
-use crate::agent::NodeControl;
+use crate::agent::{ControlClient, NodeControl};
 use crate::cache::policy::{
     cache_key_for, compute_etag, decide_storage, etag_matches, is_uncacheable_header,
     request_bypasses_cache, request_method_cacheable, resolve_rule_policy, strip_response_headers,
@@ -22,6 +22,7 @@ use crate::metrics::EdgeMetrics;
 use crate::origin::{OriginClient, OriginResponse};
 use crate::server::access_log::AccessLog;
 use crate::server::acme_challenge::ChallengeStore;
+use crate::server::cc::{CcConfig, CcDecision, CcMode, CcProtector};
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
 use crate::server::default_page::{self, OriginFailure};
@@ -61,6 +62,8 @@ pub struct AppState {
     pub domains: DomainRegistry,
     pub access_log: AccessLog,
     pub rate_limiter: RateLimiter,
+    pub cc: CcProtector,
+    pub control: ControlClient,
     pub origin_health: OriginHealthMap,
     pub agent_token: String,
     pub inflight: Inflight,
@@ -88,6 +91,7 @@ struct Effective<'a> {
     hotlink: &'a str,
     rate_limit_rps: u32,
     rate_limit_burst: u32,
+    cc: CcConfig,
 }
 
 enum Fetched {
@@ -276,6 +280,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 hotlink: e.hotlink_allow_referers.as_str(),
                 rate_limit_rps: e.rate_limit_rps,
                 rate_limit_burst: e.rate_limit_burst,
+                cc: e.cc.clone(),
             }
         }
         None => {
@@ -298,9 +303,91 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 hotlink: "",
                 rate_limit_rps: 0,
                 rate_limit_burst: 0,
+                cc: CcConfig::default(),
             }
         }
     };
+
+    if let Some(ip) = client_ip_addr {
+        let decision = state.cc.check(&host, ip, &eff.cc).await;
+        if decision != CcDecision::Allow {
+            let banned = decision.is_banned();
+            let action = if eff.cc.mode == CcMode::Monitor {
+                "log"
+            } else if banned {
+                "cc-ban"
+            } else {
+                "cc-limit"
+            };
+            state
+                .waf_log
+                .push(
+                    &host,
+                    &client_ip,
+                    method.as_str(),
+                    &path_and_query,
+                    action,
+                    "cc",
+                    if banned {
+                        "cc-auto-ban"
+                    } else {
+                        "cc-rate-limit"
+                    },
+                    if eff.cc.mode == CcMode::Block {
+                        "block"
+                    } else {
+                        "monitor"
+                    },
+                )
+                .await;
+            if eff.cc.mode == CcMode::Block {
+                if let CcDecision::Banned {
+                    newly_banned: true, ..
+                } = decision
+                {
+                    let control = state.control.clone();
+                    let cc = state.cc.clone();
+                    let domain = host.clone();
+                    let report_host = domain.clone();
+                    let report_ip = ip;
+                    let seconds = eff.cc.ban_seconds;
+                    tokio::spawn(async move {
+                        let body = serde_json::json!({
+                            "domain": domain,
+                            "ip": report_ip.to_string(),
+                            "seconds": seconds,
+                            "reason": "cc-auto-ban"
+                        });
+                        match control.post_json("/api/v1/cc/bans", &body).await {
+                            Ok(()) => cc.mark_reported(&report_host, report_ip).await,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "report shared CC ban failed")
+                            }
+                        }
+                    });
+                }
+                tracing::warn!(
+                    %host, %client_ip, banned,
+                    "CC protection rejected request"
+                );
+                log_access(
+                    &state.access_log,
+                    &method,
+                    &host,
+                    &path_only,
+                    429,
+                    start,
+                    &client_ip,
+                    &user_agent,
+                    &referer,
+                    0,
+                    if banned { "CC-BAN" } else { "CC" },
+                )
+                .await;
+                return cc_too_many(decision.retry_after(), banned);
+            }
+        }
+    }
 
     // Rate limit per host.
     let rl_key = if host.is_empty() {
@@ -980,6 +1067,7 @@ fn spawn_revalidation(
             hotlink: "",
             rate_limit_rps: 0,
             rate_limit_burst: 0,
+            cc: CcConfig::default(),
         };
         match fetch_origin(&state, &eff, &host, &path_and_query, &headers, &Method::GET).await {
             Ok(resp) => {
@@ -1353,6 +1441,20 @@ fn pass_through_response(
     *out.status_mut() = resp.status;
     *out.headers_mut() = headers;
     out
+}
+
+fn cc_too_many(retry_after: u64, banned: bool) -> Response {
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").into_response();
+    let headers = resp.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
+        headers.insert(header::RETRY_AFTER, value);
+    }
+    headers.insert(
+        "x-lagran-cc",
+        HeaderValue::from_static(if banned { "banned" } else { "limit" }),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
 }
 
 fn not_modified_response(etag: &str) -> Response {

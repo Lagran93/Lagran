@@ -107,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
         domains,
         access_log,
         rate_limiter,
+        cc: edge::server::cc::CcProtector::new(),
+        control: control.clone(),
         origin_health: origin_health_map,
         agent_token: config.agent_token.clone(),
         inflight: Inflight::default(),
@@ -116,6 +118,8 @@ async fn main() -> anyhow::Result<()> {
         node_control,
         https_redirect_port: config.https_redirect_port,
     });
+
+    agent::cc_sync::spawn_cc_sync(config.clone(), control.clone(), state.cc.clone());
 
     let admin_listen = config.admin_listen_addr.clone();
     if let Some(ref admin) = admin_listen {

@@ -369,6 +369,66 @@
           </EmptyState>
         </div>
 
+        <!-- 跨节点共享封禁 -->
+        <div v-else-if="tab === 'bans'" class="card-body tight">
+          <div class="filter-bar">
+            <select v-model="banDomainFilter" class="select" @change="loadBans">
+              <option value="">全部域名</option>
+              <option v-for="d in domains" :key="d.id" :value="d.name">{{ d.name }}</option>
+            </select>
+            <span class="text-muted" style="font-size: 13px">
+              控制面统一封禁库；自动封禁会同步到所有边缘，手动解封后边缘下一轮同步解除
+            </span>
+            <span class="spacer" />
+            <button class="btn btn-default btn-sm" type="button" :disabled="bansLoading" @click="loadBans">
+              <AppIcon name="refresh" :size="14" />
+              刷新
+            </button>
+            <span class="text-muted" style="font-size: 13px">{{ bans.length }} 个封禁</span>
+          </div>
+
+          <div v-if="bans.length" class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>域名</th>
+                  <th>客户端 IP</th>
+                  <th>原因</th>
+                  <th>来源节点</th>
+                  <th>到期时间</th>
+                  <th class="text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="b in bans" :key="`${b.domain}|${b.ip}`">
+                  <td class="cell-main">{{ b.domain }}</td>
+                  <td class="mono">{{ b.ip }}</td>
+                  <td class="text-2">{{ b.reason || 'cc-auto-ban' }}</td>
+                  <td class="text-2">{{ b.source || '—' }}</td>
+                  <td>
+                    <div>{{ formatDateTime(b.expires_at) }}</div>
+                    <div class="cell-sub">剩余 {{ remainingLabel(b.remaining_secs) }}</div>
+                  </td>
+                  <td class="text-right">
+                    <button class="btn btn-text btn-sm danger" type="button" @click="unbanIp(b)">
+                      解封
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-else-if="bansLoading" class="card-body">
+            <div class="skeleton" style="height: 32px; width: 100%" />
+          </div>
+          <EmptyState
+            v-else
+            icon="shield"
+            title="暂无共享封禁"
+            text="CC 自动封禁或管理员手动封禁会在这里展示；解封后所有边缘节点会在下一轮同步时解除。"
+          />
+        </div>
+
         <!-- 事件日志 -->
         <div v-else class="card-body tight">
           <div class="filter-bar">
@@ -535,8 +595,9 @@
 const api = useApi()
 const toast = useToast()
 const { ask } = useConfirm()
+const auth = useAuthStore()
 
-type Tab = 'overview' | 'settings' | 'rules' | 'ips' | 'events'
+type Tab = 'overview' | 'settings' | 'rules' | 'ips' | 'bans' | 'events'
 
 const domains = ref<any[]>([])
 const domainId = ref('')
@@ -599,6 +660,10 @@ const eventsLoading = ref(false)
 const eventAction = ref('')
 const eventLimit = ref(100)
 
+const bans = ref<any[]>([])
+const bansLoading = ref(false)
+const banDomainFilter = ref('')
+
 const ruleModalOpen = ref(false)
 const editingRule = ref<any>(null)
 const ruleError = ref('')
@@ -634,6 +699,9 @@ const tabs = computed(() => [
   { value: 'settings' as Tab, label: '防护设置' },
   { value: 'rules' as Tab, label: '自定义规则', count: rules.value.length },
   { value: 'ips' as Tab, label: 'IP 黑白名单', count: ips.value.length },
+  ...(auth.isAdmin
+    ? [{ value: 'bans' as Tab, label: '共享封禁', count: bans.value.length }]
+    : []),
   { value: 'events' as Tab, label: '事件日志' },
 ])
 
@@ -812,11 +880,56 @@ async function loadEvents() {
   }
 }
 
+async function loadBans() {
+  if (!auth.isAdmin) {
+    bans.value = []
+    return
+  }
+  bansLoading.value = true
+  try {
+    const q = new URLSearchParams()
+    if (banDomainFilter.value) q.set('domain', banDomainFilter.value)
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    const res = await api.get<{ bans: any[] }>(`/api/v1/cc/bans/all${suffix}`)
+    bans.value = res.bans || []
+  } catch {
+    bans.value = []
+  } finally {
+    bansLoading.value = false
+  }
+}
+
+function remainingLabel(seconds: number) {
+  const s = Math.max(0, Number(seconds) || 0)
+  if (s < 60) return `${s} 秒`
+  if (s < 3600) return `${Math.ceil(s / 60)} 分钟`
+  return `${Math.floor(s / 3600)} 小时 ${Math.ceil((s % 3600) / 60)} 分`
+}
+
+async function unbanIp(ban: any) {
+  const ok = await ask({
+    title: '解除共享封禁',
+    message: `确认解封 ${ban.domain} 的 ${ban.ip}？所有边缘节点会在下一轮同步时解除。`,
+    confirmText: '解封',
+    danger: true,
+  })
+  if (!ok) return
+  try {
+    await api.del(
+      `/api/v1/cc/bans/${encodeURIComponent(ban.domain)}/${encodeURIComponent(ban.ip)}`
+    )
+    toast.success('已解封，边缘节点将在约 5 秒内同步')
+    await loadBans()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '解封失败')
+  }
+}
+
 async function reload() {
   loading.value = true
   try {
     await loadDomains()
-    await Promise.all([loadSettings(), loadRules(), loadIps()])
+    await Promise.all([loadSettings(), loadRules(), loadIps(), loadBans()])
     if (tab.value === 'events') await loadEvents()
     if (tab.value === 'overview') await loadStats()
   } finally {
@@ -829,6 +942,7 @@ async function switchTab(next: Tab) {
   if (next === 'events') await loadEvents()
   if (next === 'rules') await loadRules()
   if (next === 'ips') await loadIps()
+  if (next === 'bans') await loadBans()
   if (next === 'settings') await loadSettings()
   if (next === 'overview') await loadStats()
 }

@@ -1,6 +1,7 @@
 pub mod access_log;
 pub mod acme_challenge;
 pub mod agent_auth;
+pub mod cc;
 pub mod cert_store;
 pub mod challenge;
 pub mod default_page;

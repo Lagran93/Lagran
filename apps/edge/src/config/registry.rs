@@ -4,6 +4,7 @@
 //! URLs and rule vectors on every lookup.
 
 use crate::cache::policy::CacheRule;
+use crate::server::cc::CcConfig;
 use crate::waf::WafConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +29,8 @@ pub struct DomainEntry {
     pub ssl_enabled: bool,
     /// WAF policy (disabled by default until configured in the console)
     pub waf: WafConfig,
+    /// CC/L7 flood policy (disabled by default).
+    pub cc: CcConfig,
 }
 
 #[derive(Clone, Default)]
@@ -138,6 +141,7 @@ mod tests {
             backup_origin_url: String::new(),
             ssl_enabled: false,
             waf: WafConfig::default(),
+            cc: CcConfig::default(),
         }
     }
 

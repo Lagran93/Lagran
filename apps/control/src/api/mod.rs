@@ -4,6 +4,7 @@ pub mod access_log;
 pub mod acme;
 pub mod audit;
 pub mod auth;
+pub mod cc;
 pub mod cert;
 pub mod config;
 pub mod dns_test;
@@ -120,7 +121,10 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/access-logs", get(access_log::list))
                 .route("/access-logs/report", post(access_log::report))
                 .route("/config", get(config::list_all_configs))
-                .route("/config/:domain", get(config::get_domain_config)),
+                .route("/config/:domain", get(config::get_domain_config))
+                .route("/cc/bans", get(cc::list).post(cc::report))
+                .route("/cc/bans/all", get(cc::list_admin))
+                .route("/cc/bans/:domain/:ip", delete(cc::remove)),
         )
         .fallback(not_found)
         .layer(TraceLayer::new_for_http())

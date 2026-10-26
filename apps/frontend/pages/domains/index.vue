@@ -285,6 +285,47 @@
           </div>
         </div>
 
+        <div class="field-label" style="margin-top: 24px; font-size: 15px">CC 防御</div>
+        <div class="field">
+          <label class="check">
+            <input v-model="settings.cc_enabled" type="checkbox" />
+            启用 CC 防御（按客户端 IP 限速，超限自动封禁）
+          </label>
+          <span class="field-hint">
+            统计窗口为 1 秒；连续超限达到次数后临时封禁该 IP，封禁状态在边缘内存中，重启后清空。
+          </span>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label class="field-label">每 IP 每秒请求数</label>
+            <input v-model.number="settings.cc_rps" class="input" type="number" min="1" />
+          </div>
+          <div class="field">
+            <label class="field-label">突发额度</label>
+            <input v-model.number="settings.cc_burst" class="input" type="number" min="0" />
+          </div>
+          <div class="field">
+            <label class="field-label">连续超限次数后封禁</label>
+            <input v-model.number="settings.cc_ban_after" class="input" type="number" min="1" />
+          </div>
+          <div class="field">
+            <label class="field-label">封禁时长（秒）</label>
+            <input v-model.number="settings.cc_ban_seconds" class="input" type="number" min="1" max="86400" />
+          </div>
+          <div class="field">
+            <label class="field-label">模式</label>
+            <select v-model="settings.cc_mode" class="select">
+              <option value="block">拦截（429）</option>
+              <option value="monitor">观察（只记录）</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label class="field-label">IP 白名单</label>
+          <input v-model="settings.cc_allow_ips" class="input" placeholder="10.0.0.0/8, 203.0.113.7" />
+          <span class="field-hint">逗号分隔，支持 IPv4/IPv6 与 CIDR；白名单 IP 不受 CC 限制。</span>
+        </div>
+
         <div class="field">
           <label class="field-label">自定义响应头</label>
           <textarea
@@ -350,6 +391,13 @@ const settings = ref({
   custom_headers: '',
   rate_limit_rps: 0,
   rate_limit_burst: 0,
+  cc_enabled: false,
+  cc_rps: 20,
+  cc_burst: 40,
+  cc_ban_after: 5,
+  cc_ban_seconds: 300,
+  cc_mode: 'block',
+  cc_allow_ips: '',
 })
 
 const filtered = computed(() => {
@@ -500,6 +548,13 @@ async function openSettings(d: any) {
       custom_headers: s.custom_headers || '',
       rate_limit_rps: s.rate_limit_rps || 0,
       rate_limit_burst: s.rate_limit_burst || 0,
+      cc_enabled: !!s.cc_enabled,
+      cc_rps: s.cc_rps ?? 20,
+      cc_burst: s.cc_burst ?? 40,
+      cc_ban_after: s.cc_ban_after ?? 5,
+      cc_ban_seconds: s.cc_ban_seconds ?? 300,
+      cc_mode: s.cc_mode || 'block',
+      cc_allow_ips: s.cc_allow_ips || '',
     }
   } catch {
     toast.error('读取高级设置失败，已使用默认值')

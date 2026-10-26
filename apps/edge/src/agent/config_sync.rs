@@ -79,6 +79,43 @@ impl RuleCfg {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CcCfg {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    rps: u32,
+    #[serde(default)]
+    burst: u32,
+    #[serde(default)]
+    ban_after: u32,
+    #[serde(default)]
+    ban_seconds: u64,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    allow_ips: String,
+}
+
+impl CcCfg {
+    fn into_config(self) -> crate::server::cc::CcConfig {
+        let allow_ips = self
+            .allow_ips
+            .split(',')
+            .filter_map(crate::waf::IpNet::parse)
+            .collect();
+        crate::server::cc::CcConfig {
+            enabled: self.enabled,
+            rps: self.rps,
+            burst: self.burst,
+            ban_after: self.ban_after,
+            ban_seconds: self.ban_seconds,
+            mode: crate::server::cc::CcMode::parse(&self.mode),
+            allow_ips,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct DomainCfg {
     domain: String,
@@ -107,6 +144,8 @@ struct DomainCfg {
     backup_origin: Option<OriginCfg>,
     #[serde(default)]
     waf: Option<WafCfg>,
+    #[serde(default)]
+    cc: Option<CcCfg>,
     version: String,
 }
 
@@ -137,6 +176,7 @@ impl DomainCfg {
             backup_origin_url,
             ssl_enabled: self.ssl_enabled,
             waf: into_waf(self.waf),
+            cc: self.cc.map(CcCfg::into_config).unwrap_or_default(),
         }
     }
 }

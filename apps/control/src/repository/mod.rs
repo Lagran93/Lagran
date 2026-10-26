@@ -216,6 +216,11 @@ pub async fn create_domain(
 }
 
 pub async fn delete_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let _ =
+        sqlx::query("DELETE FROM cc_bans WHERE domain = (SELECT name FROM domains WHERE id = $1)")
+            .bind(id)
+            .execute(pool)
+            .await;
     let r = sqlx::query("DELETE FROM domains WHERE id = $1")
         .bind(id)
         .execute(pool)
@@ -1482,6 +1487,13 @@ pub struct DomainSettingsRow {
     pub custom_headers: String,
     pub rate_limit_rps: i32,
     pub rate_limit_burst: i32,
+    pub cc_enabled: bool,
+    pub cc_rps: i32,
+    pub cc_burst: i32,
+    pub cc_ban_after: i32,
+    pub cc_ban_seconds: i32,
+    pub cc_mode: String,
+    pub cc_allow_ips: String,
 }
 
 pub async fn get_domain_settings(
@@ -1491,7 +1503,8 @@ pub async fn get_domain_settings(
     sqlx::query_as::<_, DomainSettingsRow>(
         r#"
         SELECT ignore_query_string, cors_origins, hotlink_allow_referers,
-               origin_timeout_ms, custom_headers, rate_limit_rps, rate_limit_burst
+               origin_timeout_ms, custom_headers, rate_limit_rps, rate_limit_burst,
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
         FROM domains WHERE name = $1
         "#,
     )
@@ -1499,6 +1512,23 @@ pub async fn get_domain_settings(
     .fetch_optional(pool)
     .await
 }
+
+type DomainSettingsPatchRow = (
+    bool,
+    String,
+    String,
+    i32,
+    String,
+    i32,
+    i32,
+    bool,
+    i32,
+    i32,
+    i32,
+    i32,
+    String,
+    String,
+);
 
 #[allow(clippy::too_many_arguments)]
 pub async fn update_domain_settings(
@@ -1511,12 +1541,20 @@ pub async fn update_domain_settings(
     headers: Option<&str>,
     rps: Option<i32>,
     burst: Option<i32>,
+    cc_enabled: Option<bool>,
+    cc_rps: Option<i32>,
+    cc_burst: Option<i32>,
+    cc_ban_after: Option<i32>,
+    cc_ban_seconds: Option<i32>,
+    cc_mode: Option<&str>,
+    cc_allow_ips: Option<&str>,
 ) -> sqlx::Result<u64> {
     // load existing then patch
-    let row: Option<(bool, String, String, i32, String, i32, i32)> = sqlx::query_as(
+    let row: Option<DomainSettingsPatchRow> = sqlx::query_as(
         r#"
         SELECT ignore_query_string, cors_origins, hotlink_allow_referers,
-               origin_timeout_ms, custom_headers, rate_limit_rps, rate_limit_burst
+               origin_timeout_ms, custom_headers, rate_limit_rps, rate_limit_burst,
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
         FROM domains WHERE id = $1
         "#,
     )
@@ -1534,6 +1572,13 @@ pub async fn update_domain_settings(
           custom_headers = $6,
           rate_limit_rps = $7,
           rate_limit_burst = $8,
+          cc_enabled = $9,
+          cc_rps = $10,
+          cc_burst = $11,
+          cc_ban_after = $12,
+          cc_ban_seconds = $13,
+          cc_mode = $14,
+          cc_allow_ips = $15,
           updated_at = NOW()
         WHERE id = $1
         "#,
@@ -1546,6 +1591,13 @@ pub async fn update_domain_settings(
     .bind(headers.unwrap_or(&e.4))
     .bind(rps.unwrap_or(e.5))
     .bind(burst.unwrap_or(e.6))
+    .bind(cc_enabled.unwrap_or(e.7))
+    .bind(cc_rps.unwrap_or(e.8))
+    .bind(cc_burst.unwrap_or(e.9))
+    .bind(cc_ban_after.unwrap_or(e.10))
+    .bind(cc_ban_seconds.unwrap_or(e.11))
+    .bind(cc_mode.unwrap_or(&e.12))
+    .bind(cc_allow_ips.unwrap_or(&e.13))
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
@@ -1904,6 +1956,13 @@ pub struct DomainFullRow {
     pub backup_origin_host: String,
     pub backup_origin_port: i32,
     pub backup_origin_proto: String,
+    pub cc_enabled: bool,
+    pub cc_rps: i32,
+    pub cc_burst: i32,
+    pub cc_ban_after: i32,
+    pub cc_ban_seconds: i32,
+    pub cc_mode: String,
+    pub cc_allow_ips: String,
 }
 
 pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>> {
@@ -1912,7 +1971,8 @@ pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>
         SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
                rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
-               backup_origin_host, backup_origin_port, backup_origin_proto
+               backup_origin_host, backup_origin_port, backup_origin_proto,
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
         FROM domains
         ORDER BY name
         "#,
@@ -1930,7 +1990,8 @@ pub async fn get_domain_full_by_name(
         SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
                rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
-               backup_origin_host, backup_origin_port, backup_origin_proto
+               backup_origin_host, backup_origin_port, backup_origin_proto,
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
         FROM domains WHERE name = $1
         "#,
     )
@@ -2382,4 +2443,77 @@ pub async fn waf_stats_group(
         .bind(limit)
         .fetch_all(pool)
         .await
+}
+
+// ---------------------------------------------------------------------------
+// Cross-node CC bans
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CcBanRow {
+    pub domain: String,
+    pub ip: String,
+    pub reason: String,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub async fn upsert_cc_ban(
+    pool: &PgPool,
+    domain: &str,
+    ip: &str,
+    seconds: i64,
+    reason: &str,
+    source: &str,
+) -> sqlx::Result<CcBanRow> {
+    sqlx::query_as::<_, CcBanRow>(
+        r#"
+        INSERT INTO cc_bans (domain, ip, reason, source, expires_at)
+        VALUES ($1, $2, $3, $4, NOW() + ($5 * INTERVAL '1 second'))
+        ON CONFLICT (domain, ip) DO UPDATE SET
+            expires_at = GREATEST(cc_bans.expires_at, EXCLUDED.expires_at),
+            reason = EXCLUDED.reason,
+            source = EXCLUDED.source,
+            updated_at = NOW()
+        RETURNING domain, ip, reason, source, created_at, expires_at
+        "#,
+    )
+    .bind(domain)
+    .bind(ip)
+    .bind(reason)
+    .bind(source)
+    .bind(seconds)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_active_cc_bans(
+    pool: &PgPool,
+    domain: Option<&str>,
+) -> sqlx::Result<Vec<CcBanRow>> {
+    let _ = sqlx::query("DELETE FROM cc_bans WHERE expires_at <= NOW()")
+        .execute(pool)
+        .await;
+    sqlx::query_as::<_, CcBanRow>(
+        r#"
+        SELECT domain, ip, reason, source, created_at, expires_at
+        FROM cc_bans
+        WHERE expires_at > NOW()
+          AND ($1::text IS NULL OR domain = $1)
+        ORDER BY expires_at DESC
+        "#,
+    )
+    .bind(domain)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn delete_cc_ban(pool: &PgPool, domain: &str, ip: &str) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM cc_bans WHERE domain = $1 AND ip = $2")
+        .bind(domain)
+        .bind(ip)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
 }

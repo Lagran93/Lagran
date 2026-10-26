@@ -25,6 +25,8 @@ pub struct EdgeConfig {
     pub control_url: String,
     pub agent_url: String,
     pub heartbeat_interval_secs: u64,
+    /// How often to pull the shared CC ban list from the control plane.
+    pub cc_sync_interval_secs: u64,
     pub domain: String,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
@@ -109,6 +111,10 @@ impl Default for EdgeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(15),
+            cc_sync_interval_secs: std::env::var("CC_SYNC_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
             domain: std::env::var("EDGE_DOMAIN").unwrap_or_default(),
             tls_cert_file: std::env::var("EDGE_TLS_CERT")
                 .ok()
