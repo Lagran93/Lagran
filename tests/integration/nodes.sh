@@ -84,11 +84,12 @@ DOMAIN_ID=$(curl -s -H "authorization: Bearer $TOKEN" "http://127.0.0.1:$CONTROL
 
 echo "== pre-register node =="
 CREATE=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
-  -d "{\"name\":\"$NODE_NAME\",\"region\":\"test-region\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
+  -d "{\"name\":\"$NODE_NAME\",\"region\":\"test-region\",\"country\":\"hk\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
 NODE_ID=$(printf '%s' "$CREATE" | jq -r '.node.id // empty')
 NODE_TOKEN=$(printf '%s' "$CREATE" | jq -r '.token // empty')
 STATUS=$(printf '%s' "$CREATE" | jq -r '.node.status // empty')
 check "node created as pending" "$STATUS" "pending"
+check "node country is normalized" "$(printf '%s' "$CREATE" | jq -r '.node.country')" "HK"
 check "node token is 64 hex chars" "${#NODE_TOKEN}" "64"
 if printf '%s' "$NODE_TOKEN" | grep -qE '^[0-9a-f]{64}$'; then
   pass "node token looks random"

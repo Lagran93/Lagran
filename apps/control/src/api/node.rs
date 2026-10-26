@@ -185,6 +185,16 @@ fn new_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+/// GeoIP DAT uses uppercase ISO 3166-1 alpha-2 codes (CN/HK/US...).
+fn normalize_country(raw: &str) -> String {
+    let country = raw.trim().to_ascii_uppercase();
+    if country.is_empty() {
+        "CN".into()
+    } else {
+        country
+    }
+}
+
 /// Public control-plane URL used inside install commands.
 fn public_base(state: &AppState, headers: &HeaderMap) -> String {
     if !state.config.public_url.is_empty() {
@@ -313,12 +323,13 @@ pub async fn create(
         db_error()
     })?;
 
+    let country = normalize_country(req.country.as_deref().unwrap_or("CN"));
     let row = repository::update_node_meta(
         &state.pool,
         row.id,
         req.public_ip.as_deref().unwrap_or(""),
         req.isp.as_deref().unwrap_or(""),
-        req.country.as_deref().unwrap_or("CN"),
+        &country,
         req.province.as_deref().unwrap_or(""),
         req.city.as_deref().unwrap_or(""),
         req.weight.unwrap_or(100).clamp(0, 1000),
@@ -450,12 +461,13 @@ pub async fn update(
             )
         })?;
 
+    let country = normalize_country(req.country.as_deref().unwrap_or(&current.country));
     let _ = repository::update_node_meta(
         &state.pool,
         node_id,
         req.public_ip.as_deref().unwrap_or(&current.public_ip),
         req.isp.as_deref().unwrap_or(&current.isp),
-        req.country.as_deref().unwrap_or(&current.country),
+        &country,
         req.province.as_deref().unwrap_or(&current.province),
         req.city.as_deref().unwrap_or(&current.city),
         req.weight.unwrap_or(current.weight).clamp(0, 1000),

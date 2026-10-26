@@ -79,7 +79,7 @@
               <td>
                 <div>{{ n.region || '默认区域' }}</div>
                 <div class="cell-sub">
-                  {{ [n.province, n.city, n.isp].filter(Boolean).join(' · ') || '未设置线路' }}
+                  {{ [n.country, n.province, n.city, n.isp].filter(Boolean).join(' · ') || '未设置线路' }}
                 </div>
                 <div class="cell-sub mono">{{ n.public_ip || '未设置公网 IP' }}</div>
               </td>
@@ -186,6 +186,34 @@
           <div class="field">
             <label class="field-label">区域</label>
             <input v-model="form.region" class="input" placeholder="例如 香港 / cn-hongkong" />
+          </div>
+          <div class="field">
+            <label class="field-label">国家/地区代码</label>
+            <input
+              v-model="form.country"
+              class="input"
+              list="node-country-codes"
+              maxlength="2"
+              placeholder="CN"
+            />
+            <datalist id="node-country-codes">
+              <option value="CN">中国大陆</option>
+              <option value="HK">中国香港</option>
+              <option value="MO">中国澳门</option>
+              <option value="TW">中国台湾</option>
+              <option value="JP">日本</option>
+              <option value="KR">韩国</option>
+              <option value="SG">新加坡</option>
+              <option value="US">美国</option>
+              <option value="GB">英国</option>
+              <option value="DE">德国</option>
+              <option value="FR">法国</option>
+              <option value="NL">荷兰</option>
+              <option value="CA">加拿大</option>
+              <option value="AU">澳大利亚</option>
+              <option value="RU">俄罗斯</option>
+            </datalist>
+            <span class="field-hint">ISO 3166-1 两位代码，需与 GeoIP 的 country 一致，如 CN / HK / US。</span>
           </div>
           <div class="field">
             <label class="field-label">公网 IP</label>
@@ -333,6 +361,10 @@
           <div class="detail-item">
             <div class="detail-label">公网 IP</div>
             <div class="detail-value mono">{{ detail.node.public_ip || '未配置' }}</div>
+          </div>
+          <div class="detail-item">
+            <div class="detail-label">国家/地区</div>
+            <div class="detail-value">{{ detail.node.country || 'CN' }}</div>
           </div>
           <div class="detail-item">
             <div class="detail-label">省份 / 城市</div>
@@ -579,6 +611,7 @@ const form = ref({
   ip: '',
   agent_url: '',
   public_ip: '',
+  country: 'CN',
   province: '',
   city: '',
   isp: '',
@@ -667,6 +700,7 @@ function openCreate() {
     ip: '',
     agent_url: '',
     public_ip: '',
+    country: 'CN',
     province: '',
     city: '',
     isp: '',
@@ -684,6 +718,7 @@ function openEdit(node: any) {
     ip: node.ip || '',
     agent_url: node.agent_url || '',
     public_ip: node.public_ip || '',
+    country: node.country || 'CN',
     province: node.province || '',
     city: node.city || '',
     isp: node.isp || '',
@@ -750,6 +785,7 @@ async function submitForm() {
       region: form.value.region.trim(),
       agent_url: form.value.agent_url.trim(),
       public_ip: form.value.public_ip.trim(),
+      country: form.value.country.trim().toUpperCase() || 'CN',
       province: form.value.province.trim(),
       city: form.value.city.trim(),
       isp: form.value.isp.trim(),
