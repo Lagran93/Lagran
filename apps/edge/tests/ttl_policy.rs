@@ -25,6 +25,7 @@ fn policy(ttl: Option<u64>, swr: u64) -> ResolvedPolicy {
         swr_secs: swr,
         browser_ttl_secs: None,
         ignore_query: None,
+        ignore_cookie: false,
     }
 }
 

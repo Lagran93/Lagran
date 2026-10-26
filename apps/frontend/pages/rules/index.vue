@@ -131,6 +131,7 @@
                   <span v-if="r.match_query" class="cond-chip">query 含 {{ r.match_query }}</span>
                   <span v-if="r.ignore_query === true" class="cond-chip warn">忽略 Query</span>
                   <span v-else-if="r.ignore_query === false" class="cond-chip">区分 Query</span>
+                  <span v-if="r.ignore_cookie" class="cond-chip warn">忽略 Cookie</span>
                   <span v-if="r.note" class="cond-chip muted" :title="r.note">{{ r.note }}</span>
                 </div>
               </td>
@@ -322,6 +323,17 @@
           </div>
 
           <div class="field span-2">
+            <label class="check">
+              <input v-model="form.ignore_cookie" type="checkbox" />
+              忽略 Cookie（静态资源可缓存）
+            </label>
+            <span class="field-hint">
+              勾选后，带 Cookie 的请求仍可读写此规则的缓存。仅用于 CSS/JS/图片等公共静态资源，
+              不要用于登录态或个性化内容。
+            </span>
+          </div>
+
+          <div class="field span-2">
             <label class="field-label">备注</label>
             <input v-model="form.note" class="input" placeholder="可选，便于团队识别这条规则" maxlength="200" />
           </div>
@@ -374,6 +386,7 @@ const form = ref({
   methods: [] as string[],
   match_query: '',
   ignore_query: 'inherit' as 'inherit' | 'on' | 'off',
+  ignore_cookie: false,
   priority: 0,
   enabled: true,
   note: '',
@@ -387,7 +400,7 @@ const actionOptions = [
 ]
 
 const presets = [
-  { label: 'CSS/JS 后缀 7 天', path: '\\.(css|js)$', matchType: 'regex', ttl: 604800, swr: 86400, browser: 604800, methods: ['GET', 'HEAD'] },
+  { label: 'CSS/JS 后缀 7 天', path: '\\.(css|js)$', matchType: 'regex', ignoreCookie: true, ttl: 604800, swr: 86400, browser: 604800, methods: ['GET', 'HEAD'] },
   { label: '静态资源 7 天', path: '/static/*', ttl: 604800, swr: 86400, browser: 604800, methods: ['GET', 'HEAD'] },
   { label: '图片 30 天', path: '/images/*', ttl: 2592000, swr: 86400, browser: 2592000, methods: ['GET', 'HEAD'] },
   { label: 'HTML 5 分钟', path: '/', ttl: 300, swr: 60, browser: 300, methods: ['GET', 'HEAD'] },
@@ -448,6 +461,7 @@ function toggleMethod(method: string) {
 function applyPreset(preset: any) {
   form.value.path_pattern = preset.path
   form.value.match_type = preset.matchType || 'glob'
+  form.value.ignore_cookie = !!preset.ignoreCookie
   form.value.action = preset.bypass ? 'bypass' : 'cache'
   form.value.ttl_seconds = preset.ttl || 60
   form.value.swr_seconds = preset.swr || 0
@@ -487,6 +501,7 @@ function openCreate() {
     methods: [],
     match_query: '',
     ignore_query: 'inherit',
+    ignore_cookie: false,
     priority: 0,
     enabled: true,
     note: '',
@@ -508,6 +523,7 @@ function openEdit(rule: any) {
     methods: rule.match_methods ? String(rule.match_methods).split(',').filter(Boolean) : [],
     match_query: rule.match_query || '',
     ignore_query: rule.ignore_query === true ? 'on' : rule.ignore_query === false ? 'off' : 'inherit',
+    ignore_cookie: !!rule.ignore_cookie,
     priority: rule.priority,
     enabled: rule.enabled,
     note: rule.note || '',
@@ -526,6 +542,7 @@ function payload() {
     match_methods: form.value.methods.join(','),
     match_query: form.value.match_query.trim(),
     ignore_query: form.value.ignore_query === 'inherit' ? null : form.value.ignore_query === 'on',
+    ignore_cookie: form.value.ignore_cookie,
     priority: Number(form.value.priority) || 0,
     enabled: form.value.enabled,
     note: form.value.note.trim(),

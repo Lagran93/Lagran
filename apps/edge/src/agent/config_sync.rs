@@ -44,6 +44,8 @@ struct RuleCfg {
     browser_ttl_seconds: u64,
     #[serde(default)]
     ignore_query: Option<bool>,
+    #[serde(default)]
+    ignore_cookie: bool,
 }
 
 impl RuleCfg {
@@ -72,6 +74,7 @@ impl RuleCfg {
             match_query: self.match_query,
             browser_ttl_seconds: self.browser_ttl_seconds,
             ignore_query: self.ignore_query,
+            ignore_cookie: self.ignore_cookie,
         }
     }
 }

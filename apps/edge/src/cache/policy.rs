@@ -104,6 +104,8 @@ pub struct CacheRule {
     pub browser_ttl_seconds: u64,
     /// Override the domain's ignore_query setting; `None` inherits it.
     pub ignore_query: Option<bool>,
+    /// Cache this rule's responses even when the request carries cookies.
+    pub ignore_cookie: bool,
 }
 
 impl CacheRule {
@@ -121,6 +123,7 @@ impl CacheRule {
             match_query: String::new(),
             browser_ttl_seconds: 0,
             ignore_query: None,
+            ignore_cookie: false,
         }
     }
 
@@ -140,6 +143,8 @@ pub struct ResolvedPolicy {
     pub browser_ttl_secs: Option<u64>,
     /// Override the domain's ignore-query-string setting.
     pub ignore_query: Option<bool>,
+    /// Cache despite request cookies (opt-in per rule).
+    pub ignore_cookie: bool,
 }
 
 impl Default for ResolvedPolicy {
@@ -150,6 +155,7 @@ impl Default for ResolvedPolicy {
             swr_secs: 0,
             browser_ttl_secs: None,
             ignore_query: None,
+            ignore_cookie: false,
         }
     }
 }
@@ -167,6 +173,7 @@ pub struct MatchedPolicy {
     pub action: String,
     pub browser_ttl_seconds: u64,
     pub ignore_query: Option<bool>,
+    pub ignore_cookie: bool,
     pub match_methods: String,
     pub match_query: String,
 }
@@ -210,6 +217,7 @@ impl RuleSet {
             action: r.action.clone(),
             browser_ttl_seconds: r.browser_ttl_seconds,
             ignore_query: r.ignore_query,
+            ignore_cookie: r.ignore_cookie,
             match_methods: r.match_methods.clone(),
             match_query: r.match_query.clone(),
         })
@@ -277,6 +285,7 @@ pub fn rule_policy(rule: &CacheRule) -> ResolvedPolicy {
         swr_secs: rule.swr_seconds,
         browser_ttl_secs: (rule.browser_ttl_seconds > 0).then_some(rule.browser_ttl_seconds),
         ignore_query: rule.ignore_query,
+        ignore_cookie: rule.ignore_cookie,
     }
 }
 
@@ -439,9 +448,9 @@ pub fn request_method_cacheable(method: &Method) -> bool {
 /// Requests whose responses must never be served from / stored in the shared
 /// cache: authenticated or personalised traffic, conditional-range probes, and
 /// explicit `no-cache`/`no-store` from the client.
-pub fn request_bypasses_cache<B>(req: &Request<B>) -> bool {
+pub fn request_bypasses_cache<B>(req: &Request<B>, ignore_cookie: bool) -> bool {
     if req.headers().contains_key(header::AUTHORIZATION)
-        || req.headers().contains_key(header::COOKIE)
+        || (!ignore_cookie && req.headers().contains_key(header::COOKIE))
         || req.headers().contains_key(header::RANGE)
     {
         return true;
@@ -452,7 +461,9 @@ pub fn request_bypasses_cache<B>(req: &Request<B>) -> bool {
         .and_then(|v| v.to_str().ok())
     {
         let cc = cc.to_ascii_lowercase();
-        if cc.contains("no-store") || cc.contains("no-cache") || cc.contains("max-age=0") {
+        // `max-age=0` is sent by Chrome on reload; allow the cached entry to
+        // answer with a 304/revalidated response instead of bypassing to origin.
+        if cc.contains("no-store") || cc.contains("no-cache") {
             return true;
         }
     }
@@ -645,6 +656,7 @@ mod tests {
             match_query: String::new(),
             browser_ttl_seconds: 0,
             ignore_query: None,
+            ignore_cookie: false,
         }
     }
 
@@ -670,6 +682,7 @@ mod tests {
             match_query: query.into(),
             browser_ttl_seconds: browser_ttl,
             ignore_query,
+            ignore_cookie: false,
         }
     }
 
@@ -798,6 +811,7 @@ mod tests {
             swr_secs: 10,
             browser_ttl_secs: None,
             ignore_query: None,
+            ignore_cookie: false,
         };
         let d =
             decide_storage(200, &hdrs(&[("cache-control", "max-age=600")]), policy, 60).unwrap();
@@ -862,7 +876,7 @@ mod tests {
             .body(())
             .unwrap();
         assert!(request_method_cacheable(plain.method()));
-        assert!(!request_bypasses_cache(&plain));
+        assert!(!request_bypasses_cache(&plain, false));
 
         for (name, value) in [
             ("authorization", "Bearer x"),
@@ -875,8 +889,22 @@ mod tests {
                 .header(name, value)
                 .body(())
                 .unwrap();
-            assert!(request_bypasses_cache(&req), "{name} should bypass");
+            assert!(request_bypasses_cache(&req, false), "{name} should bypass");
         }
+
+        let cookie = Request::builder()
+            .uri("http://cdn.test/a.js")
+            .header("cookie", "sid=1")
+            .body(())
+            .unwrap();
+        assert!(!request_bypasses_cache(&cookie, true));
+
+        let reload = Request::builder()
+            .uri("http://cdn.test/a.js")
+            .header("cache-control", "max-age=0")
+            .body(())
+            .unwrap();
+        assert!(!request_bypasses_cache(&reload, false));
     }
 
     #[test]

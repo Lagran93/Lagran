@@ -515,7 +515,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     }
 
     let request_cacheable = request_method_cacheable(&method)
-        && !request_bypasses_cache(&req)
+        && !request_bypasses_cache(&req, eff.policy.ignore_cookie)
         && eff.policy.action == RuleAction::Cache;
 
     if !request_cacheable {

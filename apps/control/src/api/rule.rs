@@ -33,6 +33,7 @@ pub struct RuleDto {
     pub match_query: String,
     pub browser_ttl_seconds: u64,
     pub ignore_query: Option<bool>,
+    pub ignore_cookie: bool,
     pub note: String,
 }
 
@@ -53,6 +54,7 @@ impl RuleDto {
             match_query: r.match_query,
             browser_ttl_seconds: r.browser_ttl_seconds.max(0) as u64,
             ignore_query: r.ignore_query,
+            ignore_cookie: r.ignore_cookie,
             note: r.note,
         }
     }
@@ -76,6 +78,8 @@ pub struct RulePayload {
     /// Double option so an explicit `null` can clear an existing override.
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub ignore_query: Option<Option<bool>>,
+    /// Cache static assets even when the request carries cookies.
+    pub ignore_cookie: Option<bool>,
     pub note: Option<String>,
 }
 
@@ -110,6 +114,7 @@ struct Normalized {
     match_query: String,
     browser_ttl_seconds: i64,
     ignore_query: Option<bool>,
+    ignore_cookie: bool,
     note: String,
 }
 
@@ -176,6 +181,7 @@ fn normalize(
     priority: i32,
     enabled: bool,
     ignore_query: Option<bool>,
+    ignore_cookie: bool,
     note: &str,
 ) -> Result<Normalized, String> {
     let match_type = normalize_match_type(match_type)?;
@@ -220,6 +226,7 @@ fn normalize(
         match_query,
         browser_ttl_seconds: browser_ttl_seconds as i64,
         ignore_query,
+        ignore_cookie,
         note,
     })
 }
@@ -272,6 +279,7 @@ pub async fn create(
         0,
         true,
         req.rule.ignore_query.flatten(),
+        req.rule.ignore_cookie.unwrap_or(false),
         req.rule.note.as_deref().unwrap_or(""),
     )
     .map_err(bad_request)?;
@@ -288,6 +296,7 @@ pub async fn create(
         match_query: &normalized.match_query,
         browser_ttl_seconds: normalized.browser_ttl_seconds,
         ignore_query: normalized.ignore_query,
+        ignore_cookie: normalized.ignore_cookie,
         note: &normalized.note,
     };
     let row = repository::create_rule(&state.pool, domain_id, &input)
@@ -362,6 +371,7 @@ pub async fn update(
         current.priority,
         current.enabled,
         req.ignore_query.unwrap_or(current.ignore_query),
+        req.ignore_cookie.unwrap_or(current.ignore_cookie),
         note,
     )
     .map_err(bad_request)?;
@@ -378,6 +388,7 @@ pub async fn update(
         match_query: &normalized.match_query,
         browser_ttl_seconds: normalized.browser_ttl_seconds,
         ignore_query: normalized.ignore_query,
+        ignore_cookie: normalized.ignore_cookie,
         note: &normalized.note,
     };
     let row = repository::update_rule(&state.pool, uid, &input)
@@ -443,6 +454,7 @@ pub struct EffectiveDto {
     pub swr_seconds: u64,
     pub browser_ttl_seconds: u64,
     pub ignore_query: Option<bool>,
+    pub ignore_cookie: bool,
     pub source: String,
 }
 
@@ -559,6 +571,7 @@ pub async fn test(
                 swr_seconds: rule.swr_seconds.max(0) as u64,
                 browser_ttl_seconds: rule.browser_ttl_seconds.max(0) as u64,
                 ignore_query: rule.ignore_query,
+                ignore_cookie: rule.ignore_cookie,
                 source: "rule".into(),
             };
             Ok(Json(TestResponse {
@@ -575,6 +588,7 @@ pub async fn test(
                 swr_seconds: 0,
                 browser_ttl_seconds: 0,
                 ignore_query: None,
+                ignore_cookie: false,
                 source: "default".into(),
             },
             note: "未命中规则：将按源站 Cache-Control / Expires，最后回退域名默认 TTL".into(),
@@ -640,6 +654,7 @@ mod tests {
             match_query: query.into(),
             browser_ttl_seconds: 0,
             ignore_query: None,
+            ignore_cookie: false,
             note: String::new(),
         }
     }

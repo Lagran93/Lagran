@@ -82,6 +82,7 @@ pub struct CacheRuleRow {
     pub match_query: String,
     pub browser_ttl_seconds: i64,
     pub ignore_query: Option<bool>,
+    pub ignore_cookie: bool,
     pub note: String,
 }
 
@@ -99,6 +100,7 @@ pub struct RuleInput<'a> {
     pub match_query: &'a str,
     pub browser_ttl_seconds: i64,
     pub ignore_query: Option<bool>,
+    pub ignore_cookie: bool,
     pub note: &'a str,
 }
 
@@ -574,7 +576,7 @@ pub async fn list_rules_for_domain(
     sqlx::query_as::<_, CacheRuleRow>(
         r#"
         SELECT id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, note
+               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, note
         FROM cache_rules
         WHERE domain_id = $1
         ORDER BY priority DESC
@@ -674,6 +676,7 @@ pub async fn list_all_rules(pool: &PgPool) -> sqlx::Result<Vec<(CacheRuleRow, St
         match_query: String,
         browser_ttl_seconds: i64,
         ignore_query: Option<bool>,
+        ignore_cookie: bool,
         note: String,
         domain_name: String,
     }
@@ -681,7 +684,7 @@ pub async fn list_all_rules(pool: &PgPool) -> sqlx::Result<Vec<(CacheRuleRow, St
         r#"
         SELECT r.id, r.domain_id, r.path_pattern, r.match_type, r.ttl_seconds, r.priority,
                r.action, r.swr_seconds, r.enabled, r.match_methods, r.match_query,
-               r.browser_ttl_seconds, r.ignore_query, r.note, d.name AS domain_name
+               r.browser_ttl_seconds, r.ignore_query, r.ignore_cookie, r.note, d.name AS domain_name
         FROM cache_rules r
         JOIN domains d ON d.id = r.domain_id
         ORDER BY r.priority DESC, r.path_pattern
@@ -707,6 +710,7 @@ pub async fn list_all_rules(pool: &PgPool) -> sqlx::Result<Vec<(CacheRuleRow, St
                     match_query: r.match_query,
                     browser_ttl_seconds: r.browser_ttl_seconds,
                     ignore_query: r.ignore_query,
+                    ignore_cookie: r.ignore_cookie,
                     note: r.note,
                 },
                 r.domain_name,
@@ -724,10 +728,10 @@ pub async fn create_rule(
         r#"
         INSERT INTO cache_rules
             (domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-             enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, note)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, note)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, note
+                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, note
         "#,
     )
     .bind(domain_id)
@@ -742,6 +746,7 @@ pub async fn create_rule(
     .bind(input.match_query)
     .bind(input.browser_ttl_seconds)
     .bind(input.ignore_query)
+    .bind(input.ignore_cookie)
     .bind(input.note)
     .fetch_one(pool)
     .await
@@ -757,10 +762,10 @@ pub async fn update_rule(
         UPDATE cache_rules SET
             path_pattern = $2, match_type = $3, ttl_seconds = $4, priority = $5, action = $6,
             swr_seconds = $7, enabled = $8, match_methods = $9, match_query = $10,
-            browser_ttl_seconds = $11, ignore_query = $12, note = $13
+            browser_ttl_seconds = $11, ignore_query = $12, ignore_cookie = $13, note = $14
         WHERE id = $1
         RETURNING id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, note
+                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, note
         "#,
     )
     .bind(id)
@@ -775,6 +780,7 @@ pub async fn update_rule(
     .bind(input.match_query)
     .bind(input.browser_ttl_seconds)
     .bind(input.ignore_query)
+    .bind(input.ignore_cookie)
     .bind(input.note)
     .fetch_optional(pool)
     .await
@@ -784,7 +790,7 @@ pub async fn get_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<CacheRuleR
     sqlx::query_as::<_, CacheRuleRow>(
         r#"
         SELECT id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, note
+               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, note
         FROM cache_rules WHERE id = $1
         "#,
     )
@@ -1937,7 +1943,7 @@ pub async fn list_rules_flat(pool: &PgPool) -> sqlx::Result<Vec<CacheRuleRow>> {
     sqlx::query_as::<_, CacheRuleRow>(
         r#"
         SELECT id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, note
+               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, note
         FROM cache_rules
         ORDER BY domain_id, priority DESC, path_pattern
         "#,

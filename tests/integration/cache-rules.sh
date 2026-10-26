@@ -83,7 +83,7 @@ echo "== create rules =="
 mk_rule() { api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules" -d "$1"; }
 
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/method/*\",\"action\":\"bypass\",\"match_methods\":\"GET\",\"priority\":10,\"note\":\"GET bypass\"}" >/dev/null
-mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"match_type\":\"regex\",\"path_pattern\":\"\\\\.(css|js)$\",\"action\":\"cache\",\"ttl_seconds\":600,\"browser_ttl_seconds\":600,\"priority\":20,\"note\":\"regex suffix\"}" >/dev/null
+mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"match_type\":\"regex\",\"path_pattern\":\"\\\\.(css|js)$\",\"action\":\"cache\",\"ttl_seconds\":600,\"browser_ttl_seconds\":600,\"ignore_cookie\":true,\"priority\":20,\"note\":\"regex suffix\"}" >/dev/null
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/q/*\",\"action\":\"bypass\",\"match_query\":\"debug=1\",\"priority\":10}" >/dev/null
 RULE_OFF=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/off/*\",\"action\":\"bypass\",\"enabled\":false,\"priority\":10}" | jq -r '.id')
 RULE_BROWSER=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/browser/*\",\"action\":\"cache\",\"ttl_seconds\":60,\"browser_ttl_seconds\":3600,\"priority\":10}" | jq -r '.id')
@@ -136,6 +136,12 @@ check "css regex rule first miss" "$(hdr x-cache)" "MISS"
 get "/assets/app.css" >/dev/null
 check "css regex rule second hit" "$(hdr x-cache)" "HIT"
 contains "css regex rule TTL applied" "$(hdr cache-control)" "max-age=600"
+CSS_ETAG="$(hdr etag)"
+get "/assets/app.css" -H 'Cookie: __cf_bm=test; sid=1' >/dev/null
+check "ignore_cookie rule caches browser cookie request" "$(hdr x-cache)" "HIT"
+CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0' -H "If-None-Match: $CSS_ETAG")
+check "Chrome reload revalidates from edge cache" "$CODE" "304"
+check "Chrome reload is not BYPASS" "$(hdr x-cache)" "REVALIDATED"
 get "/assets/app.js" >/dev/null
 check "js regex rule miss" "$(hdr x-cache)" "MISS"
 get "/assets/app.js" >/dev/null
