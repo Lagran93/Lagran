@@ -17,8 +17,9 @@ pub struct AppConfig {
     /// Public base URL of the control plane (used in node install commands).
     /// Empty = derive from the incoming request Host header.
     pub public_url: String,
-    /// CIDR → geo JSON used by the scheduler (empty / missing = weights only).
-    pub geoip_json_path: String,
+    /// CIDR -> geo table used by the scheduler. Supports V2Ray `geoip.dat`
+    /// (Loyalsoldier) and the legacy JSON format.
+    pub geoip_path: String,
     /// TTL returned by the scheduling API (seconds).
     pub schedule_ttl: u64,
     /// DNS server used by the console "DNS test" endpoint (host:port).
@@ -51,8 +52,11 @@ impl Default for AppConfig {
                 .or_else(|_| std::env::var("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
             public_url: std::env::var("CONTROL_PUBLIC_URL").unwrap_or_default(),
-            geoip_json_path: std::env::var("GEOIP_JSON_PATH")
-                .unwrap_or_else(|_| "./data/geoip.json".into()),
+            geoip_path: std::env::var("GEOIP_PATH")
+                .or_else(|_| std::env::var("GEOIP_DAT_PATH"))
+                // Legacy name: a `.json` path still loads as JSON.
+                .or_else(|_| std::env::var("GEOIP_JSON_PATH"))
+                .unwrap_or_else(|_| "./data/geoip.dat".into()),
             schedule_ttl: std::env::var("SCHEDULE_TTL")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())

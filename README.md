@@ -25,7 +25,7 @@
 - 证书：上传、SNI 下发、**Let's Encrypt（ACME v2 / HTTP-01）生产签发**、Staging 调试、自动续期
 - 节点管理：预注册节点 + 一键生成安装命令（二进制/Docker）、单节点令牌、启用/停用（下发边缘立即 503）、删除吊销、心跳与 CPU/内存/版本
 - 节点调度（Geo/ISP Phase 1）：节点公网 IP / 省份 / 城市 / 运营商 / 权重，`/api/v1/schedule` 按客户端 IP 与
-  GeoIP CIDR 表打分返回主备节点；附 PowerDNS pipe backend 接入示例
+  **V2Ray/Loyalsoldier `geoip.dat` 或旧版 JSON** 打分返回主备节点；附 PowerDNS pipe backend 接入示例
 - 自研权威 DNS（`apps/dns`）：UDP/TCP 53、SOA/NS/A/AAAA、EDNS0 + ECS、调度结果缓存、控制面故障时
   用旧结果兜底；可直接作为 `edge.lagran.net` 的权威服务器
 - WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器 / **RCE / SSRF / XXE / Log4Shell / CRLF**）、
@@ -117,7 +117,8 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | JWT_EXPIRE_HOURS | 72 | Token 有效期（兼容 JWT_EXPIRES_SECS） |
 | AGENT_TOKEN | 空 | 全局 token：DNS `/schedule` 使用；边缘配置/心跳必须使用节点 `auth_token` |
 | CONTROL_PUBLIC_URL | 空 | 控制面公网地址，用于生成节点安装命令；留空按请求 Host 推导 |
-| GEOIP_JSON_PATH | ./data/geoip.json | 调度用 CIDR → 国家/省/市/运营商 JSON 表；缺失时按权重/负载调度 |
+| GEOIP_PATH | ./data/geoip.dat | 调度用 GeoIP：支持 V2Ray/Loyalsoldier `geoip.dat` 或旧版 CIDR JSON；缺失时按权重/负载调度 |
+| GEOIP_JSON_PATH | 空 | 兼容旧配置的 JSON 路径别名；新部署建议使用 `GEOIP_PATH` |
 | SCHEDULE_TTL | 30 | `/api/v1/schedule` 返回的 DNS TTL（秒） |
 | ACME_DIRECTORY_URL | Let's Encrypt 生产 | ACME v2 目录地址 |
 | ACME_STAGING_DIRECTORY_URL | Let's Encrypt Staging | Staging 目录地址 |

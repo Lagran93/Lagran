@@ -15,7 +15,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(pool: PgPool, config: AppConfig) -> Self {
-        let geo = crate::scheduler::GeoTable::load(&config.geoip_json_path);
+        let geo = crate::scheduler::GeoTable::load(&config.geoip_path);
         let schedule_ttl = config.schedule_ttl;
         Self {
             pool,
