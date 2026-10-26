@@ -184,11 +184,38 @@ H5D=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/
 contains "expires first MISS" "$H5C" "x-cache: MISS"
 contains "expires TTL honoured (HIT)" "$H5D" "x-cache: HIT"
 
+echo "== vary: accept-language =="
+curl -s -D "$LOG_DIR/vary_en.h" -o "$LOG_DIR/vary_en.b" -H "Host: $DOMAIN" -H 'Accept-Language: en-US,en;q=0.9' "http://127.0.0.1:$EDGE_PORT/vary" >/dev/null
+curl -s -D "$LOG_DIR/vary_zh.h" -o "$LOG_DIR/vary_zh.b" -H "Host: $DOMAIN" -H 'Accept-Language: zh-CN,zh;q=0.9' "http://127.0.0.1:$EDGE_PORT/vary" >/dev/null
+curl -s -D "$LOG_DIR/vary_en2.h" -o "$LOG_DIR/vary_en2.b" -H "Host: $DOMAIN" -H 'Accept-Language: en-US,en;q=0.9' "http://127.0.0.1:$EDGE_PORT/vary" >/dev/null
+contains "accept-language en is separate MISS" "$(tr '[:upper:]' '[:lower:]' < "$LOG_DIR/vary_en.h")" "x-cache: miss"
+contains "accept-language zh does not reuse en" "$(tr '[:upper:]' '[:lower:]' < "$LOG_DIR/vary_zh.h")" "x-cache: miss"
+contains "accept-language en caches independently" "$(tr '[:upper:]' '[:lower:]' < "$LOG_DIR/vary_en2.h")" "x-cache: hit"
+contains "en body preserved" "$(cat "$LOG_DIR/vary_en2.b")" "lang=en-US,en;q=0.9"
+contains "zh body is not en" "$(cat "$LOG_DIR/vary_zh.b")" "lang=zh-CN,zh;q=0.9"
+
 echo "== per-domain rule isolation =="
 H7=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN2" "http://127.0.0.1:$EDGE_PORT/cached")
 contains "second domain bypass rule applies there" "$H7" "x-cache: BYPASS"
 H8=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
 contains "first domain still HIT (no cross-domain pollution)" "$H8" "x-cache: HIT"
+
+echo "== etag is content-based =="
+curl -s -D "$LOG_DIR/etag1_miss.h" -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/etag" >/dev/null
+curl -s -D "$LOG_DIR/etag1_hit.h" -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/etag" >/dev/null
+ETAG1=$(tr -d '\r' < "$LOG_DIR/etag1_hit.h" | awk 'tolower($1)=="etag:" {print $2}')
+curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/purge" -H "$AUTH" \
+  -H 'content-type: application/json' \
+  -d "{\"domain\":\"$DOMAIN\",\"prefixes\":[\"/etag\"]}" >/dev/null
+curl -s -D "$LOG_DIR/etag2_miss.h" -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/etag" >/dev/null
+curl -s -D "$LOG_DIR/etag2_hit.h" -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/etag" >/dev/null
+ETAG2=$(tr -d '\r' < "$LOG_DIR/etag2_hit.h" | awk 'tolower($1)=="etag:" {print $2}')
+check "etag is present on cache hit" "$([[ -n "$ETAG1" && -n "$ETAG2" ]] && echo yes)" "yes"
+if [[ "$ETAG1" != "$ETAG2" ]]; then
+  pass "etag changes when body changes"
+else
+  fail "etag changes when body changes (same '$ETAG1')"
+fi
 
 echo "== bypass rule + POST forwarding =="
 H5=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/api/data")
@@ -199,6 +226,9 @@ contains "POST method forwarded" "$POST_BODY" '"method":"POST"'
 contains "POST body forwarded" "$POST_BODY" '"echo":"ping"'
 contains "custom header forwarded" "$POST_BODY" '"x_custom":"yes"'
 contains "POST labelled DYNAMIC" "$(curl -s -D - -o /dev/null -X POST -H "Host: $DOMAIN" --data x "http://127.0.0.1:$EDGE_PORT/echo")" "x-cache: DYNAMIC"
+POST_CC=$(curl -s -X POST -H "Host: $DOMAIN" -H 'content-type: text/plain' -H 'Cache-Control: no-store' \
+  --data 'cc' "http://127.0.0.1:$EDGE_PORT/echo")
+contains "dynamic request keeps Cache-Control" "$POST_CC" '"cache_control":"no-store"'
 
 echo "== purge =="
 PURGE=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/purge" -H "$AUTH" \

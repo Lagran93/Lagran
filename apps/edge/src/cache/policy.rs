@@ -497,7 +497,38 @@ pub fn cache_key_opts<B>(req: &Request<B>, ignore_query: bool) -> String {
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string())
     };
-    cache_key_for(req.method(), host, &path)
+    cache_key_for_request(req.method(), host, &path, req.headers())
+}
+
+/// Stable cache key including the normalized `Accept-Language` value.
+///
+/// `Vary: Accept-Language` is accepted by the storage policy, so the key must
+/// include the language to avoid serving a Chinese object to an English client
+/// (or vice versa). The tag is hashed to keep keys bounded and purge-friendly.
+pub fn cache_key_for_request(
+    method: &Method,
+    host: &str,
+    path: &str,
+    headers: &HeaderMap,
+) -> String {
+    let base = cache_key_for(method, host, path);
+    let Some(lang) = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return base;
+    };
+    let normalized = lang
+        .split(',')
+        .map(|tag| tag.trim().to_ascii_lowercase())
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if normalized.is_empty() {
+        base
+    } else {
+        format!("{base}|lang={:x}", fnv1a64(normalized.as_bytes()))
+    }
 }
 
 /// Stable cache key: `METHOD:host:path[?query]` (host lowercased, port stripped).

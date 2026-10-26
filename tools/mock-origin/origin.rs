@@ -5,8 +5,11 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static ETAG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let port: u16 = std::env::args()
@@ -60,6 +63,8 @@ fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
     let mut content_length = 0usize;
     let mut custom_header = String::new();
     let mut cookie = String::new();
+    let mut accept_language = String::new();
+    let mut cache_control = String::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim();
@@ -70,6 +75,10 @@ fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
                 custom_header = value.to_string();
             } else if name.eq_ignore_ascii_case("cookie") {
                 cookie = value.to_string();
+            } else if name.eq_ignore_ascii_case("accept-language") {
+                accept_language = value.to_string();
+            } else if name.eq_ignore_ascii_case("cache-control") {
+                cache_control = value.to_string();
             }
         }
     }
@@ -86,10 +95,11 @@ fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
     let (status, payload, extra): (u16, Vec<u8>, Vec<(&str, String)>) = match method.as_str() {
         "POST" => {
             let json = format!(
-                "{{\"method\":\"POST\",\"path\":\"{}\",\"x_custom\":\"{}\",\"cookie\":\"{}\",\"bytes\":{},\"echo\":\"{}\"}}",
+                "{{\"method\":\"POST\",\"path\":\"{}\",\"x_custom\":\"{}\",\"cookie\":\"{}\",\"cache_control\":\"{}\",\"bytes\":{},\"echo\":\"{}\"}}",
                 json_escape(&target),
                 json_escape(&custom_header),
                 json_escape(&cookie),
+                json_escape(&cache_control),
                 body.len(),
                 json_escape(&String::from_utf8_lossy(&body))
             );
@@ -100,6 +110,22 @@ fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
             )
         }
         _ => match path.as_str() {
+            "/etag" => {
+                let n = ETAG_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+                (
+                    200,
+                    format!("version-{n}").into_bytes(),
+                    vec![("Cache-Control", "public, max-age=60".into())],
+                )
+            }
+            "/vary" => (
+                200,
+                format!("lang={}", accept_language).into_bytes(),
+                vec![
+                    ("Vary", "Accept-Language".into()),
+                    ("Cache-Control", "public, max-age=60".into()),
+                ],
+            ),
             "/cached" => (
                 200,
                 b"hello from origin".to_vec(),

@@ -12,7 +12,7 @@
 use crate::agent::origin_health::OriginHealthMap;
 use crate::agent::{ControlClient, NodeControl};
 use crate::cache::policy::{
-    cache_key_for, compute_etag, decide_storage, etag_matches, is_uncacheable_header,
+    cache_key_for_request, compute_etag, decide_storage, etag_matches, is_uncacheable_header,
     request_bypasses_cache, request_method_cacheable, resolve_rule_policy, strip_response_headers,
     CacheStatus, ResolvedPolicy, RuleAction, RuleSet,
 };
@@ -633,7 +633,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     } else {
         path_and_query.clone()
     };
-    let key = cache_key_for(&method, &host, &cache_lookup_path);
+    let key = cache_key_for_request(&method, &host, &cache_lookup_path, &headers);
 
     let lookup = state.cache.get_result(&key).await;
     let from_expired = matches!(lookup, CacheGetResult::Expired);

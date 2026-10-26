@@ -6,6 +6,7 @@
 //! header that is stripped before the response reaches the client; this keeps
 //! disk/hybrid persistence working without a separate metadata sidecar.
 
+use crate::cache::policy::compute_etag;
 use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
 use async_trait::async_trait;
 use base64::Engine;
@@ -38,11 +39,15 @@ impl NativeStorage {
 
 fn encode_meta(meta: &CacheMeta) -> pingora::Result<String> {
     let (internal, header) = meta.serialize()?;
+    Ok(encode_meta_parts(&internal, &header))
+}
+
+fn encode_meta_parts(internal: &[u8], header: &[u8]) -> String {
     let mut raw = Vec::with_capacity(4 + internal.len() + header.len());
     raw.extend_from_slice(&(internal.len() as u32).to_be_bytes());
-    raw.extend_from_slice(&internal);
-    raw.extend_from_slice(&header);
-    Ok(B64.encode(raw))
+    raw.extend_from_slice(internal);
+    raw.extend_from_slice(header);
+    B64.encode(raw)
 }
 
 fn decode_meta(encoded: &str) -> Option<CacheMeta> {
@@ -132,12 +137,16 @@ impl HandleMiss for EntryMiss {
         }
         let mut headers = self.headers;
         headers.push((META_HEADER.to_string(), self.encoded_meta));
-        let entry = CacheEntry {
+        let mut entry = CacheEntry {
             status: self.status,
             headers,
             body: self.body.freeze(),
             stored_at_epoch_secs: now_epoch_secs(),
         };
+        if entry.header("etag").is_none() {
+            let etag = compute_etag(&entry);
+            entry.headers.push(("etag".to_string(), etag));
+        }
         self.cache
             .set_with_swr(&self.key, entry, self.fresh_secs, self.swr_secs)
             .await;
@@ -186,9 +195,14 @@ impl Storage for NativeStorage {
         else {
             return Ok(None);
         };
-        let Some(meta) = decode_meta(encoded) else {
+        let Some(mut meta) = decode_meta(encoded) else {
             return Ok(None);
         };
+        if let Some(etag) = entry.header("etag") {
+            if !meta.response_header().headers.contains_key("etag") {
+                meta.response_header_mut().insert_header("etag", etag)?;
+            }
+        }
         Ok(Some((
             meta,
             Box::new(EntryHit {

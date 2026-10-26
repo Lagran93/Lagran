@@ -8,7 +8,8 @@
 //! WebSocket) are handed to the in-process handler.
 
 use crate::cache::policy::{
-    cache_key_for, decide_storage, fnv1a64, resolve_rule_policy, ResolvedPolicy, RuleAction,
+    cache_key_for_request, compute_etag, decide_storage, resolve_rule_policy, ResolvedPolicy,
+    RuleAction,
 };
 use crate::config::registry::DomainEntry;
 use crate::config::EdgeConfig;
@@ -306,10 +307,13 @@ impl ProxyHttp for DataPlaneProxy {
             if plan.is_head && self.serve_head_cache(session, &plan, ctx).await {
                 return Ok(true);
             }
-            // Chrome sends max-age=0 on reload; keep the cached entry eligible
-            // so If-None-Match can produce a 304/revalidated response.
-            session.req_header_mut().remove_header("cache-control");
-            session.req_header_mut().remove_header("pragma");
+            if plan.cacheable || plan.is_head {
+                // Chrome sends max-age=0 on reload; keep the cached entry
+                // eligible so If-None-Match can produce a 304/revalidated
+                // response. Never strip these from BYPASS/dynamic requests.
+                session.req_header_mut().remove_header("cache-control");
+                session.req_header_mut().remove_header("pragma");
+            }
             ctx.plan = Some(plan);
             return Ok(false);
         }
@@ -412,21 +416,6 @@ impl ProxyHttp for DataPlaneProxy {
         Ok(())
     }
 
-    async fn upstream_response_filter(
-        &self,
-        _session: &mut Session,
-        upstream_response: &mut ResponseHeader,
-        ctx: &mut Self::CTX,
-    ) -> Result<()> {
-        if let Some(plan) = ctx.plan.as_ref() {
-            if !upstream_response.headers.contains_key("etag") {
-                let etag = format!("\"{:x}\"", fnv1a64(plan.key.as_bytes()));
-                upstream_response.insert_header("etag", etag)?;
-            }
-        }
-        Ok(())
-    }
-
     fn response_cache_filter(
         &self,
         _session: &Session,
@@ -498,10 +487,6 @@ impl ProxyHttp for DataPlaneProxy {
         response.insert_header("x-cache", label)?;
         response.insert_header("x-cache-status", label)?;
         response.insert_header("x-powered-by", "lagran-edge")?;
-        if (plan.cacheable || plan.is_head) && !response.headers.contains_key("etag") {
-            let etag = format!("\"{:x}\"", fnv1a64(plan.key.as_bytes()));
-            response.insert_header("etag", etag)?;
-        }
 
         let mut headers = response.headers.clone();
         if plan.cacheable || plan.is_head {
@@ -564,7 +549,7 @@ impl ProxyHttp for DataPlaneProxy {
                     self.state.default_ttl_secs,
                 ) {
                     if ctx.head_body.len() <= 8 * 1024 * 1024 {
-                        let entry = crate::cache::CacheEntry {
+                        let mut entry = crate::cache::CacheEntry {
                             status: ctx.head_status,
                             headers: hdrs,
                             body: ctx.head_body.clone().freeze(),
@@ -573,6 +558,10 @@ impl ProxyHttp for DataPlaneProxy {
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0),
                         };
+                        if entry.header("etag").is_none() {
+                            let etag = compute_etag(&entry);
+                            entry.headers.push(("etag".to_string(), etag));
+                        }
                         self.state
                             .cache
                             .set_with_swr(&plan.key, entry, decision.ttl_secs, decision.swr_secs)
@@ -667,7 +656,7 @@ impl DataPlaneProxy {
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| "/".to_string())
         };
-        let key = cache_key_for(&req.method, &host, &lookup_path);
+        let key = cache_key_for_request(&req.method, &host, &lookup_path, &req.headers);
         Some(NativePlan {
             domain: domain.clone(),
             key,
@@ -820,7 +809,7 @@ impl DataPlaneProxy {
         let etag = entry
             .header("etag")
             .map(str::to_string)
-            .unwrap_or_else(|| format!("\"{:x}\"", fnv1a64(plan.key.as_bytes())));
+            .unwrap_or_else(|| compute_etag(&entry));
         let inm = session
             .req_header()
             .headers

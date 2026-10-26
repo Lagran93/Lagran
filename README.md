@@ -42,7 +42,8 @@
 - 多域名反向代理（按 Host/SNI 路由）+ 主备源站
 - 缓存：`memory`（DashMap + LRU）/ `disk`（文件缓存，按 mtime 淘汰）/ `hybrid`
 - 缓存语义：规则 TTL → `Cache-Control`(`s-maxage`/`max-age`) → `Expires` → 默认 TTL；
-  `no-store`/`private`/`no-cache`/复杂 `Vary` 不写入；SWR + single-flight 合并回源
+  `no-store`/`private`/`no-cache`/复杂 `Vary` 不写入；`Vary: Accept-Language` 的 key 含语言哈希；
+  ETag 基于响应 body；SWR + single-flight 合并回源
 - 条件请求（304）、`Age`、`X-Cache` / `X-Cache-Status`、每域名限流、防盗链
 - WAF：托管特征匹配 + 自定义规则 + IP 白/黑名单，支持观察模式；命中后返回 403 拦截页并上报事件
 - WAF 安全级别：低/中/高/攻击中，按 UA 与请求类型自动下发浏览器质询；静态资源不受影响
