@@ -122,6 +122,9 @@ get "/method/x" -X HEAD >/dev/null
 check "HEAD does not match GET-only rule (cacheable)" "$(hdr x-cache)" "MISS"
 get "/method/x" -X HEAD >/dev/null
 check "HEAD response cached on second hit" "$(hdr x-cache)" "HIT"
+get "/browser/headonly" -X HEAD >/dev/null
+get "/browser/headonly" >/dev/null
+check "HEAD does not poison GET cache" "$(cat "$LOG_DIR/b")" "hello from origin"
 
 echo "== query condition =="
 get "/q/x?debug=1" >/dev/null

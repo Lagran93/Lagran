@@ -735,7 +735,16 @@ async fn fetch_with_single_flight(
 ) -> Result<(Fetched, bool), FetchError> {
     match state.inflight.begin(key).await {
         Slot::Leader(leader) => {
-            let result = fetch_origin(state, eff, host, path_and_query, headers, method).await;
+            // HEAD must fetch and cache the full GET representation; otherwise
+            // the empty HEAD body is stored under the shared GET key and later
+            // GETs are poisoned with an empty response.
+            let origin_method = if method == Method::HEAD {
+                Method::GET
+            } else {
+                method.clone()
+            };
+            let result =
+                fetch_origin(state, eff, host, path_and_query, headers, &origin_method).await;
             if let Ok(resp) = &result {
                 let content_type = resp
                     .headers
