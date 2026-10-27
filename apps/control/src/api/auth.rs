@@ -27,6 +27,9 @@ pub struct UserInfo {
     pub email: String,
     pub name: String,
     pub role: String,
+    pub is_active: bool,
+    pub created_at: String,
+    pub last_login_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -40,11 +43,46 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+#[derive(Serialize)]
+pub struct PublicAuthConfig {
+    pub allow_register: bool,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateProfileRequest {
+    pub name: String,
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+pub(crate) fn to_user_info(user: repository::UserRow) -> UserInfo {
+    UserInfo {
+        id: user.id.to_string(),
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        is_active: user.is_active,
+        created_at: user.created_at.to_rfc3339(),
+        last_login_at: user.last_login_at.map(|t| t.to_rfc3339()),
+    }
+}
+
+pub async fn public_config(State(state): State<AppState>) -> Json<PublicAuthConfig> {
+    Json(PublicAuthConfig {
+        allow_register: state.config.allow_register,
+    })
+}
+
 pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorBody>)> {
-    let limit_key = format!("login:{}", req.email.trim().to_ascii_lowercase());
+    let email = normalize_email(&req.email);
+    let limit_key = format!("login:{email}");
     if !state.login_limiter.check(&limit_key) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
@@ -53,7 +91,7 @@ pub async fn login(
             }),
         ));
     }
-    let user = repository::find_user_by_email(&state.pool, &req.email)
+    let user = repository::find_user_by_email(&state.pool, &email)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "db error");
@@ -82,6 +120,15 @@ pub async fn login(
             }),
         ));
     }
+    if !user.is_active {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "account is disabled".into(),
+            }),
+        ));
+    }
+    let _ = repository::touch_last_login(&state.pool, user.id).await;
 
     let token = issue_token(
         user.id,
@@ -101,12 +148,7 @@ pub async fn login(
 
     Ok(Json(LoginResponse {
         token,
-        user: UserInfo {
-            id: user.id.to_string(),
-            email: user.email,
-            name: user.name,
-            role: user.role,
-        },
+        user: to_user_info(user),
     }))
 }
 
@@ -122,7 +164,14 @@ pub async fn register(
             }),
         ));
     }
-    let limit_key = format!("register:{}", req.email.trim().to_ascii_lowercase());
+    let email = normalize_email(&req.email);
+    if let Err(msg) = validate_email(&email) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody { error: msg.into() }),
+        ));
+    }
+    let limit_key = format!("register:{email}");
     if !state.login_limiter.check(&limit_key) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
@@ -139,7 +188,7 @@ pub async fn register(
             }),
         ));
     }
-    if repository::find_user_by_email(&state.pool, &req.email)
+    if repository::find_user_by_email(&state.pool, &email)
         .await
         .map_err(|_| {
             (
@@ -168,18 +217,50 @@ pub async fn register(
         )
     })?;
 
-    let name = req.name.unwrap_or_else(|| req.email.clone());
-    let user = repository::create_user(&state.pool, &req.email, &hash, &name)
+    let name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| email.split('@').next().unwrap_or(&email).to_string());
+    if name.chars().count() > 80 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "name is too long".into(),
+            }),
+        ));
+    }
+    let user = repository::create_user(&state.pool, &email, &hash, &name)
         .await
         .map_err(|e| {
+            let unique = e
+                .as_database_error()
+                .map(|d| d.is_unique_violation())
+                .unwrap_or(false);
             tracing::error!(error = %e, "create user");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: "database error".into(),
-                }),
-            )
+            if unique {
+                (
+                    StatusCode::CONFLICT,
+                    Json(ErrorBody {
+                        error: "email already registered".into(),
+                    }),
+                )
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: "database error".into(),
+                    }),
+                )
+            }
         })?;
+
+    if let Err(e) = repository::ensure_personal_project(&state.pool, user.id).await {
+        tracing::warn!(error = %e, user_id = %user.id, "create personal project failed");
+    }
+    let _ = repository::touch_last_login(&state.pool, user.id).await;
 
     let token = issue_token(
         user.id,
@@ -201,12 +282,7 @@ pub async fn register(
         StatusCode::CREATED,
         Json(LoginResponse {
             token,
-            user: UserInfo {
-                id: user.id.to_string(),
-                email: user.email,
-                name: user.name,
-                role: user.role,
-            },
+            user: to_user_info(user),
         }),
     ))
 }
@@ -243,16 +319,188 @@ pub async fn me(
             )
         })?;
 
-    Ok(Json(UserInfo {
-        id: user.id.to_string(),
-        email: user.email,
-        name: user.name,
-        role: user.role,
-    }))
+    if !user.is_active {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "account is disabled".into(),
+            }),
+        ));
+    }
+    Ok(Json(to_user_info(user)))
 }
 
+pub async fn update_me(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Json(req): Json<UpdateProfileRequest>,
+) -> Result<Json<UserInfo>, (StatusCode, Json<ErrorBody>)> {
+    let id = Uuid::parse_str(&claims.sub).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "invalid token".into(),
+            }),
+        )
+    })?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "name required".into(),
+            }),
+        ));
+    }
+    if name.chars().count() > 80 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "name is too long".into(),
+            }),
+        ));
+    }
+    let current = repository::find_user_by_id(&state.pool, id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "database error".into(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: "user not found".into(),
+                }),
+            )
+        })?;
+    if !current.is_active {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "account is disabled".into(),
+            }),
+        ));
+    }
+    let user = repository::update_user_profile(&state.pool, id, name)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "database error".into(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: "user not found".into(),
+                }),
+            )
+        })?;
+    Ok(Json(to_user_info(user)))
+}
 
-fn validate_password(password: &str) -> Result<(), &'static str> {
+pub async fn change_password(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    let id = Uuid::parse_str(&claims.sub).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "invalid token".into(),
+            }),
+        )
+    })?;
+    let user = repository::find_user_by_id(&state.pool, id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "database error".into(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: "user not found".into(),
+                }),
+            )
+        })?;
+    if !user.is_active {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "account is disabled".into(),
+            }),
+        ));
+    }
+    if !verify_password(&req.current_password, &user.password_hash).unwrap_or(false) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "current password is incorrect".into(),
+            }),
+        ));
+    }
+    if let Err(msg) = validate_password(&req.new_password) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: msg.into(),
+            }),
+        ));
+    }
+    let hash = crate::utils::hash_password(&req.new_password).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "hash error".into(),
+            }),
+        )
+    })?;
+    repository::update_user_password(&state.pool, id, &hash)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "database error".into(),
+                }),
+            )
+        })?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+pub(crate) fn normalize_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+pub(crate) fn validate_email(email: &str) -> Result<(), &'static str> {
+    if email.len() < 3 || email.len() > 254 {
+        return Err("invalid email");
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        return Err("invalid email");
+    };
+    if local.is_empty() || domain.is_empty() || domain.contains('@') || !domain.contains('.') {
+        return Err("invalid email");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_password(password: &str) -> Result<(), &'static str> {
     if password.len() < 8 {
         return Err("password must be at least 8 characters");
     }

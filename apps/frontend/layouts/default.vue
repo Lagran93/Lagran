@@ -39,6 +39,7 @@ const MENU: MenuGroup[] = [
     title: '系统',
     items: [
       { label: '项目管理', to: '/projects', icon: 'project' },
+      { label: '用户管理', to: '/users', icon: 'users', admin: true },
       { label: '系统设置', to: '/settings', icon: 'settings' },
     ],
   },

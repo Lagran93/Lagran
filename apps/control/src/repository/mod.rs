@@ -11,7 +11,12 @@ pub struct UserRow {
     pub password_hash: String,
     pub name: String,
     pub role: String,
+    pub is_active: bool,
+    pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Populated by the admin list query only.
+    #[sqlx(default)]
+    pub project_count: i64,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -108,7 +113,7 @@ pub struct RuleInput<'a> {
 
 pub async fn find_user_by_email(pool: &PgPool, email: &str) -> sqlx::Result<Option<UserRow>> {
     sqlx::query_as::<_, UserRow>(
-        "SELECT id, email, password_hash, name, role, created_at FROM users WHERE email = $1",
+        "SELECT id, email, password_hash, name, role, is_active, last_login_at, created_at FROM users WHERE lower(email) = lower($1)",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -117,7 +122,7 @@ pub async fn find_user_by_email(pool: &PgPool, email: &str) -> sqlx::Result<Opti
 
 pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<UserRow>> {
     sqlx::query_as::<_, UserRow>(
-        "SELECT id, email, password_hash, name, role, created_at FROM users WHERE id = $1",
+        "SELECT id, email, password_hash, name, role, is_active, last_login_at, created_at FROM users WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -134,7 +139,7 @@ pub async fn create_user(
         r#"
         INSERT INTO users (email, password_hash, name)
         VALUES ($1, $2, $3)
-        RETURNING id, email, password_hash, name, role, created_at
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, created_at
         "#,
     )
     .bind(email)
@@ -142,6 +147,124 @@ pub async fn create_user(
     .bind(name)
     .fetch_one(pool)
     .await
+}
+
+pub async fn create_user_with_role(
+    pool: &PgPool,
+    email: &str,
+    password_hash: &str,
+    name: &str,
+    role: &str,
+) -> sqlx::Result<UserRow> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        INSERT INTO users (email, password_hash, name, role)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, created_at
+        "#,
+    )
+    .bind(email)
+    .bind(password_hash)
+    .bind(name)
+    .bind(role)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_users(pool: &PgPool) -> sqlx::Result<Vec<UserRow>> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        SELECT u.id, u.email, u.password_hash, u.name, u.role, u.is_active,
+               u.last_login_at, u.created_at,
+               (SELECT COUNT(*) FROM projects p WHERE p.owner_id = u.id) AS project_count
+        FROM users u
+        ORDER BY u.created_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn update_user_admin(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+    role: &str,
+    is_active: bool,
+    password_hash: Option<&str>,
+) -> sqlx::Result<Option<UserRow>> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        UPDATE users SET
+            name = $2, role = $3, is_active = $4,
+            password_hash = COALESCE($5, password_hash),
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(role)
+    .bind(is_active)
+    .bind(password_hash)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn update_user_profile(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+) -> sqlx::Result<Option<UserRow>> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        UPDATE users SET name = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn update_user_password(
+    pool: &PgPool,
+    id: Uuid,
+    password_hash: &str,
+) -> sqlx::Result<bool> {
+    let r = sqlx::query("UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .bind(password_hash)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+pub async fn touch_last_login(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_user(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn count_active_admins(pool: &PgPool) -> sqlx::Result<i64> {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active")
+            .fetch_one(pool)
+            .await?;
+    Ok(n)
 }
 
 pub async fn list_domains(pool: &PgPool) -> sqlx::Result<Vec<DomainRow>> {
@@ -1313,6 +1436,19 @@ pub async fn list_projects_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Resul
     .await
 }
 
+pub async fn list_all_projects(pool: &PgPool) -> sqlx::Result<Vec<ProjectRow>> {
+    sqlx::query_as::<_, ProjectRow>(
+        r#"
+        SELECT p.id, p.name, p.owner_id, p.created_at,
+               (SELECT COUNT(*) FROM domains d WHERE d.project_id = p.id) AS domain_count
+        FROM projects p
+        ORDER BY p.created_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn create_project(pool: &PgPool, name: &str, owner_id: Uuid) -> sqlx::Result<ProjectRow> {
     let row = sqlx::query_as::<_, ProjectRow>(
         r#"
@@ -1352,6 +1488,14 @@ pub async fn delete_project(pool: &PgPool, id: Uuid, owner_id: Uuid) -> sqlx::Re
     let r = sqlx::query("DELETE FROM projects WHERE id = $1 AND owner_id = $2")
         .bind(id)
         .bind(owner_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn delete_project_any(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM projects WHERE id = $1")
+        .bind(id)
         .execute(pool)
         .await?;
     Ok(r.rows_affected())
@@ -1836,9 +1980,10 @@ pub async fn list_access_logs(
 
 /// Global role (`admin` | `user`) for a user; `None` when the user is gone.
 pub async fn get_user_role(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(pool)
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT role FROM users WHERE id = $1 AND is_active")
+            .bind(user_id)
+            .fetch_optional(pool)
         .await?;
     Ok(row.map(|r| r.0))
 }

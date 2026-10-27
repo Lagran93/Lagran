@@ -39,6 +39,14 @@
               </span>
             </div>
           </div>
+          <div class="flex gap-8 mt-16">
+            <button class="btn btn-default btn-sm" type="button" @click="openProfile">
+              编辑资料
+            </button>
+            <button class="btn btn-default btn-sm" type="button" @click="openPassword">
+              修改密码
+            </button>
+          </div>
           <p class="text-muted mt-16" style="font-size: 12px">
             账号由控制面数据库管理；如需新增用户，可调用 <code class="mono">POST /api/v1/auth/register</code>。
           </p>
@@ -118,6 +126,42 @@
         生产环境请修改默认管理员密码、JWT_SECRET 与 AGENT_TOKEN，并通过 HTTPS 暴露控制台；不要将 8080 端口直接开放到公网。
       </span>
     </div>
+
+    <BaseModal
+      v-model="profileOpen"
+      title="编辑个人资料"
+      confirm-text="保存"
+      :loading="saving"
+      @confirm="saveProfile"
+    >
+      <div class="form-col">
+        <div class="field">
+          <label class="field-label">显示名称</label>
+          <input v-model="profileName" class="input" />
+        </div>
+        <p v-if="profileError" class="text-danger" style="font-size: 13px">{{ profileError }}</p>
+      </div>
+    </BaseModal>
+
+    <BaseModal
+      v-model="passwordOpen"
+      title="修改密码"
+      confirm-text="修改"
+      :loading="saving"
+      @confirm="savePassword"
+    >
+      <div class="form-col">
+        <div class="field">
+          <label class="field-label">当前密码</label>
+          <input v-model="currentPassword" class="input" type="password" />
+        </div>
+        <div class="field">
+          <label class="field-label">新密码</label>
+          <input v-model="newPassword" class="input" type="password" placeholder="至少 8 位，含字母和数字" />
+        </div>
+        <p v-if="passwordError" class="text-danger" style="font-size: 13px">{{ passwordError }}</p>
+      </div>
+    </BaseModal>
   </div>
 </template>
 
@@ -131,6 +175,64 @@ const apiBase = config.public.apiBase as string
 
 const checking = ref(false)
 const healthStatus = ref<{ ok: boolean; at: string; message?: string } | null>(null)
+
+const profileOpen = ref(false)
+const profileName = ref('')
+const profileError = ref('')
+const passwordOpen = ref(false)
+const currentPassword = ref('')
+const newPassword = ref('')
+const passwordError = ref('')
+const saving = ref(false)
+
+function openProfile() {
+  profileName.value = auth.user?.name || ''
+  profileError.value = ''
+  profileOpen.value = true
+}
+
+function openPassword() {
+  currentPassword.value = ''
+  newPassword.value = ''
+  passwordError.value = ''
+  passwordOpen.value = true
+}
+
+async function saveProfile() {
+  profileError.value = ''
+  saving.value = true
+  try {
+    const user = await api.put<any>('/api/v1/auth/me', {
+      name: profileName.value.trim(),
+    })
+    auth.setSession(auth.token!, user)
+    profileOpen.value = false
+    toast.success('资料已更新')
+  } catch (e: any) {
+    profileError.value = e?.data?.error || '保存失败'
+  } finally {
+    saving.value = false
+  }
+}
+
+async function savePassword() {
+  passwordError.value = ''
+  saving.value = true
+  try {
+    await api.put('/api/v1/auth/me/password', {
+      current_password: currentPassword.value,
+      new_password: newPassword.value,
+    })
+    passwordOpen.value = false
+    currentPassword.value = ''
+    newPassword.value = ''
+    toast.success('密码已修改')
+  } catch (e: any) {
+    passwordError.value = e?.data?.error || '修改失败'
+  } finally {
+    saving.value = false
+  }
+}
 
 const initial = computed(() => (auth.user?.name || auth.user?.email || 'L').slice(0, 1).toUpperCase())
 

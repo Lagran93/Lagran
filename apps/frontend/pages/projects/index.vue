@@ -174,6 +174,22 @@
                 </td>
                 <td class="text-right">
                   <button
+                    v-if="m.role === 'member'"
+                    class="btn btn-text btn-sm"
+                    type="button"
+                    @click="setMemberRole(m, 'admin')"
+                  >
+                    设为管理员
+                  </button>
+                  <button
+                    v-else-if="m.role === 'admin'"
+                    class="btn btn-text btn-sm"
+                    type="button"
+                    @click="setMemberRole(m, 'member')"
+                  >
+                    设为只读
+                  </button>
+                  <button
                     v-if="m.role !== 'owner'"
                     class="btn btn-text btn-sm danger"
                     type="button"
@@ -357,6 +373,17 @@ async function addMember() {
     toast.error(e?.data?.error || '添加失败，请确认邮箱已注册且你有管理权限')
   } finally {
     adding.value = false
+  }
+}
+
+async function setMemberRole(m: any, role: 'member' | 'admin') {
+  if (!activeProject.value) return
+  try {
+    await api.put(`/api/v1/projects/${activeProject.value.id}/members/${m.user_id}`, { role })
+    toast.success(role === 'admin' ? '已设为项目管理员' : '已设为只读成员')
+    await loadMembers()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '修改角色失败')
   }
 }
 

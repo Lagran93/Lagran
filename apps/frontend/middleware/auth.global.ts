@@ -5,9 +5,9 @@ export default defineNuxtRouteMiddleware((to) => {
   const auth = useAuthStore()
   if (!auth.hydrated) auth.hydrate()
 
-  const publicPaths = ['/login']
+  const publicPaths = ['/login', '/register']
   if (publicPaths.includes(to.path)) {
-    if (auth.isAuthenticated && to.path === '/login') {
+    if (auth.isAuthenticated) {
       return navigateTo('/')
     }
     return
@@ -15,5 +15,9 @@ export default defineNuxtRouteMiddleware((to) => {
 
   if (!auth.isAuthenticated) {
     return navigateTo('/login')
+  }
+
+  if (to.path.startsWith('/users') && !auth.isAdmin) {
+    return navigateTo('/')
   }
 })

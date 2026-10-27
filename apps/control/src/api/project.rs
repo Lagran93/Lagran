@@ -45,6 +45,11 @@ pub struct AddMemberRequest {
     pub role: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct UpdateMemberRequest {
+    pub role: String,
+}
+
 fn to_dto(r: repository::ProjectRow) -> ProjectDto {
     ProjectDto {
         id: r.id.to_string(),
@@ -88,12 +93,15 @@ pub async fn list(
     State(state): State<AppState>,
     actor: Actor,
 ) -> Result<Json<Vec<ProjectDto>>, (StatusCode, Json<ErrorBody>)> {
-    let rows = repository::list_projects_for_user(&state.pool, actor.id)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "list projects");
-            db_error()
-        })?;
+    let rows = if actor.admin() {
+        repository::list_all_projects(&state.pool).await
+    } else {
+        repository::list_projects_for_user(&state.pool, actor.id).await
+    }
+    .map_err(|e| {
+        tracing::error!(error = %e, "list projects");
+        db_error()
+    })?;
     Ok(Json(rows.into_iter().map(to_dto).collect()))
 }
 
@@ -167,12 +175,15 @@ pub async fn delete(
             _ => return Err(forbidden()),
         }
     }
-    let n = repository::delete_project(&state.pool, pid, actor.id)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "delete project");
-            db_error()
-        })?;
+    let n = if actor.admin() {
+        repository::delete_project_any(&state.pool, pid).await
+    } else {
+        repository::delete_project(&state.pool, pid, actor.id).await
+    }
+    .map_err(|e| {
+        tracing::error!(error = %e, "delete project");
+        db_error()
+    })?;
     if n == 0 {
         return Err((
             StatusCode::NOT_FOUND,
@@ -262,6 +273,14 @@ pub async fn add_member(
                 }),
             )
         })?;
+    if !user.is_active {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "user is disabled".into(),
+            }),
+        ));
+    }
     // The owner's role is implicit and must not be overwritten.
     let current = repository::project_role(&state.pool, pid, user.id)
         .await
@@ -341,4 +360,80 @@ pub async fn remove_member(
     )
     .await;
     Ok(Json(serde_json::json!({ "success": true })))
+}
+
+pub async fn update_member(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path((id, user_id)): Path<(String, String)>,
+    Json(req): Json<UpdateMemberRequest>,
+) -> Result<Json<MemberDto>, (StatusCode, Json<ErrorBody>)> {
+    let pid = parse_uuid(&id)?;
+    let uid = parse_uuid(&user_id)?;
+    if !actor.can_write_project(&state, pid).await {
+        return Err(forbidden());
+    }
+    let role = req.role.trim().to_ascii_lowercase();
+    if role != "member" && role != "admin" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "role must be member or admin".into(),
+            }),
+        ));
+    }
+    if repository::project_role(&state.pool, pid, uid)
+        .await
+        .unwrap_or(None)
+        .as_deref()
+        == Some("owner")
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "cannot change the project owner".into(),
+            }),
+        ));
+    }
+    let user = repository::find_user_by_id(&state.pool, uid)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: "user not found".into(),
+                }),
+            )
+        })?;
+    if repository::project_role(&state.pool, pid, uid)
+        .await
+        .unwrap_or(None)
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "member not found".into(),
+            }),
+        ));
+    }
+    repository::upsert_project_member(&state.pool, pid, uid, &role)
+        .await
+        .map_err(|_| db_error())?;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "project.member.update",
+        &pid.to_string(),
+        &format!("{}={role}", user.email),
+    )
+    .await;
+    Ok(Json(MemberDto {
+        user_id: user.id.to_string(),
+        email: user.email,
+        name: user.name,
+        role,
+        joined_at: chrono::Utc::now().to_rfc3339(),
+    }))
 }

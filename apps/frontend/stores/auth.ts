@@ -5,6 +5,9 @@ export interface AuthUser {
   email: string
   name: string
   role?: 'admin' | 'user' | string
+  is_active?: boolean
+  created_at?: string
+  last_login_at?: string | null
 }
 
 const TOKEN_KEY = 'lagran_token'

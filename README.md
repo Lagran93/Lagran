@@ -14,8 +14,9 @@
 
 ### 控制端 (`apps/control`)
 - 健康检查 `GET /health` / `GET /ready`
-- 注册 / 登录（bcrypt + JWT）、`GET /api/v1/auth/me`（含角色）
-- 项目与成员（多租户）：`/api/v1/projects`、`/projects/{id}/members`
+- 注册 / 登录（bcrypt + JWT）、`GET /api/v1/auth/me`、个人资料与改密（`PUT /auth/me`、`PUT /auth/me/password`）
+- 用户管理（admin）：`/api/v1/users` 创建、角色调整、启用/禁用、重置密码、删除；禁止自降权/自禁用并保护最后一个管理员
+- 项目与成员（多租户）：`/api/v1/projects`、`/projects/{id}/members`，支持成员角色调整
 - 域名接入与管理：源站/备源、SSL、限流、CORS、防盗链、回源超时、自定义头
 - 缓存规则：路径通配 / **正则匹配（按 .css/.js 等后缀）**、**请求方法 / 查询串 / 响应 Content-Type 条件**、TTL、优先级、SWR、
   **动作（cache/bypass/no_store）**、**浏览器 TTL 覆盖**、**按规则忽略 Query / Cookie**、启用/停用与**规则测试器**
@@ -97,6 +98,7 @@ curl -i http://127.0.0.1:8081/            # 第二次 HIT（源站可达时）
 cargo test --workspace          # 单元/契约测试（含 TTL 优先级矩阵）
 cargo clippy --workspace --all-targets
 bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（需 Postgres）
+bash tests/integration/users.sh # 端到端：注册、用户管理、禁用、改密、项目成员角色
 bash tests/integration/backup-origin.sh # 端到端：备用源站创建/读取/修改/清空与配置下发
 bash tests/integration/failover-https.sh # 端到端：主源站宕机切换备用 + HTTPS 跳转开关
 bash tests/integration/origin-health.sh # 端到端：健康探测标记 down/恢复后主备选择
@@ -162,7 +164,10 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 ## 角色与多租户
 
 - `users.role`: `admin` | `user`；`demo@lagran.dev` 为 `admin`
-- 项目成员：`owner` / `admin`（读写）、`member`（只读）
+- `users.is_active=false` 的账号不能登录，已有 JWT 也会被 `Actor`/`/auth/me` 拒绝
+- `ALLOW_REGISTER=true` 时开放 `/register`；新用户默认 `user` 并自动创建个人 `Default` 项目
+- admin 可管理全部用户；不能禁用/降权/删除自己，且不能移除最后一个启用中的 admin
+- 项目成员：`owner` / `admin`（读写）、`member`（只读）；owner 不可被改角色或移除
 - 非 admin 只能看到自己项目内的域名、规则、证书、统计、访问日志、源站健康
 - 非 admin 新建域名且未指定项目时，自动归入其个人 `Default` 项目
 - 节点列表与审计日志仅 admin 可见

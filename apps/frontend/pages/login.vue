@@ -51,7 +51,7 @@
     <section class="login-panel">
       <div class="login-card">
         <h2>登录控制台</h2>
-        <p class="login-sub">使用管理员账号登录，管理域名与边缘节点</p>
+        <p class="login-sub">使用账号登录，管理域名、缓存与边缘节点</p>
 
         <form class="login-form" @submit.prevent="onSubmit">
           <div class="field">
@@ -114,6 +114,9 @@
           <button class="link-btn" type="button" @click="fillDemo">一键填入</button>
         </div>
 
+        <p v-if="allowRegister" class="register-link">
+          还没有账号？<NuxtLink to="/register">注册新用户</NuxtLink>
+        </p>
         <p class="login-foot">登录即表示同意内部安全规范，请勿在公网环境使用默认密码。</p>
       </div>
     </section>
@@ -132,6 +135,7 @@ const email = ref(import.meta.dev ? 'demo@lagran.dev' : '')
 const password = ref(import.meta.dev ? 'demo123' : '')
 const remember = ref(true)
 const showPassword = ref(false)
+const allowRegister = ref(false)
 const loading = ref(false)
 const error = ref('')
 
@@ -175,7 +179,7 @@ async function onSubmit() {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   auth.hydrate()
   if (auth.isAuthenticated) {
     navigateTo('/')
@@ -184,6 +188,14 @@ onMounted(() => {
   if (import.meta.client) {
     const saved = localStorage.getItem(REMEMBER_KEY)
     if (saved) email.value = saved
+  }
+  try {
+    const cfg = await $fetch<{ allow_register: boolean }>(
+      `${apiBase}/api/v1/auth/config`,
+    )
+    allowRegister.value = !!cfg.allow_register
+  } catch {
+    allowRegister.value = false
   }
 })
 </script>
@@ -438,6 +450,19 @@ onMounted(() => {
   color: var(--text-4);
   line-height: 1.7;
   text-align: center;
+}
+
+.register-link {
+  margin-top: 14px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-3);
+}
+
+.register-link a {
+  color: var(--brand);
+  font-weight: 600;
+  margin-left: 4px;
 }
 
 @media (max-width: 900px) {

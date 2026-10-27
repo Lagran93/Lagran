@@ -18,6 +18,7 @@ pub mod project;
 pub mod purge;
 pub mod rule;
 pub mod stats;
+pub mod user;
 pub mod waf;
 
 use crate::state::AppState;
@@ -48,7 +49,15 @@ pub fn create_router(state: AppState) -> Router {
             Router::new()
                 .route("/auth/login", post(auth::login))
                 .route("/auth/register", post(auth::register))
-                .route("/auth/me", get(auth::me))
+                .route("/auth/config", get(auth::public_config))
+                .route("/auth/me", get(auth::me).put(auth::update_me))
+                .route("/auth/me/password", put(auth::change_password))
+                .route("/users", get(user::list).post(user::create))
+                .route(
+                    "/users/:id",
+                    get(user::get).put(user::update).delete(user::delete),
+                )
+                .route("/users/:id/password", put(user::reset_password))
                 .route("/projects", get(project::list).post(project::create))
                 .route("/projects/:id", get(project::get).delete(project::delete))
                 .route("/projects/:id/domains", get(project::list_domains))
@@ -58,7 +67,7 @@ pub fn create_router(state: AppState) -> Router {
                 )
                 .route(
                     "/projects/:id/members/:user_id",
-                    delete(project::remove_member),
+                    put(project::update_member).delete(project::remove_member),
                 )
                 .route("/domains", get(domain::list).post(domain::create))
                 .route("/origin-health", get(health_origin::list))
