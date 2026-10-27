@@ -42,7 +42,10 @@
 - 多域名反向代理（按 Host/SNI 路由）+ 主备源站
 - 缓存：`memory`（DashMap + LRU）/ `disk`（文件缓存，按 mtime 淘汰）/ `hybrid`
 - 缓存语义：规则 TTL → `Cache-Control`(`s-maxage`/`max-age`) → `Expires` → 默认 TTL；
-  `no-store`/`private`/`no-cache`/复杂 `Vary` 不写入；`Vary: Accept-Language` 的 key 含语言哈希；
+  `no-store`/`private`/无规则 TTL 的 `no-cache`/复杂 `Vary` 不写入；显式规则 TTL 可覆盖源站 `no-cache`；
+  `ignore_cookie` 同时放行 `Vary: Cookie`；`lagran_clearance` 是 Edge 内部 Cookie，
+  不参与缓存绕过，也不会转发给可缓存请求的源站；HTML 文档永不写入共享缓存并强制 `no-cache`
+  （避免旧 HTML 引用已删除的 hash chunk）；`Vary: Accept-Language` 的 key 含语言哈希；
   ETag 基于响应 body；SWR + single-flight 合并回源
 - 条件请求（304）、`Age`、`X-Cache` / `X-Cache-Status`、每域名限流、防盗链
 - WAF：托管特征匹配 + 自定义规则 + IP 白/黑名单，支持观察模式；命中后返回 403 拦截页并上报事件
@@ -99,6 +102,7 @@ bash tests/integration/backup-origin.sh # 端到端：备用源站创建/读取/
 bash tests/integration/failover-https.sh # 端到端：主源站宕机切换备用 + HTTPS 跳转开关
 bash tests/integration/origin-health.sh # 端到端：健康探测标记 down/恢复后主备选择
 bash tests/integration/ws-echo.sh # 端到端：WebSocket 101 + text/binary/ping/close 帧回显（需 perl）
+bash tests/integration/http-optimizations.sh # config/cert ETag/304、metrics 批量、access/WAF gzip
 bash tests/integration/schedule.sh # 端到端：节点 Geo/ISP 元数据、调度打分、admin 测试与 PowerDNS 示例
 bash tests/integration/dns.sh # 端到端：自研权威 DNS 的 ECS 调度、SOA/NS、TCP、缓存降级
 bash tests/integration/nodes.sh # 端到端：节点预注册→安装命令→单节点令牌→上下线→删除

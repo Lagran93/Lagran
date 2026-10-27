@@ -883,6 +883,32 @@ pub async fn insert_metrics(
     Ok(())
 }
 
+/// Insert a batch of per-domain metric samples in one transaction.
+pub async fn insert_metrics_batch(
+    pool: &PgPool,
+    rows: &[(String, String, i64, i64, i64, i64)],
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    for (node, domain, requests, hits, misses, bytes) in rows {
+        sqlx::query(
+            r#"
+            INSERT INTO edge_metrics (node_name, domain, requests, cache_hits, cache_misses, bytes_sent)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(node)
+        .bind(domain)
+        .bind(requests)
+        .bind(hits)
+        .bind(misses)
+        .bind(bytes)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn sum_metrics(pool: &PgPool) -> sqlx::Result<(i64, i64, i64, i64)> {
     #[derive(sqlx::FromRow)]
     struct S {

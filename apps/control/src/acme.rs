@@ -4,12 +4,13 @@
 //! account registration, newOrder, http-01, finalize and certificate download.
 
 use crate::repository;
+use crate::service::agent_http;
 use crate::state::AppState;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::header::{self, HeaderMap};
+use hyper::header::HeaderMap;
 use hyper::Request;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -63,7 +64,6 @@ struct Challenge {
 }
 
 type AcmeHttp = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
-type EdgeHttp = Client<HttpConnector, Full<Bytes>>;
 
 struct HttpReply {
     status: u16,
@@ -82,15 +82,6 @@ fn acme_http() -> &'static AcmeHttp {
             .enable_http1()
             .build();
         Client::builder(TokioExecutor::new()).build(https)
-    })
-}
-
-fn edge_http() -> &'static EdgeHttp {
-    static C: OnceLock<EdgeHttp> = OnceLock::new();
-    C.get_or_init(|| {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        Client::builder(TokioExecutor::new()).build(connector)
     })
 }
 
@@ -373,35 +364,18 @@ async fn publish_challenge(
             "{}/__lagran/acme/challenge",
             node.agent_url.trim_end_matches('/')
         );
-        let body = serde_json::to_vec(&json!({
+        let body = json!({
             "token": token,
             "key_authorization": key_auth,
-        }))
-        .map_err(|e| e.to_string())?;
+        });
         let token_header = if node.auth_token.is_empty() {
-            state.config.agent_token.clone()
+            &state.config.agent_token
         } else {
-            node.auth_token.clone()
+            &node.auth_token
         };
-        let req = Request::builder()
-            .method("PUT")
-            .uri(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-lagran-agent-token", token_header.as_str())
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|e| format!("build challenge push: {e}"))?;
-        match tokio::time::timeout(Duration::from_secs(5), edge_http().request(req)).await {
-            Ok(Ok(resp)) if resp.status().is_success() => {
-                let _ = resp.into_body().collect().await;
-                ok += 1;
-            }
-            Ok(Ok(resp)) => {
-                tracing::warn!(node = %node.name, status = %resp.status(), "ACME challenge push failed");
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(node = %node.name, error = %e, "ACME challenge push error")
-            }
-            Err(_) => tracing::warn!(node = %node.name, "ACME challenge push timed out"),
+        match agent_http::put_json_ok(&url, &body, token_header).await {
+            Ok(()) => ok += 1,
+            Err(e) => tracing::warn!(node = %node.name, error = %e, "ACME challenge push failed"),
         }
     }
     if ok == 0 {
@@ -618,41 +592,19 @@ pub async fn push_certificate_to_edges(
             "{}/__lagran/certs/load",
             node.agent_url.trim_end_matches('/')
         );
-        let body = serde_json::to_vec(&json!({
+        let body = json!({
             "names": [domain],
             "cert_pem": cert_pem,
             "key_pem": key_pem,
-        }))
-        .unwrap_or_default();
+        });
         let token = if node.auth_token.is_empty() {
-            state.config.agent_token.clone()
+            &state.config.agent_token
         } else {
-            node.auth_token.clone()
+            &node.auth_token
         };
-        let req = Request::builder()
-            .method("POST")
-            .uri(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-lagran-agent-token", token.as_str())
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|e| format!("build cert push: {e}"));
-        match req {
-            Ok(req) => {
-                match tokio::time::timeout(Duration::from_secs(5), edge_http().request(req)).await {
-                    Ok(Ok(resp)) if resp.status().is_success() => {
-                        let _ = resp.into_body().collect().await;
-                        pushed += 1;
-                    }
-                    Ok(Ok(resp)) => {
-                        tracing::warn!(node = %node.name, status = %resp.status(), "cert push failed")
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(node = %node.name, error = %e, "cert push error")
-                    }
-                    Err(_) => tracing::warn!(node = %node.name, "cert push timed out"),
-                }
-            }
-            Err(e) => tracing::warn!(node = %node.name, error = %e, "cert push request error"),
+        match agent_http::post_json_ok(&url, &body, token).await {
+            Ok(()) => pushed += 1,
+            Err(e) => tracing::warn!(node = %node.name, error = %e, "cert push failed"),
         }
     }
     pushed

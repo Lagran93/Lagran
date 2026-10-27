@@ -84,6 +84,7 @@ mk_rule() { api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules" -d "$1"; }
 
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/method/*\",\"action\":\"bypass\",\"match_methods\":\"GET\",\"priority\":10,\"note\":\"GET bypass\"}" >/dev/null
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"match_type\":\"regex\",\"path_pattern\":\"\\\\.(css|js)$\",\"action\":\"cache\",\"ttl_seconds\":600,\"browser_ttl_seconds\":600,\"ignore_cookie\":true,\"priority\":20,\"note\":\"regex suffix\"}" >/dev/null
+mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/html\",\"action\":\"cache\",\"ttl_seconds\":600,\"priority\":10,\"note\":\"html never stored\"}" >/dev/null
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/q/*\",\"action\":\"bypass\",\"match_query\":\"debug=1\",\"priority\":10}" >/dev/null
 RULE_OFF=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/off/*\",\"action\":\"bypass\",\"enabled\":false,\"priority\":10}" | jq -r '.id')
 RULE_BROWSER=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/browser/*\",\"action\":\"cache\",\"ttl_seconds\":60,\"browser_ttl_seconds\":3600,\"priority\":10}" | jq -r '.id')
@@ -142,10 +143,23 @@ check "ignore_cookie rule caches browser cookie request" "$(hdr x-cache)" "HIT"
 CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0' -H "If-None-Match: $CSS_ETAG")
 check "Chrome reload revalidates from edge cache" "$CODE" "304"
 check "Chrome reload is not BYPASS" "$(hdr x-cache)" "REVALIDATED"
+CODE=$(get "/assets/app.css" -H 'Cookie: lagran_clearance=test' \
+  -H 'Cache-Control: no-cache' -H "If-None-Match: $CSS_ETAG")
+check "no-cache + cookie still revalidates cache" "$CODE" "304"
+check "no-cache + cookie is not BYPASS" "$(hdr x-cache)" "REVALIDATED"
 get "/assets/app.js" >/dev/null
 check "js regex rule miss" "$(hdr x-cache)" "MISS"
 get "/assets/app.js" >/dev/null
 check "js regex rule hit" "$(hdr x-cache)" "HIT"
+get "/assets/vary.js" -H 'Cookie: sid=1' >/dev/null
+check "vary:cookie static first miss" "$(hdr x-cache)" "MISS"
+get "/assets/vary.js" -H 'Cookie: sid=1' >/dev/null
+check "vary:cookie static hit with ignore_cookie" "$(hdr x-cache)" "HIT"
+get "/html" >/dev/null
+check "html first request misses" "$(hdr x-cache)" "MISS"
+get "/html" >/dev/null
+check "html is never stored" "$(hdr x-cache)" "MISS"
+contains "html browser cache is no-cache" "$(hdr cache-control)" "no-cache"
 get "/assets/app.html" >/dev/null
 if [[ "$(hdr cache-control)" == *"max-age=600"* ]]; then
   fail "html should not match css/js regex"
@@ -165,6 +179,10 @@ check "disabled rule ignored (hit)" "$(hdr x-cache)" "HIT"
 echo "== browser TTL =="
 get "/browser/x" >/dev/null
 contains "browser TTL overrides Cache-Control" "$(hdr cache-control)" "max-age=3600"
+get "/browser/clearance" -H 'Cookie: lagran_clearance=1793089070.908f' >/dev/null
+check "clearance cookie alone does not bypass" "$(hdr x-cache)" "MISS"
+get "/browser/clearance" -H 'Cookie: lagran_clearance=1793089070.908f' >/dev/null
+check "clearance cookie alone is cacheable" "$(hdr x-cache)" "HIT"
 
 echo "== per-rule ignore query =="
 get "/iq/x?a=1" >/dev/null

@@ -17,7 +17,7 @@ pub fn spawn_waf_report(control: ControlClient, log: WafLog, interval_secs: u64)
             }
             let n = events.len();
             let body = json!({ "events": events });
-            if let Err(e) = control.post_json("/api/v1/waf/events", &body).await {
+            if let Err(e) = control.post_gzip_json("/api/v1/waf/events", &body).await {
                 tracing::warn!(error = %e, n, "WAF event report failed; re-queueing");
                 // events were moved into Value — recover from body
                 if let Some(arr) = body.get("events").cloned() {

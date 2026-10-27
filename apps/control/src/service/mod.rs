@@ -1,5 +1,6 @@
 //! services
 
+pub mod agent_http;
 pub mod auth_service;
 pub mod cert_service;
 pub mod config_service;

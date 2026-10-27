@@ -6,10 +6,13 @@ use crate::repository;
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use uuid::Uuid;
 
 #[derive(Serialize)]
@@ -263,9 +266,10 @@ pub struct EdgeCertResponse {
 
 pub async fn edge_get(
     State(state): State<AppState>,
+    headers: HeaderMap,
     _agent: AgentAuth,
     Path(domain): Path<String>,
-) -> Result<Json<EdgeCertResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     let row = repository::get_cert_by_domain(&state.pool, &domain)
         .await
         .map_err(|_| db_error())?
@@ -277,12 +281,19 @@ pub async fn edge_get(
                 }),
             )
         })?;
-    Ok(Json(EdgeCertResponse {
+    let etag = cert_etag(&row.domain_name, &row.cert_pem, &row.key_pem, &row.status);
+    if if_none_match(&headers, &etag) {
+        return Ok(not_modified(&etag));
+    }
+    let mut response = Json(EdgeCertResponse {
         domain: row.domain_name,
         cert_pem: row.cert_pem,
         key_pem: row.key_pem,
         status: row.status,
-    }))
+    })
+    .into_response();
+    add_etag(&mut response, &etag);
+    Ok(response)
 }
 
 #[derive(Serialize)]
@@ -296,8 +307,9 @@ pub struct EdgeCertBundle {
 /// Edge: list all active certs with PEM (agent token required).
 pub async fn edge_list_active(
     State(state): State<AppState>,
+    headers: HeaderMap,
     _agent: AgentAuth,
-) -> Result<Json<Vec<EdgeCertBundle>>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     let rows = repository::list_certs(&state.pool).await.map_err(|e| {
         tracing::error!(error = %e, "list certs for edge");
         db_error()
@@ -312,5 +324,55 @@ pub async fn edge_list_active(
             status: r.status,
         })
         .collect();
-    Ok(Json(out))
+    let mut h = DefaultHasher::new();
+    for cert in &out {
+        cert.domain.hash(&mut h);
+        cert.cert_pem.hash(&mut h);
+        cert.key_pem.hash(&mut h);
+        cert.status.hash(&mut h);
+    }
+    let etag = format!("\"{:x}\"", h.finish());
+    if if_none_match(&headers, &etag) {
+        return Ok(not_modified(&etag));
+    }
+    let mut response = Json(out).into_response();
+    add_etag(&mut response, &etag);
+    Ok(response)
+}
+
+fn cert_etag(domain: &str, cert: &str, key: &str, status: &str) -> String {
+    let mut h = DefaultHasher::new();
+    domain.hash(&mut h);
+    cert.hash(&mut h);
+    key.hash(&mut h);
+    status.hash(&mut h);
+    format!("\"{:x}\"", h.finish())
+}
+
+fn add_etag(response: &mut Response, etag: &str) {
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+}
+
+fn not_modified(etag: &str) -> Response {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    add_etag(&mut response, etag);
+    response
+}
+
+fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|part| {
+                let part = part.trim();
+                part == etag || part.strip_prefix("W/") == Some(etag)
+            })
+        })
 }

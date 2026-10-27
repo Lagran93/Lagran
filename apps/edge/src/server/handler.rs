@@ -909,6 +909,33 @@ pub(crate) fn policy_browser_ttl(policy: &ResolvedPolicy) -> Option<u64> {
 }
 
 pub(crate) fn apply_browser_ttl(headers: &mut HeaderMap, ttl: Option<u64>) {
+    // HTML shells embed deployment-specific hashed chunk names. Never let a
+    // browser or intermediary cache them long-term.
+    let is_html = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            v.starts_with("text/html") || v.starts_with("application/xhtml+xml")
+        })
+        .unwrap_or(false);
+    if is_html {
+        let keep_no_store = headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v.contains("no-store") || v.contains("private")
+            })
+            .unwrap_or(false);
+        if !keep_no_store {
+            headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache"),
+            );
+        }
+        return;
+    }
     let Some(ttl) = ttl.filter(|t| *t > 0) else {
         return;
     };

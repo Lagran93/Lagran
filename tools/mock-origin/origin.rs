@@ -223,6 +223,25 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16) -> std::io::Result
             // No cache headers at all: the domain default (CACHE_TTL) applies.
             "/ttl/default" => (200, b"ttl default".to_vec(), vec![]),
             "/big" => (200, vec![b'x'; 512 * 1024], vec![]),
+            "/html" => (
+                200,
+                b"<!doctype html><html><body>deploy shell</body></html>".to_vec(),
+                vec![
+                    ("Content-Type", "text/html; charset=utf-8".into()),
+                    ("Cache-Control", "public, max-age=3600".into()),
+                ],
+            ),
+            // Realistic static asset: origin asks revalidation and varies on
+            // Cookie. An ignore_cookie cache rule must be able to override both.
+            "/assets/vary.js" => (
+                200,
+                b"console.log('vary');".to_vec(),
+                vec![
+                    ("Content-Type", "application/javascript".into()),
+                    ("Cache-Control", "no-cache".into()),
+                    ("Vary", "Cookie".into()),
+                ],
+            ),
             _ => (
                 200,
                 b"hello from origin".to_vec(),

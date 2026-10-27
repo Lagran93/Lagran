@@ -370,36 +370,50 @@ pub fn spawn_config_sync(
     tokio::spawn(async move {
         tracing::info!(url = %control.endpoint("/api/v1/config"), "domain registry sync started");
         let mut last_version = String::new();
+        let mut last_etag: Option<String> = None;
 
         loop {
-            match control.get_json::<AllConfig>("/api/v1/config").await {
-                Ok(cfg) => {
-                    if cfg.version != last_version {
-                        let entries: Vec<DomainEntry> =
-                            cfg.domains.into_iter().map(DomainCfg::into_entry).collect();
-                        let n = entries.len();
-                        registry
-                            .replace_all(entries.clone(), cfg.version.clone())
-                            .await;
-                        // Global rule set is only a legacy single-domain fallback,
-                        // so keep the union but never use it for onboarded hosts.
-                        rules
-                            .replace(
-                                entries
-                                    .iter()
-                                    .flat_map(|e| e.rules.iter().cloned())
-                                    .collect(),
-                            )
-                            .await;
+            match control
+                .get_json_conditional::<AllConfig>("/api/v1/config", last_etag.as_deref())
+                .await
+            {
+                Ok(conditional) => {
+                    if let Some(etag) = conditional.etag {
+                        last_etag = Some(etag);
+                    }
+                    if let Some(cfg) = conditional.value {
+                        if cfg.version != last_version {
+                            let entries: Vec<DomainEntry> =
+                                cfg.domains.into_iter().map(DomainCfg::into_entry).collect();
+                            let n = entries.len();
+                            registry
+                                .replace_all(entries.clone(), cfg.version.clone())
+                                .await;
+                            // Global rule set is only a legacy single-domain fallback,
+                            // so keep the union but never use it for onboarded hosts.
+                            rules
+                                .replace(
+                                    entries
+                                        .iter()
+                                        .flat_map(|e| e.rules.iter().cloned())
+                                        .collect(),
+                                )
+                                .await;
 
-                        if !config.domain.is_empty() {
-                            if let Some(d) = registry.get(&config.domain).await {
-                                origin.set_base_url(d.origin_url.clone()).await;
+                            if !config.domain.is_empty() {
+                                if let Some(d) = registry.get(&config.domain).await {
+                                    origin.set_base_url(d.origin_url.clone()).await;
+                                }
+                            }
+
+                            tracing::info!(domains = n, version = %cfg.version, "domain registry updated");
+                            last_version = cfg.version;
+                            if last_etag.is_none() {
+                                last_etag = Some(format!("\"{}\"", last_version));
                             }
                         }
-
-                        tracing::info!(domains = n, version = %cfg.version, "domain registry updated");
-                        last_version = cfg.version;
+                    } else {
+                        tracing::debug!("domain config not modified (304)");
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, "config sync failed"),

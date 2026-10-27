@@ -23,7 +23,10 @@ pub fn spawn_access_report(config: EdgeConfig, control: ControlClient, access_lo
             }
             let n = batch.len();
             let body = json!({ "entries": batch });
-            if let Err(e) = control.post_json("/api/v1/access-logs/report", &body).await {
+            if let Err(e) = control
+                .post_gzip_json("/api/v1/access-logs/report", &body)
+                .await
+            {
                 tracing::warn!(error = %e, n, "access log report failed; re-queueing");
                 if let Some(arr) = body.get("entries").cloned() {
                     if let Ok(restored) = serde_json::from_value(arr) {

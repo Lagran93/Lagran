@@ -2,16 +2,10 @@
 
 use crate::middleware::authz::Actor;
 use crate::repository;
+use crate::service::agent_http;
 use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, Json};
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::Request;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
 
 #[derive(Deserialize, Clone)]
 pub struct PurgeRequest {
@@ -45,7 +39,7 @@ pub struct ErrorBody {
     pub error: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct EdgePurgeBody {
     domain: String,
     urls: Vec<String>,
@@ -58,15 +52,6 @@ struct EdgePurgeReply {
     success: bool,
     purged_count: u64,
     message: String,
-}
-
-fn http_client() -> &'static Client<HttpConnector, Full<Bytes>> {
-    static CLIENT: OnceLock<Client<HttpConnector, Full<Bytes>>> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        Client::builder(TokioExecutor::new()).build(connector)
-    })
 }
 
 pub async fn purge(
@@ -120,8 +105,6 @@ pub async fn purge(
         prefixes: req.prefixes.clone().unwrap_or_default(),
         purge_all: req.purge_all.unwrap_or(false),
     };
-    let body_bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
-    let client = http_client();
 
     let mut results = Vec::new();
     let mut total = 0u64;
@@ -134,7 +117,7 @@ pub async fn purge(
         } else {
             node.auth_token.clone()
         };
-        let result = dispatch_one(client, &url, body_bytes.clone(), &token).await;
+        let result = dispatch_one(&url, &body, &token).await;
         match result {
             Ok(reply) => {
                 total += reply.purged_count;
@@ -194,35 +177,9 @@ fn forbidden() -> (StatusCode, Json<ErrorBody>) {
 }
 
 async fn dispatch_one(
-    client: &Client<HttpConnector, Full<Bytes>>,
     url: &str,
-    body: Bytes,
+    body: &EdgePurgeBody,
     token: &str,
 ) -> Result<EdgePurgeReply, String> {
-    let req = Request::builder()
-        .method("POST")
-        .uri(url)
-        .header("content-type", "application/json")
-        .header("x-lagran-agent-token", token)
-        .body(Full::new(body))
-        .map_err(|e| e.to_string())?;
-
-    let resp = client.request(req).await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let bytes = resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| e.to_string())?
-        .to_bytes();
-
-    if !status.is_success() {
-        return Err(format!(
-            "HTTP {}: {}",
-            status,
-            String::from_utf8_lossy(&bytes)
-        ));
-    }
-
-    serde_json::from_slice(&bytes).map_err(|e| format!("invalid edge response: {e}"))
+    agent_http::request_json("POST", url, body, token).await
 }

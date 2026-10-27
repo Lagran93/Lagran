@@ -6,8 +6,10 @@
 //!   3. `Expires` - `Date` (or now, when `Date` is absent)
 //!   4. the domain/default TTL
 //!
-//! `no-store`, `private`, `no-cache`, `max-age=0` and non-trivial `Vary`
-//! always prevent storing, regardless of rules.
+//! `no-store`, `private`, `no-cache` without an explicit rule TTL, `max-age=0`
+//! without a rule, and non-trivial `Vary` prevent storing. A cache rule with an
+//! explicit TTL may override the origin's `no-cache`; `ignore_cookie` also allows
+//! `Vary: Cookie` for deliberately shared static assets.
 
 use axum::http::{header, HeaderMap, Method, Request};
 use lagran_cache::CacheEntry;
@@ -365,9 +367,11 @@ pub fn status_is_cacheable(status: u16) -> bool {
     matches!(status, 200 | 203 | 204 | 300 | 301 | 308)
 }
 
-/// `Vary` is only safe for us when it solely names `accept-encoding`
-/// (we force identity encoding towards the origin).
-fn vary_allows_storage(vary: Option<&str>) -> bool {
+/// `Vary` is only safe for us when it names fields the cache can safely ignore
+/// or explicitly normalise. `Accept-Encoding` is forced to identity upstream;
+/// `Accept-Language` is part of the cache key; `Cookie` is allowed only when the
+/// matching rule explicitly opts into `ignore_cookie`.
+fn vary_allows_storage(vary: Option<&str>, ignore_cookie: bool) -> bool {
     match vary {
         None => true,
         Some(v) => {
@@ -379,6 +383,7 @@ fn vary_allows_storage(vary: Option<&str>) -> bool {
             fields.iter().all(|f| {
                 f.eq_ignore_ascii_case("accept-encoding")
                     || f.eq_ignore_ascii_case("accept-language")
+                    || (ignore_cookie && f.eq_ignore_ascii_case("cookie"))
             })
         }
     }
@@ -397,6 +402,19 @@ fn expires_ttl(headers: &[(String, String)]) -> Option<u64> {
     )
 }
 
+/// HTML documents reference hashed JS/CSS chunks. Caching them is unsafe across
+/// deployments: an old HTML shell keeps importing chunks that no longer exist,
+/// which Nuxt surfaces as "500 importing a module script failed". HTML must be
+/// revalidated (and is therefore never stored in the shared cache).
+fn response_is_html(headers: &[(String, String)]) -> bool {
+    header_value(headers, "content-type")
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            v.starts_with("text/html") || v.starts_with("application/xhtml+xml")
+        })
+        .unwrap_or(false)
+}
+
 /// Decide the TTL for a response, or `None` when it must not be stored.
 pub fn decide_storage(
     status: u16,
@@ -407,14 +425,23 @@ pub fn decide_storage(
     if !status_is_cacheable(status) {
         return None;
     }
-    if !vary_allows_storage(header_value(headers, "vary")) {
+    if response_is_html(headers) {
+        return None;
+    }
+    if !vary_allows_storage(header_value(headers, "vary"), policy.ignore_cookie) {
         return None;
     }
 
     let cc = header_value(headers, "cache-control")
         .map(parse_cache_control)
         .unwrap_or_default();
-    if cc.no_store || cc.private || cc.no_cache {
+    if cc.no_store || cc.private {
+        return None;
+    }
+    // `no-cache` means "revalidate", not "never store". An explicit rule TTL is
+    // an operator override (for example CSS/JS 7 days), so let it win; without
+    // a rule TTL keep the conservative origin behaviour.
+    if cc.no_cache && policy.ttl_override.is_none() {
         return None;
     }
 
@@ -445,12 +472,26 @@ pub fn request_method_cacheable(method: &Method) -> bool {
     method == Method::GET || method == Method::HEAD
 }
 
+/// The WAF clearance cookie is edge-internal and is never forwarded upstream
+/// for cacheable requests. It must not make an otherwise public asset
+/// non-cacheable.
+pub fn has_non_clearance_cookie(headers: &HeaderMap) -> bool {
+    let Some(raw) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    raw.split(';').any(|part| {
+        let name = part.trim().split_once('=').map(|(k, _)| k.trim()).unwrap_or("");
+        !name.is_empty() && !name.eq_ignore_ascii_case("lagran_clearance")
+    })
+}
+
 /// Requests whose responses must never be served from / stored in the shared
 /// cache: authenticated or personalised traffic, conditional-range probes, and
-/// explicit `no-cache`/`no-store` from the client.
+/// explicit `no-store` from the client. `no-cache`/`max-age=0` remain
+/// cache-eligible so they can revalidate an existing entry.
 pub fn request_bypasses_cache<B>(req: &Request<B>, ignore_cookie: bool) -> bool {
     if req.headers().contains_key(header::AUTHORIZATION)
-        || (!ignore_cookie && req.headers().contains_key(header::COOKIE))
+        || (!ignore_cookie && has_non_clearance_cookie(req.headers()))
         || req.headers().contains_key(header::RANGE)
     {
         return true;
@@ -460,19 +501,7 @@ pub fn request_bypasses_cache<B>(req: &Request<B>, ignore_cookie: bool) -> bool 
         .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
     {
-        let cc = cc.to_ascii_lowercase();
-        // `max-age=0` is sent by Chrome on reload; allow the cached entry to
-        // answer with a 304/revalidated response instead of bypassing to origin.
-        if cc.contains("no-store") || cc.contains("no-cache") {
-            return true;
-        }
-    }
-    if let Some(p) = req
-        .headers()
-        .get(header::PRAGMA)
-        .and_then(|v| v.to_str().ok())
-    {
-        if p.eq_ignore_ascii_case("no-cache") {
+        if cc.to_ascii_lowercase().contains("no-store") {
             return true;
         }
     }
@@ -862,10 +891,80 @@ mod tests {
     }
 
     #[test]
+    fn explicit_rule_ttl_overrides_origin_no_cache() {
+        let mut policy = ResolvedPolicy::default();
+        policy.ttl_override = Some(604_800);
+        assert!(
+            decide_storage(
+                200,
+                &hdrs(&[("cache-control", "no-cache")]),
+                policy,
+                60
+            )
+            .is_some(),
+            "CSS/JS rule TTL must override origin no-cache"
+        );
+        assert!(
+            decide_storage(
+                200,
+                &hdrs(&[("cache-control", "no-store")]),
+                policy,
+                60
+            )
+            .is_none()
+        );
+        assert!(
+            decide_storage(
+                200,
+                &hdrs(&[("cache-control", "private")]),
+                policy,
+                60
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn html_documents_are_never_stored() {
+        let mut policy = ResolvedPolicy::default();
+        policy.ttl_override = Some(3600);
+        for ct in ["text/html", "text/html; charset=utf-8", "application/xhtml+xml"] {
+            assert!(
+                decide_storage(200, &hdrs(&[("content-type", ct)]), policy, 60).is_none(),
+                "{ct} must not be cached"
+            );
+        }
+        assert!(
+            decide_storage(
+                200,
+                &hdrs(&[("content-type", "application/javascript")]),
+                policy,
+                60
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
     fn vary_blocks_unless_encoding_only() {
         let policy = ResolvedPolicy::default();
         assert!(decide_storage(200, &hdrs(&[("vary", "Accept-Encoding")]), policy, 60).is_some());
         assert!(decide_storage(200, &hdrs(&[("vary", "User-Agent")]), policy, 60).is_none());
+    }
+
+    #[test]
+    fn ignore_cookie_allows_vary_cookie() {
+        let mut policy = ResolvedPolicy::default();
+        assert!(decide_storage(200, &hdrs(&[("vary", "Cookie")]), policy, 60).is_none());
+        policy.ignore_cookie = true;
+        assert!(
+            decide_storage(200, &hdrs(&[("vary", "Cookie")]), policy, 60).is_some(),
+            "explicit ignore_cookie must allow Vary: Cookie static assets"
+        );
+        assert!(
+            decide_storage(200, &hdrs(&[("vary", "Cookie, Accept-Encoding")]), policy, 60)
+                .is_some()
+        );
     }
 
     #[test]
@@ -930,12 +1029,42 @@ mod tests {
             .unwrap();
         assert!(!request_bypasses_cache(&cookie, true));
 
+        let clearance = Request::builder()
+            .uri("http://cdn.test/a.js")
+            .header("cookie", "lagran_clearance=1793089070.908f")
+            .body(())
+            .unwrap();
+        assert!(
+            !request_bypasses_cache(&clearance, false),
+            "edge-internal clearance cookie must not bypass public caching"
+        );
+
+        let clearance_plus_session = Request::builder()
+            .uri("http://cdn.test/a.js")
+            .header("cookie", "lagran_clearance=1793089070.908f; sid=1")
+            .body(())
+            .unwrap();
+        assert!(
+            request_bypasses_cache(&clearance_plus_session, false),
+            "a real application cookie must still bypass"
+        );
+
         let reload = Request::builder()
             .uri("http://cdn.test/a.js")
             .header("cache-control", "max-age=0")
             .body(())
             .unwrap();
         assert!(!request_bypasses_cache(&reload, false));
+
+        let revalidate = Request::builder()
+            .uri("http://cdn.test/a.js")
+            .header("cache-control", "no-cache")
+            .body(())
+            .unwrap();
+        assert!(
+            !request_bypasses_cache(&revalidate, false),
+            "no-cache must revalidate, not bypass"
+        );
     }
 
     #[test]

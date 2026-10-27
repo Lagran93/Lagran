@@ -30,6 +30,7 @@ use axum::{
 };
 use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::trace::TraceLayer;
 
 pub fn create_router(state: AppState) -> Router {
@@ -108,6 +109,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/nodes/heartbeat", post(node::heartbeat))
                 .route("/nodes/:id/heartbeat", post(node::heartbeat_by_path))
                 .route("/metrics/report", post(metrics::report))
+                .route("/metrics/report/batch", post(metrics::report_batch))
                 .route("/certs", get(cert::list).post(cert::create))
                 .route("/certs/issue", post(acme::issue))
                 .route("/certs/:id", get(cert::get).delete(cert::delete))
@@ -128,6 +130,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .fallback(not_found)
         .layer(TraceLayer::new_for_http())
+        .layer(RequestDecompressionLayer::new())
         .layer(cors)
         .with_state(state)
 }

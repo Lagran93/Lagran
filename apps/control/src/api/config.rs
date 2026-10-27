@@ -9,7 +9,8 @@ use crate::repository;
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Serialize;
@@ -330,9 +331,10 @@ fn build(
 
 pub async fn get_domain_config(
     State(state): State<AppState>,
+    headers: HeaderMap,
     _agent: AgentAuth,
     Path(domain): Path<String>,
-) -> Result<Json<DomainConfigResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     let row = repository::get_domain_full_by_name(&state.pool, &domain)
         .await
         .map_err(|_| db_error())?
@@ -356,13 +358,27 @@ pub async fn get_domain_config(
         }
         None => None,
     };
-    Ok(Json(build(&row, rule_configs(rules), waf)))
+    let cfg = build(&row, rule_configs(rules), waf);
+    let etag = format!("\"{}\"", cfg.version);
+    if if_none_match(&headers, &etag) {
+        return Ok(not_modified(&etag));
+    }
+    let mut response = Json(cfg).into_response();
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    Ok(response)
 }
 
 pub async fn list_all_configs(
     State(state): State<AppState>,
+    headers: HeaderMap,
     _agent: AgentAuth,
-) -> Result<Json<AllDomainsConfigResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     let rows = repository::list_domains_full(&state.pool)
         .await
         .map_err(|e| {
@@ -436,7 +452,43 @@ pub async fn list_all_configs(
         format!("{:x}", h.finish())
     };
 
-    Ok(Json(AllDomainsConfigResponse { domains, version }))
+    let etag = format!("\"{version}\"");
+    if if_none_match(&headers, &etag) {
+        return Ok(not_modified(&etag));
+    }
+    let mut response = Json(AllDomainsConfigResponse { domains, version }).into_response();
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    Ok(response)
+}
+
+fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|part| {
+                let part = part.trim();
+                part == etag || part.strip_prefix("W/") == Some(etag)
+            })
+        })
+}
+
+fn not_modified(etag: &str) -> Response {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 fn db_error() -> (StatusCode, Json<ErrorBody>) {

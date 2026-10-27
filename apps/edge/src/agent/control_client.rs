@@ -5,12 +5,16 @@
 
 use crate::config::EdgeConfig;
 use bytes::Bytes;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use http::{HeaderMap, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{de::DeserializeOwned, Serialize};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,17 +66,25 @@ impl ControlClient {
         self.base.starts_with("https://")
     }
 
-    async fn send(
+    async fn send_response(
         &self,
         method: &str,
         path: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
-    ) -> Result<Bytes, String> {
+        content_encoding: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<(StatusCode, HeaderMap, Bytes), String> {
         let url = self.endpoint(path);
         let mut builder = Request::builder().method(method).uri(&url);
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
+        }
+        if let Some(encoding) = content_encoding {
+            builder = builder.header("content-encoding", encoding);
+        }
+        if let Some(etag) = if_none_match.filter(|s| !s.is_empty()) {
+            builder = builder.header("if-none-match", etag);
         }
         if !self.token.is_empty() {
             builder = builder.header("x-lagran-agent-token", self.token.as_str());
@@ -84,13 +96,14 @@ impl ControlClient {
         let send = async {
             let resp = self.client.request(req).await.map_err(|e| e.to_string())?;
             let status = resp.status();
+            let headers = resp.headers().clone();
             let bytes = resp
                 .into_body()
                 .collect()
                 .await
                 .map_err(|e| e.to_string())?
                 .to_bytes();
-            if !status.is_success() {
+            if status != StatusCode::NOT_MODIFIED && !status.is_success() {
                 return Err(format!(
                     "HTTP {status}: {}",
                     String::from_utf8_lossy(&bytes)
@@ -99,7 +112,7 @@ impl ControlClient {
                         .collect::<String>()
                 ));
             }
-            Ok(bytes)
+            Ok((status, headers, bytes))
         };
 
         tokio::time::timeout(REQUEST_TIMEOUT, send)
@@ -107,9 +120,46 @@ impl ControlClient {
             .map_err(|_| format!("timeout after {REQUEST_TIMEOUT:?}: {url}"))?
     }
 
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Bytes>,
+        content_type: Option<&str>,
+    ) -> Result<Bytes, String> {
+        let (_, _, bytes) = self
+            .send_response(method, path, body, content_type, None, None)
+            .await?;
+        Ok(bytes)
+    }
+
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
         let bytes = self.send("GET", path, None, None).await?;
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from {path}: {e}"))
+    }
+
+    /// GET with If-None-Match. Returns `value = None` for HTTP 304.
+    pub async fn get_json_conditional<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<ConditionalJson<T>, String> {
+        let (status, headers, bytes) = self
+            .send_response("GET", path, None, None, None, if_none_match)
+            .await?;
+        let etag = headers
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if status == StatusCode::NOT_MODIFIED {
+            return Ok(ConditionalJson { etag, value: None });
+        }
+        let value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("invalid JSON from {path}: {e}"))?;
+        Ok(ConditionalJson {
+            etag,
+            value: Some(value),
+        })
     }
 
     pub async fn post_json<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
@@ -119,6 +169,28 @@ impl ControlClient {
             path,
             Some(Bytes::from(bytes)),
             Some("application/json"),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// POST a JSON document compressed with gzip.
+    pub async fn post_gzip_json<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<(), String> {
+        let json = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&json).map_err(|e| e.to_string())?;
+        let compressed = encoder.finish().map_err(|e| e.to_string())?;
+        self.send_response(
+            "POST",
+            path,
+            Some(Bytes::from(compressed)),
+            Some("application/json"),
+            Some("gzip"),
+            None,
         )
         .await
         .map(|_| ())
@@ -141,6 +213,12 @@ impl ControlClient {
             .await?;
         serde_json::from_slice(&reply).map_err(|e| format!("invalid JSON from {path}: {e}"))
     }
+}
+
+#[derive(Debug)]
+pub struct ConditionalJson<T> {
+    pub etag: Option<String>,
+    pub value: Option<T>,
 }
 
 #[cfg(test)]

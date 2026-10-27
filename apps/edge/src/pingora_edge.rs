@@ -8,8 +8,8 @@
 //! WebSocket) are handed to the in-process handler.
 
 use crate::cache::policy::{
-    cache_key_for_request, compute_etag, decide_storage, resolve_rule_policy, ResolvedPolicy,
-    RuleAction,
+    cache_key_for_request, compute_etag, decide_storage, has_non_clearance_cookie,
+    resolve_rule_policy, ResolvedPolicy, RuleAction,
 };
 use crate::config::registry::DomainEntry;
 use crate::config::EdgeConfig;
@@ -40,7 +40,8 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::Result;
 use pingora_cache::lock::CacheLock;
 use pingora_cache::{
-    CacheKey, CacheMeta, CacheOptionOverrides, CachePhase, NoCacheReason, RespCacheable,
+    CacheKey, CacheMeta, CacheOptionOverrides, CachePhase, ForcedFreshness, NoCacheReason,
+    RespCacheable,
 };
 
 use std::sync::Arc;
@@ -350,6 +351,32 @@ impl ProxyHttp for DataPlaneProxy {
             }
         }
         Ok(())
+    }
+
+    async fn cache_hit_filter(
+        &self,
+        _session: &mut Session,
+        meta: &CacheMeta,
+        _hit_handler: &mut pingora_cache::HitHandler,
+        _is_fresh: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<ForcedFreshness>> {
+        // Older cache entries may predate the HTML no-store policy. Never serve
+        // a cached HTML shell: it can reference chunks removed by a deploy.
+        let is_html = meta
+            .response_header()
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v.starts_with("text/html") || v.starts_with("application/xhtml+xml")
+            })
+            .unwrap_or(false);
+        if is_html {
+            return Ok(Some(ForcedFreshness::ForceMiss));
+        }
+        Ok(None)
     }
 
     fn cache_key_callback(&self, _session: &Session, ctx: &mut Self::CTX) -> Result<CacheKey> {
@@ -1208,20 +1235,20 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
 }
 
 fn request_bypasses(headers: &HeaderMap, ignore_cookie: bool) -> bool {
-    if headers.contains_key("authorization") || (!ignore_cookie && headers.contains_key("cookie")) {
+    if headers.contains_key("authorization")
+        || (!ignore_cookie && has_non_clearance_cookie(headers))
+    {
         return true;
     }
+    // `no-cache`/`max-age=0` mean "revalidate", not "skip the cache". Keep the
+    // request cache-eligible so If-None-Match can produce REVALIDATED/304.
+    // Only `no-store` genuinely forbids using or storing a cache entry.
     if let Some(cc) = headers.get("cache-control").and_then(|v| v.to_str().ok()) {
-        let cc = cc.to_ascii_lowercase();
-        if cc.contains("no-store") || cc.contains("no-cache") {
+        if cc.to_ascii_lowercase().contains("no-store") {
             return true;
         }
     }
-    headers
-        .get("pragma")
-        .and_then(|v| v.to_str().ok())
-        .map(|p| p.eq_ignore_ascii_case("no-cache"))
-        .unwrap_or(false)
+    false
 }
 
 fn request_host(raw: Option<&str>) -> String {

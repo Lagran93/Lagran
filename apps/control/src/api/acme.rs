@@ -3,21 +3,15 @@
 use crate::acme as acme_client;
 use crate::middleware::authz::Actor;
 use crate::repository;
+use crate::service::agent_http;
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Json,
 };
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::Request;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -42,15 +36,6 @@ pub struct IssueResponse {
 #[derive(Serialize)]
 pub struct ErrorBody {
     pub error: String,
-}
-
-fn http_client() -> &'static Client<HttpConnector, Full<Bytes>> {
-    static C: OnceLock<Client<HttpConnector, Full<Bytes>>> = OnceLock::new();
-    C.get_or_init(|| {
-        let mut c = HttpConnector::new();
-        c.set_nodelay(true);
-        Client::builder(TokioExecutor::new()).build(c)
-    })
 }
 
 pub async fn issue(
@@ -105,9 +90,7 @@ pub async fn issue(
                     "token": token,
                     "key_authorization": key_auth,
                 });
-                let _ = request_json(
-                    http_client(),
-                    "PUT",
+                let _ = agent_http::put_json_ok(
                     &url,
                     &body,
                     if node.auth_token.is_empty() {
@@ -218,7 +201,7 @@ pub async fn issue(
             } else {
                 &node.auth_token
             };
-            if request_json(http_client(), "POST", &url, &body, token)
+            if agent_http::post_json_ok(&url, &body, token)
                 .await
                 .is_ok()
             {
@@ -249,31 +232,6 @@ fn issue_dev_cert(domain: &str) -> Result<(String, String), String> {
     let key_pair = KeyPair::generate().map_err(|e| e.to_string())?;
     let cert = params.self_signed(&key_pair).map_err(|e| e.to_string())?;
     Ok((cert.pem(), key_pair.serialize_pem()))
-}
-
-async fn request_json(
-    client: &Client<HttpConnector, Full<Bytes>>,
-    method: &str,
-    url: &str,
-    body: &serde_json::Value,
-    token: &str,
-) -> Result<(), String> {
-    let bytes = Bytes::from(serde_json::to_vec(body).map_err(|e| e.to_string())?);
-    let req = Request::builder()
-        .method(method)
-        .uri(url)
-        .header("content-type", "application/json")
-        .header("x-lagran-agent-token", token)
-        .body(Full::new(bytes))
-        .map_err(|e| e.to_string())?;
-    let resp = client.request(req).await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let _ = resp.into_body().collect().await;
-    if status.is_success() || status.as_u16() == 204 {
-        Ok(())
-    } else {
-        Err(format!("HTTP {status}"))
-    }
 }
 
 pub async fn challenge(
