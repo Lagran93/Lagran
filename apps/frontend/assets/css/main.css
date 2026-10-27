@@ -1334,3 +1334,147 @@ textarea {
     padding-right: 14px;
   }
 }
+
+/* ------------------------------------------------------------ large screens */
+
+@media (min-width: 1920px) {
+  :root {
+    --sidebar-w: 252px;
+    --topbar-h: 64px;
+  }
+
+  .content {
+    padding: 28px 36px 56px;
+  }
+
+  .page {
+    max-width: 2200px;
+  }
+
+  .page-title {
+    font-size: 24px;
+  }
+
+  .page-desc {
+    font-size: 14px;
+  }
+
+  .table {
+    font-size: 15px;
+  }
+
+  .card-head {
+    padding-left: 24px;
+    padding-right: 24px;
+  }
+
+  .card-body {
+    padding: 22px 24px;
+  }
+}
+
+@media (min-width: 2560px) {
+  :root {
+    --sidebar-w: 292px;
+    --topbar-h: 72px;
+  }
+
+  body {
+    font-size: 15px;
+  }
+
+  .content {
+    padding: 36px 56px 72px;
+  }
+
+  .page {
+    max-width: 2800px;
+  }
+
+  .page-title {
+    font-size: 28px;
+  }
+
+  .page-desc {
+    font-size: 15px;
+  }
+
+  .page-head {
+    margin-bottom: 22px;
+  }
+
+  .table {
+    font-size: 16px;
+  }
+
+  .table th,
+  .table td {
+    padding: 15px 20px;
+  }
+
+  .btn {
+    font-size: 15px;
+  }
+
+  .stat-grid {
+    gap: 20px;
+  }
+
+  .card-head {
+    padding: 22px 28px 0;
+  }
+
+  .card-body {
+    padding: 24px 28px;
+  }
+}
+
+@media (min-width: 1920px) {
+  .stat-card {
+    padding: 22px;
+    gap: 16px;
+  }
+
+  .stat-icon {
+    width: 46px;
+    height: 46px;
+    border-radius: 12px;
+  }
+
+  .stat-label {
+    font-size: 15px;
+  }
+
+  .stat-value {
+    font-size: 32px;
+  }
+
+  .stat-hint {
+    font-size: 13px;
+  }
+}
+
+@media (min-width: 2560px) {
+  .stat-card {
+    padding: 26px;
+    gap: 18px;
+  }
+
+  .stat-icon {
+    width: 52px;
+    height: 52px;
+    border-radius: 14px;
+  }
+
+  .stat-label {
+    font-size: 16px;
+  }
+
+  .stat-value {
+    font-size: 38px;
+  }
+
+  .stat-hint {
+    font-size: 14px;
+  }
+}

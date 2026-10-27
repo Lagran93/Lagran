@@ -133,7 +133,7 @@ onMounted(async () => {
 
       <div class="sidebar-foot">
         <span class="dot" style="background: var(--success)" />
-        <span>控制面已连接 · v0.1.0</span>
+        <span>控制面已连接</span>
       </div>
     </aside>
 

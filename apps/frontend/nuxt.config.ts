@@ -4,7 +4,7 @@ export default defineNuxtConfig({
   future: {
     compatibilityVersion: 4,
   },
-  devtools: { enabled: true },
+  devtools: { enabled: process.env.NODE_ENV === 'development' },
   // The console authenticates with a JWT kept in localStorage, so there is no
   // meaningful server-rendered state; SPA mode avoids hydration mismatches
   // between the logged-out shell and the hydrated session.

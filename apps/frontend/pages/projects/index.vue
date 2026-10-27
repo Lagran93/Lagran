@@ -508,4 +508,21 @@ onMounted(load)
     min-width: 100%;
   }
 }
+
+@media (min-width: 1920px) {
+  .project-grid {
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    gap: 20px;
+  }
+
+  .project-card {
+    padding: 22px;
+  }
+}
+
+@media (min-width: 2560px) {
+  .project-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
 </style>

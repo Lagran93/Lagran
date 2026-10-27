@@ -97,6 +97,18 @@ const CARD_CSS: &str = r#"
       font-size: 12px; color: #9a8b78; position: relative; z-index: 1;
     }
     .foot { margin: 18px 0 0; text-align: center; font-size: 12px; color: #a29380; letter-spacing: .06em; }
+    @media (min-width: 1920px) {
+      .wrap { width: min(820px, 100%); }
+      .card { padding: 52px 56px; }
+      h1 { font-size: 34px; }
+      p { font-size: 16px; }
+    }
+    @media (min-width: 2560px) {
+      .wrap { width: min(960px, 100%); }
+      .card { padding: 64px 72px; }
+      h1 { font-size: 40px; }
+      p { font-size: 17px; }
+    }
     @media (max-width: 520px) {
       body { padding: 18px 12px 28px; }
       .brand { margin-left: 2px; }

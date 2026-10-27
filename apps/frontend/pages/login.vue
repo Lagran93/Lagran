@@ -16,28 +16,36 @@
 
       <ul class="brand-points">
         <li>
-          <span class="point-icon"><AppIcon name="zap" :size="16" /></span>
+          <span class="point-icon">
+            <AppIcon name="zap" :size="16" />
+          </span>
           <div>
             <strong>边缘加速</strong>
             <span>多节点分布式缓存，命中即返回</span>
           </div>
         </li>
         <li>
-          <span class="point-icon"><AppIcon name="rules" :size="16" /></span>
+          <span class="point-icon">
+            <AppIcon name="rules" :size="16" />
+          </span>
           <div>
             <strong>灵活策略</strong>
             <span>按路径配置 TTL、绕过与 SWR</span>
           </div>
         </li>
         <li>
-          <span class="point-icon"><AppIcon name="users" :size="16" /></span>
+          <span class="point-icon">
+            <AppIcon name="users" :size="16" />
+          </span>
           <div>
             <strong>多租户隔离</strong>
             <span>项目成员按角色分配权限</span>
           </div>
         </li>
         <li>
-          <span class="point-icon"><AppIcon name="stats" :size="16" /></span>
+          <span class="point-icon">
+            <AppIcon name="stats" :size="16" />
+          </span>
           <div>
             <strong>可观测</strong>
             <span>命中率、访问日志与源站健康</span>
@@ -56,35 +64,17 @@
         <form class="login-form" @submit.prevent="onSubmit">
           <div class="field">
             <label class="field-label" for="email">邮箱</label>
-            <input
-              id="email"
-              v-model="email"
-              class="input"
-              type="email"
-              autocomplete="username"
-              placeholder="请输入邮箱地址"
-              required
-            />
+            <input id="email" v-model="email" class="input" type="email" autocomplete="username" placeholder="请输入邮箱地址"
+              required />
           </div>
 
           <div class="field">
             <label class="field-label" for="password">密码</label>
             <div class="password-wrap">
-              <input
-                id="password"
-                v-model="password"
-                class="input"
-                :type="showPassword ? 'text' : 'password'"
-                autocomplete="current-password"
-                placeholder="请输入密码"
-                required
-              />
-              <button
-                class="password-toggle"
-                type="button"
-                :aria-label="showPassword ? '隐藏密码' : '显示密码'"
-                @click="showPassword = !showPassword"
-              >
+              <input id="password" v-model="password" class="input" :type="showPassword ? 'text' : 'password'"
+                autocomplete="current-password" placeholder="请输入密码" required />
+              <button class="password-toggle" type="button" :aria-label="showPassword ? '隐藏密码' : '显示密码'"
+                @click="showPassword = !showPassword">
                 <AppIcon :name="showPassword ? 'eye-off' : 'eye'" :size="16" />
               </button>
             </div>
@@ -108,16 +98,10 @@
           </button>
         </form>
 
-        <div class="demo-box">
-          <span class="demo-title">演示账号</span>
-          <span class="mono">demo@lagran.dev / demo123</span>
-          <button class="link-btn" type="button" @click="fillDemo">一键填入</button>
-        </div>
-
         <p v-if="allowRegister" class="register-link">
           还没有账号？<NuxtLink to="/register">注册新用户</NuxtLink>
         </p>
-        <p class="login-foot">登录即表示同意内部安全规范，请勿在公网环境使用默认密码。</p>
+        <p class="login-foot">请妥善保管账号信息，勿与他人共享。</p>
       </div>
     </section>
   </div>
@@ -131,8 +115,8 @@ const apiBase = config.public.apiBase as string
 const auth = useAuthStore()
 const toast = useToast()
 
-const email = ref(import.meta.dev ? 'demo@lagran.dev' : '')
-const password = ref(import.meta.dev ? 'demo123' : '')
+const email = ref('')
+const password = ref('')
 const remember = ref(true)
 const showPassword = ref(false)
 const allowRegister = ref(false)
@@ -140,12 +124,6 @@ const loading = ref(false)
 const error = ref('')
 
 const REMEMBER_KEY = 'lagran_last_email'
-
-function fillDemo() {
-  email.value = 'demo@lagran.dev'
-  password.value = 'demo123'
-  error.value = ''
-}
 
 async function onSubmit() {
   error.value = ''
@@ -173,7 +151,7 @@ async function onSubmit() {
     error.value =
       e?.data?.error ||
       e?.message ||
-      '登录失败，请确认控制端与数据库已启动'
+      '登录失败，请稍后重试'
   } finally {
     loading.value = false
   }
@@ -420,30 +398,6 @@ onMounted(async () => {
   margin: 0;
 }
 
-.demo-box {
-  margin-top: 22px;
-  padding: 10px 12px;
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius);
-  background: #fafbfc;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-3);
-  flex-wrap: wrap;
-}
-
-.demo-title {
-  color: var(--text-2);
-  font-weight: 500;
-}
-
-.demo-box .link-btn {
-  margin-left: auto;
-  font-size: 12px;
-}
-
 .login-foot {
   margin-top: 18px;
   font-size: 12px;
@@ -477,6 +431,38 @@ onMounted(async () => {
 
   .login-panel {
     padding: 32px 24px;
+  }
+}
+
+@media (min-width: 1920px) {
+  .login-shell {
+    width: min(1240px, 90vw);
+    min-height: 700px;
+  }
+
+  .login-brand {
+    padding: 52px 52px 36px;
+  }
+
+  .login-card {
+    width: 100%;
+    max-width: 360px;
+  }
+}
+
+@media (min-width: 2560px) {
+  .login-shell {
+    width: min(1480px, 86vw);
+    min-height: 820px;
+  }
+
+  .login-brand {
+    padding: 64px 64px 44px;
+  }
+
+  .login-card {
+    width: 100%;
+    max-width: 360px;
   }
 }
 </style>

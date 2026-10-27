@@ -25,7 +25,7 @@
       <AppIcon name="alert" :size="16" class="icon" />
       <span>
         自动签发支持 Let's Encrypt（ACME v2 / HTTP-01）。生产域名请先接入并解析到边缘节点；
-        调试建议先使用 Staging，避免触发生产速率限制。
+        首次配置可使用预发布校验，避免触发生产速率限制。
       </span>
     </div>
 
@@ -168,8 +168,7 @@
           <label class="field-label">签发方式 <span class="req">*</span></label>
           <select v-model="issueForm.provider" class="select">
             <option value="letsencrypt">Let's Encrypt（生产）</option>
-            <option value="letsencrypt-staging">Let's Encrypt（Staging / 测试）</option>
-            <option value="dev">本地开发 CA（仅测试）</option>
+            <option value="letsencrypt-staging">Let's Encrypt（预发布校验）</option>
           </select>
         </div>
         <div class="field">

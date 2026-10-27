@@ -48,7 +48,7 @@
             </button>
           </div>
           <p class="text-muted mt-16" style="font-size: 12px">
-            账号由控制面数据库管理；如需新增用户，可调用 <code class="mono">POST /api/v1/auth/register</code>。
+            账号由系统管理员统一管理。
           </p>
         </div>
       </div>
@@ -61,14 +61,14 @@
           <div class="field">
             <label class="field-label">控制端 API 地址</label>
             <div class="copy-row">
-              <input class="input mono" :value="apiBase" readonly />
-              <button class="btn btn-default" type="button" @click="copy(apiBase, 'API 地址')">
+              <input class="input mono" :value="effectiveApiBase" readonly />
+              <button class="btn btn-default" type="button" @click="copy(effectiveApiBase, 'API 地址')">
                 <AppIcon name="copy" :size="15" />
                 复制
               </button>
             </div>
             <span class="field-hint">
-              前端通过 <code class="mono">NUXT_PUBLIC_API_BASE</code> 注入，修改后需重新构建前端。
+              未单独配置时使用当前站点同源地址，由反向代理转发到控制面。
             </span>
           </div>
 
@@ -101,20 +101,20 @@
       <div class="card-body">
         <div class="info-grid">
           <div class="info-item">
-            <div class="info-label">控制台版本</div>
-            <div class="info-value">Lagran CDN v0.1.0</div>
+            <div class="info-label">控制台</div>
+            <div class="info-value">Lagran CDN</div>
           </div>
           <div class="info-item">
-            <div class="info-label">前端框架</div>
-            <div class="info-value">Nuxt 4 · Vue 3 · Pinia</div>
+            <div class="info-label">当前角色</div>
+            <div class="info-value">{{ auth.isAdmin ? '系统管理员' : '普通用户' }}</div>
           </div>
           <div class="info-item">
-            <div class="info-label">控制面</div>
-            <div class="info-value">Rust · Axum · PostgreSQL</div>
+            <div class="info-label">会话策略</div>
+            <div class="info-value">密码修改后旧会话立即失效</div>
           </div>
           <div class="info-item">
-            <div class="info-label">边缘节点</div>
-            <div class="info-value">Rust · Hyper · rustls</div>
+            <div class="info-label">接入方式</div>
+            <div class="info-value">同源 API + 边缘节点</div>
           </div>
         </div>
       </div>
@@ -122,9 +122,7 @@
 
     <div class="alert alert-warning mt-16">
       <AppIcon name="shield" :size="16" class="icon" />
-      <span>
-        生产环境请修改默认管理员密码、JWT_SECRET 与 AGENT_TOKEN，并通过 HTTPS 暴露控制台；不要将 8080 端口直接开放到公网。
-      </span>
+      <span>如遇访问异常，请联系系统管理员。</span>
     </div>
 
     <BaseModal
@@ -172,6 +170,11 @@ const toast = useToast()
 
 const config = useRuntimeConfig()
 const apiBase = config.public.apiBase as string
+const effectiveApiBase = computed(() => {
+  const configured = (apiBase || '').trim().replace(/\/+$/, '')
+  if (configured) return configured
+  return import.meta.client ? window.location.origin : ''
+})
 
 const checking = ref(false)
 const healthStatus = ref<{ ok: boolean; at: string; message?: string } | null>(null)
@@ -256,7 +259,7 @@ async function copy(text: string, label: string) {
 async function checkHealth() {
   checking.value = true
   try {
-    const res = await fetch(`${apiBase}/health`)
+    const res = await fetch(`${effectiveApiBase.value}/health`)
     const text = await res.text()
     healthStatus.value = {
       ok: res.ok,

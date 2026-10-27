@@ -398,4 +398,24 @@ onMounted(() => {
     min-width: 680px;
   }
 }
+
+@media (min-width: 1920px) {
+  .stat-card {
+    padding: 22px;
+  }
+
+  .stat-num {
+    font-size: 32px;
+  }
+}
+
+@media (min-width: 2560px) {
+  .stat-card {
+    padding: 26px;
+  }
+
+  .stat-num {
+    font-size: 38px;
+  }
+}
 </style>
