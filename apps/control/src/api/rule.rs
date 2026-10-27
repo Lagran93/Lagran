@@ -317,7 +317,7 @@ pub async fn create(
         ),
     )
     .await;
-
+    crate::service::edge_notify::notify_config_reload(&state).await;
     Ok((
         StatusCode::CREATED,
         Json(RuleDto::from_row(row, &domain.name)),
@@ -407,6 +407,7 @@ pub async fn update(
         &format!("{} action={}", row.path_pattern, row.action),
     )
     .await;
+    crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(RuleDto::from_row(row, &domain.name)))
 }
 
@@ -434,6 +435,7 @@ pub async fn delete(
         &rule.domain_id.to_string(),
     )
     .await;
+    crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 

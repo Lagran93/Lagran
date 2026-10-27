@@ -20,7 +20,7 @@ use crate::server::handler::{
     apply_browser_ttl, apply_cors_and_custom, apply_security_headers, log_access,
     policy_browser_ttl, preflight_cacheable, proxy_handler, AppState,
 };
-use crate::server::native_cache::{leak_storage, NativeStorage, META_HEADER};
+use crate::server::native_cache::{leak_storage_with_limit, NativeStorage, META_HEADER};
 use crate::server::purge;
 use async_trait::async_trait;
 use axum::body::Body;
@@ -122,6 +122,7 @@ struct ReqCtx {
     path: String,
     method: Method,
     client_ip: String,
+    request_id: String,
     user_agent: String,
     referer: String,
     start: Instant,
@@ -141,6 +142,7 @@ impl Default for ReqCtx {
             path: String::new(),
             method: Method::GET,
             client_ip: String::new(),
+            request_id: String::new(),
             user_agent: String::new(),
             referer: String::new(),
             start: Instant::now(),
@@ -186,6 +188,21 @@ impl ProxyHttp for DataPlaneProxy {
             .map(str::trim)
             .unwrap_or("")
             .to_string();
+        ctx.request_id = req
+            .headers
+            .get("x-request-id")
+            .or_else(|| req.headers.get("x-correlation-id"))
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let n = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                format!("lr-{n:x}")
+            });
         ctx.user_agent = req
             .headers
             .get("user-agent")
@@ -621,6 +638,7 @@ impl ProxyHttp for DataPlaneProxy {
             &ctx.referer,
             bytes,
             label,
+        &ctx.request_id,
         )
         .await;
         match label {
@@ -751,7 +769,19 @@ impl DataPlaneProxy {
             .get("x-lagran-agent-token")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !expected.is_empty() && got != expected {
+        let allow_insecure = matches!(
+            std::env::var("ALLOW_INSECURE_AGENT")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        let unauthorized = if expected.is_empty() {
+            !allow_insecure
+        } else {
+            got != expected
+        };
+        if unauthorized {
             write_plain(
                 session,
                 401,
@@ -839,6 +869,24 @@ impl DataPlaneProxy {
                     Ok(()) => write_json(session, 200, &serde_json::json!({"ok": true})).await,
                     Err(e) => write_json(session, 400, &serde_json::json!({"error": e})).await,
                 }
+            }
+            ("POST", "/__lagran/config/reload") => {
+                crate::agent::config_sync::request_config_reload();
+                write_json(session, 200, &serde_json::json!({ "ok": true, "reloading": true })).await;
+            }
+            ("GET", "/__lagran/metrics") => {
+                let snaps = self.state.metrics.take_snapshots_peek().await;
+                let mut body = String::from("# TYPE lagran_edge_requests_total counter\n");
+                for s in snaps {
+                    body.push_str(&format!(
+                        "lagran_edge_requests_total{{domain=\"{d}\"}} {v}\nlagran_edge_cache_hits_total{{domain=\"{d}\"}} {h}\nlagran_edge_cache_misses_total{{domain=\"{d}\"}} {m}\n",
+                        d = s.domain.replace('"', ""),
+                        v = s.requests,
+                        h = s.cache_hits,
+                        m = s.cache_misses,
+                    ));
+                }
+                write_plain(session, 200, "text/plain; version=0.0.4; charset=utf-8", Bytes::from(body)).await;
             }
             ("GET", "/__lagran/access-logs") => {
                 let entries = self.state.access_log.snapshot(200).await;
@@ -959,6 +1007,7 @@ impl DataPlaneProxy {
             &ctx.referer,
             0,
             cache_label,
+        &ctx.request_id,
         )
         .await;
         if cache_label == "HIT" {
@@ -1308,7 +1357,7 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
     let mut server = Server::new(Some(opt))?;
     server.bootstrap();
 
-    let storage = Some(leak_storage(state.cache.clone()));
+    let storage = Some(leak_storage_with_limit(state.cache.clone(), state.max_cacheable_body));
     let cache_lock: &'static CacheLock = Box::leak(CacheLock::new_boxed(Duration::from_secs(10)));
     let proxy = DataPlaneProxy {
         trust_proxy: config.trust_proxy_headers,

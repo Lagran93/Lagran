@@ -21,12 +21,17 @@ pub fn spawn_access_report(config: EdgeConfig, control: ControlClient, access_lo
             if batch.is_empty() {
                 continue;
             }
+            let n = batch.len();
             let body = json!({ "entries": batch });
             if let Err(e) = control.post_json("/api/v1/access-logs/report", &body).await {
-                // Records are drained; on failure they are lost (bounded buffer).
-                tracing::warn!(error = %e, n = batch.len(), "access log report failed");
+                tracing::warn!(error = %e, n, "access log report failed; re-queueing");
+                if let Some(arr) = body.get("entries").cloned() {
+                    if let Ok(restored) = serde_json::from_value(arr) {
+                        access_log.requeue(restored).await;
+                    }
+                }
             } else {
-                tracing::debug!(n = batch.len(), "access logs reported");
+                tracing::debug!(n, "access logs reported");
             }
         }
     });

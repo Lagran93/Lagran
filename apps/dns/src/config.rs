@@ -64,7 +64,10 @@ impl DnsConfig {
         let soa_rname =
             std::env::var("DNS_SOA_RNAME").unwrap_or_else(|_| format!("hostmaster.{zone}"));
         Self {
-            listen: std::env::var("DNS_LISTEN").unwrap_or_else(|_| "0.0.0.0:53".into()),
+            // DNS_LISTEN is canonical; DNS_BIND is kept for older example files.
+            listen: env_nonempty("DNS_LISTEN")
+                .or_else(|| env_nonempty("DNS_BIND"))
+                .unwrap_or_else(|| "0.0.0.0:53".into()),
             zone,
             ttl: std::env::var("DNS_TTL")
                 .ok()
@@ -108,4 +111,11 @@ impl DnsConfig {
                 .unwrap_or(800),
         )
     }
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }

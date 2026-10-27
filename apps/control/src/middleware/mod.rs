@@ -1,6 +1,7 @@
 //! Auth middleware / extractors
 
 pub mod agent_auth;
+pub mod login_limit;
 pub mod authz;
 
 use crate::state::AppState;

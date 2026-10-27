@@ -46,6 +46,11 @@ pub struct EdgeConfig {
     /// Port to use in HTTP→HTTPS redirects (None = 443, or derived from the
     /// HTTPS listener port when it is not 443).
     pub https_redirect_port: Option<u16>,
+    /// Max response body size stored in cache (bytes). Larger responses are
+    /// still proxied but not written to cache.
+    pub max_cacheable_body: usize,
+    /// How often the edge pulls domain config from control (seconds).
+    pub config_sync_interval_secs: u64,
 }
 
 impl Default for EdgeConfig {
@@ -117,8 +122,8 @@ impl Default for EdgeConfig {
             access_log_path: std::env::var("ACCESS_LOG_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            agent_token: std::env::var("AGENT_TOKEN")
-                .or_else(|_| std::env::var("EDGE_AGENT_TOKEN"))
+            agent_token: env_nonempty("AGENT_TOKEN")
+                .or_else(|| env_nonempty("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
             access_log_json: std::env::var("ACCESS_LOG_JSON")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -143,6 +148,16 @@ impl Default for EdgeConfig {
                 .unwrap_or(5),
             challenge_secret: std::env::var("CHALLENGE_SECRET").unwrap_or_default(),
             https_redirect_port,
+            max_cacheable_body: std::env::var("MAX_CACHEABLE_BODY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8 * 1024 * 1024)
+                .clamp(64 * 1024, 64 * 1024 * 1024),
+            config_sync_interval_secs: std::env::var("CONFIG_SYNC_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15)
+                .clamp(5, 300),
         }
     }
 }
@@ -151,6 +166,13 @@ fn bool_env(name: &str, default: bool) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(default)
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 impl EdgeConfig {

@@ -117,11 +117,13 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | DATABASE_URL | postgres://lagran:lagran@127.0.0.1:5432/lagran | 控制面数据库 |
 | CONTROL_BIND | 0.0.0.0:8080 | 控制面监听（兼容 CONTROL_HOST/CONTROL_PORT） |
 | JWT_SECRET | lagran-dev-secret-change-me | JWT 签名密钥，生产必须修改 |
-| JWT_EXPIRE_HOURS | 72 | Token 有效期（兼容 JWT_EXPIRES_SECS） |
+| JWT_EXPIRE_HOURS | 24 | Token 有效期（小时；优先于 JWT_EXPIRES_SECS） |
+| JWT_EXPIRES_SECS | 空 | 兼容旧配置的 Token 秒数；仅当 JWT_EXPIRE_HOURS 未设置时生效 |
 | AGENT_TOKEN | 空 | 全局 token：DNS `/schedule` 使用；边缘配置/心跳必须使用节点 `auth_token` |
 | CONTROL_PUBLIC_URL | 空 | 控制面公网地址，用于生成节点安装命令；留空按请求 Host 推导 |
 | GEOIP_PATH | ./data/geoip.dat | 调度用 GeoIP：支持 V2Ray/Loyalsoldier `geoip.dat` 或旧版 CIDR JSON；缺失时按权重/负载调度 |
 | GEOIP_JSON_PATH | 空 | 兼容旧配置的 JSON 路径别名；新部署建议使用 `GEOIP_PATH` |
+| GEOIP_DAT_PATH | 空 | 兼容旧配置的 protobuf 路径别名；GEOIP_PATH 优先 |
 | SCHEDULE_TTL | 30 | `/api/v1/schedule` 返回的 DNS TTL（秒） |
 | ACME_DIRECTORY_URL | Let's Encrypt 生产 | ACME v2 目录地址 |
 | ACME_STAGING_DIRECTORY_URL | Let's Encrypt Staging | Staging 目录地址 |

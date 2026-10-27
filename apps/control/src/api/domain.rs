@@ -446,6 +446,7 @@ pub async fn update(
         .unwrap_or(row);
     let _ =
         repository::insert_audit(&state.pool, &actor.email, "domain.update", &row.name, "").await;
+    crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(to_dto(row)))
 }
 
@@ -489,6 +490,7 @@ pub async fn set_status(
         &status,
     )
     .await;
+    crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(to_dto(row)))
 }
 
@@ -650,5 +652,6 @@ pub async fn put_settings(
         "updated",
     )
     .await;
+    crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(settings_dto(s)))
 }

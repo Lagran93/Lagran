@@ -4,7 +4,7 @@
 //! unbounded channel to a single writer task, which keeps the hot path free of
 //! lock contention and file I/O.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessRecord {
     pub ts: String,
     pub node_id: String,
@@ -26,6 +26,7 @@ pub struct AccessRecord {
     pub cache_status: String,
     pub user_agent: String,
     pub referer: String,
+    pub request_id: String,
 }
 
 #[derive(Clone)]
@@ -135,6 +136,7 @@ impl AccessLog {
         cache_status: &str,
         user_agent: &str,
         referer: &str,
+        request_id: &str,
     ) -> AccessRecord {
         let ts = chrono_like_now();
         AccessRecord {
@@ -150,6 +152,7 @@ impl AccessLog {
             cache_status: cache_status.to_string(),
             user_agent: truncate(user_agent, 256),
             referer: truncate(referer, 256),
+            request_id: truncate(request_id, 64),
         }
     }
 
@@ -190,6 +193,21 @@ impl AccessLog {
             }
         }
         out
+    }
+
+    /// Put records back at the front after a failed report (oldest first).
+    pub async fn requeue(&self, records: Vec<AccessRecord>) {
+        if records.is_empty() {
+            return;
+        }
+        let mut buf = self.buffer.lock().await;
+        // prepend preserving order: push_front in reverse
+        for r in records.into_iter().rev() {
+            if buf.len() >= self.buffer_cap {
+                buf.pop_back();
+            }
+            buf.push_front(r);
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -280,7 +298,7 @@ mod tests {
     async fn records_reach_ring_buffer() {
         let log = AccessLog::open(None, "n1", 100, false).await;
         log.write(log.record(
-            "1.2.3.4", "GET", "a.test", "/x", 200, 10, 5, "HIT", "ua", "",
+            "1.2.3.4", "GET", "a.test", "/x", 200, 10, 5, "HIT", "ua", "", "rid-1",
         ))
         .await;
         // The writer task applies the record asynchronously.

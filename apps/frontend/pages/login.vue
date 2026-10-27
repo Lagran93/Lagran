@@ -128,8 +128,8 @@ const apiBase = config.public.apiBase as string
 const auth = useAuthStore()
 const toast = useToast()
 
-const email = ref('demo@lagran.dev')
-const password = ref('demo123')
+const email = ref(import.meta.dev ? 'demo@lagran.dev' : '')
+const password = ref(import.meta.dev ? 'demo123' : '')
 const remember = ref(true)
 const showPassword = ref(false)
 const loading = ref(false)

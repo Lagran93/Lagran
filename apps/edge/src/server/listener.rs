@@ -20,6 +20,8 @@ fn management_routes() -> Router<Arc<AppState>> {
         .route("/__lagran/acme/challenge", put(put_challenge_authed))
         .route("/__lagran/certs/load", post(load_cert_authed))
         .route("/__lagran/access-logs", get(list_access_logs))
+        .route("/__lagran/config/reload", post(config_reload_authed))
+        .route("/__lagran/metrics", get(prometheus_metrics))
 }
 
 /// Control-plane management listener: purge/cert/challenge/access-log endpoints.
@@ -94,4 +96,56 @@ async fn load_cert_authed(
         )
             .into_response(),
     }
+}
+
+async fn config_reload_authed(_auth: RequireAgentToken) -> impl IntoResponse {
+    crate::agent::config_sync::request_config_reload();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "reloading": true })),
+    )
+        .into_response()
+}
+
+async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let snaps = state.metrics.take_snapshots_peek().await;
+    let mut out = String::from(
+        "# HELP lagran_edge_requests_total Requests handled\n# TYPE lagran_edge_requests_total counter\n",
+    );
+    let mut hits = String::from(
+        "# HELP lagran_edge_cache_hits_total Cache hits\n# TYPE lagran_edge_cache_hits_total counter\n",
+    );
+    let mut misses = String::from(
+        "# HELP lagran_edge_cache_misses_total Cache misses\n# TYPE lagran_edge_cache_misses_total counter\n",
+    );
+    let mut bytes = String::from(
+        "# HELP lagran_edge_bytes_sent_total Bytes sent\n# TYPE lagran_edge_bytes_sent_total counter\n",
+    );
+    for s in &snaps {
+        let d = s.domain.replace('\\', "\\\\").replace('"', "");
+        out.push_str(&format!(
+            "lagran_edge_requests_total{{domain=\"{d}\"}} {}\n",
+            s.requests
+        ));
+        hits.push_str(&format!(
+            "lagran_edge_cache_hits_total{{domain=\"{d}\"}} {}\n",
+            s.cache_hits
+        ));
+        misses.push_str(&format!(
+            "lagran_edge_cache_misses_total{{domain=\"{d}\"}} {}\n",
+            s.cache_misses
+        ));
+        bytes.push_str(&format!(
+            "lagran_edge_bytes_sent_total{{domain=\"{d}\"}} {}\n",
+            s.bytes_sent
+        ));
+    }
+    out.push_str(&hits);
+    out.push_str(&misses);
+    out.push_str(&bytes);
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        out,
+    )
 }

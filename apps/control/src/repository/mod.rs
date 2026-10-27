@@ -2517,3 +2517,30 @@ pub async fn delete_cc_ban(pool: &PgPool, domain: &str, ip: &str) -> sqlx::Resul
         .await?;
     Ok(r.rows_affected())
 }
+
+
+/// Delete access_logs and edge_metrics older than `days` days.
+pub async fn purge_old_telemetry(pool: &PgPool, days: i64) -> sqlx::Result<(u64, u64)> {
+    let days = days.max(1);
+    let a = sqlx::query(
+        r#"DELETE FROM access_logs WHERE created_at < NOW() - ($1::text || ' days')::interval"#,
+    )
+    .bind(days.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let m = sqlx::query(
+        r#"DELETE FROM edge_metrics WHERE reported_at < NOW() - ($1::text || ' days')::interval"#,
+    )
+    .bind(days.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let _ = sqlx::query(
+        r#"DELETE FROM waf_events WHERE created_at < NOW() - ($1::text || ' days')::interval"#,
+    )
+    .bind(days.to_string())
+    .execute(pool)
+    .await;
+    Ok((a, m))
+}

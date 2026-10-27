@@ -46,7 +46,6 @@ use std::time::{Duration, Instant};
 /// Largest request body we are willing to buffer for pass-through traffic.
 const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;
 /// Largest origin object we keep in the cache.
-const MAX_CACHE_OBJECT: usize = 8 * 1024 * 1024;
 /// How long a follower waits for the in-flight fetch before fetching itself.
 const FETCH_WAIT: Duration = Duration::from_secs(5);
 
@@ -77,6 +76,8 @@ pub struct AppState {
     pub node_control: NodeControl,
     /// Port used when redirecting HTTP to HTTPS (None = 443).
     pub https_redirect_port: Option<u16>,
+    /// Responses larger than this are proxied but not stored in cache.
+    pub max_cacheable_body: usize,
 }
 
 /// Per-request view of the effective domain configuration.
@@ -159,6 +160,13 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let request_id = headers
+        .get("x-request-id")
+        .or_else(|| headers.get("x-correlation-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uuid_like_request_id());
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -179,6 +187,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             &referer,
             0,
             "NODE_DISABLED",
+        &request_id,
         )
         .await;
         return default_page::node_disabled_page(&host);
@@ -217,6 +226,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             &referer,
             0,
             CacheStatus::None.as_str(),
+        &request_id,
         )
         .await;
         return default_page::unknown_domain_page(display);
@@ -315,6 +325,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             &referer,
             0,
             "WS",
+        &request_id,
         )
         .await;
         return resp;
@@ -337,6 +348,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             &client_ip,
             &user_agent,
             &referer,
+            &request_id,
             start,
         )
         .await;
@@ -368,6 +380,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 &client_ip,
                 &user_agent,
                 &referer,
+                &request_id,
                 if_none_match.as_deref(),
                 &eff,
                 start,
@@ -397,6 +410,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 &client_ip,
                 &user_agent,
                 &referer,
+                &request_id,
                 if_none_match.as_deref(),
                 &eff,
                 start,
@@ -433,6 +447,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         &referer,
                         body_len,
                         CacheStatus::Hit.as_str(),
+                    &request_id,
                     )
                     .await;
                     origin_response(
@@ -478,6 +493,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         &referer,
                         body_len,
                         label.as_str(),
+                    &request_id,
                     )
                     .await;
                     out
@@ -498,6 +514,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         &referer,
                         0,
                         failure.log_label(),
+                    &request_id,
                     )
                     .await;
                     default_page::origin_error_page(&host, &path_only, failure)
@@ -520,6 +537,7 @@ async fn bypass_to_origin(
     client_ip: &str,
     user_agent: &str,
     referer: &str,
+    request_id: &str,
     start: Instant,
 ) -> Response {
     let label = if request_method_cacheable(method) {
@@ -543,6 +561,7 @@ async fn bypass_to_origin(
             referer,
             0,
             OriginFailure::Unhealthy.log_label(),
+        &request_id,
         )
         .await;
         return default_page::origin_error_page(host, path_only, OriginFailure::Unhealthy);
@@ -567,6 +586,7 @@ async fn bypass_to_origin(
                 referer,
                 0,
                 label.as_str(),
+            &request_id,
             )
             .await;
             return (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large").into_response();
@@ -632,6 +652,7 @@ async fn bypass_to_origin(
                 referer,
                 body_len,
                 label.as_str(),
+            &request_id,
             )
             .await;
             out
@@ -652,6 +673,7 @@ async fn bypass_to_origin(
                 referer,
                 0,
                 failure.log_label(),
+            &request_id,
             )
             .await;
             default_page::origin_error_page(host, path_only, failure)
@@ -680,7 +702,7 @@ async fn fetch_with_single_flight(
                     eff.policy,
                     state.default_ttl_secs,
                 ) {
-                    if resp.body.len() <= MAX_CACHE_OBJECT {
+                    if resp.body.len() <= state.max_cacheable_body {
                         let entry = clone_as_entry(resp);
                         state
                             .cache
@@ -792,7 +814,7 @@ fn spawn_revalidation(
                     policy,
                     state.default_ttl_secs,
                 ) {
-                    if resp.body.len() <= MAX_CACHE_OBJECT {
+                    if resp.body.len() <= state.max_cacheable_body {
                         let entry = resp.into_entry();
                         state
                             .cache
@@ -819,6 +841,7 @@ async fn serve_cached(
     client_ip: &str,
     user_agent: &str,
     referer: &str,
+    request_id: &str,
     if_none_match: Option<&str>,
     eff: &Effective,
     start: Instant,
@@ -843,6 +866,7 @@ async fn serve_cached(
                 referer,
                 0,
                 CacheStatus::Revalidated.as_str(),
+            &request_id,
             )
             .await;
             return not_modified_response(&etag);
@@ -863,6 +887,7 @@ async fn serve_cached(
         referer,
         bytes,
         label.as_str(),
+    &request_id,
     )
     .await;
     entry_to_response(
@@ -975,6 +1000,13 @@ pub(crate) async fn preflight_cacheable(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let request_id = headers
+        .get("x-request-id")
+        .or_else(|| headers.get("x-correlation-id"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(uuid_like_request_id);
     let client_ip_addr: Option<IpAddr> = client_ip.parse().ok();
 
     if domain.ssl_enabled && !is_https {
@@ -995,6 +1027,7 @@ pub(crate) async fn preflight_cacheable(
             &referer,
             0,
             "HTTPS_REDIRECT",
+        &request_id,
         )
         .await;
         return Some(https_redirect_response(
@@ -1074,6 +1107,7 @@ pub(crate) async fn preflight_cacheable(
                     &referer,
                     0,
                     if banned { "CC-BAN" } else { "CC" },
+                &request_id,
                 )
                 .await;
                 return Some(cc_too_many(decision.retry_after(), banned));
@@ -1099,6 +1133,7 @@ pub(crate) async fn preflight_cacheable(
             &referer,
             0,
             CacheStatus::None.as_str(),
+        &request_id,
         )
         .await;
         return Some(
@@ -1184,6 +1219,7 @@ pub(crate) async fn preflight_cacheable(
                             &referer,
                             0,
                             "CHALLENGE",
+                        &request_id,
                         )
                         .await;
                         let nonce = challenge::issue_nonce(host, &state.challenge_secret);
@@ -1209,6 +1245,7 @@ pub(crate) async fn preflight_cacheable(
                             &referer,
                             0,
                             "WAF",
+                        &request_id,
                         )
                         .await;
                         return Some(default_page::waf_blocked_page(
@@ -1238,6 +1275,7 @@ pub(crate) async fn preflight_cacheable(
             &referer,
             0,
             CacheStatus::None.as_str(),
+        &request_id,
         )
         .await;
         return Some((StatusCode::FORBIDDEN, "Hotlink Forbidden").into_response());
@@ -1300,6 +1338,7 @@ pub(crate) async fn log_access(
     referer: &str,
     bytes: u64,
     cache_status: &str,
+    request_id: &str,
 ) {
     let ms = start.elapsed().as_millis() as u64;
     let rec = log.record(
@@ -1313,8 +1352,18 @@ pub(crate) async fn log_access(
         cache_status,
         user_agent,
         referer,
+        request_id,
     );
     log.write(rec).await;
+}
+
+fn uuid_like_request_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("lr-{:x}", nanos)
 }
 
 pub(crate) fn apply_security_headers(headers: &mut HeaderMap) {

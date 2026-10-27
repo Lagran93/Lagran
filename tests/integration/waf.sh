@@ -206,6 +206,13 @@ CODE=$(curl -s -o "$LOG_DIR/body" -b "$LOG_DIR/challenge.jar" -w '%{http_code}' 
   -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/challenge-me")
 check "clearance cookie passes the challenge" "$CODE" "200"
 
+CLEAR_VALUE=$(awk '$6 == "lagran_clearance" { print $7 }' "$LOG_DIR/challenge.jar" | tail -1)
+CODE=$(curl -s -o "$LOG_DIR/body" -w '%{http_code}' \
+  -H "Host: $DOMAIN" \
+  -H "Cookie: lagran_clearance=1.invalid; lagran_clearance=$CLEAR_VALUE" \
+  "http://127.0.0.1:$EDGE_PORT/challenge-me")
+check "stale duplicate clearance cookie does not shadow valid one" "$CODE" "200"
+
 CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.2' -H 'Accept: text/html')
 check "a different client is still challenged" "$CODE" "403"
 

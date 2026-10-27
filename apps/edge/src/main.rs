@@ -71,6 +71,12 @@ async fn main() -> anyhow::Result<()> {
         random_secret()
     };
 
+    if config.challenge_secret.is_empty() {
+        tracing::warn!(
+            "CHALLENGE_SECRET is empty; clearance/nonce signatures fall back to AGENT_TOKEN or a random per-process secret. Multi-edge or restart-stable challenge requires an explicit shared CHALLENGE_SECRET."
+        );
+    }
+
     agent::spawn_heartbeat(config.clone(), control.clone(), node_control.clone());
     config_sync::spawn_config_sync(
         config.clone(),
@@ -119,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         challenge_secret,
         node_control,
         https_redirect_port: config.https_redirect_port,
+        max_cacheable_body: config.max_cacheable_body,
     });
 
     agent::cc_sync::spawn_cc_sync(config.clone(), control.clone(), state.cc.clone());

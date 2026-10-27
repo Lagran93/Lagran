@@ -1,7 +1,20 @@
-//! Sync all accelerated domains + rules from control plane
-//!
-//! Runs every 15s, sends the agent token, and follows the control plane's
-//! aggregate version so unchanged config is not re-applied.
+use std::sync::OnceLock;
+use tokio::sync::Notify;
+
+static CONFIG_KICK: OnceLock<Notify> = OnceLock::new();
+
+fn config_kick() -> &'static Notify {
+    CONFIG_KICK.get_or_init(Notify::new)
+}
+
+/// Ask the background config sync loop to run immediately.
+pub fn request_config_reload() {
+    config_kick().notify_one();
+}
+
+// Sync all accelerated domains + rules from control plane.
+// Runs periodically, sends the agent token, and follows the control plane's
+// aggregate version so unchanged config is not re-applied.
 
 use crate::agent::ControlClient;
 use crate::cache::policy::{CacheRule, RuleSet};
@@ -14,7 +27,6 @@ use crate::waf::{
 use serde::Deserialize;
 use std::time::Duration;
 
-const SYNC_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Deserialize)]
 struct OriginCfg {
@@ -407,7 +419,12 @@ pub fn spawn_config_sync(
                 }
             }
 
-            tokio::time::sleep(SYNC_INTERVAL).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(config.config_sync_interval_secs.max(5))) => {}
+                _ = config_kick().notified() => {
+                    tracing::info!("config reload requested; pulling immediately");
+                }
+            }
         }
     });
 }

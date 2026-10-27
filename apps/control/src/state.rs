@@ -1,6 +1,7 @@
 //! Shared application state
 
 use crate::config::AppConfig;
+use crate::middleware::login_limit::LoginLimiter;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ pub struct AppState {
     /// CIDR → geo table used by the scheduler.
     pub geo: crate::scheduler::GeoTable,
     pub schedule_ttl: u64,
+    pub login_limiter: Arc<LoginLimiter>,
 }
 
 impl AppState {
@@ -22,6 +24,7 @@ impl AppState {
             config: Arc::new(config),
             geo,
             schedule_ttl,
+            login_limiter: Arc::new(LoginLimiter::new()),
         }
     }
 }

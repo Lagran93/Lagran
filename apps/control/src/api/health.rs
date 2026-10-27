@@ -41,3 +41,27 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<ReadyResponse>,
         }
     }
 }
+
+
+
+
+use axum::response::IntoResponse;
+
+/// Minimal Prometheus text for scrape.
+pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let db = match sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+    {
+        Ok(_) => 1,
+        Err(_) => 0,
+    };
+    let body = format!(
+        "# HELP lagran_control_up Control plane process up\n# TYPE lagran_control_up gauge\nlagran_control_up 1\n# HELP lagran_control_db_up Database reachable\n# TYPE lagran_control_db_up gauge\nlagran_control_db_up {db}\n"
+    );
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}

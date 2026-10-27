@@ -65,6 +65,23 @@ impl EdgeMetrics {
     }
 
     /// Snapshot and reset all domain counters for reporting
+
+    /// Read counters without resetting (for Prometheus scrape).
+    pub async fn take_snapshots_peek(&self) -> Vec<DomainSnapshot> {
+        let map = self.by_domain.lock().await;
+        let mut out = Vec::new();
+        for (domain, c) in map.iter() {
+            out.push(DomainSnapshot {
+                domain: domain.clone(),
+                requests: c.requests.load(Ordering::Relaxed),
+                cache_hits: c.cache_hits.load(Ordering::Relaxed),
+                cache_misses: c.cache_misses.load(Ordering::Relaxed),
+                bytes_sent: c.bytes_sent.load(Ordering::Relaxed),
+            });
+        }
+        out
+    }
+
     pub async fn take_snapshots(&self) -> Vec<DomainSnapshot> {
         let mut map = self.by_domain.lock().await;
         let mut out = Vec::new();

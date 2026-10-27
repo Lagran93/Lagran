@@ -44,6 +44,15 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorBody>)> {
+    let limit_key = format!("login:{}", req.email.trim().to_ascii_lowercase());
+    if !state.login_limiter.check(&limit_key) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorBody {
+                error: "too many login attempts, try again later".into(),
+            }),
+        ));
+    }
     let user = repository::find_user_by_email(&state.pool, &req.email)
         .await
         .map_err(|e| {
@@ -105,11 +114,28 @@ pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<LoginResponse>), (StatusCode, Json<ErrorBody>)> {
-    if req.password.len() < 6 {
+    if !state.config.allow_register {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "registration is disabled".into(),
+            }),
+        ));
+    }
+    let limit_key = format!("register:{}", req.email.trim().to_ascii_lowercase());
+    if !state.login_limiter.check(&limit_key) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorBody {
+                error: "too many registration attempts, try again later".into(),
+            }),
+        ));
+    }
+    if let Err(msg) = validate_password(&req.password) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
-                error: "password too short".into(),
+                error: msg.into(),
             }),
         ));
     }
@@ -223,4 +249,17 @@ pub async fn me(
         name: user.name,
         role: user.role,
     }))
+}
+
+
+fn validate_password(password: &str) -> Result<(), &'static str> {
+    if password.len() < 8 {
+        return Err("password must be at least 8 characters");
+    }
+    let has_letter = password.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = password.chars().any(|c| c.is_ascii_digit());
+    if !has_letter || !has_digit {
+        return Err("password must contain letters and digits");
+    }
+    Ok(())
 }

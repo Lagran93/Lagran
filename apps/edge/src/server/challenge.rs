@@ -115,23 +115,19 @@ pub fn clearance_value(host: &str, ttl_secs: u64, secret: &str) -> (String, u64)
     )
 }
 
-fn cookie_from_headers<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in raw.split(';') {
-        let part = part.trim();
-        if let Some((k, v)) = part.split_once('=') {
-            if k.trim() == name {
-                return Some(v.trim());
-            }
-        }
-    }
-    None
+fn cookie_values<'a>(headers: &'a HeaderMap, name: &str) -> Vec<&'a str> {
+    let Some(raw) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) else {
+        return Vec::new();
+    };
+    raw.split(';')
+        .filter_map(|part| {
+            let (k, v) = part.trim().split_once('=')?;
+            (k.trim() == name).then_some(v.trim())
+        })
+        .collect()
 }
 
-pub fn has_clearance(headers: &HeaderMap, host: &str, ttl_secs: u64, secret: &str) -> bool {
-    let Some(value) = cookie_from_headers(headers, CLEARANCE_COOKIE) else {
-        return false;
-    };
+fn clearance_valid(value: &str, host: &str, ttl_secs: u64, secret: &str) -> bool {
     let parts: Vec<&str> = value.split('.').collect();
     if parts.len() != 2 {
         return false;
@@ -144,6 +140,17 @@ pub fn has_clearance(headers: &HeaderMap, host: &str, ttl_secs: u64, secret: &st
         return false;
     }
     hmac_ok(secret, &format!("clearance|{host}|{ts}"), parts[1])
+}
+
+pub fn has_clearance(headers: &HeaderMap, host: &str, ttl_secs: u64, secret: &str) -> bool {
+    // Browsers may send more than one lagran_clearance cookie (for example an
+    // old Domain-scoped cookie plus a new host-only cookie after an upgrade).
+    // Checking only the first value made the stale cookie permanently shadow
+    // the valid one, producing an endless challenge loop until the user cleared
+    // all cookies manually.
+    cookie_values(headers, CLEARANCE_COOKIE)
+        .into_iter()
+        .any(|value| clearance_valid(value, host, ttl_secs, secret))
 }
 
 fn secure_request(req: &Request<Body>, headers: &HeaderMap) -> bool {
@@ -207,6 +214,17 @@ pub fn page(host: &str, nonce: &str, next: &str, difficulty: u8, secure: bool) -
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    // Drop a stale host-only clearance cookie while re-challenging. Domain-scoped
+    // legacy duplicates cannot be deleted from here, but has_clearance() now
+    // accepts any valid value instead of blindly using the first one.
+    let clear = if secure {
+        "lagran_clearance=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"
+    } else {
+        "lagran_clearance=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+    };
+    if let Ok(v) = HeaderValue::from_str(clear) {
+        headers.insert(header::SET_COOKIE, v);
+    }
     response
 }
 
@@ -497,6 +515,32 @@ mod tests {
         assert!(!has_clearance(&headers, host, ttl, "other-secret"));
         assert!(!has_clearance(&headers, "evil.test", ttl, "secret"));
         assert!(!has_clearance(&HeaderMap::new(), host, ttl, "secret"));
+    }
+
+    #[test]
+    fn stale_duplicate_cookie_does_not_shadow_valid_one() {
+        let host = "cdn.test";
+        let (value, ttl) = clearance_value(host, 300, "secret");
+        let (stale, _) = clearance_value(host, 300, "old-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{CLEARANCE_COOKIE}={stale}; {CLEARANCE_COOKIE}={value}"
+            ))
+            .unwrap(),
+        );
+        assert!(has_clearance(&headers, host, ttl, "secret"));
+
+        let mut bad = HeaderMap::new();
+        bad.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{CLEARANCE_COOKIE}=1.invalid; {CLEARANCE_COOKIE}={value}"
+            ))
+            .unwrap(),
+        );
+        assert!(has_clearance(&bad, host, ttl, "secret"));
     }
 
     #[test]

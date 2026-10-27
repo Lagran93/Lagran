@@ -1,11 +1,11 @@
 //! WAF event buffer shipped to the control plane.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WafEvent {
     pub domain: String,
     pub node_id: String,
@@ -76,6 +76,19 @@ impl WafLog {
             }
         }
         out
+    }
+
+    pub async fn requeue(&self, events: Vec<WafEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut buf = self.inner.lock().await;
+        for ev in events.into_iter().rev() {
+            if buf.len() >= self.cap {
+                buf.pop_back();
+            }
+            buf.push_front(ev);
+        }
     }
 
     pub async fn len(&self) -> usize {

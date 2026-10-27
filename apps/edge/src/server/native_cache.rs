@@ -26,11 +26,19 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL
 
 pub struct NativeStorage {
     cache: SharedCache,
+    max_body: usize,
 }
 
 impl NativeStorage {
     pub fn new(cache: SharedCache) -> Self {
-        Self { cache }
+        Self::with_max_body(cache, 8 * 1024 * 1024)
+    }
+
+    pub fn with_max_body(cache: SharedCache, max_body: usize) -> Self {
+        Self {
+            cache,
+            max_body: max_body.clamp(64 * 1024, 64 * 1024 * 1024),
+        }
     }
 
     fn key_str(key: &CacheKey) -> Option<&str> {
@@ -116,13 +124,14 @@ struct EntryMiss {
     body: BytesMut,
     fresh_secs: u64,
     swr_secs: u64,
+    max_body: usize,
     too_large: bool,
 }
 
 #[async_trait]
 impl HandleMiss for EntryMiss {
     async fn write_body(&mut self, data: Bytes, _eof: bool) -> pingora::Result<()> {
-        if self.body.len() + data.len() > 8 * 1024 * 1024 {
+        if self.body.len() + data.len() > self.max_body {
             self.too_large = true;
         }
         if !self.too_large {
@@ -261,6 +270,7 @@ impl Storage for NativeStorage {
             body: BytesMut::new(),
             fresh_secs: meta.fresh_sec(),
             swr_secs: u64::from(meta.stale_while_revalidate_sec()),
+            max_body: self.max_body,
             too_large: false,
         }) as MissHandler)
     }
@@ -291,5 +301,9 @@ impl Storage for NativeStorage {
 }
 
 pub fn leak_storage(cache: SharedCache) -> &'static NativeStorage {
-    Box::leak(Box::new(NativeStorage::new(cache)))
+    leak_storage_with_limit(cache, 8 * 1024 * 1024)
+}
+
+pub fn leak_storage_with_limit(cache: SharedCache, max_body: usize) -> &'static NativeStorage {
+    Box::leak(Box::new(NativeStorage::with_max_body(cache, max_body)))
 }

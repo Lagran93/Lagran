@@ -18,6 +18,25 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = AppConfig::load();
+    const DEFAULT_JWT: &str = "lagran-dev-secret-change-me";
+    if config.jwt_secret == DEFAULT_JWT || config.jwt_secret.len() < 16 {
+        if config.require_secure_secrets {
+            anyhow::bail!(
+                "JWT_SECRET is missing or uses the insecure default; set a strong secret or disable REQUIRE_SECURE_SECRETS for local dev"
+            );
+        }
+        tracing::warn!(
+            "JWT_SECRET is the built-in default or too short — do not use this in production"
+        );
+    }
+    if config.agent_token.is_empty() {
+        tracing::warn!(
+            "AGENT_TOKEN is empty; edge→control agent routes still require per-node tokens, but schedule/DNS global auth is weakened"
+        );
+    }
+    if config.allow_register {
+        tracing::warn!("ALLOW_REGISTER=true — open self-registration is enabled");
+    }
     tracing::info!("connecting to database...");
 
     let pool = PgPoolOptions::new()
@@ -35,8 +54,12 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("migrations applied");
 
-    repository::ensure_demo_user(&pool).await?;
-    repository::ensure_demo_domain(&pool).await?;
+    if config.seed_demo {
+        repository::ensure_demo_user(&pool).await?;
+        repository::ensure_demo_domain(&pool).await?;
+    } else {
+        tracing::info!("SEED_DEMO=false — skipping demo user/domain seed");
+    }
 
     {
         let pool = pool.clone();
@@ -53,7 +76,32 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Background: retention for access_logs / edge_metrics
+    if config.log_retention_days > 0 {
+        let pool = pool.clone();
+        let days = config.log_retention_days;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                match control::repository::purge_old_telemetry(&pool, days).await {
+                    Ok((a, m)) if a > 0 || m > 0 => {
+                        tracing::info!(
+                            access_logs = a,
+                            metrics = m,
+                            days,
+                            "telemetry retention purge"
+                        )
+                    }
+                    Err(e) => tracing::warn!(error = %e, "telemetry retention failed"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
     let addr = config.bind_addr();
+    let seed_demo = config.seed_demo;
     let state = AppState::new(pool, config);
 
     {
@@ -74,7 +122,9 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("Control plane listening on http://{}", addr);
-    tracing::info!("Demo login: demo@lagran.dev / demo123");
+    if seed_demo {
+        tracing::info!("Demo login: demo@lagran.dev / demo123");
+    }
 
     axum::serve(listener, app).await?;
     Ok(())

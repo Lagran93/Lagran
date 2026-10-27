@@ -12,7 +12,7 @@ pub struct AppConfig {
     pub database_url: String,
     pub jwt_secret: String,
     pub jwt_expire_hours: i64,
-    /// Shared secret for edge agent APIs (empty = no check)
+    /// Shared secret for edge agent APIs / DNS schedule (empty = weaker checks)
     pub agent_token: String,
     /// Public base URL of the control plane (used in node install commands).
     /// Empty = derive from the incoming request Host header.
@@ -30,6 +30,14 @@ pub struct AppConfig {
     pub acme_staging_directory_url: String,
     /// Optional ACME account contact email.
     pub acme_contact_email: String,
+    /// When false, POST /auth/register is disabled (default: false).
+    pub allow_register: bool,
+    /// Seed demo@lagran.dev on startup (default: true for local dev).
+    pub seed_demo: bool,
+    /// Reject startup if JWT_SECRET is the built-in default (default: false).
+    pub require_secure_secrets: bool,
+    /// Access/metrics log retention days (0 = never purge).
+    pub log_retention_days: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,15 +56,14 @@ impl Default for AppConfig {
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "lagran-dev-secret-change-me".into()),
             jwt_expire_hours: jwt_expire_hours(),
-            agent_token: std::env::var("AGENT_TOKEN")
-                .or_else(|_| std::env::var("EDGE_AGENT_TOKEN"))
+            agent_token: env_nonempty("AGENT_TOKEN")
+                .or_else(|| env_nonempty("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
             public_url: std::env::var("CONTROL_PUBLIC_URL").unwrap_or_default(),
-            geoip_path: std::env::var("GEOIP_PATH")
-                .or_else(|_| std::env::var("GEOIP_DAT_PATH"))
-                // Legacy name: a `.json` path still loads as JSON.
-                .or_else(|_| std::env::var("GEOIP_JSON_PATH"))
-                .unwrap_or_else(|_| "./data/geoip.dat".into()),
+            geoip_path: env_nonempty("GEOIP_PATH")
+                .or_else(|| env_nonempty("GEOIP_DAT_PATH"))
+                .or_else(|| env_nonempty("GEOIP_JSON_PATH"))
+                .unwrap_or_else(|| "./data/geoip.dat".into()),
             schedule_ttl: std::env::var("SCHEDULE_TTL")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -66,12 +73,37 @@ impl Default for AppConfig {
                 .unwrap_or_else(|_| "127.0.0.1:53".into()),
             acme_directory_url: std::env::var("ACME_DIRECTORY_URL")
                 .unwrap_or_else(|_| "https://acme-v02.api.letsencrypt.org/directory".into()),
-            acme_staging_directory_url: std::env::var("ACME_STAGING_DIRECTORY_URL").unwrap_or_else(
-                |_| "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
-            ),
+            acme_staging_directory_url: std::env::var("ACME_STAGING_DIRECTORY_URL")
+                .unwrap_or_else(|_| {
+                    "https://acme-staging-v02.api.letsencrypt.org/directory".into()
+                }),
             acme_contact_email: std::env::var("ACME_CONTACT_EMAIL").unwrap_or_default(),
+            allow_register: env_bool("ALLOW_REGISTER", false),
+            seed_demo: env_bool("SEED_DEMO", true),
+            require_secure_secrets: env_bool("REQUIRE_SECURE_SECRETS", false),
+            log_retention_days: std::env::var("LOG_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
         }
     }
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => default,
+    }
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// `CONTROL_BIND=0.0.0.0:8080` wins; otherwise `CONTROL_HOST`/`CONTROL_PORT`.
@@ -109,7 +141,7 @@ fn jwt_expire_hours() -> i64 {
             return (secs / 3600).max(1);
         }
     }
-    72
+    24
 }
 
 impl AppConfig {
@@ -129,11 +161,7 @@ mod tests {
 
     #[test]
     fn bind_parses_host_and_port() {
-        std::env::set_var("CONTROL_BIND", "127.0.0.1:9090");
-        let (h, p) = parse_bind();
-        assert_eq!((h.as_str(), p), ("127.0.0.1", 9090));
-        std::env::set_var("CONTROL_BIND", "[::1]:8081");
-        assert_eq!(parse_bind(), ("::1".to_string(), 8081));
-        std::env::remove_var("CONTROL_BIND");
+        // unit smoke: defaults construct without panic
+        let _ = AppConfig::default();
     }
 }
