@@ -18,7 +18,7 @@
     </div>
 
     <div v-if="projects.length" class="project-grid">
-      <div v-for="p in projects" :key="p.id" class="project-card">
+      <div v-for="p in pagedProjects" :key="p.id" class="project-card">
         <div class="project-head">
           <div class="project-mark">{{ p.name.slice(0, 1) }}</div>
           <div class="flex-1" style="min-width: 0">
@@ -60,29 +60,23 @@
       </div>
     </div>
 
-    <div v-else-if="loading" class="card">
+    <div v-if="!projects.length && loading" class="card">
       <div class="card-body">
         <div class="skeleton" style="height: 120px; width: 100%" />
       </div>
     </div>
 
-    <div v-else class="card">
-      <EmptyState
-        icon="project"
-        title="还没有项目"
-        text="项目用于隔离域名与成员权限。也可以不建项目，直接接入域名（域名会归入你的 Default 项目）。"
-      >
+    <div v-else-if="!projects.length" class="card">
+      <EmptyState icon="project" title="还没有项目" text="项目用于隔离域名与成员权限。也可以不建项目，直接接入域名（域名会归入你的 Default 项目）。">
         <button class="btn btn-primary btn-sm" type="button" @click="openCreate">新建项目</button>
       </EmptyState>
     </div>
 
-    <BaseModal
-      v-model="createOpen"
-      title="新建项目"
-      confirm-text="创建项目"
-      :loading="submitting"
-      @confirm="createProject"
-    >
+    <div v-if="projects.length > pageSize" class="table-footer">
+      <AppPagination v-model:page="page" :total="projects.length" :page-size="pageSize" />
+    </div>
+
+    <BaseModal v-model="createOpen" title="新建项目" confirm-text="创建项目" :loading="submitting" @confirm="createProject">
       <div class="form-col">
         <div class="field">
           <label class="field-label">项目名称 <span class="req">*</span></label>
@@ -132,12 +126,7 @@
             </tbody>
           </table>
         </div>
-        <EmptyState
-          v-else
-          icon="domain"
-          title="项目下暂无域名"
-          text="在「域名管理」把域名的所属项目设为该项目即可。"
-        />
+        <EmptyState v-else icon="domain" title="项目下暂无域名" text="在「域名管理」把域名的所属项目设为该项目即可。" />
       </div>
 
       <div v-else>
@@ -173,28 +162,16 @@
                   </StatusTag>
                 </td>
                 <td class="text-right">
-                  <button
-                    v-if="m.role === 'member'"
-                    class="btn btn-text btn-sm"
-                    type="button"
-                    @click="setMemberRole(m, 'admin')"
-                  >
+                  <button v-if="m.role === 'member'" class="btn btn-text btn-sm" type="button"
+                    @click="setMemberRole(m, 'admin')">
                     设为管理员
                   </button>
-                  <button
-                    v-else-if="m.role === 'admin'"
-                    class="btn btn-text btn-sm"
-                    type="button"
-                    @click="setMemberRole(m, 'member')"
-                  >
+                  <button v-else-if="m.role === 'admin'" class="btn btn-text btn-sm" type="button"
+                    @click="setMemberRole(m, 'member')">
                     设为只读
                   </button>
-                  <button
-                    v-if="m.role !== 'owner'"
-                    class="btn btn-text btn-sm danger"
-                    type="button"
-                    @click="removeMember(m)"
-                  >
+                  <button v-if="m.role !== 'owner'" class="btn btn-text btn-sm danger" type="button"
+                    @click="removeMember(m)">
                     移除
                   </button>
                   <span v-else class="text-muted" style="font-size: 12px">—</span>
@@ -203,12 +180,7 @@
             </tbody>
           </table>
         </div>
-        <EmptyState
-          v-else
-          icon="users"
-          title="暂无成员"
-          text="添加成员后，对方可以在自己的控制台看到该项目下的域名。"
-        />
+        <EmptyState v-else icon="users" title="暂无成员" text="添加成员后，对方可以在自己的控制台看到该项目下的域名。" />
       </div>
     </BaseDrawer>
   </div>
@@ -225,6 +197,18 @@ interface MemberCount {
 }
 
 const projects = ref<any[]>([])
+const pageSize = 8
+const page = ref(1)
+const pagedProjects = computed(() => {
+  const start = (page.value - 1) * pageSize
+  return projects.value.slice(start, start + pageSize)
+})
+watch(
+  () => projects.value.length,
+  (total) => {
+    page.value = Math.min(page.value, Math.max(1, Math.ceil(total / pageSize)))
+  },
+)
 const loading = ref(false)
 const submitting = ref(false)
 
@@ -504,5 +488,24 @@ onMounted(load)
 
 .add-member .input {
   flex: 1;
+}
+
+@media (max-width: 640px) {
+  .project-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .project-card {
+    padding: 14px;
+  }
+
+  .add-member {
+    flex-wrap: wrap;
+  }
+
+  .add-member .input {
+    min-width: 100%;
+  }
 }
 </style>

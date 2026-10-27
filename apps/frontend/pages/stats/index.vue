@@ -63,7 +63,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="d in byDomain" :key="d.domain">
+            <tr v-for="d in pagedByDomain" :key="d.domain">
               <td class="cell-main">{{ d.domain }}</td>
               <td class="num">{{ formatNumber(d.requests) }}</td>
               <td class="num text-success">{{ formatNumber(d.cache_hits) }}</td>
@@ -81,8 +81,11 @@
           </tbody>
         </table>
       </div>
+      <div v-if="byDomain.length > pageSize" class="table-footer">
+        <AppPagination v-model:page="domainPage" :total="byDomain.length" :page-size="pageSize" />
+      </div>
       <EmptyState
-        v-else
+        v-if="!byDomain.length"
         icon="stats"
         title="暂无统计数据"
         text="边缘节点上报指标后（约 15 秒一次），这里会显示各域名的流量与命中率。"
@@ -110,7 +113,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="h in health" :key="h.domain_name">
+            <tr v-for="h in pagedHealth" :key="h.domain_name">
               <td class="cell-main">{{ h.domain_name }}</td>
               <td class="mono text-2">{{ h.origin_url }}</td>
               <td>
@@ -126,8 +129,11 @@
           </tbody>
         </table>
       </div>
+      <div v-if="health.length > pageSize" class="table-footer">
+        <AppPagination v-model:page="healthPage" :total="health.length" :page-size="pageSize" />
+      </div>
       <EmptyState
-        v-else
+        v-if="!health.length"
         icon="shield"
         title="暂无探测数据"
         text="边缘节点启动并同步域名后，大约 30 秒内会上报第一次源站健康结果。"
@@ -153,6 +159,29 @@ const stats = ref<any>({
 })
 const byDomain = ref<any[]>([])
 const health = ref<any[]>([])
+const pageSize = 10
+const domainPage = ref(1)
+const healthPage = ref(1)
+const pagedByDomain = computed(() => {
+  const start = (domainPage.value - 1) * pageSize
+  return byDomain.value.slice(start, start + pageSize)
+})
+const pagedHealth = computed(() => {
+  const start = (healthPage.value - 1) * pageSize
+  return health.value.slice(start, start + pageSize)
+})
+watch(
+  () => byDomain.value.length,
+  (total) => {
+    domainPage.value = Math.min(domainPage.value, Math.max(1, Math.ceil(total / pageSize)))
+  },
+)
+watch(
+  () => health.value.length,
+  (total) => {
+    healthPage.value = Math.min(healthPage.value, Math.max(1, Math.ceil(total / pageSize)))
+  },
+)
 
 async function load() {
   loading.value = true
@@ -173,3 +202,11 @@ async function load() {
 
 onMounted(load)
 </script>
+
+<style scoped>
+@media (max-width: 640px) {
+  .table {
+    min-width: 760px;
+  }
+}
+</style>

@@ -10,33 +10,101 @@ use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 
 const CARD_CSS: &str = r#"
-    :root { color-scheme: light dark; }
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
     body {
-      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-      background: #0b1220; color: #e2e8f0;
+      margin: 0; min-height: 100svh; display: grid; place-items: center;
+      padding: clamp(20px, 6vw, 72px) 16px;
+      font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC", system-ui, sans-serif;
+      color: #332f2a;
+      background:
+        radial-gradient(900px 420px at 8% -10%, rgba(176,58,46,.12), transparent 60%),
+        radial-gradient(700px 360px at 100% 0%, rgba(198,155,86,.12), transparent 55%),
+        linear-gradient(180deg, #fbf8f1 0%, #f3ecdf 100%);
+      position: relative; overflow-x: hidden;
     }
+    .landscape {
+      position: fixed; inset: auto 0 0; height: min(34vh, 300px);
+      pointer-events: none; opacity: .55; z-index: 0;
+    }
+    .landscape svg { width: 100%; height: 100%; display: block; }
+    .wrap { width: min(660px, 100%); position: relative; z-index: 2; }
+    .brand { display: flex; align-items: center; gap: 12px; margin: 0 0 18px 4px; }
+    .seal {
+      width: 46px; height: 46px; border-radius: 10px; display: grid; place-items: center;
+      background: linear-gradient(145deg, #b33a30, #8f2a22); color: #fff8ee;
+      font-family: "Songti SC", "Noto Serif SC", "STSong", serif;
+      font-size: 24px; font-weight: 700; border: 1px solid rgba(255,255,255,.22);
+      box-shadow: 0 8px 20px rgba(143,42,34,.22);
+    }
+    .brand-text { display: flex; flex-direction: column; line-height: 1.2; }
+    .brand-text b {
+      font-family: "Songti SC", "Noto Serif SC", "STSong", serif;
+      font-size: 15px; letter-spacing: .08em; color: #4a4036;
+    }
+    .brand-text small { margin-top: 3px; font-size: 10px; color: #9b8d7a; letter-spacing: .18em; }
     .card {
-      max-width: 560px; padding: 2rem 2.25rem; border-radius: 16px;
-      background: #111827; border: 1px solid #1f2937; box-shadow: 0 20px 50px rgba(0,0,0,.35);
+      background: rgba(255,253,248,.96); border: 1px solid #eadfce; border-radius: 22px;
+      padding: clamp(26px, 5vw, 44px);
+      box-shadow: 0 28px 70px rgba(72,54,36,.12), inset 0 1px 0 rgba(255,255,255,.8);
+      position: relative; overflow: hidden;
+    }
+    .card::before {
+      content: ""; position: absolute; inset: 0 0 auto; height: 4px;
+      background: linear-gradient(90deg, #a7372d, #c99854, #a7372d); opacity: .85;
+    }
+    .card::after {
+      content: ""; position: absolute; right: -40px; top: -50px; width: 180px; height: 180px;
+      border: 1px solid rgba(167,55,45,.08); border-radius: 50%;
+      box-shadow: 0 0 0 22px rgba(167,55,45,.025);
     }
     .badge {
-      display: inline-block; font-size: 0.75rem; letter-spacing: .06em; text-transform: uppercase;
-      color: #38bdf8; background: rgba(56,189,248,.12); padding: .25rem .6rem; border-radius: 999px;
-      margin-bottom: 1rem;
+      display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+      letter-spacing: .14em; color: #9c3b31; background: rgba(167,55,45,.08);
+      border: 1px solid rgba(167,55,45,.14); padding: 5px 10px; border-radius: 999px;
+      margin-bottom: 18px; position: relative; z-index: 1;
     }
-    .badge.warn { color: #fbbf24; background: rgba(251,191,36,.12); }
-    h1 { margin: 0 0 .75rem; font-size: 1.35rem; font-weight: 650; }
-    p { margin: 0 0 .75rem; line-height: 1.6; color: #94a3b8; font-size: .95rem; }
+    .badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+    .badge.warn { color: #8a5a16; background: rgba(176,124,35,.10); border-color: rgba(176,124,35,.20); }
+    h1 {
+      margin: 0 0 14px; font-family: "Songti SC", "Noto Serif SC", "STSong", serif;
+      font-size: clamp(23px, 4vw, 30px); line-height: 1.35; letter-spacing: .02em;
+      color: #2f2a24; font-weight: 700; position: relative; z-index: 1;
+    }
+    h1::after {
+      content: ""; display: block; width: 42px; height: 3px; margin-top: 12px;
+      border-radius: 2px; background: linear-gradient(90deg, #a7372d, #d2aa6a);
+    }
+    p { margin: 0 0 12px; line-height: 1.9; color: #6d6358; font-size: 15px; position: relative; z-index: 1; }
+    strong { color: #4a4036; }
     code {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      background: #0f172a; padding: .15rem .4rem; border-radius: 6px; color: #fbbf24;
-      word-break: break-all;
+      background: #f6ecdd; color: #8f3b31; padding: 2px 6px; border-radius: 6px;
+      border: 1px solid #ead8c4; word-break: break-all; font-size: .88em;
     }
-    ul { margin: .5rem 0 0; padding-left: 1.2rem; color: #94a3b8; font-size: .9rem; }
-    ul li { margin: .25rem 0; }
-    .meta { font-size: .85rem; color: #64748b; margin-top: 1rem; }
-    .foot { margin-top: 1.5rem; font-size: .8rem; color: #64748b; }
+    ul {
+      margin: 14px 0 0; padding: 0; list-style: none; display: grid; gap: 8px;
+      position: relative; z-index: 1;
+    }
+    li { position: relative; padding-left: 16px; color: #74695d; line-height: 1.7; font-size: 14px; }
+    li::before {
+      content: ""; position: absolute; left: 0; top: .62em; width: 5px; height: 5px;
+      border-radius: 50%; background: #b98a4a; box-shadow: 0 0 0 3px rgba(185,138,74,.12);
+    }
+    .meta {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      margin-top: 24px; padding-top: 16px; border-top: 1px solid #eee3d4;
+      font-size: 12px; color: #9a8b78; position: relative; z-index: 1;
+    }
+    .foot { margin: 18px 0 0; text-align: center; font-size: 12px; color: #a29380; letter-spacing: .06em; }
+    @media (max-width: 520px) {
+      body { padding: 18px 12px 28px; }
+      .brand { margin-left: 2px; }
+      .card { padding: 22px; border-radius: 18px; }
+      p { font-size: 14px; }
+      .meta { font-size: 11px; }
+      .landscape { opacity: .35; }
+    }
 "#;
 
 /// Why an origin fetch could not produce a response.
@@ -230,23 +298,39 @@ fn render_page(
     warn: bool,
 ) -> Response {
     let html = format!(
-        r#"<!DOCTYPE html>
+        r##"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#f6f0e5" />
   <title>{page_title} | Lagran CDN</title>
   <style>{CARD_CSS}</style>
 </head>
 <body>
-  <div class="card">
-    <div class="badge{badge_cls}">{badge}</div>
-    {body_html}
-    <p class="meta">错误码：<code>{code}</code></p>
-    <p class="foot">Error: {code} · Powered by Lagran Edge</p>
+  <div class="landscape" aria-hidden="true">
+    <svg viewBox="0 0 1440 320" preserveAspectRatio="none">
+      <path fill="#e7ddcc" d="M0 250 L120 190 L230 235 L350 145 L470 225 L610 175 L760 245 L900 155 L1030 220 L1160 170 L1290 230 L1440 180 L1440 320 L0 320 Z"/>
+      <path fill="#f0e7d8" d="M0 285 L180 235 L330 270 L500 215 L680 275 L840 235 L1010 280 L1180 225 L1330 270 L1440 245 L1440 320 L0 320 Z"/>
+    </svg>
+  </div>
+  <div class="wrap">
+    <div class="brand">
+      <div class="seal">澜</div>
+      <div class="brand-text">
+        <b>Lagran 边缘</b>
+        <small>EDGE SECURITY &amp; ACCELERATION</small>
+      </div>
+    </div>
+    <div class="card">
+      <div class="badge{badge_cls}">{badge}</div>
+      {body_html}
+      <div class="meta"><span>错误码</span><code>{code}</code></div>
+    </div>
+    <p class="foot">Lagran Edge · 为每一次访问保驾护航</p>
   </div>
 </body>
-</html>"#,
+</html>"##,
         badge_cls = if warn { " warn" } else { "" },
     );
 

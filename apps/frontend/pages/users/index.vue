@@ -52,7 +52,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="u in filtered" :key="u.id">
+              <tr v-for="u in pagedUsers" :key="u.id">
                 <td>
                   <div class="user-cell">
                     <span class="user-avatar">{{ (u.name || u.email).slice(0, 1).toUpperCase() }}</span>
@@ -98,6 +98,9 @@
           title="暂无用户"
           text="创建账号后，可将用户加入项目并分配只读或管理权限。"
         />
+        <div v-if="filtered.length > pageSize" class="table-footer">
+          <AppPagination v-model:page="page" :total="filtered.length" :page-size="pageSize" />
+        </div>
       </div>
     </div>
 
@@ -202,6 +205,21 @@ const filtered = computed(() => {
     (u) => String(u.email).toLowerCase().includes(q) || String(u.name).toLowerCase().includes(q),
   )
 })
+const pageSize = 10
+const page = ref(1)
+const pagedUsers = computed(() => {
+  const start = (page.value - 1) * pageSize
+  return filtered.value.slice(start, start + pageSize)
+})
+watch(keyword, () => {
+  page.value = 1
+})
+watch(
+  () => filtered.value.length,
+  (total) => {
+    page.value = Math.min(page.value, Math.max(1, Math.ceil(total / pageSize)))
+  },
+)
 const activeCount = computed(() => users.value.filter((u) => u.is_active).length)
 const adminCount = computed(() => users.value.filter((u) => u.role === 'admin' && u.is_active).length)
 
@@ -367,7 +385,17 @@ onMounted(() => {
     grid-template-columns: 1fr;
   }
   .search {
-    width: 160px;
+    width: 100%;
+  }
+}
+
+@media (max-width: 640px) {
+  .card-head .search {
+    width: 100%;
+  }
+
+  .table {
+    min-width: 680px;
   }
 }
 </style>

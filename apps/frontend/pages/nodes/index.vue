@@ -71,7 +71,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="n in nodes" :key="n.id">
+            <tr v-for="n in pagedNodes" :key="n.id">
               <td>
                 <div class="cell-main">{{ n.name }}</div>
                 <div class="cell-sub mono">{{ n.id.slice(0, 8) }}</div>
@@ -139,12 +139,16 @@
         </table>
       </div>
 
-      <div v-else-if="loading" class="card-body">
+      <div v-if="nodes.length > pageSize" class="table-footer">
+        <AppPagination v-model:page="page" :total="nodes.length" :page-size="pageSize" />
+      </div>
+
+      <div v-if="!nodes.length && loading" class="card-body">
         <div class="skeleton" style="height: 34px; width: 100%" />
       </div>
 
       <EmptyState
-        v-else
+        v-else-if="!nodes.length"
         icon="node"
         title="还没有边缘节点"
         text="点击「添加节点」预注册一个节点，控制台会生成带一次性令牌的安装命令；在服务器上运行后约 15 秒出现在列表里。"
@@ -637,6 +641,20 @@ const detail = ref<CreatedNode | null>(null)
 
 let timer: ReturnType<typeof setInterval> | null = null
 
+const page = ref(1)
+const pageSize = 10
+const pagedNodes = computed(() => {
+  const start = (page.value - 1) * pageSize
+  return nodes.value.slice(start, start + pageSize)
+})
+watch(
+  () => nodes.value.length,
+  (total) => {
+    const last = Math.max(1, Math.ceil(total / pageSize))
+    if (page.value > last) page.value = last
+  },
+)
+
 const counts = computed(() => {
   const result = { online: 0, offline: 0, pending: 0, disabled: 0 }
   for (const n of nodes.value) {
@@ -1074,6 +1092,10 @@ onUnmounted(() => {
 
   .detail-item.span-2 {
     grid-column: span 1;
+  }
+
+  .table {
+    min-width: 900px;
   }
 }
 </style>
