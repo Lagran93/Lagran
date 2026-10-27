@@ -9,7 +9,7 @@
 
 use crate::cache::policy::{
     cache_key_for_request, compute_etag, decide_storage, has_non_clearance_cookie,
-    resolve_rule_policy, ResolvedPolicy, RuleAction,
+    resolve_rule_policy, resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
 };
 use crate::config::registry::DomainEntry;
 use crate::config::EdgeConfig;
@@ -40,7 +40,8 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::Result;
 use pingora_cache::lock::CacheLock;
 use pingora_cache::{
-    CacheKey, CacheMeta, CacheOptionOverrides, CachePhase, NoCacheReason, RespCacheable,
+    CacheKey, CacheMeta, CacheOptionOverrides, CachePhase, ForcedFreshness, NoCacheReason,
+    RespCacheable,
 };
 
 use std::sync::Arc;
@@ -129,6 +130,7 @@ struct ReqCtx {
     cache_label: &'static str,
     status: u16,
     attempt: u8,
+    response_bypass: bool,
     head_body: BytesMut,
     head_headers: Option<ResponseHeader>,
     head_status: u16,
@@ -149,6 +151,7 @@ impl Default for ReqCtx {
             cache_label: "MISS",
             status: 0,
             attempt: 0,
+            response_bypass: false,
             head_body: BytesMut::new(),
             head_headers: None,
             head_status: 0,
@@ -352,6 +355,40 @@ impl ProxyHttp for DataPlaneProxy {
         Ok(())
     }
 
+    async fn cache_hit_filter(
+        &self,
+        session: &mut Session,
+        meta: &CacheMeta,
+        _hit_handler: &mut pingora_cache::HitHandler,
+        _is_fresh: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<ForcedFreshness>> {
+        let Some(plan) = ctx.plan.as_ref() else {
+            return Ok(None);
+        };
+        let content_type = meta
+            .response_header()
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if content_type.is_empty() {
+            return Ok(None);
+        }
+        let query = session.req_header().uri.query().unwrap_or("");
+        let response_policy = resolve_rule_policy_for_response(
+            &plan.domain.rules,
+            &ctx.path,
+            ctx.method.as_str(),
+            query,
+            content_type,
+        );
+        if response_policy.action != RuleAction::Cache {
+            return Ok(Some(ForcedFreshness::ForceMiss));
+        }
+        Ok(None)
+    }
+
     fn cache_key_callback(&self, _session: &Session, ctx: &mut Self::CTX) -> Result<CacheKey> {
         let key = ctx
             .plan
@@ -455,7 +492,7 @@ impl ProxyHttp for DataPlaneProxy {
 
     fn response_cache_filter(
         &self,
-        _session: &Session,
+        session: &Session,
         resp: &ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
@@ -474,11 +511,30 @@ impl ProxyHttp for DataPlaneProxy {
                 "set-cookie",
             )));
         }
+        let content_type = resp
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let query = session.req_header().uri.query().unwrap_or("");
+        let response_policy = resolve_rule_policy_for_response(
+            &plan.domain.rules,
+            &ctx.path,
+            ctx.method.as_str(),
+            query,
+            content_type,
+        );
+        if response_policy.action != RuleAction::Cache {
+            ctx.response_bypass = true;
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "content-type rule",
+            )));
+        }
         let headers = header_vec(&resp.headers);
         let Some(decision) = decide_storage(
             resp.status.as_u16(),
             &headers,
-            plan.policy,
+            response_policy,
             self.state.default_ttl_secs,
         ) else {
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
@@ -519,14 +575,30 @@ impl ProxyHttp for DataPlaneProxy {
         let Some(plan) = ctx.plan.as_ref() else {
             return Ok(());
         };
-        let mut label = if plan.is_websocket {
+        let content_type = response
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let query = session.req_header().uri.query().unwrap_or("");
+        let response_policy = resolve_rule_policy_for_response(
+            &plan.domain.rules,
+            &ctx.path,
+            ctx.method.as_str(),
+            query,
+            content_type,
+        );
+        let mut label = if ctx.response_bypass {
+            "BYPASS"
+        } else if plan.is_websocket {
             "WS"
         } else if plan.cacheable {
             cache_label(session.cache.phase())
         } else {
             plan.label
         };
-        if plan.cacheable
+        if !ctx.response_bypass
+            && plan.cacheable
             && response.status == 304
             && session.req_header().headers.contains_key("if-none-match")
         {
@@ -541,7 +613,10 @@ impl ProxyHttp for DataPlaneProxy {
 
         let mut headers = response.headers.clone();
         if plan.cacheable || plan.is_head {
-            apply_browser_ttl(&mut headers, policy_browser_ttl(&plan.policy));
+            let browser_ttl = (response_policy.action == RuleAction::Cache)
+                .then(|| policy_browser_ttl(&response_policy))
+                .flatten();
+            apply_browser_ttl(&mut headers, browser_ttl);
         }
         apply_security_headers(&mut headers);
         apply_cors_and_custom(&mut headers, &plan.cors, &plan.custom);

@@ -102,6 +102,8 @@ pub struct CacheRule {
     pub match_methods: String,
     /// Case-insensitive substring of the raw query string.
     pub match_query: String,
+    /// Optional case-insensitive response `Content-Type` substring.
+    pub match_content_type: String,
     /// `Cache-Control: max-age` override sent to clients (0 = keep origin).
     pub browser_ttl_seconds: u64,
     /// Override the domain's ignore_query setting; `None` inherits it.
@@ -126,6 +128,7 @@ impl CacheRule {
             browser_ttl_seconds: 0,
             ignore_query: None,
             ignore_cookie: false,
+            match_content_type: String::new(),
         }
     }
 
@@ -178,6 +181,7 @@ pub struct MatchedPolicy {
     pub ignore_cookie: bool,
     pub match_methods: String,
     pub match_query: String,
+    pub match_content_type: String,
 }
 
 #[derive(Clone, Default)]
@@ -222,6 +226,7 @@ impl RuleSet {
             ignore_cookie: r.ignore_cookie,
             match_methods: r.match_methods.clone(),
             match_query: r.match_query.clone(),
+            match_content_type: r.match_content_type.clone(),
         })
     }
 }
@@ -235,7 +240,39 @@ pub fn match_rule<'a>(
 ) -> Option<&'a CacheRule> {
     let mut best: Option<&CacheRule> = None;
     for r in rules {
+        // Content-Type rules can only be decided after the response arrives.
+        if !r.enabled
+            || !r.match_content_type.trim().is_empty()
+            || !request_matches_rule(r, path, method, query)
+        {
+            continue;
+        }
+        match best {
+            Some(b) if b.priority >= r.priority => {}
+            _ => best = Some(r),
+        }
+    }
+    best
+}
+
+/// Resolve the effective rule after the origin response headers are known.
+/// Content-Type-specific rules participate here; rules without a Content-Type
+/// condition still match any response.
+pub fn match_rule_for_response<'a>(
+    rules: &'a [CacheRule],
+    path: &str,
+    method: &str,
+    query: &str,
+    content_type: &str,
+) -> Option<&'a CacheRule> {
+    let content_type = content_type.trim().to_ascii_lowercase();
+    let mut best: Option<&CacheRule> = None;
+    for r in rules {
         if !r.enabled || !request_matches_rule(r, path, method, query) {
+            continue;
+        }
+        let needle = r.match_content_type.trim().to_ascii_lowercase();
+        if !needle.is_empty() && !content_type.contains(&needle) {
             continue;
         }
         match best {
@@ -299,6 +336,18 @@ pub fn resolve_rule_policy(
     query: &str,
 ) -> ResolvedPolicy {
     match_rule(rules, path, method, query)
+        .map(rule_policy)
+        .unwrap_or_default()
+}
+
+pub fn resolve_rule_policy_for_response(
+    rules: &[CacheRule],
+    path: &str,
+    method: &str,
+    query: &str,
+    content_type: &str,
+) -> ResolvedPolicy {
+    match_rule_for_response(rules, path, method, query, content_type)
         .map(rule_policy)
         .unwrap_or_default()
 }
@@ -701,6 +750,7 @@ mod tests {
             browser_ttl_seconds: 0,
             ignore_query: None,
             ignore_cookie: false,
+            match_content_type: String::new(),
         }
     }
 
@@ -727,6 +777,7 @@ mod tests {
             browser_ttl_seconds: browser_ttl,
             ignore_query,
             ignore_cookie: false,
+            match_content_type: String::new(),
         }
     }
 
@@ -751,6 +802,39 @@ mod tests {
         assert!(request_matches_rule(&r, "/style.css", "GET", ""));
         assert!(!request_matches_rule(&r, "/index.html", "GET", ""));
         assert!(!request_matches_rule(&r, "/app.js.map", "GET", ""));
+    }
+
+    #[test]
+    fn content_type_rule_matches_only_after_response() {
+        let mut html_bypass = rule("/*", 0, 100, "bypass", 0);
+        html_bypass.match_content_type = "text/html".into();
+        let js_cache = rule("/*", 3600, 10, "cache", 0);
+        let rules = vec![html_bypass, js_cache];
+
+        // Request-time matching must defer Content-Type rules.
+        assert_eq!(
+            resolve_rule_policy(&rules, "/app.js", "GET", "").action,
+            RuleAction::Cache
+        );
+
+        let html = resolve_rule_policy_for_response(
+            &rules,
+            "/",
+            "GET",
+            "",
+            "text/html; charset=utf-8",
+        );
+        assert_eq!(html.action, RuleAction::Bypass);
+
+        let js = resolve_rule_policy_for_response(
+            &rules,
+            "/app.js",
+            "GET",
+            "",
+            "application/javascript",
+        );
+        assert_eq!(js.action, RuleAction::Cache);
+        assert_eq!(js.ttl_override, Some(3600));
     }
 
     #[test]

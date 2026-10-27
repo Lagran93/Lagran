@@ -13,8 +13,9 @@ use crate::agent::origin_health::OriginHealthMap;
 use crate::agent::{ControlClient, NodeControl};
 use crate::cache::policy::{
     cache_key_for_request, compute_etag, decide_storage, etag_matches, is_uncacheable_header,
-    request_bypasses_cache, request_method_cacheable, resolve_rule_policy, strip_response_headers,
-    CacheStatus, ResolvedPolicy, RuleAction, RuleSet,
+    request_bypasses_cache, request_method_cacheable, resolve_rule_policy,
+    resolve_rule_policy_for_response, strip_response_headers, CacheRule, CacheStatus,
+    ResolvedPolicy, RuleAction, RuleSet,
 };
 use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
 use crate::config::registry::{DomainEntry, DomainRegistry};
@@ -85,6 +86,9 @@ struct Effective {
     origin_url: String,
     backup_url: String,
     policy: ResolvedPolicy,
+    rules: Vec<CacheRule>,
+    path: String,
+    method: Method,
     ignore_query: bool,
     cors: String,
     custom_headers: String,
@@ -245,8 +249,11 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             Effective {
                 origin_url: e.origin_url.clone(),
                 backup_url: e.backup_origin_url.clone(),
-                ignore_query: policy.ignore_query.unwrap_or(e.ignore_query_string),
                 policy,
+                rules: e.rules.clone(),
+                path: path_only.clone(),
+                method: method.clone(),
+                ignore_query: policy.ignore_query.unwrap_or(e.ignore_query_string),
                 cors: e.cors_origins.clone(),
                 custom_headers: e.custom_headers.clone(),
                 timeout_ms: u64::from(if e.origin_timeout_ms == 0 {
@@ -270,6 +277,9 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 backup_url: String::new(),
                 ignore_query,
                 policy,
+                rules: Vec::new(),
+                path: path_only.clone(),
+                method: method.clone(),
                 cors: String::new(),
                 custom_headers: String::new(),
                 timeout_ms: 10_000,
@@ -366,7 +376,17 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     };
     let key = cache_key_for_request(&key_method, &host, &cache_lookup_path, &headers);
 
-    let lookup = state.cache.get_result(&key).await;
+    let mut lookup = state.cache.get_result(&key).await;
+    let cached_bypass = match &lookup {
+        CacheGetResult::Hit(entry) | CacheGetResult::Stale(entry) => {
+            entry_response_bypass(&eff, entry)
+        }
+        _ => false,
+    };
+    if cached_bypass {
+        state.cache.delete(&key).await;
+        lookup = CacheGetResult::Miss;
+    }
     let from_expired = matches!(lookup, CacheGetResult::Expired);
     match lookup {
         CacheGetResult::Hit(ref entry) => {
@@ -399,6 +419,8 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 headers.clone(),
                 eff.timeout_ms,
                 eff.policy,
+                eff.rules.clone(),
+                eff.path.clone(),
             );
             serve_cached(
                 &state,
@@ -463,12 +485,27 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                     let status = resp.status;
                     let body_len = resp.body.len() as u64;
                     let etag = entry_etag(&resp);
-                    if (200..300).contains(&status.as_u16()) {
+                    let content_type = resp
+                        .headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let response_policy = resolve_rule_policy_for_response(
+                        &eff.rules,
+                        &eff.path,
+                        method.as_str(),
+                        path_and_query.split_once('?').map(|(_, q)| q).unwrap_or(""),
+                        content_type,
+                    );
+                    let response_bypass = response_policy.action != RuleAction::Cache;
+                    if !response_bypass && (200..300).contains(&status.as_u16()) {
                         state.metrics.record_miss(&host, body_len).await;
                     } else {
                         state.metrics.record_bypass(&host, body_len).await;
                     }
-                    let label = if from_expired {
+                    let label = if response_bypass {
+                        CacheStatus::Bypass
+                    } else if from_expired {
                         CacheStatus::Expired
                     } else {
                         CacheStatus::Miss
@@ -479,7 +516,11 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         &etag,
                         &eff.cors,
                         &eff.custom_headers,
-                        policy_browser_ttl(&eff.policy),
+                        if response_bypass {
+                            None
+                        } else {
+                            policy_browser_ttl(&response_policy)
+                        },
                     );
                     log_access(
                         &state.access_log,
@@ -696,20 +737,38 @@ async fn fetch_with_single_flight(
         Slot::Leader(leader) => {
             let result = fetch_origin(state, eff, host, path_and_query, headers, method).await;
             if let Ok(resp) = &result {
-                if let Some(decision) = decide_storage(
-                    resp.status.as_u16(),
-                    &headers_vec(&resp.headers),
-                    eff.policy,
-                    state.default_ttl_secs,
-                ) {
-                    if resp.body.len() <= state.max_cacheable_body {
-                        let entry = clone_as_entry(resp);
-                        state
-                            .cache
-                            .set_with_swr(key, entry, decision.ttl_secs, decision.swr_secs)
-                            .await;
-                    } else {
-                        tracing::debug!(len = resp.body.len(), %host, "object too large to cache");
+                let content_type = resp
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let query = path_and_query
+                    .split_once('?')
+                    .map(|(_, q)| q)
+                    .unwrap_or("");
+                let response_policy = resolve_rule_policy_for_response(
+                    &eff.rules,
+                    &eff.path,
+                    method.as_str(),
+                    query,
+                    content_type,
+                );
+                if response_policy.action == RuleAction::Cache {
+                    if let Some(decision) = decide_storage(
+                        resp.status.as_u16(),
+                        &headers_vec(&resp.headers),
+                        response_policy,
+                        state.default_ttl_secs,
+                    ) {
+                        if resp.body.len() <= state.max_cacheable_body {
+                            let entry = clone_as_entry(resp);
+                            state
+                                .cache
+                                .set_with_swr(key, entry, decision.ttl_secs, decision.swr_secs)
+                                .await;
+                        } else {
+                            tracing::debug!(len = resp.body.len(), %host, "object too large to cache");
+                        }
                     }
                 }
             }
@@ -792,6 +851,8 @@ fn spawn_revalidation(
     headers: HeaderMap,
     timeout_ms: u64,
     policy: ResolvedPolicy,
+    rules: Vec<CacheRule>,
+    path: String,
 ) {
     tokio::spawn(async move {
         let Slot::Leader(leader) = state.inflight.begin(&key).await else {
@@ -801,6 +862,9 @@ fn spawn_revalidation(
             origin_url,
             backup_url,
             policy,
+            rules,
+            path,
+            method: Method::GET,
             ignore_query: false,
             cors: String::new(),
             custom_headers: String::new(),
@@ -808,19 +872,37 @@ fn spawn_revalidation(
         };
         match fetch_origin(&state, &eff, &host, &path_and_query, &headers, &Method::GET).await {
             Ok(resp) => {
-                if let Some(decision) = decide_storage(
-                    resp.status.as_u16(),
-                    &headers_vec(&resp.headers),
-                    policy,
-                    state.default_ttl_secs,
-                ) {
-                    if resp.body.len() <= state.max_cacheable_body {
-                        let entry = resp.into_entry();
-                        state
-                            .cache
-                            .set_with_swr(&key, entry, decision.ttl_secs, decision.swr_secs)
-                            .await;
-                        tracing::debug!(%key, "revalidated stale entry");
+                let content_type = resp
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let query = path_and_query
+                    .split_once('?')
+                    .map(|(_, q)| q)
+                    .unwrap_or("");
+                let response_policy = resolve_rule_policy_for_response(
+                    &eff.rules,
+                    &eff.path,
+                    "GET",
+                    query,
+                    content_type,
+                );
+                if response_policy.action == RuleAction::Cache {
+                    if let Some(decision) = decide_storage(
+                        resp.status.as_u16(),
+                        &headers_vec(&resp.headers),
+                        response_policy,
+                        state.default_ttl_secs,
+                    ) {
+                        if resp.body.len() <= state.max_cacheable_body {
+                            let entry = resp.into_entry();
+                            state
+                                .cache
+                                .set_with_swr(&key, entry, decision.ttl_secs, decision.swr_secs)
+                                .await;
+                            tracing::debug!(%key, "revalidated stale entry");
+                        }
                     }
                 }
             }
@@ -936,6 +1018,27 @@ fn entry_etag(resp: &OriginResponse) -> String {
         return v.to_string();
     }
     compute_etag(&clone_as_entry(resp))
+}
+
+fn entry_response_bypass(eff: &Effective, entry: &CacheEntry) -> bool {
+    let content_type = entry
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    if content_type.is_empty() {
+        return false;
+    }
+    resolve_rule_policy_for_response(
+        &eff.rules,
+        &eff.path,
+        eff.method.as_str(),
+        "",
+        content_type,
+    )
+    .action
+        != RuleAction::Cache
 }
 
 fn clone_as_entry(resp: &OriginResponse) -> CacheEntry {

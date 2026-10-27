@@ -40,6 +40,7 @@ pub struct CacheRuleConfig {
     pub browser_ttl_seconds: u64,
     pub ignore_query: Option<bool>,
     pub ignore_cookie: bool,
+    pub match_content_type: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -136,6 +137,7 @@ fn rule_configs(rows: Vec<repository::CacheRuleRow>) -> Vec<CacheRuleConfig> {
             browser_ttl_seconds: r.browser_ttl_seconds.max(0) as u64,
             ignore_query: r.ignore_query,
             ignore_cookie: r.ignore_cookie,
+            match_content_type: r.match_content_type,
         })
         .collect()
 }
@@ -273,6 +275,7 @@ fn build(
         r.browser_ttl_seconds.hash(&mut h);
         r.ignore_query.hash(&mut h);
         r.ignore_cookie.hash(&mut h);
+        r.match_content_type.hash(&mut h);
     }
     match &waf {
         Some(w) => {

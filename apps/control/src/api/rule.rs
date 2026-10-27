@@ -34,6 +34,7 @@ pub struct RuleDto {
     pub browser_ttl_seconds: u64,
     pub ignore_query: Option<bool>,
     pub ignore_cookie: bool,
+    pub match_content_type: String,
     pub note: String,
 }
 
@@ -55,6 +56,7 @@ impl RuleDto {
             browser_ttl_seconds: r.browser_ttl_seconds.max(0) as u64,
             ignore_query: r.ignore_query,
             ignore_cookie: r.ignore_cookie,
+            match_content_type: r.match_content_type,
             note: r.note,
         }
     }
@@ -80,6 +82,9 @@ pub struct RulePayload {
     pub ignore_query: Option<Option<bool>>,
     /// Cache static assets even when the request carries cookies.
     pub ignore_cookie: Option<bool>,
+    /// Optional case-insensitive Content-Type substring (e.g. text/html).
+    #[serde(default)]
+    pub match_content_type: Option<String>,
     pub note: Option<String>,
 }
 
@@ -115,6 +120,7 @@ struct Normalized {
     browser_ttl_seconds: i64,
     ignore_query: Option<bool>,
     ignore_cookie: bool,
+    match_content_type: String,
     note: String,
 }
 
@@ -182,6 +188,7 @@ fn normalize(
     enabled: bool,
     ignore_query: Option<bool>,
     ignore_cookie: bool,
+    match_content_type: &str,
     note: &str,
 ) -> Result<Normalized, String> {
     let match_type = normalize_match_type(match_type)?;
@@ -214,6 +221,16 @@ fn normalize(
     if note.len() > 200 {
         return Err("note is too long".into());
     }
+    let match_content_type = match_content_type.trim().to_ascii_lowercase();
+    if match_content_type.len() > 128 {
+        return Err("match_content_type is too long".into());
+    }
+    if match_content_type
+        .chars()
+        .any(|c| c.is_control() || c == '\r' || c == '\n')
+    {
+        return Err("invalid match_content_type".into());
+    }
     Ok(Normalized {
         path_pattern,
         match_type,
@@ -227,6 +244,7 @@ fn normalize(
         browser_ttl_seconds: browser_ttl_seconds as i64,
         ignore_query,
         ignore_cookie,
+        match_content_type,
         note,
     })
 }
@@ -280,6 +298,7 @@ pub async fn create(
         true,
         req.rule.ignore_query.flatten(),
         req.rule.ignore_cookie.unwrap_or(false),
+        req.rule.match_content_type.as_deref().unwrap_or(""),
         req.rule.note.as_deref().unwrap_or(""),
     )
     .map_err(bad_request)?;
@@ -297,6 +316,7 @@ pub async fn create(
         browser_ttl_seconds: normalized.browser_ttl_seconds,
         ignore_query: normalized.ignore_query,
         ignore_cookie: normalized.ignore_cookie,
+        match_content_type: &normalized.match_content_type,
         note: &normalized.note,
     };
     let row = repository::create_rule(&state.pool, domain_id, &input)
@@ -372,6 +392,9 @@ pub async fn update(
         current.enabled,
         req.ignore_query.unwrap_or(current.ignore_query),
         req.ignore_cookie.unwrap_or(current.ignore_cookie),
+        req.match_content_type
+            .as_deref()
+            .unwrap_or(&current.match_content_type),
         note,
     )
     .map_err(bad_request)?;
@@ -389,6 +412,7 @@ pub async fn update(
         browser_ttl_seconds: normalized.browser_ttl_seconds,
         ignore_query: normalized.ignore_query,
         ignore_cookie: normalized.ignore_cookie,
+        match_content_type: &normalized.match_content_type,
         note: &normalized.note,
     };
     let row = repository::update_rule(&state.pool, uid, &input)
@@ -447,6 +471,8 @@ pub struct TestRequest {
     pub path: String,
     pub method: Option<String>,
     pub query: Option<String>,
+    /// Optional simulated origin response Content-Type.
+    pub content_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -511,12 +537,26 @@ fn rule_path_matches(rule: &repository::CacheRuleRow, path: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn pick<'a>(
     rows: &'a [repository::CacheRuleRow],
     path: &str,
     method: &str,
     query: &str,
 ) -> Option<&'a repository::CacheRuleRow> {
+    pick_with_content_type(rows, path, method, query, None)
+}
+
+fn pick_with_content_type<'a>(
+    rows: &'a [repository::CacheRuleRow],
+    path: &str,
+    method: &str,
+    query: &str,
+    content_type: Option<&str>,
+) -> Option<&'a repository::CacheRuleRow> {
+    let content_type = content_type
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
     let mut best: Option<&repository::CacheRuleRow> = None;
     for r in rows {
         if !r.enabled
@@ -525,6 +565,16 @@ fn pick<'a>(
             || !query_matches(&r.match_query, query)
         {
             continue;
+        }
+        let needle = r.match_content_type.trim().to_ascii_lowercase();
+        if !needle.is_empty() {
+            let Some(ct) = content_type.as_deref() else {
+                // Response-dependent rules cannot be evaluated without a type.
+                continue;
+            };
+            if !ct.contains(&needle) {
+                continue;
+            }
         }
         match best {
             Some(b) if b.priority >= r.priority => {}
@@ -565,7 +615,13 @@ pub async fn test(
         .to_ascii_uppercase();
     let query = req.query.clone().unwrap_or_default();
 
-    match pick(&rules, path, &method, &query) {
+    match pick_with_content_type(
+        &rules,
+        path,
+        &method,
+        &query,
+        req.content_type.as_deref(),
+    ) {
         Some(rule) => {
             let effective = EffectiveDto {
                 action: rule.action.clone(),
@@ -657,6 +713,7 @@ mod tests {
             browser_ttl_seconds: 0,
             ignore_query: None,
             ignore_cookie: false,
+            match_content_type: String::new(),
             note: String::new(),
         }
     }

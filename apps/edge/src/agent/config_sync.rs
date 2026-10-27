@@ -53,6 +53,8 @@ struct RuleCfg {
     #[serde(default)]
     match_query: String,
     #[serde(default)]
+    match_content_type: String,
+    #[serde(default)]
     browser_ttl_seconds: u64,
     #[serde(default)]
     ignore_query: Option<bool>,
@@ -84,6 +86,7 @@ impl RuleCfg {
             enabled: self.enabled,
             match_methods: self.match_methods,
             match_query: self.match_query,
+            match_content_type: self.match_content_type,
             browser_ttl_seconds: self.browser_ttl_seconds,
             ignore_query: self.ignore_query,
             ignore_cookie: self.ignore_cookie,

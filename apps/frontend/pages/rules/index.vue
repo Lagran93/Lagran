@@ -37,6 +37,12 @@
           <option v-for="m in methodOptions" :key="m" :value="m">{{ m }}</option>
         </select>
         <input v-model="tester.query" class="input" placeholder="查询串（可选）" style="width: 180px" />
+        <input
+          v-model="tester.content_type"
+          class="input"
+          placeholder="Content-Type（可选）"
+          style="width: 190px"
+        />
         <button class="btn btn-primary" type="button" :disabled="testing" @click="runTest">
           {{ testing ? '测试中…' : '测试' }}
         </button>
@@ -129,6 +135,7 @@
                   <span v-if="r.match_methods" class="cond-chip">{{ r.match_methods.replaceAll(',', ' / ') }}</span>
                   <span v-else class="cond-chip muted">全部方法</span>
                   <span v-if="r.match_query" class="cond-chip">query 含 {{ r.match_query }}</span>
+                  <span v-if="r.match_content_type" class="cond-chip">Content-Type 含 {{ r.match_content_type }}</span>
                   <span v-if="r.ignore_query === true" class="cond-chip warn">忽略 Query</span>
                   <span v-else-if="r.ignore_query === false" class="cond-chip">区分 Query</span>
                   <span v-if="r.ignore_cookie" class="cond-chip warn">忽略 Cookie</span>
@@ -268,6 +275,19 @@
           </div>
 
           <div class="field span-2">
+            <label class="field-label">响应 Content-Type 包含（可选）</label>
+            <input
+              v-model="form.match_content_type"
+              class="input"
+              placeholder="例如 text/html"
+            />
+            <span class="field-hint">
+              响应头 Content-Type 不区分大小写子串匹配；留空匹配所有类型。
+              例如用 <code>text/html</code> + 绕过缓存，静态 JS/CSS 仍按高优先级规则缓存。
+            </span>
+          </div>
+
+          <div class="field span-2">
             <label class="field-label">缓存动作</label>
             <div class="segmented">
               <button
@@ -368,7 +388,7 @@ const statusFilter = ref('')
 const page = ref(1)
 const pageSize = 10
 
-const tester = ref({ domain_id: '', path: '/', method: 'GET', query: '' })
+const tester = ref({ domain_id: '', path: '/', method: 'GET', query: '', content_type: '' })
 const testing = ref(false)
 const testResult = ref<any>(null)
 
@@ -385,6 +405,7 @@ const form = ref({
   browser_ttl_seconds: 0,
   methods: [] as string[],
   match_query: '',
+  match_content_type: '',
   ignore_query: 'inherit' as 'inherit' | 'on' | 'off',
   ignore_cookie: false,
   priority: 0,
@@ -461,6 +482,7 @@ function toggleMethod(method: string) {
 function applyPreset(preset: any) {
   form.value.path_pattern = preset.path
   form.value.match_type = preset.matchType || 'glob'
+  form.value.match_content_type = ''
   form.value.ignore_cookie = !!preset.ignoreCookie
   form.value.action = preset.bypass ? 'bypass' : 'cache'
   form.value.ttl_seconds = preset.ttl || 60
@@ -500,6 +522,7 @@ function openCreate() {
     browser_ttl_seconds: 0,
     methods: [],
     match_query: '',
+    match_content_type: '',
     ignore_query: 'inherit',
     ignore_cookie: false,
     priority: 0,
@@ -522,6 +545,7 @@ function openEdit(rule: any) {
     browser_ttl_seconds: rule.browser_ttl_seconds,
     methods: rule.match_methods ? String(rule.match_methods).split(',').filter(Boolean) : [],
     match_query: rule.match_query || '',
+    match_content_type: rule.match_content_type || '',
     ignore_query: rule.ignore_query === true ? 'on' : rule.ignore_query === false ? 'off' : 'inherit',
     ignore_cookie: !!rule.ignore_cookie,
     priority: rule.priority,
@@ -541,6 +565,7 @@ function payload() {
     browser_ttl_seconds: Number(form.value.browser_ttl_seconds) || 0,
     match_methods: form.value.methods.join(','),
     match_query: form.value.match_query.trim(),
+    match_content_type: form.value.match_content_type.trim(),
     ignore_query: form.value.ignore_query === 'inherit' ? null : form.value.ignore_query === 'on',
     ignore_cookie: form.value.ignore_cookie,
     priority: Number(form.value.priority) || 0,
@@ -616,6 +641,7 @@ async function runTest() {
       path: tester.value.path || '/',
       method: tester.value.method,
       query: tester.value.query,
+      content_type: tester.value.content_type || null,
     })
   } catch (e: any) {
     toast.error(e?.data?.error || '测试失败')

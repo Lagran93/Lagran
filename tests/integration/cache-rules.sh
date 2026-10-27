@@ -84,6 +84,7 @@ mk_rule() { api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules" -d "$1"; }
 
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/method/*\",\"action\":\"bypass\",\"match_methods\":\"GET\",\"priority\":10,\"note\":\"GET bypass\"}" >/dev/null
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"match_type\":\"regex\",\"path_pattern\":\"\\\\.(css|js)$\",\"action\":\"cache\",\"ttl_seconds\":600,\"browser_ttl_seconds\":600,\"ignore_cookie\":true,\"priority\":20,\"note\":\"regex suffix\"}" >/dev/null
+mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/*\",\"match_content_type\":\"text/html\",\"action\":\"bypass\",\"priority\":100,\"note\":\"html content type\"}" >/dev/null
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/q/*\",\"action\":\"bypass\",\"match_query\":\"debug=1\",\"priority\":10}" >/dev/null
 RULE_OFF=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/off/*\",\"action\":\"bypass\",\"enabled\":false,\"priority\":10}" | jq -r '.id')
 RULE_BROWSER=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/browser/*\",\"action\":\"cache\",\"ttl_seconds\":60,\"browser_ttl_seconds\":3600,\"priority\":10}" | jq -r '.id')
@@ -154,6 +155,11 @@ get "/assets/vary.js" -H 'Cookie: sid=1' >/dev/null
 check "vary:cookie static first miss" "$(hdr x-cache)" "MISS"
 get "/assets/vary.js" -H 'Cookie: sid=1' >/dev/null
 check "vary:cookie static hit with ignore_cookie" "$(hdr x-cache)" "HIT"
+get "/html" >/dev/null
+check "content-type html bypasses cache" "$(hdr x-cache)" "BYPASS"
+get "/html" >/dev/null
+check "content-type html still bypasses on second request" "$(hdr x-cache)" "BYPASS"
+contains "content-type bypass keeps origin ttl" "$(hdr cache-control)" "max-age=3600"
 get "/assets/app.html" >/dev/null
 if [[ "$(hdr cache-control)" == *"max-age=600"* ]]; then
   fail "html should not match css/js regex"
@@ -163,6 +169,9 @@ fi
 TEST=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules/test" \
   -d "{\"domain_id\":\"$DOMAIN_ID\",\"path\":\"/assets/app.js\"}")
 check "tester matches regex suffix" "$(printf '%s' "$TEST" | jq -r '.matched.note')" "regex suffix"
+TEST=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules/test" \
+  -d "{\"domain_id\":\"$DOMAIN_ID\",\"path\":\"/anything\",\"content_type\":\"text/html; charset=utf-8\"}")
+check "tester matches content-type rule" "$(printf '%s' "$TEST" | jq -r '.matched.note')" "html content type"
 
 echo "== disabled rule =="
 get "/off/x" >/dev/null
