@@ -1007,7 +1007,14 @@ impl DataPlaneProxy {
                 .any(|candidate| candidate == etag || candidate == "*")
         });
         let status = if not_modified { 304 } else { entry.status };
-        let len = if not_modified { 0 } else { entry.body.len() };
+        let is_h2 = session.downstream_session.is_http2();
+        let len = if not_modified {
+            0
+        } else if is_h2 {
+            entry.body.len()
+        } else {
+            0
+        };
         let mut headers = HeaderMap::new();
         for (name, value) in &entry.headers {
             if name.eq_ignore_ascii_case(META_HEADER)
@@ -1233,7 +1240,16 @@ fn query_param(query: &str, name: &str) -> Option<String> {
     })
 }
 
+fn head_content_length_for_protocol(is_h2: bool, body_len: usize) -> String {
+    if is_h2 {
+        body_len.to_string()
+    } else {
+        "0".to_string()
+    }
+}
+
 async fn write_axum_response(session: &mut Session, resp: axum::response::Response, is_head: bool) {
+    let is_h2 = session.downstream_session.is_http2();
     let (parts, body) = resp.into_parts();
     let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -1245,15 +1261,19 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
             return;
         }
     };
-    let head_content_length = parts
-        .headers
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| "0".to_string());
+    let body_len = bytes.len();
+    let head_content_length = if is_head {
+        // HTTP/2 frames HEAD with END_STREAM and can safely carry the real
+        // representation length. Pingora's H1 encoder cannot reliably do so
+        // without waiting for a body, so H1 keeps the 0 workaround.
+        head_content_length_for_protocol(is_h2, body_len)
+    } else {
+        "0".to_string()
+    };
     let bytes = if is_head { Bytes::new() } else { bytes };
     let end_of_stream = bytes.is_empty();
-    let Ok(mut response) = ResponseHeader::build(parts.status.as_u16(), Some(bytes.len())) else {
+    let initial_len = if is_head { None } else { Some(bytes.len()) };
+    let Ok(mut response) = ResponseHeader::build(parts.status.as_u16(), initial_len) else {
         return;
     };
     for (name, value) in parts.headers.iter() {
@@ -1470,4 +1490,16 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 
     server.add_service(service);
     server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::head_content_length_for_protocol;
+
+    #[test]
+    fn head_length_is_http2_only() {
+        assert_eq!(head_content_length_for_protocol(true, 1234), "1234");
+        assert_eq!(head_content_length_for_protocol(false, 1234), "0");
+        assert_eq!(head_content_length_for_protocol(true, 0), "0");
+    }
 }

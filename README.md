@@ -39,7 +39,7 @@
 
 ### 边缘端 (`apps/edge`)
 - **Pingora 公共网络层**：HTTP/1.1 + HTTP/2、HTTP/HTTPS 监听、SNI 动态证书、连接管理；
-  所有域名请求先做 WAF/CC/限流/防盗链/HTTPS 预检；可缓存 GET 走 `pingora-cache` + `upstream_peer`，BYPASS/动态请求和 WebSocket 直接 `upstream_peer` 流式转发；HEAD 由同进程引擎处理并复用 GET cache key；health/ACME/challenge verify/管理接口由 Pingora 直接响应；未知/旧模式域名在进程内调用旧引擎，无 loopback 监听
+  所有域名请求先做 WAF/CC/限流/防盗链/HTTPS 预检；可缓存 GET 走 `pingora-cache` + `upstream_peer`，BYPASS/动态请求和 WebSocket 直接 `upstream_peer` 流式转发；HEAD 由同进程引擎回源 GET 并复用 GET cache key（HTTP/2 返回真实 Content-Length，HTTP/1.1 使用 0 兼容 Pingora H1 编码器）；health/ACME/challenge verify/管理接口由 Pingora 直接响应；未知/旧模式域名在进程内调用旧引擎，无 loopback 监听
 - 多域名反向代理（按 Host/SNI 路由）+ 主备源站
 - 缓存：`memory`（DashMap + LRU）/ `disk`（文件缓存，按 mtime 淘汰）/ `hybrid`
 - 缓存语义：规则 TTL → `Cache-Control`(`s-maxage`/`max-age`) → `Expires` → 默认 TTL；
@@ -99,6 +99,7 @@ cargo test --workspace          # 单元/契约测试（含 TTL 优先级矩阵�
 cargo clippy --workspace --all-targets
 bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（需 Postgres）
 bash tests/integration/users.sh # 端到端：注册、用户管理、禁用、改密、项目成员角色
+bash tests/integration/head-h2.sh # 端到端：HTTP/2 HEAD 真实长度、HTTP/1.1 HEAD 0、GET 不污染
 bash tests/integration/backup-origin.sh # 端到端：备用源站创建/读取/修改/清空与配置下发
 bash tests/integration/failover-https.sh # 端到端：主源站宕机切换备用 + HTTPS 跳转开关
 bash tests/integration/origin-health.sh # 端到端：健康探测标记 down/恢复后主备选择
