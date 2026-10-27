@@ -44,8 +44,7 @@
 - 缓存语义：规则 TTL → `Cache-Control`(`s-maxage`/`max-age`) → `Expires` → 默认 TTL；
   `no-store`/`private`/无规则 TTL 的 `no-cache`/复杂 `Vary` 不写入；显式规则 TTL 可覆盖源站 `no-cache`；
   `ignore_cookie` 同时放行 `Vary: Cookie`；`lagran_clearance` 是 Edge 内部 Cookie，
-  不参与缓存绕过，也不会转发给可缓存请求的源站；HTML 文档永不写入共享缓存并强制 `no-cache`
-  （避免旧 HTML 引用已删除的 hash chunk）；`Vary: Accept-Language` 的 key 含语言哈希；
+  不参与缓存绕过，也不会转发给可缓存请求的源站；`Vary: Accept-Language` 的 key 含语言哈希；
   ETag 基于响应 body；SWR + single-flight 合并回源
 - 条件请求（304）、`Age`、`X-Cache` / `X-Cache-Status`、每域名限流、防盗链
 - WAF：托管特征匹配 + 自定义规则 + IP 白/黑名单，支持观察模式；命中后返回 403 拦截页并上报事件

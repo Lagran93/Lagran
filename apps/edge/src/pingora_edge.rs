@@ -40,8 +40,7 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::Result;
 use pingora_cache::lock::CacheLock;
 use pingora_cache::{
-    CacheKey, CacheMeta, CacheOptionOverrides, CachePhase, ForcedFreshness, NoCacheReason,
-    RespCacheable,
+    CacheKey, CacheMeta, CacheOptionOverrides, CachePhase, NoCacheReason, RespCacheable,
 };
 
 use std::sync::Arc;
@@ -351,32 +350,6 @@ impl ProxyHttp for DataPlaneProxy {
             }
         }
         Ok(())
-    }
-
-    async fn cache_hit_filter(
-        &self,
-        _session: &mut Session,
-        meta: &CacheMeta,
-        _hit_handler: &mut pingora_cache::HitHandler,
-        _is_fresh: bool,
-        _ctx: &mut Self::CTX,
-    ) -> Result<Option<ForcedFreshness>> {
-        // Older cache entries may predate the HTML no-store policy. Never serve
-        // a cached HTML shell: it can reference chunks removed by a deploy.
-        let is_html = meta
-            .response_header()
-            .headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                let v = v.to_ascii_lowercase();
-                v.starts_with("text/html") || v.starts_with("application/xhtml+xml")
-            })
-            .unwrap_or(false);
-        if is_html {
-            return Ok(Some(ForcedFreshness::ForceMiss));
-        }
-        Ok(None)
     }
 
     fn cache_key_callback(&self, _session: &Session, ctx: &mut Self::CTX) -> Result<CacheKey> {

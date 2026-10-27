@@ -402,19 +402,6 @@ fn expires_ttl(headers: &[(String, String)]) -> Option<u64> {
     )
 }
 
-/// HTML documents reference hashed JS/CSS chunks. Caching them is unsafe across
-/// deployments: an old HTML shell keeps importing chunks that no longer exist,
-/// which Nuxt surfaces as "500 importing a module script failed". HTML must be
-/// revalidated (and is therefore never stored in the shared cache).
-fn response_is_html(headers: &[(String, String)]) -> bool {
-    header_value(headers, "content-type")
-        .map(|v| {
-            let v = v.to_ascii_lowercase();
-            v.starts_with("text/html") || v.starts_with("application/xhtml+xml")
-        })
-        .unwrap_or(false)
-}
-
 /// Decide the TTL for a response, or `None` when it must not be stored.
 pub fn decide_storage(
     status: u16,
@@ -423,9 +410,6 @@ pub fn decide_storage(
     default_ttl_secs: u64,
 ) -> Option<CacheDecision> {
     if !status_is_cacheable(status) {
-        return None;
-    }
-    if response_is_html(headers) {
         return None;
     }
     if !vary_allows_storage(header_value(headers, "vary"), policy.ignore_cookie) {
@@ -921,27 +905,6 @@ mod tests {
                 60
             )
             .is_none()
-        );
-    }
-
-    #[test]
-    fn html_documents_are_never_stored() {
-        let mut policy = ResolvedPolicy::default();
-        policy.ttl_override = Some(3600);
-        for ct in ["text/html", "text/html; charset=utf-8", "application/xhtml+xml"] {
-            assert!(
-                decide_storage(200, &hdrs(&[("content-type", ct)]), policy, 60).is_none(),
-                "{ct} must not be cached"
-            );
-        }
-        assert!(
-            decide_storage(
-                200,
-                &hdrs(&[("content-type", "application/javascript")]),
-                policy,
-                60
-            )
-            .is_some()
         );
     }
 
