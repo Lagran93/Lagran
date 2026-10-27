@@ -9,6 +9,7 @@
 use crate::cache::policy::compute_etag;
 use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
 use async_trait::async_trait;
+use axum::http::{HeaderName, HeaderValue};
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use pingora_cache::meta::CacheMeta;
@@ -154,6 +155,32 @@ impl HandleMiss for EntryMiss {
     }
 }
 
+use std::time::{Duration, SystemTime};
+
+fn derive_meta(entry: &CacheEntry) -> pingora::Result<CacheMeta> {
+    let mut header = pingora::http::ResponseHeader::build(entry.status, Some(entry.body.len()))?;
+    for (name, value) in &entry.headers {
+        if name.eq_ignore_ascii_case(META_HEADER) || name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            header.append_header(name, value)?;
+        }
+    }
+    header.insert_header("content-length", entry.body.len().to_string())?;
+    let now = SystemTime::now();
+    Ok(CacheMeta::new(
+        now + Duration::from_secs(3600),
+        now,
+        0,
+        0,
+        header,
+    ))
+}
+
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -187,16 +214,21 @@ impl Storage for NativeStorage {
             CacheGetResult::Hit(entry) | CacheGetResult::Stale(entry) => entry,
             CacheGetResult::Expired | CacheGetResult::Miss => return Ok(None),
         };
-        let Some(encoded) = entry
+        let mut meta = if let Some(encoded) = entry
             .headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(META_HEADER))
             .map(|(_, v)| v.as_str())
-        else {
-            return Ok(None);
-        };
-        let Some(mut meta) = decode_meta(encoded) else {
-            return Ok(None);
+        {
+            let Some(meta) = decode_meta(encoded) else {
+                return Ok(None);
+            };
+            meta
+        } else {
+            // HEAD entries are written through the legacy SharedCache path and
+            // intentionally have no encoded CacheMeta. Derive a metadata record
+            // so GET can reuse the body and HEAD can reuse GET entries.
+            derive_meta(&entry)?
         };
         if let Some(etag) = entry.header("etag") {
             if !meta.response_header().headers.contains_key("etag") {

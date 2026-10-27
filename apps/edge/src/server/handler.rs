@@ -22,7 +22,7 @@ use crate::metrics::EdgeMetrics;
 use crate::origin::{OriginClient, OriginResponse};
 use crate::server::access_log::AccessLog;
 use crate::server::acme_challenge::ChallengeStore;
-use crate::server::cc::{CcConfig, CcDecision, CcMode, CcProtector};
+use crate::server::cc::{CcDecision, CcMode, CcProtector};
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
 use crate::server::default_page::{self, OriginFailure};
@@ -80,7 +80,7 @@ pub struct AppState {
 }
 
 /// Per-request view of the effective domain configuration.
-struct Effective<'a> {
+struct Effective {
     origin_url: String,
     backup_url: String,
     policy: ResolvedPolicy,
@@ -88,10 +88,6 @@ struct Effective<'a> {
     cors: String,
     custom_headers: String,
     timeout_ms: u64,
-    hotlink: &'a str,
-    rate_limit_rps: u32,
-    rate_limit_burst: u32,
-    cc: CcConfig,
 }
 
 enum Fetched {
@@ -199,35 +195,6 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.eq_ignore_ascii_case("https"))
                 .unwrap_or(false));
-    if let Some(ref entry) = domain_entry {
-        if entry.ssl_enabled && !is_https {
-            let status = if method == Method::GET || method == Method::HEAD {
-                StatusCode::MOVED_PERMANENTLY
-            } else {
-                StatusCode::PERMANENT_REDIRECT
-            };
-            log_access(
-                &state.access_log,
-                &method,
-                &host,
-                &path_only,
-                status.as_u16(),
-                start,
-                &client_ip,
-                &user_agent,
-                &referer,
-                0,
-                "HTTPS_REDIRECT",
-            )
-            .await;
-            return https_redirect_response(
-                &host,
-                &path_and_query,
-                status,
-                state.https_redirect_port,
-            );
-        }
-    }
 
     let registry_empty = state.domains.is_empty().await;
 
@@ -277,10 +244,6 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 } else {
                     e.origin_timeout_ms
                 }),
-                hotlink: e.hotlink_allow_referers.as_str(),
-                rate_limit_rps: e.rate_limit_rps,
-                rate_limit_burst: e.rate_limit_burst,
-                cc: e.cc.clone(),
             }
         }
         None => {
@@ -300,258 +263,28 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 cors: String::new(),
                 custom_headers: String::new(),
                 timeout_ms: 10_000,
-                hotlink: "",
-                rate_limit_rps: 0,
-                rate_limit_burst: 0,
-                cc: CcConfig::default(),
             }
         }
     };
 
-    if let Some(ip) = client_ip_addr {
-        let decision = state.cc.check(&host, ip, &eff.cc).await;
-        if decision != CcDecision::Allow {
-            let banned = decision.is_banned();
-            let action = if eff.cc.mode == CcMode::Monitor {
-                "log"
-            } else if banned {
-                "cc-ban"
-            } else {
-                "cc-limit"
-            };
-            state
-                .waf_log
-                .push(
-                    &host,
-                    &client_ip,
-                    method.as_str(),
-                    &path_and_query,
-                    action,
-                    "cc",
-                    if banned {
-                        "cc-auto-ban"
-                    } else {
-                        "cc-rate-limit"
-                    },
-                    if eff.cc.mode == CcMode::Block {
-                        "block"
-                    } else {
-                        "monitor"
-                    },
-                )
-                .await;
-            if eff.cc.mode == CcMode::Block {
-                if let CcDecision::Banned {
-                    newly_banned: true, ..
-                } = decision
-                {
-                    let control = state.control.clone();
-                    let cc = state.cc.clone();
-                    let domain = host.clone();
-                    let report_host = domain.clone();
-                    let report_ip = ip;
-                    let seconds = eff.cc.ban_seconds;
-                    tokio::spawn(async move {
-                        let body = serde_json::json!({
-                            "domain": domain,
-                            "ip": report_ip.to_string(),
-                            "seconds": seconds,
-                            "reason": "cc-auto-ban"
-                        });
-                        match control.post_json("/api/v1/cc/bans", &body).await {
-                            Ok(()) => cc.mark_reported(&report_host, report_ip).await,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "report shared CC ban failed")
-                            }
-                        }
-                    });
-                }
-                tracing::warn!(
-                    %host, %client_ip, banned,
-                    "CC protection rejected request"
-                );
-                log_access(
-                    &state.access_log,
-                    &method,
-                    &host,
-                    &path_only,
-                    429,
-                    start,
-                    &client_ip,
-                    &user_agent,
-                    &referer,
-                    0,
-                    if banned { "CC-BAN" } else { "CC" },
-                )
-                .await;
-                return cc_too_many(decision.retry_after(), banned);
-            }
-        }
-    }
-
-    // Rate limit per host.
-    let rl_key = if host.is_empty() {
-        "default"
-    } else {
-        host.as_str()
-    };
-    if !state
-        .rate_limiter
-        .check(rl_key, eff.rate_limit_rps, eff.rate_limit_burst)
-        .await
-    {
-        log_access(
-            &state.access_log,
+    // Single preflight implementation shared with the Pingora native path:
+    // HTTPS redirect, CC, rate-limit, WAF and hotlink.
+    if let Some(domain) = domain_entry.as_ref() {
+        if let Some(resp) = preflight_cacheable(
+            &state,
+            domain,
             &method,
             &host,
             &path_only,
-            429,
-            start,
+            &path_and_query,
+            &headers,
             &client_ip,
-            &user_agent,
-            &referer,
-            0,
-            CacheStatus::None.as_str(),
+            is_https,
+            start,
         )
-        .await;
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("retry-after", "1")],
-            "Too Many Requests",
-        )
-            .into_response();
-    }
-
-    // WAF runs before cache/向源站: blocked requests never touch the origin.
-    if let Some(ref entry) = domain_entry {
-        if entry.waf.enabled {
-            let waf_request = WafRequest {
-                method: method.as_str(),
-                path: &path_only,
-                query: req.uri().query().unwrap_or(""),
-                user_agent: &user_agent,
-                referer: &referer,
-                ip: client_ip_addr,
-                headers: &headers,
-            };
-            if let Some(verdict) = waf_evaluate(&entry.waf, &waf_request) {
-                if verdict.action != WafAction::Allow {
-                    let mode_is_block = entry.waf.mode == WafMode::Block;
-                    // A JS challenge only works for a top-level document
-                    // navigation. XHR/fetch/API calls (e.g. POST /login) must
-                    // not be turned into a 403 challenge page.
-                    let challenge_capable = challenge_accepts_html(&method, &headers);
-                    let cleared = challenge::has_clearance(
-                        &headers,
-                        &host,
-                        entry.waf.challenge_ttl_secs,
-                        &state.challenge_secret,
-                    );
-                    let challenge_needed = verdict.action == WafAction::Challenge
-                        && mode_is_block
-                        && challenge_capable
-                        && !cleared;
-                    let challenge_skipped = verdict.action == WafAction::Challenge
-                        && mode_is_block
-                        && !challenge_capable;
-                    let blocked = mode_is_block && verdict.is_block();
-
-                    if challenge_needed
-                        || blocked
-                        || challenge_skipped
-                        || verdict.action == WafAction::Log
-                        || !mode_is_block
-                    {
-                        let action = if blocked {
-                            "block"
-                        } else if challenge_needed {
-                            "challenge"
-                        } else if challenge_skipped {
-                            "skip-challenge"
-                        } else if verdict.action == WafAction::Log {
-                            "log"
-                        } else {
-                            "monitor"
-                        };
-                        let mode = if mode_is_block { "block" } else { "monitor" };
-                        state
-                            .waf_log
-                            .push(
-                                &host,
-                                &client_ip,
-                                method.as_str(),
-                                &path_and_query,
-                                action,
-                                &verdict.category,
-                                &verdict.rule_name,
-                                mode,
-                            )
-                            .await;
-
-                        if challenge_needed {
-                            tracing::info!(
-                                %host, %client_ip, rule = %verdict.rule_name,
-                                "serving WAF challenge"
-                            );
-                            log_access(
-                                &state.access_log,
-                                &method,
-                                &host,
-                                &path_only,
-                                403,
-                                start,
-                                &client_ip,
-                                &user_agent,
-                                &referer,
-                                0,
-                                "CHALLENGE",
-                            )
-                            .await;
-                            let nonce = challenge::issue_nonce(&host, &state.challenge_secret);
-                            let secure = req.extensions().get::<host_util::TlsSni>().is_some()
-                                || headers
-                                    .get("x-forwarded-proto")
-                                    .and_then(|v| v.to_str().ok())
-                                    .map(|v| v.eq_ignore_ascii_case("https"))
-                                    .unwrap_or(false);
-                            return challenge::page(
-                                &host,
-                                &nonce,
-                                &path_and_query,
-                                entry.waf.challenge_difficulty,
-                                secure,
-                            );
-                        }
-
-                        if blocked {
-                            tracing::warn!(
-                                %host, %client_ip, rule = %verdict.rule_name,
-                                category = %verdict.category, "request blocked by WAF"
-                            );
-                            log_access(
-                                &state.access_log,
-                                &method,
-                                &host,
-                                &path_only,
-                                403,
-                                start,
-                                &client_ip,
-                                &user_agent,
-                                &referer,
-                                0,
-                                "WAF",
-                            )
-                            .await;
-                            return default_page::waf_blocked_page(
-                                &host,
-                                &path_only,
-                                &verdict.rule_name,
-                                &verdict.category,
-                            );
-                        }
-                    }
-                }
-            }
+        .await
+        {
+            return resp;
         }
     }
 
@@ -587,25 +320,6 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         return resp;
     }
 
-    // Hotlink protection.
-    if !eff.hotlink.is_empty() && !hotlink_allowed(eff.hotlink, &referer) {
-        log_access(
-            &state.access_log,
-            &method,
-            &host,
-            &path_only,
-            403,
-            start,
-            &client_ip,
-            &user_agent,
-            &referer,
-            0,
-            CacheStatus::None.as_str(),
-        )
-        .await;
-        return (StatusCode::FORBIDDEN, "Hotlink Forbidden").into_response();
-    }
-
     let request_cacheable = request_method_cacheable(&method)
         && !request_bypasses_cache(&req, eff.policy.ignore_cookie)
         && eff.policy.action == RuleAction::Cache;
@@ -633,7 +347,12 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     } else {
         path_and_query.clone()
     };
-    let key = cache_key_for_request(&method, &host, &cache_lookup_path, &headers);
+    let key_method = if method == Method::HEAD {
+        Method::GET
+    } else {
+        method.clone()
+    };
+    let key = cache_key_for_request(&key_method, &host, &cache_lookup_path, &headers);
 
     let lookup = state.cache.get_result(&key).await;
     let from_expired = matches!(lookup, CacheGetResult::Expired);
@@ -792,7 +511,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
 async fn bypass_to_origin(
     state: &AppState,
     req: Request<Body>,
-    eff: &Effective<'_>,
+    eff: &Effective,
     method: &Method,
     host: &str,
     path_and_query: &str,
@@ -945,7 +664,7 @@ async fn bypass_to_origin(
 async fn fetch_with_single_flight(
     state: &Arc<AppState>,
     key: &str,
-    eff: &Effective<'_>,
+    eff: &Effective,
     path_and_query: &str,
     headers: &HeaderMap,
     method: &Method,
@@ -991,7 +710,7 @@ async fn fetch_with_single_flight(
 
 async fn fetch_origin(
     state: &AppState,
-    eff: &Effective<'_>,
+    eff: &Effective,
     host: &str,
     path_and_query: &str,
     headers: &HeaderMap,
@@ -1064,10 +783,6 @@ fn spawn_revalidation(
             cors: String::new(),
             custom_headers: String::new(),
             timeout_ms,
-            hotlink: "",
-            rate_limit_rps: 0,
-            rate_limit_burst: 0,
-            cc: CcConfig::default(),
         };
         match fetch_origin(&state, &eff, &host, &path_and_query, &headers, &Method::GET).await {
             Ok(resp) => {
@@ -1105,7 +820,7 @@ async fn serve_cached(
     user_agent: &str,
     referer: &str,
     if_none_match: Option<&str>,
-    eff: &Effective<'_>,
+    eff: &Effective,
     start: Instant,
 ) -> Response {
     let etag = entry

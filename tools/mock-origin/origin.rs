@@ -65,12 +65,15 @@ fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
     let mut cookie = String::new();
     let mut accept_language = String::new();
     let mut cache_control = String::new();
+    let mut host = String::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim();
             let value = value.trim();
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("host") {
+                host = value.to_string();
             } else if name.eq_ignore_ascii_case("x-custom") {
                 custom_header = value.to_string();
             } else if name.eq_ignore_ascii_case("cookie") {
@@ -81,6 +84,14 @@ fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
                 cache_control = value.to_string();
             }
         }
+    }
+
+    if path == "/ws" {
+        stream.write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        )?;
+        stream.flush()?;
+        return Ok(());
     }
 
     let mut body = buf[head_end..].to_vec();
@@ -110,6 +121,14 @@ fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
             )
         }
         _ => match path.as_str() {
+            "/swr" => (
+                200,
+                b"swr-body".to_vec(),
+                vec![(
+                    "Cache-Control",
+                    "public, max-age=1, stale-while-revalidate=30".into(),
+                )],
+            ),
             "/etag" => {
                 let n = ETAG_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
                 (
@@ -204,6 +223,7 @@ fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
         payload.len()
     );
     response.push_str(&format!("X-Origin-Port: {port}\r\n"));
+    response.push_str(&format!("X-Origin-Host: {host}\r\n"));
     for (name, value) in extra {
         response.push_str(&format!("{name}: {value}\r\n"));
     }

@@ -38,7 +38,7 @@
 
 ### 边缘端 (`apps/edge`)
 - **Pingora 公共网络层**：HTTP/1.1 + HTTP/2、HTTP/HTTPS 监听、SNI 动态证书、连接管理；
-  所有域名请求先做 WAF/CC/限流/防盗链/HTTPS 预检；可缓存 GET 走 `pingora-cache` + `upstream_peer`，BYPASS/动态请求和 WebSocket 直接 `upstream_peer` 流式转发，HEAD 使用 SharedCache 手动缓存；health/ACME/challenge verify/管理接口由 Pingora 直接响应；未知/旧模式域名在进程内调用旧引擎，无 loopback 监听
+  所有域名请求先做 WAF/CC/限流/防盗链/HTTPS 预检；可缓存 GET 走 `pingora-cache` + `upstream_peer`，BYPASS/动态请求和 WebSocket 直接 `upstream_peer` 流式转发；HEAD 由同进程引擎处理并复用 GET cache key；health/ACME/challenge verify/管理接口由 Pingora 直接响应；未知/旧模式域名在进程内调用旧引擎，无 loopback 监听
 - 多域名反向代理（按 Host/SNI 路由）+ 主备源站
 - 缓存：`memory`（DashMap + LRU）/ `disk`（文件缓存，按 mtime 淘汰）/ `hybrid`
 - 缓存语义：规则 TTL → `Cache-Control`(`s-maxage`/`max-age`) → `Expires` → 默认 TTL；

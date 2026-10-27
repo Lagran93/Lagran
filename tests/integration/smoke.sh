@@ -169,6 +169,12 @@ RANGE_HDR=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" -H 'Range: bytes=0-3' "
 contains "range request is served 206/partial" "$RANGE_HDR" "206 Partial Content"
 contains "range request carries content-range" "$(printf '%s' "$RANGE_HDR" | tr '[:upper:]' '[:lower:]')" "content-range:"
 
+SWR1=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/swr")
+contains "swr first request is MISS" "$SWR1" "x-cache: MISS"
+sleep 2
+SWR2=$(curl -s -D "$LOG_DIR/swr2.h" -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/swr" && cat "$LOG_DIR/swr2.h")
+contains "swr stale window serves STALE" "$(printf '%s' "$SWR2" | tr '[:upper:]' '[:lower:]')" "x-cache: stale"
+
 H3=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/nostore")
 H4=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/nostore")
 contains "no-store first MISS" "$H3" "x-cache: MISS"
@@ -200,6 +206,10 @@ contains "second domain bypass rule applies there" "$H7" "x-cache: BYPASS"
 H8=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
 contains "first domain still HIT (no cross-domain pollution)" "$H8" "x-cache: HIT"
 
+echo "== head shares GET cache =="
+HEAD_CACHED=$(curl -s -D - -o /dev/null -X HEAD -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached" | tr '[:upper:]' '[:lower:]')
+contains "HEAD hits the GET cache entry" "$HEAD_CACHED" "x-cache: hit"
+
 echo "== etag is content-based =="
 curl -s -D "$LOG_DIR/etag1_miss.h" -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/etag" >/dev/null
 curl -s -D "$LOG_DIR/etag1_hit.h" -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/etag" >/dev/null
@@ -229,6 +239,22 @@ contains "POST labelled DYNAMIC" "$(curl -s -D - -o /dev/null -X POST -H "Host: 
 POST_CC=$(curl -s -X POST -H "Host: $DOMAIN" -H 'content-type: text/plain' -H 'Cache-Control: no-store' \
   --data 'cc' "http://127.0.0.1:$EDGE_PORT/echo")
 contains "dynamic request keeps Cache-Control" "$POST_CC" '"cache_control":"no-store"'
+
+echo "== large body streaming =="
+dd if=/dev/zero bs=1048576 count=1 2>/dev/null | tr '\0' 'x' > "$LOG_DIR/large.bin"
+BIG_BODY=$(curl -s -X POST -H "Host: $DOMAIN" -H 'content-type: application/octet-stream' \
+  --data-binary "@$LOG_DIR/large.bin" "http://127.0.0.1:$EDGE_PORT/echo")
+contains "1MiB upload arrives at origin" "$BIG_BODY" '"bytes":1048576'
+
+echo "== websocket upgrade =="
+WS_H=$(curl -s -D - -o /dev/null --max-time 2 \
+  -H "Host: $DOMAIN" \
+  -H 'Connection: Upgrade' \
+  -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  "http://127.0.0.1:$EDGE_PORT/ws" 2>/dev/null || true)
+contains "websocket upgrade reaches origin tunnel" "$WS_H" "101 Switching Protocols"
 
 echo "== purge =="
 PURGE=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/purge" -H "$AUTH" \

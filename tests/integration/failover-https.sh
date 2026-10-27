@@ -72,7 +72,7 @@ TOKEN=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/login" \
 [[ -n "$TOKEN" ]] || { echo "login failed"; exit 1; }
 
 CREATE=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" \
-  -d "{\"name\":\"$DOMAIN\",\"origin_host\":\"127.0.0.1\",\"origin_port\":$PRIMARY_PORT,\"origin_proto\":\"http\",\"backup_origin_host\":\"127.0.0.1\",\"backup_origin_port\":$BACKUP_PORT,\"backup_origin_proto\":\"http\"}")
+  -d "{\"name\":\"$DOMAIN\",\"origin_host\":\"127.0.0.1\",\"origin_port\":$PRIMARY_PORT,\"origin_proto\":\"http\",\"backup_origin_host\":\"localhost\",\"backup_origin_port\":$BACKUP_PORT,\"backup_origin_proto\":\"http\"}")
 DOMAIN_ID=$(printf '%s' "$CREATE" | jq -r '.id // empty')
 [[ -n "$DOMAIN_ID" ]] || { echo "create failed: $CREATE"; exit 1; }
 
@@ -111,6 +111,7 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 check "backup serves after primary stops" "$FAILOVER" "1"
+check "backup receives its own Host" "$(hdr x-origin-host)" "localhost"
 CODE=$(get "/api/data")
 check "bypass/API path also fails over" "$(hdr x-origin-port)" "$BACKUP_PORT"
 

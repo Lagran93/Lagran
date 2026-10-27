@@ -1,11 +1,10 @@
 //! HTTP listener setup
 
 use crate::server::agent_auth::RequireAgentToken;
-use crate::server::challenge;
-use crate::server::handler::{proxy_handler, AppState};
+use crate::server::handler::AppState;
 use crate::server::purge::{self, EdgePurgeRequest};
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post, put},
@@ -15,36 +14,12 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
-fn data_routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/__lagran/health", get(health))
-        .route("/__lagran/challenge/verify", get(challenge::verify))
-        .route("/.well-known/acme-challenge/:token", get(acme_challenge))
-}
-
 fn management_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/__lagran/purge", post(purge_authed))
         .route("/__lagran/acme/challenge", put(put_challenge_authed))
         .route("/__lagran/certs/load", post(load_cert_authed))
         .route("/__lagran/access-logs", get(list_access_logs))
-}
-
-/// Legacy combined listener: data plane + management on the same port.
-pub fn create_router(state: Arc<AppState>) -> Router {
-    data_routes()
-        .merge(management_routes())
-        .fallback(proxy_handler)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
-}
-
-/// Data/HTTP listener: CDN traffic, WAF challenge verify and ACME HTTP-01 only.
-pub fn create_data_router(state: Arc<AppState>) -> Router {
-    data_routes()
-        .fallback(proxy_handler)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }
 
 /// Control-plane management listener: purge/cert/challenge/access-log endpoints.
@@ -84,16 +59,6 @@ async fn put_challenge_authed(
     state.challenges.put(&body.token, &body.key_authorization);
     tracing::info!(token = %body.token, "ACME challenge installed");
     StatusCode::NO_CONTENT
-}
-
-async fn acme_challenge(
-    State(state): State<Arc<AppState>>,
-    Path(token): Path<String>,
-) -> impl IntoResponse {
-    match state.challenges.get(&token) {
-        Some(key_auth) => (StatusCode::OK, key_auth).into_response(),
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
-    }
 }
 
 #[derive(Deserialize)]

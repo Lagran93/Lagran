@@ -353,20 +353,30 @@ impl ProxyHttp for DataPlaneProxy {
             .plan
             .as_ref()
             .ok_or_else(|| pingora::Error::new_str("native plan missing"))?;
+        let healthy = self.state.origin_health.is_healthy(&ctx.host).await;
+        if !healthy && !plan.backup_url.is_empty() {
+            tracing::warn!(domain = %ctx.host, backup = %plan.backup_url, "primary origin unhealthy; using backup");
+            ctx.attempt = ctx.attempt.max(1);
+        }
         let url = if ctx.attempt > 0 && !plan.backup_url.is_empty() {
             plan.backup_url.as_str()
         } else {
+            if !healthy {
+                tracing::warn!(domain = %ctx.host, "primary origin unhealthy; no backup configured");
+            }
             // For the primary peer these cached values are already parsed.
-            return self.peer_for(
-                &plan.origin_host,
-                plan.origin_port,
-                plan.origin_tls,
-                plan.timeout_ms,
-            );
+            return self
+                .peer_for(
+                    &plan.origin_host,
+                    plan.origin_port,
+                    plan.origin_tls,
+                    plan.timeout_ms,
+                )
+                .await;
         };
         let (host, port, tls) = parse_origin(url)
             .ok_or_else(|| pingora::Error::new_str("invalid backup origin URL"))?;
-        self.peer_for(&host, port, tls, plan.timeout_ms)
+        self.peer_for(&host, port, tls, plan.timeout_ms).await
     }
 
     fn fail_to_connect(
@@ -395,7 +405,17 @@ impl ProxyHttp for DataPlaneProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         if let Some(plan) = ctx.plan.as_ref() {
-            upstream_request.insert_header("host", plan.origin_host.as_str())?;
+            // Keep HTTP Host aligned with the peer actually selected. The
+            // previous code always sent the primary origin Host, so a backup
+            // virtual host received the wrong site name.
+            let host = if ctx.attempt > 0 && !plan.backup_url.is_empty() {
+                parse_origin(&plan.backup_url)
+                    .map(|(h, _, _)| h)
+                    .unwrap_or_else(|| plan.origin_host.clone())
+            } else {
+                plan.origin_host.clone()
+            };
+            upstream_request.insert_header("host", host.as_str())?;
             if plan.cacheable || plan.is_head {
                 for name in [
                     "authorization",
@@ -457,6 +477,20 @@ impl ProxyHttp for DataPlaneProxy {
             resp.clone(),
         );
         Ok(RespCacheable::Cacheable(meta))
+    }
+
+    fn should_serve_stale(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        error: Option<&pingora::Error>,
+    ) -> bool {
+        // None means the normal SWR/stale-updating path. For errors, only
+        // upstream failures should be masked by a stale object.
+        match error {
+            None => true,
+            Some(e) => e.esource() == &pingora::ErrorSource::Upstream,
+        }
     }
 
     async fn response_filter(
@@ -541,7 +575,12 @@ impl ProxyHttp for DataPlaneProxy {
         let label = ctx.cache_label;
         if plan.is_head && ctx.head_status == 200 && !ctx.head_body.is_empty() {
             if let Some(headers) = ctx.head_headers.as_ref() {
-                let hdrs = header_vec(&headers.headers);
+                let mut hdrs = header_vec(&headers.headers);
+                hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+                hdrs.push((
+                    "content-length".to_string(),
+                    ctx.head_body.len().to_string(),
+                ));
                 if let Some(decision) = decide_storage(
                     ctx.head_status,
                     &hdrs,
@@ -594,14 +633,26 @@ impl ProxyHttp for DataPlaneProxy {
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
-        _e: &pingora::Error,
+        e: &pingora::Error,
         ctx: &mut Self::CTX,
     ) -> FailToProxy {
+        let timeout = matches!(
+            e.etype(),
+            pingora::ErrorType::ConnectTimedout
+                | pingora::ErrorType::TLSHandshakeTimedout
+                | pingora::ErrorType::ReadTimedout
+                | pingora::ErrorType::WriteTimedout
+        );
+        let failure = if timeout {
+            OriginFailure::Timeout
+        } else {
+            OriginFailure::Unreachable
+        };
         let code = if ctx.plan.is_some() {
-            let page =
-                default_page::origin_error_page(&ctx.host, &ctx.path, OriginFailure::Unreachable);
+            let status = failure.status().as_u16();
+            let page = default_page::origin_error_page(&ctx.host, &ctx.path, failure);
             write_axum_response(session, page, ctx.method == Method::HEAD).await;
-            502
+            status
         } else {
             502
         };
@@ -618,6 +669,12 @@ impl DataPlaneProxy {
             return None;
         }
         let req = session.req_header();
+        // HEAD stays on the in-process engine: it fetches GET, returns the real
+        // Content-Length, and shares the GET cache entry. Pingora's H1 encoder
+        // cannot carry an upstream GET body under a HEAD response.
+        if req.method == Method::HEAD {
+            return None;
+        }
         let host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
         if host.is_empty() {
             return None;
@@ -633,12 +690,13 @@ impl DataPlaneProxy {
             req.method.as_str(),
             req.uri.query().unwrap_or(""),
         );
-        let is_head = req.method == Method::HEAD;
+        let bypasses = request_bypasses(&req.headers, policy.ignore_cookie);
+        let is_head = req.method == Method::HEAD && policy.action == RuleAction::Cache && !bypasses;
         let is_websocket = is_websocket_upgrade(&req.headers);
         let cacheable = req.method == Method::GET
             && policy.action == RuleAction::Cache
             && !is_websocket
-            && !request_bypasses(&req.headers, policy.ignore_cookie);
+            && !bypasses;
         let label = if cacheable || is_head {
             "MISS"
         } else if policy.action == RuleAction::Bypass || req.method == Method::GET {
@@ -656,7 +714,12 @@ impl DataPlaneProxy {
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| "/".to_string())
         };
-        let key = cache_key_for_request(&req.method, &host, &lookup_path, &req.headers);
+        let key_method = if is_head {
+            Method::GET
+        } else {
+            req.method.clone()
+        };
+        let key = cache_key_for_request(&key_method, &host, &lookup_path, &req.headers);
         Some(NativePlan {
             domain: domain.clone(),
             key,
@@ -875,7 +938,7 @@ impl DataPlaneProxy {
             }
         }
         let _ = response.remove_header("content-length");
-        let _ = response.insert_header("content-length", "0");
+        let _ = response.insert_header("content-length", len.to_string());
         if session
             .write_response_header(Box::new(response), true)
             .await
@@ -906,8 +969,29 @@ impl DataPlaneProxy {
         true
     }
 
-    fn peer_for(&self, host: &str, port: u16, tls: bool, timeout_ms: u64) -> Result<Box<HttpPeer>> {
-        let mut peer = HttpPeer::new((host, port), tls, host.to_string());
+    async fn peer_for(
+        &self,
+        host: &str,
+        port: u16,
+        tls: bool,
+        timeout_ms: u64,
+    ) -> Result<Box<HttpPeer>> {
+        // HttpPeer::new() unwraps DNS resolution in Pingora 0.9 and panics on
+        // NXDOMAIN. Resolve here so a dead/misconfigured origin becomes a
+        // normal 502 page instead of taking the Pingora service down.
+        let addr = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| {
+                pingora::Error::because(
+                    pingora::ErrorType::ConnectError,
+                    "resolve origin address",
+                    e,
+                )
+            })?
+            .next()
+            .ok_or_else(|| pingora::Error::new_str("origin DNS returned no addresses"))?;
+        // Passing a resolved SocketAddr avoids the panicking DNS path.
+        let mut peer = HttpPeer::new(addr, tls, host.to_string());
         peer.options.connection_timeout = Some(Duration::from_millis(timeout_ms));
         peer.options.read_timeout = Some(Duration::from_millis(timeout_ms));
         Ok(Box::new(peer))
@@ -1041,8 +1125,8 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
         .headers
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("0")
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| "0".to_string());
     let bytes = if is_head { Bytes::new() } else { bytes };
     let end_of_stream = bytes.is_empty();
     let Ok(mut response) = ResponseHeader::build(parts.status.as_u16(), Some(bytes.len())) else {
