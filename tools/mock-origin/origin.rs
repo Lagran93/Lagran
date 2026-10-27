@@ -16,11 +16,17 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(9090);
+    // Health-probe fixture: MOCK_ROOT_STATUS=500 makes GET / unhealthy while
+    // other paths (for example /ok) remain 200.
+    let root_status: u16 = std::env::var("MOCK_ROOT_STATUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind mock origin");
-    eprintln!("mock origin listening on 127.0.0.1:{port}");
+    eprintln!("mock origin listening on 127.0.0.1:{port} root_status={root_status}");
     for stream in listener.incoming().flatten() {
         thread::spawn(move || {
-            if let Err(e) = handle(stream, port) {
+            if let Err(e) = handle(stream, port, root_status) {
                 eprintln!("mock origin connection error: {e}");
             }
         });
@@ -33,7 +39,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, port: u16, root_status: u16) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -121,6 +127,13 @@ fn handle(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
             )
         }
         _ => match path.as_str() {
+            // Root is the origin-health probe target. Other paths stay 200 so
+            // the test can distinguish "health says down" from "connection down".
+            "/" => (
+                root_status,
+                b"root".to_vec(),
+                vec![("Content-Type", "text/plain".into())],
+            ),
             "/swr" => (
                 200,
                 b"swr-body".to_vec(),

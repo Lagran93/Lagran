@@ -97,6 +97,8 @@ cargo clippy --workspace --all-targets
 bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（需 Postgres）
 bash tests/integration/backup-origin.sh # 端到端：备用源站创建/读取/修改/清空与配置下发
 bash tests/integration/failover-https.sh # 端到端：主源站宕机切换备用 + HTTPS 跳转开关
+bash tests/integration/origin-health.sh # 端到端：健康探测标记 down/恢复后主备选择
+bash tests/integration/ws-echo.sh # 端到端：WebSocket 101 + text/binary/ping/close 帧回显（需 perl）
 bash tests/integration/schedule.sh # 端到端：节点 Geo/ISP 元数据、调度打分、admin 测试与 PowerDNS 示例
 bash tests/integration/dns.sh # 端到端：自研权威 DNS 的 ECS 调度、SOA/NS、TCP、缓存降级
 bash tests/integration/nodes.sh # 端到端：节点预注册→安装命令→单节点令牌→上下线→删除
