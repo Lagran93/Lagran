@@ -97,10 +97,16 @@ api "$ADMIN_TOKEN" -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/users/$USER_ID"
   -H 'content-type: application/json' -d '{"is_active":true}' >/dev/null
 USER_TOKEN=$(login "$USER_EMAIL" "$PASSWORD" | jq -r '.token // empty')
 [[ -n "$USER_TOKEN" ]] || { echo "re-enabled login failed"; exit 1; }
-CHANGED=$(api "$USER_TOKEN" -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/me/password" \
+CHANGE_RESP=$(api "$USER_TOKEN" -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/me/password" \
   -H 'content-type: application/json' \
-  -d "{\"current_password\":\"$PASSWORD\",\"new_password\":\"$NEW_PASSWORD\"}" | jq -r '.success')
-check "user changes own password" "$CHANGED" "true"
+  -d "{\"current_password\":\"$PASSWORD\",\"new_password\":\"$NEW_PASSWORD\"}")
+check "user changes own password" "$(printf '%s' "$CHANGE_RESP" | jq -r '.success')" "true"
+NEW_USER_TOKEN=$(printf '%s' "$CHANGE_RESP" | jq -r '.token // empty')
+[[ -n "$NEW_USER_TOKEN" ]] || { echo "password change did not return a token"; exit 1; }
+check "old JWT is revoked immediately" \
+  "$(api "$USER_TOKEN" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/me")" "401"
+check "new JWT works after password change" \
+  "$(api "$NEW_USER_TOKEN" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/me")" "200"
 OLD_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/login" \
   -H 'content-type: application/json' -d "{\"email\":\"$USER_EMAIL\",\"password\":\"$PASSWORD\"}")
 NEW_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/login" \
@@ -125,6 +131,16 @@ UPDATED_ROLE=$(api "$ADMIN_TOKEN" -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/
   -H 'content-type: application/json' -d '{"role":"admin"}')
 check "admin promotes project member" "$(printf '%s' "$UPDATED_ROLE" | jq -r '.role')" "admin"
 api "$ADMIN_TOKEN" -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/projects/$PROJECT_ID" >/dev/null
+
+echo "== admin password reset revokes token =="
+RESET=$(api "$ADMIN_TOKEN" -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/users/$USER_ID/password" \
+  -H 'content-type: application/json' -d "{\"password\":\"$PASSWORD\"}")
+check "admin resets user password" "$(printf '%s' "$RESET" | jq -r '.success')" "true"
+check "admin reset revokes old JWT" \
+  "$(api "$NEW_USER_TOKEN" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/me")" "401"
+check "reset password can login" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/login" \
+      -H 'content-type: application/json' -d "{\"email\":\"$USER_EMAIL\",\"password\":\"$PASSWORD\"}")" "200"
 
 echo "== delete =="
 DELETED=$(api "$ADMIN_TOKEN" -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/users/$USER_ID" | jq -r '.success')

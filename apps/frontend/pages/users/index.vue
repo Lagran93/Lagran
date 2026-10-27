@@ -163,7 +163,7 @@
           />
           启用该账号
         </label>
-        <div class="field">
+        <div v-if="editing.id !== auth.user?.id" class="field">
           <label class="field-label">重置密码（可选）</label>
           <input v-model="form.password" class="input" type="password" placeholder="留空则不修改" />
         </div>

@@ -259,6 +259,9 @@ pub async fn update(
 
     let password_hash = match req.password.as_deref() {
         Some(password) if !password.is_empty() => {
+            if uid == actor.id {
+                return Err(bad_request("use /auth/me/password to change your own password"));
+            }
             validate_password(password).map_err(bad_request)?;
             Some(crate::utils::hash_password(password).map_err(|_| {
                 (
@@ -312,9 +315,10 @@ pub async fn reset_password(
             }),
         )
     })?;
-    if !repository::update_user_password(&state.pool, uid, &hash)
+    if repository::update_user_password(&state.pool, uid, &hash)
         .await
         .map_err(|_| db_error())?
+        .is_none()
     {
         return Err(not_found());
     }

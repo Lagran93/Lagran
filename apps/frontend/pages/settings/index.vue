@@ -219,10 +219,18 @@ async function savePassword() {
   passwordError.value = ''
   saving.value = true
   try {
-    await api.put('/api/v1/auth/me/password', {
-      current_password: currentPassword.value,
-      new_password: newPassword.value,
-    })
+    const res = await api.put<{ success: boolean; token: string }>(
+      '/api/v1/auth/me/password',
+      {
+        current_password: currentPassword.value,
+        new_password: newPassword.value,
+      },
+    )
+    if (res.token && auth.user) {
+      // The old JWT is revoked by the token-version bump. Keep the current
+      // session alive with the newly issued token.
+      auth.setSession(res.token, auth.user)
+    }
     passwordOpen.value = false
     currentPassword.value = ''
     newPassword.value = ''

@@ -59,6 +59,12 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
+#[derive(Serialize)]
+pub struct ChangePasswordResponse {
+    pub success: bool,
+    pub token: String,
+}
+
 pub(crate) fn to_user_info(user: repository::UserRow) -> UserInfo {
     UserInfo {
         id: user.id.to_string(),
@@ -136,6 +142,7 @@ pub async fn login(
         &user.name,
         &state.config.jwt_secret,
         state.config.jwt_expire_hours,
+        user.token_version,
     )
     .map_err(|_| {
         (
@@ -268,6 +275,7 @@ pub async fn register(
         &user.name,
         &state.config.jwt_secret,
         state.config.jwt_expire_hours,
+        user.token_version,
     )
     .map_err(|_| {
         (
@@ -324,6 +332,14 @@ pub async fn me(
             StatusCode::FORBIDDEN,
             Json(ErrorBody {
                 error: "account is disabled".into(),
+            }),
+        ));
+    }
+    if claims.ver != user.token_version {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "session expired".into(),
             }),
         ));
     }
@@ -386,6 +402,14 @@ pub async fn update_me(
             }),
         ));
     }
+    if claims.ver != current.token_version {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "session expired".into(),
+            }),
+        ));
+    }
     let user = repository::update_user_profile(&state.pool, id, name)
         .await
         .map_err(|_| {
@@ -411,7 +435,7 @@ pub async fn change_password(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Json(req): Json<ChangePasswordRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Json<ChangePasswordResponse>, (StatusCode, Json<ErrorBody>)> {
     let id = Uuid::parse_str(&claims.sub).map_err(|_| {
         (
             StatusCode::UNAUTHORIZED,
@@ -446,6 +470,14 @@ pub async fn change_password(
             }),
         ));
     }
+    if claims.ver != user.token_version {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "session expired".into(),
+            }),
+        ));
+    }
     if !verify_password(&req.current_password, &user.password_hash).unwrap_or(false) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -470,7 +502,7 @@ pub async fn change_password(
             }),
         )
     })?;
-    repository::update_user_password(&state.pool, id, &hash)
+    let Some(new_version) = repository::update_user_password(&state.pool, id, &hash)
         .await
         .map_err(|_| {
             (
@@ -479,8 +511,35 @@ pub async fn change_password(
                     error: "database error".into(),
                 }),
             )
-        })?;
-    Ok(Json(serde_json::json!({ "success": true })))
+        })?
+    else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "user not found".into(),
+            }),
+        ));
+    };
+    let token = issue_token(
+        user.id,
+        &user.email,
+        &user.name,
+        &state.config.jwt_secret,
+        state.config.jwt_expire_hours,
+        new_version,
+    )
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "token error".into(),
+            }),
+        )
+    })?;
+    Ok(Json(ChangePasswordResponse {
+        success: true,
+        token,
+    }))
 }
 
 pub(crate) fn normalize_email(email: &str) -> String {

@@ -71,10 +71,17 @@ impl FromRequestParts<AppState> for Actor {
             .map_err(|_| ActorError::unauthorized("unauthorized"))?;
         let id = Uuid::parse_str(&user.0.sub)
             .map_err(|_| ActorError::unauthorized("invalid token subject"))?;
-        let role = repository::get_user_role(&state.pool, id)
-            .await
-            .map_err(|_| ActorError::internal())?
-            .ok_or_else(|| ActorError::unauthorized("user no longer exists"))?;
+        let (role, is_active, token_version) =
+            repository::get_user_session(&state.pool, id)
+                .await
+                .map_err(|_| ActorError::internal())?
+                .ok_or_else(|| ActorError::unauthorized("user no longer exists"))?;
+        if !is_active {
+            return Err(ActorError::unauthorized("account is disabled"));
+        }
+        if user.0.ver != token_version {
+            return Err(ActorError::unauthorized("session expired"));
+        }
         Ok(Actor {
             id,
             email: user.0.email.clone(),

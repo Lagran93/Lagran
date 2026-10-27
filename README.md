@@ -166,6 +166,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 
 - `users.role`: `admin` | `user`；`demo@lagran.dev` 为 `admin`
 - `users.is_active=false` 的账号不能登录，已有 JWT 也会被 `Actor`/`/auth/me` 拒绝
+- 密码修改 / 管理员重置密码会递增 `users.token_version`，旧 JWT 立即失效；自助改密返回新 token
 - `ALLOW_REGISTER=true` 时开放 `/register`；新用户默认 `user` 并自动创建个人 `Default` 项目
 - admin 可管理全部用户；不能禁用/降权/删除自己，且不能移除最后一个启用中的 admin
 - 项目成员：`owner` / `admin`（读写）、`member`（只读）；owner 不可被改角色或移除
