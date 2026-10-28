@@ -8,9 +8,15 @@ use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct EdgeEndpointDto {
+    pub id: String,
     pub name: String,
     pub ip: String,
     pub region: String,
+    pub status: String,
+    pub cpu_usage: Option<f64>,
+    pub memory_usage: Option<f64>,
+    pub active_connections: Option<i64>,
+    pub last_heartbeat: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -29,19 +35,24 @@ pub async fn list(
     let nodes = repository::list_nodes(&state.pool).await.unwrap_or_default();
     let mut ips = Vec::new();
     let mut out = Vec::new();
-    for node in nodes.into_iter().filter(|n| n.status == "online") {
-        let ip = if node.public_ip.trim().is_empty() {
-            node.ip.clone()
-        } else {
-            node.public_ip.clone()
-        };
-        if !ip.trim().is_empty() && !ips.contains(&ip) {
+    for node in nodes.into_iter() {
+        let online = node.status == "online";
+        let ip = crate::utils::normalize_node_ip(&node.public_ip)
+            .or_else(|| crate::utils::normalize_node_ip(&node.ip))
+            .unwrap_or_default();
+        if online && !ip.trim().is_empty() && !ips.contains(&ip) {
             ips.push(ip.clone());
         }
         out.push(EdgeEndpointDto {
+            id: node.id.to_string(),
             name: node.name,
             ip,
             region: node.region,
+            status: node.status,
+            cpu_usage: node.cpu_usage,
+            memory_usage: node.memory_usage,
+            active_connections: node.active_connections,
+            last_heartbeat: node.last_heartbeat.map(|v| v.to_rfc3339()),
         });
     }
     let cname = std::env::var("EDGE_CNAME")

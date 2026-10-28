@@ -96,12 +96,16 @@ pub async fn diagnose(
     }
     let domain = row.name.clone();
     let nodes = repository::list_nodes(&state.pool).await.unwrap_or_default();
-    let edge_ips: Vec<String> = nodes
-        .iter()
-        .filter(|n| n.status == "online")
-        .flat_map(|n| [n.public_ip.clone(), n.ip.clone()])
-        .filter(|ip| !ip.trim().is_empty())
-        .collect();
+    let mut edge_ips: Vec<String> = Vec::new();
+    for node in nodes.iter().filter(|n| n.status == "online") {
+        for raw in [&node.public_ip, &node.ip] {
+            if let Some(ip) = crate::utils::normalize_node_ip(raw) {
+                if !edge_ips.contains(&ip) {
+                    edge_ips.push(ip);
+                }
+            }
+        }
+    }
 
     let dns_start = Instant::now();
     let lookup_name = domain.clone();

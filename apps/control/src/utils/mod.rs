@@ -3,7 +3,29 @@
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use uuid::Uuid;
+
+/// Normalize an edge node address for display/API output.
+///
+/// Node heartbeats can report a listen address such as `0.0.0.0:80`; that is
+/// not a reachable edge IP and must not be shown as one. Loopback, unspecified
+/// and multicast addresses are dropped; ports and URL schemes are stripped.
+pub fn normalize_node_ip(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    if let Some((_, rest)) = value.split_once("://") {
+        value = rest;
+    }
+    let value = value.trim_end_matches('/');
+    let ip = value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| value.parse::<SocketAddr>().ok().map(|addr| addr.ip()))?;
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return None;
+    }
+    Some(ip.to_string())
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
@@ -79,5 +101,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(claims.ver, 0);
+    }
+
+    #[test]
+    fn node_ip_ignores_listen_and_loopback_addresses() {
+        assert_eq!(normalize_node_ip("0.0.0.0:80"), None);
+        assert_eq!(normalize_node_ip("[::]:443"), None);
+        assert_eq!(normalize_node_ip("127.0.0.1"), None);
+        assert_eq!(
+            normalize_node_ip("146.56.187.190").as_deref(),
+            Some("146.56.187.190")
+        );
+        assert_eq!(
+            normalize_node_ip("https://129.154.202.52:443/").as_deref(),
+            Some("129.154.202.52")
+        );
     }
 }

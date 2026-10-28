@@ -113,18 +113,18 @@ const maxDomain = computed(() => Math.max(1, ...byDomain.value.map((d) => d.requ
 
 async function load() {
   const bucket = rangeHours.value <= 1 ? 60 : rangeHours.value <= 24 ? 1800 : 3600
-  const [s, ts, bd, ns, hs] = await Promise.all([
+  const [s, ts, bd, endpoints, hs] = await Promise.all([
     api.get<any>('/api/v1/stats/summary').catch(() => null),
     api.get<any>(`/api/v1/stats/timeseries?hours=${rangeHours.value}&bucket=${bucket}&compare=true`).catch(() => null),
     api.get<any[]>('/api/v1/stats/by-domain').catch(() => []),
-    api.get<any[]>('/api/v1/nodes').catch(() => []),
+    api.get<any>('/api/v1/edge-endpoints').catch(() => null),
     api.get<any[]>('/api/v1/origin-health').catch(() => []),
   ])
   if (s) stats.value = s
   series.value = ts?.current || []
   previousSeries.value = ts?.previous || []
   byDomain.value = bd || []
-  nodes.value = ns || []
+  nodes.value = endpoints?.nodes || []
   health.value = hs || []
   updatedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
 }
