@@ -25,6 +25,8 @@ pub struct EdgeDiagRequest {
     #[serde(default)]
     pub simulate_authorization: bool,
     pub request_cache_control: Option<String>,
+    #[serde(default)]
+    pub probe_range: bool,
 }
 
 #[derive(Serialize)]
@@ -73,6 +75,11 @@ pub async fn diag_handler(
         .filter(|v| !v.is_empty())
     {
         builder = builder.header(header::CACHE_CONTROL, cc);
+    }
+    if req.probe_range {
+        // Large video/stream probes must not download the whole object. One
+        // byte is enough to exercise the real cache/range path.
+        builder = builder.header(header::RANGE, "bytes=0-0");
     }
     let mut request = match builder.body(Body::empty()) {
         Ok(request) => request,

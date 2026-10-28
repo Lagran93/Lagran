@@ -15,8 +15,13 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio_rustls::rustls::{
+    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 
@@ -184,6 +189,37 @@ async fn check_tls(domain: &str) -> (bool, String) {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let (ok, detail) = strict_tls(domain, roots.clone()).await;
+    if ok || !detail.contains("UnknownIssuer") {
+        return (ok, detail);
+    }
+
+    // Some servers omit the intermediate certificate from the TLS chain.
+    // Browsers repair this through the certificate's AIA URL; do the same so a
+    // working public certificate is not reported as invalid.
+    let urls = insecure_leaf_aia(domain).await;
+    for url in urls {
+        let (status, _headers, body) = match agent_http::get_response(&url, &[]).await {
+            Ok(result) => result,
+            Err(_) => continue,
+        };
+        if !(200..300).contains(&status) || body.is_empty() {
+            continue;
+        }
+        let cert = CertificateDer::from(body.to_vec());
+        if roots.add(cert).is_err() {
+            continue;
+        }
+        let (ok, repaired) = strict_tls(domain, roots.clone()).await;
+        if ok {
+            return (true, format!("{repaired}（已通过 AIA 补全中间证书）"));
+        }
+    }
+    (false, detail)
+}
+
+async fn strict_tls(domain: &str, roots: RootCertStore) -> (bool, String) {
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -213,6 +249,129 @@ async fn check_tls(domain: &str) -> (bool, String) {
         }
         Ok(Err(e)) => (false, format!("TLS 校验失败：{e}")),
         Err(_) => (false, "TLS 握手超时".into()),
+    }
+}
+
+async fn insecure_leaf_aia(domain: &str) -> Vec<String> {
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let Ok(name) = ServerName::try_from(domain.to_string()) else {
+        return Vec::new();
+    };
+    let Ok(Ok(tcp)) = tokio::time::timeout(
+        Duration::from_secs(6),
+        TcpStream::connect((domain, 443)),
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    let Ok(Ok(stream)) =
+        tokio::time::timeout(Duration::from_secs(8), connector.connect(name, tcp)).await
+    else {
+        return Vec::new();
+    };
+    let Some(leaf) = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+    else {
+        return Vec::new();
+    };
+    aia_urls(leaf.as_ref())
+}
+
+fn aia_urls(der: &[u8]) -> Vec<String> {
+    const CHARS: &[u8] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~:/?#[]@!$&'()*+,;=%";
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset + 7 < der.len() {
+        let rest = &der[offset..];
+        let hit = [b"http://".as_slice(), b"https://".as_slice()]
+            .iter()
+            .filter_map(|prefix| {
+                rest.windows(prefix.len())
+                    .position(|w| w == *prefix)
+                    .map(|pos| (pos, prefix.len()))
+            })
+            .min_by_key(|(pos, _)| *pos);
+        let Some((start, prefix_len)) = hit else {
+            break;
+        };
+        let start = offset + start;
+        let mut end = der[start..]
+            .iter()
+            .position(|b| !CHARS.contains(b))
+            .map(|offset| start + offset)
+            .unwrap_or(der.len());
+        // GeneralName URI is [6] IA5String: tag 0x86 + length. DER length bytes
+        // are often ASCII digits (0x30 = '0'), so a naive scan would include
+        // the next TLV's length byte in the URL.
+        if start >= 2 && der[start - 2] == 0x86 {
+            let len = der[start - 1] as usize;
+            if len > 0 && start + len <= der.len() {
+                end = start + len;
+            }
+        } else if start >= 3 && der[start - 3] == 0x86 && der[start - 2] == 0x81 {
+            let len = der[start - 1] as usize;
+            if len > 0 && start + len <= der.len() {
+                end = start + len;
+            }
+        }
+        if end > start + prefix_len {
+            if let Ok(url) = String::from_utf8(der[start..end].to_vec()) {
+                if !out.contains(&url) {
+                    out.push(url);
+                }
+            }
+        }
+        offset = end.max(start + prefix_len);
+    }
+    out
+}
+
+#[derive(Debug)]
+struct NoVerify;
+
+impl ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, tokio_rustls::rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

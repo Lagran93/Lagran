@@ -102,6 +102,7 @@ pub async fn diagnose(
         "simulate_cookie": req.simulate_cookie,
         "simulate_authorization": req.simulate_authorization,
         "request_cache_control": req.request_cache_control.clone(),
+        "probe_range": is_stream_path(&path),
     });
 
     // Prefer asking an online edge to execute locally. This avoids public DNS,
@@ -160,6 +161,9 @@ pub async fn diagnose(
     {
         cache_control = cc.to_string();
         headers.push(("cache-control", cache_control.as_str()));
+    }
+    if is_stream_path(&path) {
+        headers.push(("range", "bytes=0-0"));
     }
 
     match agent_http::get_response(&url, &headers).await {
@@ -262,6 +266,14 @@ fn build_response(
         headers,
         body_preview,
     }
+}
+
+fn is_stream_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path).to_ascii_lowercase();
+    path.contains("/stream")
+        || [".mp4", ".m4v", ".mov", ".webm", ".mkv", ".ts", ".m3u8", ".mp3", ".flac"]
+            .iter()
+            .any(|ext| path.ends_with(ext))
 }
 
 fn advice_for(reason: &str) -> String {

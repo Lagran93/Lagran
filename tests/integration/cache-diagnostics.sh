@@ -132,6 +132,9 @@ HTTP_DIAG=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/cache/diagnose" \
   -d "{\"domain\":\"$TLS_DOMAIN\",\"path\":\"/cached\",\"scheme\":\"http\"}")
 check "http diagnose reports redirect" "$(printf '%s' "$HTTP_DIAG" | jq -r '.status')" "301"
 check "http diagnose reason" "$(printf '%s' "$HTTP_DIAG" | jq -r '.cache_reason')" "https-redirect"
+STREAM_DIAG=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/cache/diagnose" \
+  -d "{\"domain\":\"$DOMAIN\",\"path\":\"/api/file/stream\"}")
+check "stream diagnose does not fail" "$(printf '%s' "$STREAM_DIAG" | jq -r '.status')" "200"
 
 echo "== request reasons =="
 get "/cached" -H 'Cookie: session=1' >/dev/null

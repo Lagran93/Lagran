@@ -106,15 +106,26 @@
           </div>
 
           <div class="dns-box">
-            <div class="dns-row">
+            <div v-if="endpoints.cname" class="dns-row">
+              <span class="dns-type">CNAME</span>
+              <code>{{ form.name }}</code>
+              <span class="text-muted">→</span>
+              <code>{{ endpoints.cname }}</code>
+              <button class="btn btn-text btn-sm" type="button" @click="copy(endpoints.cname)">复制</button>
+            </div>
+            <div v-else-if="nodeIps.length" class="dns-row">
               <span class="dns-type">A</span>
               <code>{{ form.name }}</code>
               <span class="text-muted">→</span>
-              <code>{{ cnameTarget }}</code>
-              <button class="btn btn-text btn-sm" type="button" @click="copy(cnameTarget)">复制</button>
+              <code>{{ nodeIps[0] }}</code>
+              <button class="btn btn-text btn-sm" type="button" @click="copy(nodeIps[0])">复制</button>
             </div>
-            <div class="text-muted" style="font-size: 12px; margin-top: 8px">
-              可解析到任意在线节点 IP：{{ nodeIps.join(', ') || '暂无在线节点' }}；如部署了统一边缘接入域名，也可使用 CNAME。
+            <div v-else class="alert alert-warning">
+              <AppIcon name="alert" :size="16" class="icon" />
+              <span>暂无在线边缘节点。请联系管理员启动节点，或配置统一边缘接入域名后再设置 DNS。</span>
+            </div>
+            <div v-if="nodeIps.length" class="text-muted" style="font-size: 12px; margin-top: 8px">
+              可解析到任意在线节点 IP：{{ nodeIps.join(', ') }}。如果使用 CNAME，请指向管理员提供的统一边缘接入域名。
             </div>
           </div>
 
@@ -165,7 +176,11 @@ const submitting = ref(false)
 const diagnosing = ref(false)
 const error = ref('')
 const projects = ref<any[]>([])
-const nodes = ref<any[]>([])
+const endpoints = ref<{ cname: string; ips: string[]; nodes: any[] }>({
+  cname: '',
+  ips: [],
+  nodes: [],
+})
 const domainId = ref('')
 const diag = ref<any>(null)
 
@@ -184,13 +199,7 @@ const canNext = computed(() => {
   return true
 })
 
-const nodeIps = computed(() =>
-  nodes.value
-    .filter((n) => n.status === 'online')
-    .flatMap((n) => [n.public_ip, n.ip])
-    .filter(Boolean),
-)
-const cnameTarget = computed(() => nodeIps.value[0] || 'edge.example.com')
+const nodeIps = computed(() => endpoints.value.ips)
 
 async function next() {
   error.value = ''
@@ -237,9 +246,14 @@ async function diagnose() {
 
 async function loadNodes() {
   try {
-    nodes.value = (await api.get<any[]>('/api/v1/nodes')) || []
+    const data = await api.get<any>('/api/v1/edge-endpoints')
+    endpoints.value = {
+      cname: data?.cname || '',
+      ips: data?.ips || [],
+      nodes: data?.nodes || [],
+    }
   } catch {
-    nodes.value = []
+    endpoints.value = { cname: '', ips: [], nodes: [] }
   }
 }
 
