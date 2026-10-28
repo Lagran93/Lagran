@@ -21,12 +21,7 @@
       <div class="filter-bar">
         <div class="search-box">
           <AppIcon name="search" :size="15" class="search-icon" />
-          <input
-            v-model="keyword"
-            class="input"
-            placeholder="搜索域名或源站"
-            style="padding-left: 32px; min-width: 220px"
-          />
+          <input v-model="keyword" class="input" placeholder="搜索域名或源站" style="padding-left: 32px; min-width: 220px" />
         </div>
         <select v-model="statusFilter" class="select">
           <option value="">全部状态</option>
@@ -80,12 +75,9 @@
                   </div>
                 </td>
                 <td>
-                  <select
-                    class="select proj-select"
-                    :value="d.project_id || ''"
+                  <select class="select proj-select" :value="d.project_id || ''"
                     :disabled="!auth.isAdmin && !projects.length"
-                    @change="onProjectChange(d, ($event.target as HTMLSelectElement).value)"
-                  >
+                    @change="onProjectChange(d, ($event.target as HTMLSelectElement).value)">
                     <option v-if="auth.isAdmin" value="">未归属</option>
                     <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
                   </select>
@@ -122,12 +114,8 @@
         </div>
       </template>
 
-      <EmptyState
-        v-else
-        icon="domain"
-        :title="domains.length ? '没有匹配的域名' : '还没有接入域名'"
-        :text="domains.length ? '试试调整搜索关键词或筛选条件。' : '接入域名并配置源站后，边缘节点会自动同步配置并开始加速。'"
-      >
+      <EmptyState v-else icon="domain" :title="domains.length ? '没有匹配的域名' : '还没有接入域名'"
+        :text="domains.length ? '试试调整搜索关键词或筛选条件。' : '接入域名并配置源站后，边缘节点会自动同步配置并开始加速。'">
         <button v-if="!domains.length" class="btn btn-primary btn-sm" type="button" @click="openCreate">
           接入第一个域名
         </button>
@@ -135,13 +123,7 @@
     </div>
 
     <!-- 接入域名 -->
-    <BaseModal
-      v-model="createOpen"
-      title="接入加速域名"
-      confirm-text="确认接入"
-      :loading="submitting"
-      @confirm="createDomain"
-    >
+    <BaseModal v-model="createOpen" title="接入加速域名" confirm-text="确认接入" :loading="submitting" @confirm="createDomain">
       <div class="form-col">
         <div class="alert alert-info">
           <AppIcon name="info" :size="16" class="icon" />
@@ -182,13 +164,8 @@
     </BaseModal>
 
     <!-- 编辑源站 -->
-    <BaseModal
-      v-model="editOpen"
-      title="编辑源站配置"
-      confirm-text="保存修改"
-      :loading="submitting"
-      @confirm="saveOrigin"
-    >
+    <BaseModal v-model="editOpen" title="编辑源站配置" width="720px" confirm-text="保存修改" :loading="submitting"
+      @confirm="saveOrigin">
       <div class="form-col">
         <div class="section-title">源站池</div>
         <div class="origin-row origin-head">
@@ -200,43 +177,21 @@
           <span>状态</span>
           <span></span>
         </div>
-        <div
-          v-for="(origin, index) in editForm.origins"
-          :key="index"
-          class="origin-row"
-        >
+        <div v-for="(origin, index) in editForm.origins" :key="index" class="origin-row">
           <select v-model="origin.proto" class="select">
             <option value="https">HTTPS</option>
             <option value="http">HTTP</option>
           </select>
           <input v-model="origin.host" class="input" placeholder="源站主机" />
           <input v-model.number="origin.port" class="input" type="number" placeholder="端口" />
-          <input
-            v-model.number="origin.weight"
-            class="input"
-            type="number"
-            min="1"
-            title="权重"
-            placeholder="权重"
-          />
-          <input
-            v-model.number="origin.priority"
-            class="input"
-            type="number"
-            min="0"
-            title="优先级"
-            placeholder="优先级"
-          />
+          <input v-model.number="origin.weight" class="input" type="number" min="1" title="权重" placeholder="权重" />
+          <input v-model.number="origin.priority" class="input" type="number" min="0" title="优先级" placeholder="优先级" />
           <label class="check origin-check">
             <input v-model="origin.enabled" type="checkbox" />
             启用
           </label>
-          <button
-            class="btn btn-text btn-sm danger"
-            type="button"
-            :disabled="editForm.origins.length <= 1"
-            @click="removeOrigin(index)"
-          >
+          <button class="btn btn-text btn-sm danger" type="button" :disabled="editForm.origins.length <= 1"
+            @click="removeOrigin(index)">
             删除
           </button>
         </div>
@@ -260,12 +215,8 @@
     </BaseModal>
 
     <!-- 高级设置 -->
-    <BaseDrawer
-      v-model="settingsOpen"
-      :title="`高级设置 · ${settingsDomain?.name || ''}`"
-      :loading="submitting"
-      @confirm="saveSettings"
-    >
+    <BaseDrawer v-model="settingsOpen" :title="`高级设置 · ${settingsDomain?.name || ''}`" :loading="submitting"
+      @confirm="saveSettings">
       <div class="form-col">
         <div class="alert alert-info">
           <AppIcon name="info" :size="16" class="icon" />
@@ -274,11 +225,7 @@
 
         <label class="switch" :class="{ on: settings.ignore_query_string }">
           <span class="switch-track" />
-          <input
-            v-model="settings.ignore_query_string"
-            type="checkbox"
-            style="display: none"
-          />
+          <input v-model="settings.ignore_query_string" type="checkbox" style="display: none" />
           忽略 URL 查询串（缓存键不含 ?query）
         </label>
 
@@ -289,7 +236,8 @@
 
         <div class="field">
           <label class="field-label">防盗链 Referer 白名单</label>
-          <input v-model="settings.hotlink_allow_referers" class="input" placeholder="example.com,*.example.com（留空关闭）" />
+          <input v-model="settings.hotlink_allow_referers" class="input"
+            placeholder="example.com,*.example.com（留空关闭）" />
         </div>
 
         <div class="form-grid">
@@ -350,12 +298,8 @@
 
         <div class="field">
           <label class="field-label">自定义响应头</label>
-          <textarea
-            v-model="settings.custom_headers"
-            class="textarea"
-            rows="4"
-            placeholder="X-CDN: lagran&#10;X-Frame-Options: DENY"
-          />
+          <textarea v-model="settings.custom_headers" class="textarea" rows="4"
+            placeholder="X-CDN: lagran&#10;X-Frame-Options: DENY" />
           <span class="field-hint">每行一个，格式 Name: Value。</span>
         </div>
       </div>
@@ -519,23 +463,23 @@ function openEdit(d: any) {
   const pool: OriginForm[] =
     Array.isArray(d.origins) && d.origins.length
       ? d.origins.map((origin: any) => ({
-          host: origin.host,
-          port: origin.port,
-          proto: origin.proto,
-          weight: origin.weight ?? 100,
-          priority: origin.priority ?? 0,
-          enabled: origin.enabled !== false,
-        }))
+        host: origin.host,
+        port: origin.port,
+        proto: origin.proto,
+        weight: origin.weight ?? 100,
+        priority: origin.priority ?? 0,
+        enabled: origin.enabled !== false,
+      }))
       : [
-          {
-            host: d.origin_host,
-            port: d.origin_port,
-            proto: d.origin_proto,
-            weight: 100,
-            priority: 0,
-            enabled: true,
-          },
-        ]
+        {
+          host: d.origin_host,
+          port: d.origin_port,
+          proto: d.origin_proto,
+          weight: 100,
+          priority: 0,
+          enabled: true,
+        },
+      ]
   editForm.value = {
     origins: pool,
     ssl_enabled: !!d.ssl_enabled,
@@ -712,7 +656,7 @@ onMounted(load)
 
 .origin-row {
   display: grid;
-  grid-template-columns: 92px minmax(0, 1.7fr) 82px 76px 76px auto auto;
+  grid-template-columns: 88px minmax(160px, 1fr) 82px 78px 78px 64px 56px;
   gap: 8px;
   align-items: center;
 }
@@ -723,15 +667,10 @@ onMounted(load)
   padding: 0 0 2px;
 }
 
-@media (max-width: 760px) {
-  .origin-head {
-    display: none;
-  }
-}
-
 .origin-row .select,
 .origin-row .input {
   height: 32px;
+  min-width: 0;
 }
 
 .origin-check {
@@ -739,16 +678,41 @@ onMounted(load)
   font-size: 12px;
 }
 
-@media (max-width: 760px) {
+@media (max-width: 900px) {
+  .origin-head {
+    display: none;
+  }
+
   .origin-row {
-    grid-template-columns: 1fr 1fr;
-    padding: 10px;
+    display: flex;
+    flex-wrap: wrap;
+    padding: 12px;
     border: 1px solid var(--divider);
-    border-radius: 8px;
+    border-radius: 10px;
+    background: #fafbfc;
+  }
+
+  .origin-row .select {
+    width: 84px;
+    flex: none;
+  }
+
+  .origin-row .input {
+    flex: 1 1 100px;
+    width: auto;
   }
 
   .origin-row .input:first-of-type {
-    grid-column: span 2;
+    flex: 1 1 100%;
+  }
+
+  .origin-row .origin-check {
+    flex: none;
+  }
+
+  .origin-row .btn {
+    flex: none;
+    margin-left: auto;
   }
 }
 </style>
