@@ -1201,6 +1201,37 @@ pub async fn metrics_by_domain_for(
     .await
 }
 
+pub async fn metrics_timeseries(
+    pool: &PgPool,
+    hosts: Option<&[String]>,
+    start_hours: i32,
+    end_hours: i32,
+    bucket_secs: i32,
+) -> sqlx::Result<Vec<(DateTime<Utc>, i64, i64, i64, i64)>> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            to_timestamp(floor(extract(epoch FROM reported_at) / $3) * $3) AS bucket,
+            COALESCE(SUM(requests), 0)::bigint,
+            COALESCE(SUM(cache_hits), 0)::bigint,
+            COALESCE(SUM(cache_misses), 0)::bigint,
+            COALESCE(SUM(bytes_sent), 0)::bigint
+        FROM edge_metrics
+        WHERE reported_at >= NOW() - make_interval(hours => $1)
+          AND reported_at < NOW() - make_interval(hours => $2)
+          AND ($4::text[] IS NULL OR domain = ANY($4))
+        GROUP BY 1
+        ORDER BY 1
+        "#,
+    )
+    .bind(start_hours)
+    .bind(end_hours)
+    .bind(bucket_secs)
+    .bind(hosts)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn list_certs(pool: &PgPool) -> sqlx::Result<Vec<CertRow>> {
     sqlx::query_as::<_, CertRow>(
         r#"

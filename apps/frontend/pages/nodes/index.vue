@@ -13,6 +13,10 @@
           <input v-model="autoRefresh" type="checkbox" style="display: none" />
           自动刷新
         </label>
+        <button class="btn btn-default" type="button" @click="exportNodes">
+          <AppIcon name="upload" :size="15" />
+          导出 CSV
+        </button>
         <button class="btn btn-default" type="button" :disabled="loading" @click="load">
           <AppIcon name="refresh" :size="15" />
           刷新
@@ -647,6 +651,20 @@ const pagedNodes = computed(() => {
   const start = (page.value - 1) * pageSize
   return nodes.value.slice(start, start + pageSize)
 })
+
+function exportNodes() {
+  exportCsv(`lagran-nodes-${new Date().toISOString().slice(0, 10)}`, nodes.value, [
+    { key: 'name', label: '节点' },
+    { key: 'region', label: '区域' },
+    { key: 'status', label: '状态' },
+    { key: 'version', label: '版本' },
+    { key: 'public_ip', label: '公网 IP' },
+    { key: 'agent_url', label: 'Agent 地址' },
+    { key: 'cpu_usage', label: 'CPU%' },
+    { key: 'memory_usage', label: '内存%' },
+    { key: 'last_heartbeat', label: '最后心跳' },
+  ])
+}
 watch(
   () => nodes.value.length,
   (total) => {

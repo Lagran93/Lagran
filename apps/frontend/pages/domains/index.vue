@@ -6,10 +6,18 @@
         <div class="page-desc">接入需要加速的域名，配置源站、项目归属与 CDN 高级策略</div>
       </div>
       <div class="page-actions">
+        <button class="btn btn-default" type="button" @click="exportDomains">
+          <AppIcon name="upload" :size="15" />
+          导出 CSV
+        </button>
         <button class="btn btn-default" type="button" :disabled="loading" @click="load">
           <AppIcon name="refresh" :size="15" />
           刷新
         </button>
+        <NuxtLink to="/domains/onboard" class="btn btn-default">
+          <AppIcon name="activity" :size="15" />
+          接入向导
+        </NuxtLink>
         <button class="btn btn-primary" type="button" @click="openCreate">
           <AppIcon name="plus" :size="15" />
           接入域名
@@ -45,10 +53,20 @@
       </div>
 
       <template v-else-if="paged.length">
+        <div v-if="selected.length" class="bulk-bar">
+          <span>已选择 <b>{{ selected.length }}</b> 个域名</span>
+          <button class="btn btn-text btn-sm" type="button" @click="bulkStatus('active')">批量启用</button>
+          <button class="btn btn-text btn-sm" type="button" @click="bulkStatus('disabled')">批量停用</button>
+          <button class="btn btn-text btn-sm danger" type="button" @click="bulkDelete">批量删除</button>
+          <button class="btn btn-text btn-sm" type="button" @click="selected = []">取消</button>
+        </div>
         <div class="table-wrap">
           <table class="table">
             <thead>
               <tr>
+                <th class="check-col">
+                  <input type="checkbox" :checked="allPageSelected" @change="togglePage" />
+                </th>
                 <th style="min-width: 220px">加速域名</th>
                 <th style="min-width: 220px">源站</th>
                 <th style="min-width: 160px">所属项目</th>
@@ -59,6 +77,9 @@
             </thead>
             <tbody>
               <tr v-for="d in paged" :key="d.id">
+                <td class="check-col">
+                  <input v-model="selected" type="checkbox" :value="d.id" />
+                </td>
                 <td>
                   <NuxtLink :to="`/domains/${d.id}`" class="cell-main">{{ d.name }}</NuxtLink>
                   <div class="cell-sub">
@@ -402,10 +423,63 @@ const filtered = computed(() => {
   })
 })
 
+const selected = ref<string[]>([])
+
 const paged = computed(() => {
   const start = (page.value - 1) * pageSize
   return filtered.value.slice(start, start + pageSize)
 })
+
+const allPageSelected = computed(
+  () => paged.value.length > 0 && paged.value.every((d) => selected.value.includes(d.id)),
+)
+
+function togglePage() {
+  if (allPageSelected.value) {
+    selected.value = selected.value.filter((id) => !paged.value.some((d) => d.id === id))
+  } else {
+    selected.value = [...new Set([...selected.value, ...paged.value.map((d) => d.id)])]
+  }
+}
+
+async function bulkStatus(status: string) {
+  if (!selected.value.length) return
+  const ids = [...selected.value]
+  await Promise.all(
+    ids.map((id) => api.post(`/api/v1/domains/${id}/status`, { status }).catch(() => null)),
+  )
+  toast.success(`已提交 ${ids.length} 个域名的状态变更`)
+  selected.value = []
+  await load()
+}
+
+async function bulkDelete() {
+  if (!selected.value.length) return
+  const ok = await ask({
+    title: '批量删除域名',
+    message: `将删除 ${selected.value.length} 个域名及其规则，此操作不可恢复。`,
+    confirmText: '确认删除',
+    danger: true,
+  })
+  if (!ok) return
+  await Promise.all(selected.value.map((id) => api.del(`/api/v1/domains/${id}`).catch(() => null)))
+  toast.success('批量删除已提交')
+  selected.value = []
+  await load()
+}
+
+function exportDomains() {
+  exportCsv(`lagran-domains-${new Date().toISOString().slice(0, 10)}`, filtered.value, [
+    { key: 'name', label: '域名' },
+    { key: 'status', label: '状态' },
+    { key: 'origin_proto', label: '源站协议' },
+    { key: 'origin_host', label: '源站主机' },
+    { key: 'origin_port', label: '源站端口' },
+    { key: 'ssl_enabled', label: 'HTTPS' },
+    { key: 'rate_limit_rps', label: '限流 QPS' },
+    { key: 'created_at', label: '创建时间' },
+  ])
+}
 
 watch([keyword, statusFilter, projectFilter], () => {
   page.value = 1
@@ -695,6 +769,26 @@ onMounted(load)
 .origin-check {
   white-space: nowrap;
   font-size: 12px;
+}
+
+.check-col {
+  width: 38px;
+}
+
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--brand-bg);
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.bulk-bar b {
+  color: var(--brand);
 }
 
 @media (max-width: 900px) {

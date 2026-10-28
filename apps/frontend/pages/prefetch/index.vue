@@ -101,7 +101,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="s in schedules" :key="s.id">
+              <tr v-for="s in pagedSchedules" :key="s.id">
                 <td class="cell-main">{{ s.domain }}</td>
                 <td>
                   <span class="mono text-2 truncate" style="display: inline-block; max-width: 260px">
@@ -134,6 +134,9 @@
           <button class="btn btn-primary btn-sm" type="button" @click="openCreateSchedule">新建定时任务</button>
         </EmptyState>
       </div>
+      <div v-if="schedules.length > schedulePageSize" class="table-footer">
+        <AppPagination v-model:page="schedulePage" :total="schedules.length" :page-size="schedulePageSize" />
+      </div>
     </div>
 
     <div class="card">
@@ -157,7 +160,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="t in tasks" :key="t.id">
+              <tr v-for="t in pagedTasks" :key="t.id">
                 <td class="text-2">{{ formatTime(t.created_at) }}</td>
                 <td class="cell-main">{{ t.domain }}</td>
                 <td class="mono text-2">{{ t.url_path }}</td>
@@ -175,6 +178,9 @@
           </table>
         </div>
         <EmptyState v-else icon="upload" title="还没有预热任务" text="创建手动或定时任务后，这里会显示执行结果。" />
+      </div>
+      <div v-if="tasks.length > taskPageSize" class="table-footer">
+        <AppPagination v-model:page="taskPage" :total="tasks.length" :page-size="taskPageSize" />
       </div>
     </div>
 
@@ -222,6 +228,30 @@ const { ask } = useConfirm()
 const domains = ref<any[]>([])
 const tasks = ref<any[]>([])
 const schedules = ref<any[]>([])
+const taskPage = ref(1)
+const schedulePage = ref(1)
+const taskPageSize = 10
+const schedulePageSize = 8
+const pagedTasks = computed(() => {
+  const start = (taskPage.value - 1) * taskPageSize
+  return tasks.value.slice(start, start + taskPageSize)
+})
+const pagedSchedules = computed(() => {
+  const start = (schedulePage.value - 1) * schedulePageSize
+  return schedules.value.slice(start, start + schedulePageSize)
+})
+watch(
+  () => tasks.value.length,
+  (total) => {
+    taskPage.value = Math.min(taskPage.value, Math.max(1, Math.ceil(total / taskPageSize)))
+  },
+)
+watch(
+  () => schedules.value.length,
+  (total) => {
+    schedulePage.value = Math.min(schedulePage.value, Math.max(1, Math.ceil(total / schedulePageSize)))
+  },
+)
 const loading = ref(false)
 const submitting = ref(false)
 const error = ref('')

@@ -271,7 +271,7 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="r in rules" :key="r.id">
+                <tr v-for="r in pagedRules" :key="r.id">
                   <td class="cell-main">{{ r.name }}</td>
                   <td>
                     <span class="mono">{{ fieldLabel(r.field) }} {{ opLabel(r.operator) }} {{ r.value }}</span>
@@ -302,8 +302,11 @@
               </tbody>
             </table>
           </div>
+          <div v-if="rules.length > rulePageSize" class="table-footer">
+            <AppPagination v-model:page="rulePage" :total="rules.length" :page-size="rulePageSize" />
+          </div>
           <EmptyState
-            v-else
+            v-if="!rules.length"
             icon="rules"
             title="还没有自定义规则"
             text="例如：路径前缀 /admin 且来源不属于办公网时拦截，或对 /api/ 只记录日志。"
@@ -339,7 +342,7 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="ip in ips" :key="ip.id">
+                <tr v-for="ip in pagedIps" :key="ip.id">
                   <td>
                     <StatusTag :tone="ip.kind === 'allow' ? 'success' : 'danger'">
                       {{ ip.kind === 'allow' ? '白名单' : '黑名单' }}
@@ -357,8 +360,11 @@
               </tbody>
             </table>
           </div>
+          <div v-if="ips.length > ipPageSize" class="table-footer">
+            <AppPagination v-model:page="ipPage" :total="ips.length" :page-size="ipPageSize" />
+          </div>
           <EmptyState
-            v-else
+            v-if="!ips.length"
             icon="shield"
             title="还没有 IP 名单"
             text="把攻击来源加入黑名单，或把办公网、监控探针加入白名单以跳过所有 WAF 检查。"
@@ -466,7 +472,7 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="e in filteredEvents" :key="e.id">
+                <tr v-for="e in pagedEvents" :key="e.id">
                   <td class="text-muted nowrap">{{ formatDateTime(e.ts) }}</td>
                   <td>
                     <StatusTag :tone="eventTone(e.action)">{{ eventLabel(e.action) }}</StatusTag>
@@ -490,6 +496,9 @@
             title="暂无 WAF 事件"
             text="命中规则的请求会在这里展示；观察模式下只记录不拦截。"
           />
+          <div v-if="filteredEvents.length > eventPageSize" class="table-footer">
+            <AppPagination v-model:page="eventPage" :total="filteredEvents.length" :page-size="eventPageSize" />
+          </div>
         </div>
       </div>
     </template>
@@ -655,6 +664,30 @@ const settings = ref<any>({
 
 const rules = ref<any[]>([])
 const ips = ref<any[]>([])
+const rulePage = ref(1)
+const ipPage = ref(1)
+const rulePageSize = 10
+const ipPageSize = 10
+const pagedRules = computed(() => {
+  const start = (rulePage.value - 1) * rulePageSize
+  return rules.value.slice(start, start + rulePageSize)
+})
+const pagedIps = computed(() => {
+  const start = (ipPage.value - 1) * ipPageSize
+  return ips.value.slice(start, start + ipPageSize)
+})
+watch(
+  () => rules.value.length,
+  (total) => {
+    rulePage.value = Math.min(rulePage.value, Math.max(1, Math.ceil(total / rulePageSize)))
+  },
+)
+watch(
+  () => ips.value.length,
+  (total) => {
+    ipPage.value = Math.min(ipPage.value, Math.max(1, Math.ceil(total / ipPageSize)))
+  },
+)
 const events = ref<any[]>([])
 const eventsLoading = ref(false)
 const eventAction = ref('')
@@ -747,6 +780,22 @@ const filteredEvents = computed(() => {
   if (!eventAction.value) return events.value
   return events.value.filter((e) => e.action === eventAction.value)
 })
+
+const eventPage = ref(1)
+const eventPageSize = 20
+const pagedEvents = computed(() => {
+  const start = (eventPage.value - 1) * eventPageSize
+  return filteredEvents.value.slice(start, start + eventPageSize)
+})
+watch([eventAction, eventLimit], () => {
+  eventPage.value = 1
+})
+watch(
+  () => filteredEvents.value.length,
+  (total) => {
+    eventPage.value = Math.min(eventPage.value, Math.max(1, Math.ceil(total / eventPageSize)))
+  },
+)
 
 function fieldLabel(field: string) {
   if (field && field.startsWith('header:')) return `请求头 ${field.slice(7)}`

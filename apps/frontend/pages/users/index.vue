@@ -6,6 +6,10 @@
         <div class="page-desc">管理账号、角色与启用状态；普通用户只能访问所属项目</div>
       </div>
       <div class="page-actions">
+        <button class="btn btn-default" type="button" @click="exportUsers">
+          <AppIcon name="upload" :size="15" />
+          导出 CSV
+        </button>
         <button class="btn btn-default" type="button" :disabled="loading" @click="load">
           <AppIcon name="refresh" :size="15" />
           刷新
@@ -211,6 +215,18 @@ const pagedUsers = computed(() => {
   const start = (page.value - 1) * pageSize
   return filtered.value.slice(start, start + pageSize)
 })
+
+function exportUsers() {
+  exportCsv(`lagran-users-${new Date().toISOString().slice(0, 10)}`, filtered.value, [
+    { key: 'email', label: '邮箱' },
+    { key: 'name', label: '名称' },
+    { key: 'role', label: '角色' },
+    { key: 'is_active', label: '启用' },
+    { key: 'project_count', label: '项目数' },
+    { key: 'last_login_at', label: '最近登录' },
+    { key: 'created_at', label: '创建时间' },
+  ])
+}
 watch(keyword, () => {
   page.value = 1
 })

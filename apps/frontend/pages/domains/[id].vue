@@ -14,6 +14,10 @@
         <div class="page-desc">查看域名的源站、缓存策略、规则与证书绑定</div>
       </div>
       <div class="page-actions">
+        <button class="btn btn-default" type="button" :disabled="diagLoading" @click="runDiagnose">
+          <AppIcon name="activity" :size="15" />
+          {{ diagLoading ? '诊断中…' : '域名诊断' }}
+        </button>
         <button class="btn btn-default" type="button" :disabled="loading" @click="load">
           <AppIcon name="refresh" :size="15" />
           刷新
@@ -222,6 +226,30 @@
         </div>
       </div>
     </template>
+
+    <BaseModal v-model="diagOpen" title="域名诊断" width="760px" hide-footer>
+      <div v-if="diagLoading" class="text-muted">正在检查 DNS、证书、源站和缓存…</div>
+      <template v-else-if="diag">
+        <div class="alert" :class="diag.overall ? 'alert-success' : 'alert-warning'">
+          <AppIcon :name="diag.overall ? 'check' : 'alert'" :size="16" class="icon" />
+          <span>{{ diag.overall ? '域名接入检查通过' : '存在需要处理的接入问题' }}</span>
+        </div>
+        <div class="diag-grid">
+          <div v-for="c in diag.checks" :key="c.key" class="diag-card" :class="{ bad: !c.ok }">
+            <div class="diag-head">
+              <AppIcon :name="c.ok ? 'check' : 'close'" :size="16" />
+              <strong>{{ c.label }}</strong>
+              <span class="text-muted">{{ c.latency_ms }} ms</span>
+            </div>
+            <div class="diag-detail">{{ c.detail }}</div>
+          </div>
+        </div>
+        <div v-if="diag.resolved_ips?.length" class="diag-meta">
+          <span>DNS 解析：</span><code>{{ diag.resolved_ips.join(', ') }}</code>
+          <span v-if="diag.edge_ips?.length"> · 在线节点：<code>{{ diag.edge_ips.join(', ') }}</code></span>
+        </div>
+      </template>
+    </BaseModal>
   </div>
 </template>
 
@@ -237,6 +265,27 @@ const settings = ref<any>(null)
 const rules = ref<any[]>([])
 const certs = ref<any[]>([])
 const projects = ref<any[]>([])
+const diagOpen = ref(false)
+const diagLoading = ref(false)
+const diag = ref<any>(null)
+
+async function runDiagnose() {
+  diagOpen.value = true
+  diagLoading.value = true
+  diag.value = null
+  try {
+    diag.value = await api.post<any>(`/api/v1/domains/${id.value}/diagnose`, {})
+  } catch (e: any) {
+    diag.value = {
+      overall: false,
+      checks: [{ key: 'error', label: '诊断失败', ok: false, detail: e?.data?.error || '请求失败', latency_ms: 0 }],
+      resolved_ips: [],
+      edge_ips: [],
+    }
+  } finally {
+    diagLoading.value = false
+  }
+}
 
 const projectName = computed(() => {
   if (!domain.value?.project_id) return ''
@@ -315,6 +364,59 @@ onMounted(load)
 .kv-val {
   color: var(--text-2);
   word-break: break-all;
+}
+
+.diag-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.diag-card {
+  border: 1px solid var(--success-border);
+  background: var(--success-bg);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.diag-card.bad {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+}
+
+.diag-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.diag-head .text-muted {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.diag-detail {
+  margin-top: 6px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.diag-meta {
+  margin-top: 12px;
+  color: var(--text-3);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+@media (max-width: 640px) {
+  .diag-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .kv-val.pre {

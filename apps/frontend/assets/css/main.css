@@ -1482,3 +1482,176 @@ textarea {
     font-size: 14px;
   }
 }
+
+/* --------------------------------------------------------------- dark theme */
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #0b0e14;
+  --card: #141922;
+  --border: #252b37;
+  --border-strong: #323a48;
+  --divider: #1f2530;
+
+  --text: #e6e8eb;
+  --text-2: #a8b0bd;
+  --text-3: #7d8796;
+  --text-4: #4d5662;
+
+  --brand: #4b9bff;
+  --brand-hover: #6caeff;
+  --brand-active: #2d86f5;
+  --brand-bg: #11294a;
+  --brand-bg-strong: #17375f;
+
+  --success: #3ddc84;
+  --success-bg: #12301c;
+  --success-border: #1f5b34;
+  --warning: #ffb454;
+  --warning-bg: #2f2515;
+  --warning-border: #5a4320;
+  --danger: #ff6b6b;
+  --danger-bg: #331b1d;
+  --danger-border: #5c2a2d;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+
+html[data-theme='dark'] body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+html[data-theme='dark'] .topbar {
+  background: rgba(20, 25, 34, 0.92);
+}
+
+html[data-theme='dark'] .menu-item:hover,
+html[data-theme='dark'] .dropdown-item:hover,
+html[data-theme='dark'] .user-chip:hover {
+  background: #1c2230;
+}
+
+html[data-theme='dark'] .table th,
+html[data-theme='dark'] .table thead th {
+  background: #181e28;
+  color: var(--text-2);
+}
+
+html[data-theme='dark'] .table tbody tr:hover {
+  background: #1a202b;
+}
+
+html[data-theme='dark'] .table td,
+html[data-theme='dark'] .table th {
+  border-color: var(--border);
+}
+
+html[data-theme='dark'] .input,
+html[data-theme='dark'] .select,
+html[data-theme='dark'] .textarea,
+html[data-theme='dark'] .search-box .input {
+  background: #0f141c;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+html[data-theme='dark'] .input::placeholder,
+html[data-theme='dark'] .textarea::placeholder {
+  color: var(--text-3);
+}
+
+html[data-theme='dark'] .btn-default {
+  background: #1a202b;
+  border-color: var(--border);
+  color: var(--text-2);
+}
+
+html[data-theme='dark'] .btn-default:hover {
+  border-color: var(--brand);
+  color: var(--brand);
+}
+
+html[data-theme='dark'] .segmented,
+html[data-theme='dark'] .filter-bar,
+html[data-theme='dark'] .table-footer,
+html[data-theme='dark'] .modal-panel,
+html[data-theme='dark'] .drawer-panel,
+html[data-theme='dark'] .dropdown,
+html[data-theme='dark'] .user-dropdown {
+  background: var(--card);
+  border-color: var(--border);
+}
+
+html[data-theme='dark'] .segmented button.active {
+  background: #1a202b;
+  color: var(--text);
+}
+
+html[data-theme='dark'] .skeleton {
+  background: linear-gradient(90deg, #1a202b, #222a38, #1a202b);
+}
+
+html[data-theme='dark'] .diff-before {
+  background: #2a1a1c;
+}
+
+html[data-theme='dark'] .diff-after {
+  background: #14261a;
+}
+
+html[data-theme='dark'] .diff-path,
+html[data-theme='dark'] .body-preview {
+  background: #10151d;
+  color: var(--text-2);
+}
+
+html[data-theme='dark'] .monitor-page {
+  background: #070a10;
+}
+
+.locale-btn {
+  min-width: 42px;
+  font-weight: 500;
+}
+
+html[data-theme='dark'] .table tbody tr:hover td {
+  background: #1a202b;
+}
+
+html[data-theme='dark'] .tag-neutral {
+  background: #1a202b;
+  color: var(--text-2);
+}
+
+html[data-theme='dark'] .card,
+html[data-theme='dark'] .modal-panel,
+html[data-theme='dark'] .drawer-panel {
+  background: var(--card);
+}
+
+html[data-theme='dark'] ::-webkit-scrollbar-thumb {
+  background: #323a48;
+}
+
+.check-col {
+  width: 38px;
+}
+
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 10px 16px;
+  background: var(--brand-bg);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.bulk-bar b {
+  color: var(--brand);
+}

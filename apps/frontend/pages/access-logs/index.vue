@@ -6,6 +6,10 @@
         <div class="page-desc">边缘节点批量上报的访客请求明细，默认展示最近 200 条</div>
       </div>
       <div class="page-actions">
+        <button class="btn btn-default" type="button" @click="exportLogs">
+          <AppIcon name="upload" :size="15" />
+          导出 CSV
+        </button>
         <button class="btn btn-default" type="button" :disabled="loading" @click="load">
           <AppIcon name="refresh" :size="15" />
           刷新
@@ -123,6 +127,21 @@ const paged = computed(() => {
   const start = (page.value - 1) * pageSize
   return filtered.value.slice(start, start + pageSize)
 })
+
+function exportLogs() {
+  exportCsv(`lagran-access-${new Date().toISOString().slice(0, 10)}`, filtered.value, [
+    { key: 'ts', label: '时间' },
+    { key: 'host', label: '域名' },
+    { key: 'method', label: '方法' },
+    { key: 'path', label: '路径' },
+    { key: 'status', label: '状态码' },
+    { key: 'cache_status', label: '缓存状态' },
+    { key: 'bytes_sent', label: '响应字节' },
+    { key: 'latency_ms', label: '耗时 ms' },
+    { key: 'client_ip', label: '客户端 IP' },
+    { key: 'user_agent', label: 'User-Agent' },
+  ])
+}
 
 watch([statusClass, limit], () => {
   page.value = 1

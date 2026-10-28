@@ -58,7 +58,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="v in filteredVersions" :key="v.id">
+              <tr v-for="v in pagedVersions" :key="v.id">
                 <td class="cell-main">{{ v.domain }}</td>
                 <td>
                   <StatusTag tone="info">v{{ v.version }}</StatusTag>
@@ -83,6 +83,9 @@
           text="修改域名配置或点击「创建版本」后会生成第一份快照。"
         />
       </div>
+      <div v-if="filteredVersions.length > versionPageSize" class="table-footer">
+        <AppPagination v-model:page="versionPage" :total="filteredVersions.length" :page-size="versionPageSize" />
+      </div>
     </div>
 
     <div v-else class="card">
@@ -106,7 +109,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="r in releases" :key="r.id">
+              <tr v-for="r in pagedReleases" :key="r.id">
                 <td><StatusTag :tone="releaseTone(r.status)" dot>{{ releaseLabel(r.status) }}</StatusTag></td>
                 <td>
                   <div v-for="d in r.domains" :key="d.domain" class="cell-sub">
@@ -156,6 +159,9 @@
           title="还没有发布单"
           text="选择配置版本、目标节点后创建发布单，审批通过即可发布。"
         />
+      </div>
+      <div v-if="releases.length > releasePageSize" class="table-footer">
+        <AppPagination v-model:page="releasePage" :total="releases.length" :page-size="releasePageSize" />
       </div>
     </div>
 
@@ -307,6 +313,34 @@ const snapshotDomain = ref('')
 
 const filteredVersions = computed(() =>
   versionDomain.value ? versions.value.filter((v) => v.domain === versionDomain.value) : versions.value,
+)
+
+const versionPage = ref(1)
+const releasePage = ref(1)
+const versionPageSize = 10
+const releasePageSize = 10
+const pagedVersions = computed(() => {
+  const start = (versionPage.value - 1) * versionPageSize
+  return filteredVersions.value.slice(start, start + versionPageSize)
+})
+const pagedReleases = computed(() => {
+  const start = (releasePage.value - 1) * releasePageSize
+  return releases.value.slice(start, start + releasePageSize)
+})
+watch(versionDomain, () => {
+  versionPage.value = 1
+})
+watch(
+  () => filteredVersions.value.length,
+  (total) => {
+    versionPage.value = Math.min(versionPage.value, Math.max(1, Math.ceil(total / versionPageSize)))
+  },
+)
+watch(
+  () => releases.value.length,
+  (total) => {
+    releasePage.value = Math.min(releasePage.value, Math.max(1, Math.ceil(total / releasePageSize)))
+  },
 )
 
 function versionsFor(domain: string) {

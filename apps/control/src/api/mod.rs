@@ -12,6 +12,7 @@ pub mod config;
 pub mod config_release;
 pub mod dns_test;
 pub mod domain;
+pub mod domain_diag;
 pub mod health;
 pub mod health_origin;
 pub mod metrics;
@@ -86,6 +87,7 @@ pub fn create_router(state: AppState) -> Router {
                     get(domain::get_settings).put(domain::put_settings),
                 )
                 .route("/domains/:id/status", post(domain::set_status))
+                .route("/domains/:id/diagnose", post(domain_diag::diagnose))
                 .route("/rules", get(rule::list).post(rule::create))
                 .route("/rules/test", post(rule::test))
                 .route("/cache/diagnose", post(cache_diag::diagnose))
@@ -142,6 +144,7 @@ pub fn create_router(state: AppState) -> Router {
                     put(prefetch::update_schedule).delete(prefetch::delete_schedule),
                 )
                 .route("/stats/by-domain", get(stats::by_domain))
+                .route("/stats/timeseries", get(stats::timeseries))
                 .route("/stats/summary", get(stats::summary))
                 .route("/audit", get(audit::list))
                 .route(

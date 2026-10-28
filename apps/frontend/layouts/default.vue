@@ -20,6 +20,7 @@ const MENU: MenuGroup[] = [
     title: '加速服务',
     items: [
       { label: '域名管理', to: '/domains', icon: 'domain' },
+      { label: '接入向导', to: '/domains/onboard', icon: 'plus' },
       { label: '缓存规则', to: '/rules', icon: 'rules' },
       { label: '缓存诊断', to: '/cache-debug', icon: 'search' },
       { label: 'WAF 防护', to: '/waf', icon: 'shield' },
@@ -34,6 +35,7 @@ const MENU: MenuGroup[] = [
     items: [
       { label: '边缘节点', to: '/nodes', icon: 'node', admin: true },
       { label: '统计分析', to: '/stats', icon: 'stats' },
+      { label: '大屏监控', to: '/monitor', icon: 'activity' },
       { label: '告警中心', to: '/alerts', icon: 'alert', admin: true },
       { label: '访问日志', to: '/access-logs', icon: 'logs' },
       { label: '操作审计', to: '/audit', icon: 'audit', admin: true },
@@ -51,31 +53,77 @@ const MENU: MenuGroup[] = [
 
 const route = useRoute()
 const auth = useAuthStore()
+const theme = useTheme()
+const i18n = useLocale()
+
+const NAV_KEYS: Record<string, string> = {
+  '/': 'nav.dashboard',
+  '/domains': 'nav.domains',
+  '/domains/onboard': 'nav.onboard',
+  '/rules': 'nav.rules',
+  '/cache-debug': 'nav.cacheDebug',
+  '/waf': 'nav.waf',
+  '/certs': 'nav.certs',
+  '/purge': 'nav.purge',
+  '/prefetch': 'nav.prefetch',
+  '/config-releases': 'nav.releases',
+  '/nodes': 'nav.nodes',
+  '/stats': 'nav.stats',
+  '/monitor': 'nav.monitor',
+  '/alerts': 'nav.alerts',
+  '/access-logs': 'nav.logs',
+  '/audit': 'nav.audit',
+  '/projects': 'nav.projects',
+  '/users': 'nav.users',
+  '/settings': 'nav.settings',
+}
+const GROUP_KEYS: Record<string, string> = {
+  概览: 'group.overview',
+  加速服务: 'group.edge',
+  运维监控: 'group.observe',
+  系统: 'group.system',
+}
 
 const sidebarOpen = ref(false)
 const userMenuOpen = ref(false)
 
 const groups = computed<MenuGroup[]>(() =>
-  MENU.map(group => ({
+  MENU.map((group) => ({
     ...group,
-    items: group.items.filter(item => !item.admin || auth.isAdmin),
-  })).filter(group => group.items.length > 0),
+    title: i18n.t(GROUP_KEYS[group.title] || group.title),
+    items: group.items
+      .filter((item) => !item.admin || auth.isAdmin)
+      .map((item) => ({ ...item, label: i18n.t(NAV_KEYS[item.to] || item.label) })),
+  })).filter((group) => group.items.length > 0),
 )
 
 function isActive(to: string): boolean {
   if (to === '/') return route.path === '/'
+  if (to === '/domains') {
+    return route.path === '/domains' || (route.path.startsWith('/domains/') && route.path !== '/domains/onboard')
+  }
   return route.path === to || route.path.startsWith(`${to}/`)
 }
 
 const current = computed<{ group: string; label: string }>(() => {
-  if (route.path === '/') return { group: '概览', label: '仪表盘' }
-  if (route.path.startsWith('/domains/')) return { group: '加速服务', label: '域名详情' }
+  if (route.path === '/') return { group: i18n.t('group.overview'), label: i18n.t('nav.dashboard') }
+  if (route.path === '/domains/onboard') {
+    return { group: i18n.t('group.edge'), label: i18n.t('nav.onboard') }
+  }
+  if (route.path.startsWith('/domains/')) {
+    return { group: i18n.t('group.edge'), label: i18n.t('nav.domains') }
+  }
   for (const group of MENU) {
     for (const item of group.items) {
-      if (isActive(item.to)) return { group: group.title, label: item.label }
+      if (isActive(item.to)) {
+        return {
+          group: i18n.t(GROUP_KEYS[group.title] || group.title),
+          label: i18n.t(NAV_KEYS[item.to] || item.label),
+        }
+      }
     }
   }
-  return { group: '控制台', label: '页面' }
+  return { group: i18n.t('group.overview'), label: 'Lagran' }
 })
 
 useHead(() => ({ title: `${current.value.label} · Lagran CDN 控制台` }))
@@ -137,7 +185,7 @@ onMounted(async () => {
 
       <div class="sidebar-foot">
         <span class="dot" style="background: var(--success)" />
-        <span>控制面已连接</span>
+        <span>{{ i18n.locale.value === 'zh' ? '控制面已连接' : 'Control plane connected' }}</span>
       </div>
     </aside>
 
@@ -163,9 +211,21 @@ onMounted(async () => {
         </div>
 
         <div class="topbar-right">
+          <button
+            class="btn btn-icon btn-default"
+            type="button"
+            :title="i18n.t('common.theme')"
+            @click="theme.toggle()"
+          >
+            <AppIcon :name="theme.mode.value === 'dark' ? 'sun' : 'moon'" :size="16" />
+          </button>
+          <button class="btn btn-default btn-sm locale-btn" type="button" @click="i18n.toggle()">
+            {{ i18n.locale.value === 'zh' ? 'EN' : '中文' }}
+          </button>
+
           <span class="env-chip">
             <span class="env-dot" />
-            服务运行中
+            {{ i18n.locale.value === 'zh' ? '服务运行中' : 'Running' }}
           </span>
 
           <div class="user-chip" @click.stop="userMenuOpen = !userMenuOpen">
@@ -190,7 +250,7 @@ onMounted(async () => {
             </div>
             <div class="dropdown-item danger" @click="logout">
               <AppIcon name="logout" :size="16" />
-              退出登录
+              {{ i18n.t('common.logout') }}
             </div>
           </div>
         </div>

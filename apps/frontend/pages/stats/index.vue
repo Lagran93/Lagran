@@ -6,11 +6,62 @@
         <div class="page-desc">近 24 小时的请求、命中率与流量分布</div>
       </div>
       <div class="page-actions">
+        <select v-model.number="rangeHours" class="select" style="min-width: 120px" @change="load">
+          <option :value="1">近 1 小时</option>
+          <option :value="24">近 24 小时</option>
+          <option :value="168">近 7 天</option>
+        </select>
         <span v-if="updatedAt" class="text-muted" style="font-size: 12px">更新于 {{ updatedAt }}</span>
+        <button class="btn btn-default" type="button" @click="exportRows">
+          <AppIcon name="upload" :size="15" />
+          导出 CSV
+        </button>
         <button class="btn btn-default" type="button" :disabled="loading" @click="load">
           <AppIcon name="refresh" :size="15" />
           刷新
         </button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">实时流量</div>
+          <div class="card-desc">每 15 秒自动刷新，可对比上一时间段</div>
+        </div>
+        <div class="card-extra flex-center gap-8">
+          <div class="segmented">
+            <button type="button" :class="{ active: chartMetric === 'requests' }" @click="chartMetric = 'requests'">
+              请求数
+            </button>
+            <button type="button" :class="{ active: chartMetric === 'bytes_sent' }" @click="chartMetric = 'bytes_sent'">
+              流量
+            </button>
+            <button type="button" :class="{ active: chartMetric === 'hit_ratio' }" @click="chartMetric = 'hit_ratio'">
+              命中率
+            </button>
+          </div>
+          <label class="check" style="font-size: 12px">
+            <input v-model="compare" type="checkbox" @change="load" />
+            对比上一时段
+          </label>
+        </div>
+      </div>
+      <div class="card-body">
+        <TrafficChart
+          :current="series"
+          :previous="compare ? previousSeries : []"
+          :metric="chartMetric"
+          :height="260"
+        />
+        <div class="compare-strip">
+          <span>当前请求 <b>{{ formatNumber(currentTotal.requests) }}</b></span>
+          <span class="text-2">上一时段 {{ formatNumber(previousTotal.requests) }}</span>
+          <StatusTag :tone="delta >= 0 ? 'success' : 'danger'">
+            {{ delta >= 0 ? '+' : '' }}{{ delta.toFixed(1) }}%
+          </StatusTag>
+          <span class="text-2">命中率 {{ percent(currentTotal.hit_ratio) }}</span>
+        </div>
       </div>
     </div>
 
@@ -148,6 +199,12 @@ const auth = useAuthStore()
 
 const loading = ref(false)
 const updatedAt = ref('')
+const rangeHours = ref(24)
+const chartMetric = ref<'requests' | 'bytes_sent' | 'hit_ratio'>('requests')
+const compare = ref(true)
+const series = ref<any[]>([])
+const previousSeries = ref<any[]>([])
+let timer: ReturnType<typeof setInterval> | null = null
 const stats = ref<any>({
   total_requests: 0,
   cache_hits: 0,
@@ -159,6 +216,35 @@ const stats = ref<any>({
 })
 const byDomain = ref<any[]>([])
 const health = ref<any[]>([])
+const currentTotal = computed(() => totals(series.value))
+const previousTotal = computed(() => totals(previousSeries.value))
+const delta = computed(() => {
+  const prev = previousTotal.value.requests
+  if (!prev) return currentTotal.value.requests ? 100 : 0
+  return ((currentTotal.value.requests - prev) / prev) * 100
+})
+
+function totals(points: any[]) {
+  const requests = points.reduce((sum, p) => sum + (p.requests || 0), 0)
+  const hits = points.reduce((sum, p) => sum + (p.cache_hits || 0), 0)
+  const misses = points.reduce((sum, p) => sum + (p.cache_misses || 0), 0)
+  return { requests, hit_ratio: hits + misses ? hits / (hits + misses) : 0 }
+}
+
+function exportRows() {
+  exportCsv(
+    `lagran-stats-${new Date().toISOString().slice(0, 10)}`,
+    byDomain.value,
+    [
+      { key: 'domain', label: '域名' },
+      { key: 'requests', label: '请求数' },
+      { key: 'cache_hits', label: '缓存命中' },
+      { key: 'cache_misses', label: '未命中' },
+      { key: 'hit_ratio', label: '命中率', value: (row: any) => `${((row.hit_ratio || 0) * 100).toFixed(2)}%` },
+      { key: 'bytes_sent', label: '流量(bytes)' },
+    ],
+  )
+}
 const pageSize = 10
 const domainPage = ref(1)
 const healthPage = ref(1)
@@ -183,6 +269,17 @@ watch(
   },
 )
 
+async function loadSeries() {
+  const bucket = rangeHours.value <= 1 ? 60 : rangeHours.value <= 24 ? 1800 : 3600
+  const res = await api
+    .get<any>(
+      `/api/v1/stats/timeseries?hours=${rangeHours.value}&bucket=${bucket}&compare=${compare.value ? 'true' : 'false'}`,
+    )
+    .catch(() => null)
+  series.value = res?.current || []
+  previousSeries.value = res?.previous || []
+}
+
 async function load() {
   loading.value = true
   try {
@@ -190,6 +287,7 @@ async function load() {
       api.get<any>('/api/v1/stats/summary').catch(() => null),
       api.get<any[]>('/api/v1/stats/by-domain').catch(() => []),
       api.get<any[]>('/api/v1/origin-health').catch(() => []),
+      loadSeries(),
     ])
     if (s) stats.value = s
     byDomain.value = bd || []
@@ -200,10 +298,30 @@ async function load() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  timer = setInterval(loadSeries, 15_000)
+})
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
+})
 </script>
 
 <style scoped>
+.compare-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 20px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.compare-strip b {
+  color: var(--text);
+}
+
 @media (max-width: 640px) {
   .table {
     min-width: 760px;
