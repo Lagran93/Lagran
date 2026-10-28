@@ -18,6 +18,7 @@ fn management_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/__lagran/purge", post(purge_authed))
         .route("/__lagran/prefetch", post(prefetch_authed))
+        .route("/__lagran/cache-diagnose", post(cache_diag_authed))
         .route("/__lagran/acme/challenge", put(put_challenge_authed))
         .route("/__lagran/certs/load", post(load_cert_authed))
         .route("/__lagran/access-logs", get(list_access_logs))
@@ -60,6 +61,14 @@ async fn prefetch_authed(
     Json(req): Json<crate::server::prefetch::EdgePrefetchRequest>,
 ) -> impl IntoResponse {
     crate::server::prefetch::prefetch_handler(State(state), Json(req)).await
+}
+
+async fn cache_diag_authed(
+    _auth: RequireAgentToken,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<crate::server::cache_diag::EdgeDiagRequest>,
+) -> impl IntoResponse {
+    crate::server::cache_diag::diag_handler(State(state), Json(req)).await
 }
 
 async fn put_challenge_authed(

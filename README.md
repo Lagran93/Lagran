@@ -37,8 +37,10 @@
 - 缓存刷新（purge 扇出到在线边缘），支持按 URL / 路径前缀 / **缓存标签（Surrogate-Key / Cache-Tag）** 批量刷新；
   **预热任务**与**定时预热**（控制面按间隔创建任务并分发到在线边缘）
 - 缓存诊断：响应头 `X-Lagran-Cache-Reason` 给出 cookie / authorization / no-store / no-cache /
-  vary:user-agent / rule-bypass / content-type-bypass 等原因；控制台「缓存诊断」可发起真实请求并解释结果
-- **Range 缓存**：带 Range 的 GET 先按完整对象回源并缓存，再从缓存切片返回 206 / `Content-Range`，支持单段范围与后缀范围
+  vary:user-agent / rule-bypass / content-type-bypass 等原因；控制台「缓存诊断」优先让在线边缘本地执行真实请求
+  （避免控制面到公网域名的 DNS/回环/TLS 依赖），并返回原因与处理建议
+- **Range 缓存**：完整对象已缓存时按小段 Range 切片返回 206 / `Content-Range`；开放范围（`bytes=0-`）
+  和大范围 Range 由 Pingora 流式透传，避免视频被整包下载导致回源超时
 - **Origin Shield / 分层缓存**：可选 `shield_url` 优先回源并保留域名 Host，Shield 异常自动回退；边缘支持
   `memory` / `disk` / `hybrid`（L1 内存 + L2 磁盘）分层存储
 - 统计：总览 / 分域名（24h）、访问日志、操作审计、源站健康
@@ -194,7 +196,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 ## 已知限制
 
 - 带 `Cookie` 的请求默认绕过缓存（偏保守）；缓存响应不保存 `Set-Cookie`
-- Range 缓存以完整对象为存储单位（单段/后缀范围从缓存切片），多段 Range 仍透传源站
+- Range 缓存以完整对象为存储单位（命中完整对象时切片）；未命中 Range 直接透传源站，多段 Range 同样透传
 - 限流为单进程内存态，多实例不共享
 - `crates/lagran-proto` / `proto/` 仍是 gRPC 占位，Redis 未接入
 

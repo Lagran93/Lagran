@@ -17,6 +17,8 @@ PIDS=()
 FAILED=0
 TOKEN=""
 DOMAIN_ID=""
+TLS_DOMAIN="diagtls-$$.test"
+TLS_DOMAIN_ID=""
 
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=$((FAILED + 1)); }
@@ -26,6 +28,10 @@ contains() { if [[ "$2" == *"$3"* ]]; then pass "$1"; else fail "$1 (missing '$3
 cleanup() {
   if [[ -n "$TOKEN" && -n "$DOMAIN_ID" ]]; then
     curl -s -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID" \
+      -H "authorization: Bearer $TOKEN" >/dev/null 2>&1
+  fi
+  if [[ -n "$TOKEN" && -n "$TLS_DOMAIN_ID" ]]; then
+    curl -s -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$TLS_DOMAIN_ID" \
       -H "authorization: Bearer $TOKEN" >/dev/null 2>&1
   fi
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null; done
@@ -66,6 +72,11 @@ api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules" \
 api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules" \
   -d "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/*\",\"match_content_type\":\"text/html\",\"action\":\"bypass\",\"priority\":20}" >/dev/null
 
+TLS_CREATED=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" \
+  -d "{\"name\":\"$TLS_DOMAIN\",\"origin_host\":\"127.0.0.1\",\"origin_port\":$ORIGIN_PORT,\"origin_proto\":\"http\",\"ssl_enabled\":true}")
+TLS_DOMAIN_ID=$(printf '%s' "$TLS_CREATED" | jq -r .id)
+[[ -n "$TLS_DOMAIN_ID" && "$TLS_DOMAIN_ID" != "null" ]] || { echo "tls domain failed: $TLS_CREATED"; exit 1; }
+
 NODE=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
   -d "{\"name\":\"diag-edge-$$\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
 NODE_TOKEN=$(printf '%s' "$NODE" | jq -r .token)
@@ -91,6 +102,36 @@ get "/cached" >/dev/null
 check "miss is MISS" "$(hdr x-cache)" "MISS"
 get "/cached" >/dev/null
 check "second is HIT" "$(hdr x-cache)" "HIT"
+
+echo "== control cache diagnose =="
+NODE_ONLINE=0
+for _ in $(seq 1 20); do
+  if [[ "$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" | jq -r --arg n "diag-edge-$$" '.[] | select(.name==$n) | .status' | head -1)" == "online" ]]; then
+    NODE_ONLINE=1
+    break
+  fi
+  sleep 0.5
+done
+check "edge node is online for diagnostics" "$NODE_ONLINE" "1"
+DIAG=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/cache/diagnose" \
+  -d "{\"domain\":\"$DOMAIN\",\"path\":\"/cached\"}")
+check "diagnose API status" "$(printf '%s' "$DIAG" | jq -r '.status')" "200"
+check "diagnose API cache reason" "$(printf '%s' "$DIAG" | jq -r '.cache_reason')" "hit"
+
+echo "== https diagnostic does not stop at redirect =="
+TLS_DIAG=""
+for _ in $(seq 1 20); do
+  TLS_DIAG=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/cache/diagnose" \
+    -d "{\"domain\":\"$TLS_DOMAIN\",\"path\":\"/cached\"}")
+  [[ "$(printf '%s' "$TLS_DIAG" | jq -r '.status')" == "200" ]] && break
+  sleep 0.5
+done
+check "https diagnose reaches cache path" "$(printf '%s' "$TLS_DIAG" | jq -r '.status')" "200"
+check "https diagnose is not a redirect" "$(printf '%s' "$TLS_DIAG" | jq -r '.cache_reason')" "stored-or-miss"
+HTTP_DIAG=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/cache/diagnose" \
+  -d "{\"domain\":\"$TLS_DOMAIN\",\"path\":\"/cached\",\"scheme\":\"http\"}")
+check "http diagnose reports redirect" "$(printf '%s' "$HTTP_DIAG" | jq -r '.status')" "301"
+check "http diagnose reason" "$(printf '%s' "$HTTP_DIAG" | jq -r '.cache_reason')" "https-redirect"
 
 echo "== request reasons =="
 get "/cached" -H 'Cookie: session=1' >/dev/null
@@ -133,6 +174,21 @@ check "range status 206" "$CODE" "206"
 contains "range content-range" "$(hdr content-range)" "bytes 0-3/"
 check "range served from cache" "$(hdr x-cache)" "HIT"
 check "range body length" "$(wc -c < "$LOG_DIR/b")" "4"
+
+echo "== range miss streams from origin =="
+CODE=$(get "/range-stream" -H 'Range: bytes=2-5')
+check "range miss status 206" "$CODE" "206"
+check "range miss body" "$(cat "$LOG_DIR/b")" "2345"
+check "range miss is BYPASS" "$(hdr x-cache)" "BYPASS"
+check "range miss reason" "$(hdr x-lagran-cache-reason)" "range-bypass"
+contains "range miss content-range" "$(hdr content-range)" "bytes 2-5/10"
+
+echo "== open-ended range streams through Pingora =="
+CODE=$(get "/range-stream" -H 'Range: bytes=0-')
+check "open range status 206" "$CODE" "206"
+check "open range body" "$(cat "$LOG_DIR/b")" "0123456789"
+check "open range is BYPASS" "$(hdr x-cache)" "BYPASS"
+check "open range reason" "$(hdr x-lagran-cache-reason)" "range-bypass"
 
 echo "== edge prefetch =="
 PREFETCH=$(curl -s -X POST "http://127.0.0.1:$EDGE_PORT/__lagran/prefetch" \

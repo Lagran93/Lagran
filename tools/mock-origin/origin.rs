@@ -73,6 +73,7 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
     let mut accept_language = String::new();
     let mut cache_control = String::new();
     let mut host = String::new();
+    let mut range = String::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim();
@@ -89,6 +90,8 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                 accept_language = value.to_string();
             } else if name.eq_ignore_ascii_case("cache-control") {
                 cache_control = value.to_string();
+            } else if name.eq_ignore_ascii_case("range") {
+                range = value.to_string();
             }
         }
     }
@@ -246,6 +249,46 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                 (200, b"slow origin".to_vec(), vec![])
             }
             "/slow" => (200, b"fast origin".to_vec(), vec![]),
+            "/range-stream" => {
+                let full = b"0123456789";
+                let parsed = range
+                    .trim()
+                    .strip_prefix("bytes=")
+                    .and_then(|v| v.split_once('-'))
+                    .and_then(|(a, b)| {
+                        let start = a.trim().parse::<usize>().ok()?;
+                        let end = b
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap_or(full.len().saturating_sub(1))
+                            .min(full.len().saturating_sub(1));
+                        (start <= end && start < full.len()).then_some((start, end))
+                    });
+                match parsed {
+                    Some((start, end)) => (
+                        206,
+                        full[start..=end].to_vec(),
+                        vec![
+                            ("Content-Type", "application/octet-stream".into()),
+                            (
+                                "Content-Range",
+                                format!("bytes {start}-{end}/{}", full.len()),
+                            ),
+                            ("Accept-Ranges", "bytes".into()),
+                            ("Cache-Control", "public, max-age=3600".into()),
+                        ],
+                    ),
+                    None => (
+                        200,
+                        full.to_vec(),
+                        vec![
+                            ("Content-Type", "application/octet-stream".into()),
+                            ("Accept-Ranges", "bytes".into()),
+                            ("Cache-Control", "public, max-age=3600".into()),
+                        ],
+                    ),
+                }
+            }
             "/big" => (200, vec![b'x'; 512 * 1024], vec![]),
             "/vary-ua" => (
                 200,

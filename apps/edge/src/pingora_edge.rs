@@ -814,7 +814,14 @@ impl DataPlaneProxy {
         // HEAD stays on the in-process engine: it fetches GET, returns the real
         // Content-Length, and shares the GET cache entry. Pingora's H1 encoder
         // cannot carry an upstream GET body under a HEAD response.
-        if req.method == Method::HEAD || req.headers.contains_key("range") {
+        if req.method == Method::HEAD {
+            return None;
+        }
+        let has_range = req.headers.contains_key("range");
+        // Small bounded ranges can use the in-process slice cache. Open-ended
+        // ranges (`bytes=0-`) and large ranges must stay on Pingora's streaming
+        // path; buffering them would download the whole video and time out.
+        if has_range && range_is_small_bounded(&req.headers) {
             return None;
         }
         let host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
@@ -832,7 +839,11 @@ impl DataPlaneProxy {
             req.method.as_str(),
             req.uri.query().unwrap_or(""),
         );
-        let request_reason = if req.method != Method::GET {
+        let request_reason = if has_range {
+            // Range requests must stay streaming. Fetching a full video to
+            // serve a slice (especially `bytes=0-`) exceeds origin timeouts.
+            Some("range-bypass")
+        } else if req.method != Method::GET {
             Some("method")
         } else {
             request_bypass_reason_headers(&req.headers, policy.ignore_cookie).or_else(|| {
@@ -849,7 +860,8 @@ impl DataPlaneProxy {
         let cacheable = req.method == Method::GET
             && policy.action == RuleAction::Cache
             && !is_websocket
-            && !bypasses;
+            && !bypasses
+            && !has_range;
         let label = if cacheable || is_head {
             "MISS"
         } else if policy.action == RuleAction::Bypass || req.method == Method::GET {
@@ -960,6 +972,28 @@ impl DataPlaneProxy {
                     };
                 let Json(resp) =
                     crate::server::prefetch::prefetch_handler(State(self.state.clone()), Json(req))
+                        .await;
+                write_json(session, 200, &resp).await;
+            }
+            ("POST", "/__lagran/cache-diagnose") => {
+                let body = read_body(session, 1024 * 1024).await?;
+                let req: crate::server::cache_diag::EdgeDiagRequest =
+                    match serde_json::from_slice(&body) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            let msg = format!("bad request: {e}");
+                            write_plain(
+                                session,
+                                400,
+                                "text/plain; charset=utf-8",
+                                Bytes::from(msg),
+                            )
+                            .await;
+                            return Ok(true);
+                        }
+                    };
+                let Json(resp) =
+                    crate::server::cache_diag::diag_handler(State(self.state.clone()), Json(req))
                         .await;
                 write_json(session, 200, &resp).await;
             }
@@ -1465,6 +1499,26 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
     if !end_of_stream {
         let _ = session.write_response_body(Some(bytes), true).await;
     }
+}
+
+fn range_is_small_bounded(headers: &HeaderMap) -> bool {
+    const MAX_SLICE: u64 = 1024 * 1024;
+    let Some(raw) = headers.get("range").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some(value) = raw.trim().strip_prefix("bytes=") else {
+        return false;
+    };
+    if value.contains(',') {
+        return false;
+    }
+    let Some((start, end)) = value.split_once('-') else {
+        return false;
+    };
+    let (Ok(start), Ok(end)) = (start.trim().parse::<u64>(), end.trim().parse::<u64>()) else {
+        return false;
+    };
+    end >= start && end - start < MAX_SLICE
 }
 
 fn request_host(raw: Option<&str>) -> String {

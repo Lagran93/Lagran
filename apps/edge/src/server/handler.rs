@@ -423,7 +423,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         {
             match parse_range_spec(&raw) {
                 Some(spec) => {
-                    range_spec = Some(spec);
+                    range_spec = Some((spec, raw));
                     headers.remove(header::RANGE);
                 }
                 None => {
@@ -467,24 +467,76 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     };
     let key = cache_key_for_request(&key_method, &host, &cache_lookup_path, &headers);
 
-    if let Some(spec) = range_spec {
-        return serve_range(
+    if let Some((spec, raw_range)) = range_spec {
+        let lookup = state.cache.get_result(&key).await;
+        match lookup {
+            CacheGetResult::Hit(entry) if !entry_response_bypass(&eff, &entry) => {
+                return serve_range_entry(
+                    &state,
+                    entry,
+                    CacheStatus::Hit,
+                    spec,
+                    &method,
+                    &host,
+                    &path_only,
+                    &client_ip,
+                    &user_agent,
+                    &referer,
+                    &request_id,
+                    &eff,
+                    start,
+                )
+                .await;
+            }
+            CacheGetResult::Stale(entry) if !entry_response_bypass(&eff, &entry) => {
+                return serve_range_entry(
+                    &state,
+                    entry,
+                    CacheStatus::Stale,
+                    spec,
+                    &method,
+                    &host,
+                    &path_only,
+                    &client_ip,
+                    &user_agent,
+                    &referer,
+                    &request_id,
+                    &eff,
+                    start,
+                )
+                .await;
+            }
+            CacheGetResult::Hit(_) | CacheGetResult::Stale(_) => {
+                state.cache.delete(&key).await;
+            }
+            CacheGetResult::Expired | CacheGetResult::Miss => {}
+        }
+
+        // A cache miss must not turn a Range request into a full-object
+        // download. Video/large-file endpoints rely on the origin's 206
+        // streaming response; buffering the whole representation here would
+        // blow the origin timeout. Pass the original Range through untouched.
+        if let Ok(value) = HeaderValue::from_str(&raw_range) {
+            headers.insert(header::RANGE, value);
+        }
+        let mut response = bypass_to_origin(
             &state,
-            &key,
+            req,
             &eff,
-            &path_and_query,
-            &headers,
             &method,
             &host,
+            &path_and_query,
             &path_only,
+            &headers,
             &client_ip,
             &user_agent,
             &referer,
             &request_id,
-            spec,
             start,
         )
         .await;
+        set_cache_reason(&mut response, Some("range-bypass"));
+        return response;
     }
 
     let mut lookup = state.cache.get_result(&key).await;
@@ -1082,12 +1134,11 @@ fn resolve_range(spec: RangeSpec, len: usize) -> Option<(usize, usize)> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn serve_range(
+async fn serve_range_entry(
     state: &AppState,
-    key: &str,
-    eff: &Effective,
-    path_and_query: &str,
-    headers: &HeaderMap,
+    mut entry: CacheEntry,
+    label: CacheStatus,
+    spec: RangeSpec,
     method: &Method,
     host: &str,
     path_only: &str,
@@ -1095,42 +1146,14 @@ async fn serve_range(
     user_agent: &str,
     referer: &str,
     request_id: &str,
-    spec: RangeSpec,
+    eff: &Effective,
     start: Instant,
 ) -> Response {
-    let lookup = state.cache.get_result(key).await;
-    let expired = matches!(lookup, CacheGetResult::Expired);
-    let (mut origin, label) = match lookup {
-        CacheGetResult::Hit(entry) => (entry_into_origin(entry), CacheStatus::Hit),
-        CacheGetResult::Stale(entry) => (entry_into_origin(entry), CacheStatus::Stale),
-        CacheGetResult::Expired | CacheGetResult::Miss => {
-            let state_arc = Arc::new(state.clone());
-            let fetched = fetch_with_single_flight(
-                &state_arc,
-                key,
-                eff,
-                path_and_query,
-                headers,
-                method,
-                host,
-            )
-            .await;
-            match fetched {
-                Ok((Fetched::FromCache(resp), _)) => (resp, CacheStatus::Hit),
-                Ok((Fetched::FromOrigin(resp), _)) => (
-                    resp,
-                    if expired {
-                        CacheStatus::Expired
-                    } else {
-                        CacheStatus::Miss
-                    },
-                ),
-                Err(e) => return default_page::origin_error_page(host, path_only, e.failure()),
-            }
-        }
-    };
-    let etag = entry_etag(&origin);
-    let total = origin.body.len();
+    let etag = entry
+        .header("etag")
+        .map(str::to_string)
+        .unwrap_or_else(|| compute_etag(&entry));
+    let total = entry.body.len();
     let Some((slice_start, slice_end)) = resolve_range(spec, total) else {
         let mut resp = Response::new(Body::empty());
         *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
@@ -1140,23 +1163,22 @@ async fn serve_range(
         cache_status_headers(resp.headers_mut(), label.as_str());
         return resp;
     };
-    let body = origin.body.slice(slice_start..=slice_end);
+    let body = entry.body.slice(slice_start..=slice_end);
     let body_len = body.len() as u64;
-    origin.body = body;
-    origin.status = StatusCode::PARTIAL_CONTENT;
-    origin.headers.remove(header::CONTENT_LENGTH);
-    if let Ok(v) = HeaderValue::from_str(&format!("bytes {slice_start}-{slice_end}/{total}")) {
-        origin.headers.insert(header::CONTENT_RANGE, v);
-    }
-    origin
+    entry.body = body;
+    entry.status = StatusCode::PARTIAL_CONTENT.as_u16();
+    entry
         .headers
-        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        .retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+    entry.headers.push((
+        "content-range".into(),
+        format!("bytes {slice_start}-{slice_end}/{total}"),
+    ));
+    entry
+        .headers
+        .push(("accept-ranges".into(), "bytes".into()));
 
-    if label == CacheStatus::Hit || label == CacheStatus::Stale {
-        state.metrics.record_hit(host, body_len).await;
-    } else {
-        state.metrics.record_miss(host, body_len).await;
-    }
+    state.metrics.record_hit(host, body_len).await;
     log_access(
         &state.access_log,
         method,
@@ -1172,8 +1194,8 @@ async fn serve_range(
         request_id,
     )
     .await;
-    origin_response(
-        origin,
+    entry_to_response(
+        entry,
         label.as_str(),
         &etag,
         &eff.cors,

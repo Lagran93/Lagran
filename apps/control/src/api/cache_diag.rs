@@ -95,6 +95,51 @@ pub async fn diagnose(
         ));
     }
     let url = format!("{scheme}://{domain}{path}");
+    let payload = json!({
+        "domain": domain,
+        "path": path,
+        "scheme": scheme,
+        "simulate_cookie": req.simulate_cookie,
+        "simulate_authorization": req.simulate_authorization,
+        "request_cache_control": req.request_cache_control.clone(),
+    });
+
+    // Prefer asking an online edge to execute locally. This avoids public DNS,
+    // hairpin NAT and client-side TLS dependencies in the control plane.
+    let nodes = repository::list_online_nodes_with_agent(&state.pool)
+        .await
+        .unwrap_or_default();
+    let mut dispatch_errors = Vec::new();
+    for node in nodes {
+        let endpoint = format!(
+            "{}/__lagran/cache-diagnose",
+            node.agent_url.trim_end_matches('/')
+        );
+        let token = if node.auth_token.is_empty() {
+            state.config.agent_token.clone()
+        } else {
+            node.auth_token.clone()
+        };
+        match agent_http::request_json::<EdgeDiagReply, _>("POST", &endpoint, &payload, &token)
+            .await
+        {
+            Ok(reply) => {
+                return Ok(Json(build_response(
+                    url,
+                    reply.status,
+                    reply.headers,
+                    reply.body_preview,
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(node = %node.name, error = %e, "cache diagnose edge dispatch failed");
+                dispatch_errors.push(format!("{}: {e}", node.name));
+            }
+        }
+    }
+
+    // Fallback for deployments where the control plane can reach the public
+    // domain directly (or no agents are registered yet).
     let mut headers: Vec<(&str, &str)> = vec![("user-agent", "lagran-cache-diagnose/1.0")];
     let cookie_value;
     if req.simulate_cookie {
@@ -117,10 +162,39 @@ pub async fn diagnose(
         headers.push(("cache-control", cache_control.as_str()));
     }
 
-    let (status, response_headers, body) = agent_http::get_response(&url, &headers)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))))?;
-    let selected = [
+    match agent_http::get_response(&url, &headers).await {
+        Ok((status, response_headers, body)) => {
+            let mut out_headers = Vec::new();
+            for name in selected_header_names() {
+                if let Some(value) = response_headers.get(name).and_then(|v| v.to_str().ok()) {
+                    out_headers.push((name.to_string(), value.to_string()));
+                }
+            }
+            let preview = String::from_utf8_lossy(&body)
+                .chars()
+                .take(300)
+                .collect::<String>();
+            Ok(Json(build_response(url, status, out_headers, preview)))
+        }
+        Err(e) => {
+            let mut message = e;
+            if !dispatch_errors.is_empty() {
+                message = format!("{message}; edge dispatch: {}", dispatch_errors.join(" | "));
+            }
+            Err((StatusCode::BAD_GATEWAY, Json(json!({"error": message}))))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct EdgeDiagReply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_preview: String,
+}
+
+fn selected_header_names() -> [&'static str; 9] {
+    [
         "x-cache",
         "x-cache-status",
         "x-lagran-cache-reason",
@@ -130,24 +204,39 @@ pub async fn diagnose(
         "vary",
         "content-type",
         "server",
-    ];
-    let mut out_headers = Vec::new();
-    for name in selected {
-        if let Some(value) = response_headers.get(name).and_then(|v| v.to_str().ok()) {
-            out_headers.push((name.to_string(), value.to_string()));
+    ]
+}
+
+fn build_response(
+    url: String,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_preview: String,
+) -> DiagnoseResponse {
+    let get = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let cache_status = {
+        let value = get("x-cache-status");
+        if value.is_empty() {
+            let fallback = get("x-cache");
+            if fallback.is_empty() {
+                "UNKNOWN".into()
+            } else {
+                fallback
+            }
+        } else {
+            value
         }
+    };
+    let mut cache_reason = get("x-lagran-cache-reason");
+    if cache_reason.is_empty() && (status == 301 || status == 308) {
+        cache_reason = "https-redirect".into();
     }
-    let cache_status = response_headers
-        .get("x-cache-status")
-        .or_else(|| response_headers.get("x-cache"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("UNKNOWN")
-        .to_string();
-    let mut cache_reason = response_headers
-        .get("x-lagran-cache-reason")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
     if cache_reason.is_empty() {
         cache_reason = match cache_status.as_str() {
             "HIT" => "hit".into(),
@@ -156,25 +245,23 @@ pub async fn diagnose(
             _ => "unknown".into(),
         };
     }
-    let advice = advice_for(&cache_reason);
-    let preview = String::from_utf8_lossy(&body)
-        .chars()
-        .take(300)
-        .collect::<String>();
-    Ok(Json(DiagnoseResponse {
+    DiagnoseResponse {
         url,
         status,
         cache_status,
+        advice: advice_for(&cache_reason),
         cache_reason,
-        age: response_headers
-            .get("age")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("—")
-            .to_string(),
-        advice,
-        headers: out_headers,
-        body_preview: preview,
-    }))
+        age: {
+            let value = get("age");
+            if value.is_empty() {
+                "—".into()
+            } else {
+                value
+            }
+        },
+        headers,
+        body_preview,
+    }
 }
 
 fn advice_for(reason: &str) -> String {
@@ -184,6 +271,8 @@ fn advice_for(reason: &str) -> String {
         "cookie" => "请求携带了 Cookie，默认不进入共享缓存。若该 Cookie 与内容无关，可为规则开启 ignore_cookie。".into(),
         "authorization" => "请求携带 Authorization，按安全策略不缓存。".into(),
         "range" => "Range 请求当前不走共享缓存；如需大文件分片缓存，请配置 Range 支持。".into(),
+        "range-bypass" => "Range 缓存未命中，已直接透传源站分段响应；视频等大文件不会整包下载。".into(),
+        "https-redirect" => "边缘先返回 HTTPS 跳转，尚未进入缓存流程。请使用 HTTPS 诊断，或确认边缘 HTTPS 监听与证书已就绪。".into(),
         "no-store" => "请求或响应带有 no-store，禁止存储。".into(),
         "private" => "响应带有 Cache-Control: private，仅允许浏览器缓存。".into(),
         "no-cache" => "响应要求每次回源校验；可为该路径配置显式缓存 TTL 覆盖。".into(),
