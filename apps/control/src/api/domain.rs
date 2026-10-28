@@ -671,6 +671,7 @@ pub struct SettingsRequest {
     pub cc_ban_seconds: Option<u32>,
     pub cc_mode: Option<String>,
     pub cc_allow_ips: Option<String>,
+    pub shield_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -689,6 +690,7 @@ pub struct SettingsDto {
     pub cc_ban_seconds: u32,
     pub cc_mode: String,
     pub cc_allow_ips: String,
+    pub shield_url: String,
 }
 
 fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
@@ -711,6 +713,7 @@ fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
             s.cc_mode
         },
         cc_allow_ips: s.cc_allow_ips,
+        shield_url: s.shield_url,
     }
 }
 
@@ -770,6 +773,21 @@ pub async fn put_settings(
         }
         None => None,
     };
+    let shield_url = req
+        .shield_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if let Some(url) = shield_url {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "shield_url must start with http:// or https://".into(),
+                }),
+            ));
+        }
+    }
     let n = repository::update_domain_settings(
         &state.pool,
         uid,
@@ -787,6 +805,7 @@ pub async fn put_settings(
         req.cc_ban_seconds.map(|v| v.clamp(1, 86_400) as i32),
         cc_mode.as_deref(),
         req.cc_allow_ips.as_deref(),
+        shield_url,
     )
     .await
     .map_err(|e| {
@@ -867,6 +886,7 @@ mod tests {
             backup_origin_host: "backup.test".into(),
             backup_origin_port: 443,
             backup_origin_proto: "https".into(),
+            shield_url: String::new(),
         };
         let pool = effective_origins(&row);
         assert_eq!(pool.len(), 2);

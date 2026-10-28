@@ -93,6 +93,24 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
         }
     }
 
+    if std::env::var("MOCK_SHIELD").is_ok() {
+        if let Ok(log) = std::env::var("MOCK_SHIELD_LOG") {
+            use std::io::Write;
+            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+                let _ = writeln!(fh, "{host}");
+            }
+        }
+        let body = b"shield-hit";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: public, max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(resp.as_bytes())?;
+        stream.write_all(body)?;
+        stream.flush()?;
+        return Ok(());
+    }
+
     if path == "/ws" {
         stream.write_all(
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
@@ -229,6 +247,32 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
             }
             "/slow" => (200, b"fast origin".to_vec(), vec![]),
             "/big" => (200, vec![b'x'; 512 * 1024], vec![]),
+            "/vary-ua" => (
+                200,
+                b"vary user agent".to_vec(),
+                vec![
+                    ("Content-Type", "text/plain".into()),
+                    ("Vary", "User-Agent".into()),
+                    ("Cache-Control", "public, max-age=3600".into()),
+                ],
+            ),
+            "/nocache" => (
+                200,
+                b"no cache".to_vec(),
+                vec![
+                    ("Content-Type", "text/plain".into()),
+                    ("Cache-Control", "no-cache".into()),
+                ],
+            ),
+            "/tagged" => (
+                200,
+                b"tagged content".to_vec(),
+                vec![
+                    ("Content-Type", "text/plain".into()),
+                    ("Surrogate-Key", "product-1 homepage".into()),
+                    ("Cache-Control", "public, max-age=3600".into()),
+                ],
+            ),
             "/html" => (
                 200,
                 b"<!doctype html><html><body>content-type rule</body></html>".to_vec(),

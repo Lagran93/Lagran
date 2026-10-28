@@ -34,7 +34,13 @@
   **安全级别（低/中/高/攻击中）**、事件日志与**统计概览**
 - CC 防御：按域名/IP 限速、突发额度、**连续超限自动封禁 IP**、CIDR 白名单、观察模式与 429 限流响应、
   **控制面统一封禁库与跨节点同步**，控制台「WAF 防护 → 共享封禁」查看/解封
-- 缓存刷新（purge 扇出到在线边缘）、预热任务
+- 缓存刷新（purge 扇出到在线边缘），支持按 URL / 路径前缀 / **缓存标签（Surrogate-Key / Cache-Tag）** 批量刷新；
+  **预热任务**与**定时预热**（控制面按间隔创建任务并分发到在线边缘）
+- 缓存诊断：响应头 `X-Lagran-Cache-Reason` 给出 cookie / authorization / no-store / no-cache /
+  vary:user-agent / rule-bypass / content-type-bypass 等原因；控制台「缓存诊断」可发起真实请求并解释结果
+- **Range 缓存**：带 Range 的 GET 先按完整对象回源并缓存，再从缓存切片返回 206 / `Content-Range`，支持单段范围与后缀范围
+- **Origin Shield / 分层缓存**：可选 `shield_url` 优先回源并保留域名 Host，Shield 异常自动回退；边缘支持
+  `memory` / `disk` / `hybrid`（L1 内存 + L2 磁盘）分层存储
 - 统计：总览 / 分域名（24h）、访问日志、操作审计、源站健康
 - 可观测性：`GET /metrics` Prometheus 文本指标（控制面/数据库/域名/节点/源站健康/证书到期/告警）、
   可选 OTLP/HTTP Trace 导出；边缘 `GET /__lagran/metrics` 输出请求/命中/回源/流量指标
@@ -51,7 +57,7 @@
   `ignore_cookie` 同时放行 `Vary: Cookie`；`lagran_clearance` 是 Edge 内部 Cookie，
   不参与缓存绕过，也不会转发给可缓存请求的源站；`Vary: Accept-Language` 的 key 含语言哈希；
   ETag 基于响应 body；SWR + single-flight 合并回源
-- 条件请求（304）、`Age`、`X-Cache` / `X-Cache-Status`、每域名限流、防盗链
+- 条件请求（304）、`Age`、`X-Cache` / `X-Cache-Status`、`X-Lagran-Cache-Reason`、每域名限流、防盗链
 - WAF：托管特征匹配 + 自定义规则 + IP 白/黑名单，支持观察模式；命中后返回 403 拦截页并上报事件
 - WAF 安全级别：低/中/高/攻击中，按 UA 与请求类型自动下发浏览器质询；静态资源不受影响
 - WAF Challenge：规则动作为「质询」时返回 JS 工作量证明页面，通过后签发 HMAC 签名的免质询 Cookie
@@ -115,6 +121,7 @@ bash tests/integration/schedule.sh # 端到端：节点 Geo/ISP 元数据、调�
 bash tests/integration/dns.sh # 端到端：自研权威 DNS 的 ECS 调度、SOA/NS、TCP、缓存降级
 bash tests/integration/nodes.sh # 端到端：节点预注册→安装命令→单节点令牌→上下线→删除
 bash tests/integration/cache-rules.sh # 端到端：方法/Query 条件、禁用规则、浏览器 TTL、规则测试器
+bash tests/integration/cache-diagnostics.sh # 端到端：缓存原因头、标签刷新、Range 切片、预热/定时预热、Origin Shield
 bash tests/integration/waf.sh   # 端到端：WAF 规则、IP 名单、观察/拦截模式与事件
 bash tests/integration/waf-advanced.sh # 端到端：新托管类别、请求头规则、安全级别与统计
 bash tests/integration/ttl.sh   # 端到端：TTL 优先级（规则→s-maxage→max-age→Expires→默认）
@@ -187,7 +194,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 ## 已知限制
 
 - 带 `Cookie` 的请求默认绕过缓存（偏保守）；缓存响应不保存 `Set-Cookie`
-- 未实现 Range 分片缓存（Range 请求直接透传）
+- Range 缓存以完整对象为存储单位（单段/后缀范围从缓存切片），多段 Range 仍透传源站
 - 限流为单进程内存态，多实例不共享
 - `crates/lagran-proto` / `proto/` 仍是 gRPC 占位，Redis 未接入
 

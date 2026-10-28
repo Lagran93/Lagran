@@ -132,6 +132,7 @@ echo "== starting edge (waiting for config sync) =="
 CACHE_DIR="$LOG_DIR/disk-cache-$$"
 rm -rf "$CACHE_DIR"
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
+EDGE_ADMIN_LISTEN= \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
 AGENT_URL="http://127.0.0.1:$EDGE_PORT" \
 AGENT_TOKEN="$EDGE_NODE_TOKEN" \

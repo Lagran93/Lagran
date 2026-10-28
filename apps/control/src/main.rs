@@ -110,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
     let alert_eval_secs = config.alert_eval_secs;
     let state = AppState::new(pool, config);
     control::service::alerting::spawn(state.pool.clone(), alert_eval_secs);
+    control::service::prefetch::spawn(state.clone(), 15);
 
     {
         let state = state.clone();

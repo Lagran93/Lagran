@@ -6,7 +6,7 @@
 use crate::agent::ControlClient;
 use crate::config::registry::DomainRegistry;
 use crate::origin::OriginClient;
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap, HeaderValue};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -188,7 +188,18 @@ pub fn spawn_origin_health(
                 };
                 for url in targets {
                     let start = Instant::now();
-                    let result = origin.fetch_from(&url, "/", &HeaderMap::new()).await;
+                    let mut headers = HeaderMap::new();
+                    if let Some(host) = entry
+                        .origins
+                        .iter()
+                        .find(|o| o.url == url)
+                        .and_then(|o| o.host_header.as_deref())
+                    {
+                        if let Ok(value) = HeaderValue::from_str(host) {
+                            headers.insert(header::HOST, value);
+                        }
+                    }
+                    let result = origin.fetch_from(&url, "/", &headers).await;
                     let latency = start.elapsed().as_millis() as u32;
                     let (ok, err) = match result {
                         Ok((status, _, _)) => {

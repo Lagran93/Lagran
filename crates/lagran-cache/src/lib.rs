@@ -22,6 +22,11 @@ pub trait CacheBackend: Send + Sync {
     async fn delete(&self, key: &str);
     async fn clear(&self);
     async fn purge_matching(&self, patterns: &[String]) -> u64;
+    /// Purge entries whose `Surrogate-Key` / `Cache-Tag` response header
+    /// contains any of the requested tags.
+    async fn purge_tags(&self, _tags: &[String], _domain: &str) -> u64 {
+        0
+    }
     async fn len(&self) -> usize;
     async fn is_empty(&self) -> bool {
         self.len().await == 0
@@ -45,6 +50,27 @@ impl CacheEntry {
             body,
             stored_at_epoch_secs: now_epoch_secs(),
         }
+    }
+
+    /// Cache tags from standard response headers.
+    pub fn tags(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, value) in &self.headers {
+            if !["surrogate-key", "cache-tag", "x-cache-tag"]
+                .iter()
+                .any(|n| name.eq_ignore_ascii_case(n))
+            {
+                continue;
+            }
+            out.extend(
+                value
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        out
     }
 
     pub fn age_secs(&self) -> u64 {
@@ -268,6 +294,37 @@ impl CacheBackend for MemoryCache {
                 patterns
                     .iter()
                     .any(|p| !p.is_empty() && e.key().contains(p))
+            })
+            .map(|e| e.key().clone())
+            .collect();
+        let mut removed = 0u64;
+        for k in keys {
+            if self.inner.remove(&k).is_some() {
+                removed += 1;
+            }
+            if let Ok(mut lru) = self.lru.lock() {
+                lru.remove(&k);
+            }
+        }
+        removed
+    }
+
+    async fn purge_tags(&self, tags: &[String], domain: &str) -> u64 {
+        let wanted: Vec<String> = tags.iter().map(|t| t.to_ascii_lowercase()).collect();
+        if wanted.is_empty() {
+            return 0;
+        }
+        let domain = domain.to_ascii_lowercase();
+        let keys: Vec<String> = self
+            .inner
+            .iter()
+            .filter(|e| {
+                (domain.is_empty() || e.key().to_ascii_lowercase().contains(&domain))
+                    && e.value()
+                        .entry
+                        .tags()
+                        .iter()
+                        .any(|tag| wanted.iter().any(|w| w == &tag.to_ascii_lowercase()))
             })
             .map(|e| e.key().clone())
             .collect();

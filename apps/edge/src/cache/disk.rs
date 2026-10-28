@@ -371,6 +371,68 @@ impl CacheBackend for DiskCache {
         removed
     }
 
+    async fn purge_tags(&self, tags: &[String], domain: &str) -> u64 {
+        let wanted: Vec<String> = tags.iter().map(|t| t.to_ascii_lowercase()).collect();
+        if wanted.is_empty() {
+            return 0;
+        }
+        let domain = domain.to_ascii_lowercase();
+        let mut victims = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let mut rd = match fs::read_dir(&dir).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                let Ok(ft) = ent.file_type().await else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    stack.push(ent.path());
+                    continue;
+                }
+                let path = ent.path();
+                if path.extension().is_none_or(|e| e != "meta") {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(&path).await else {
+                    continue;
+                };
+                let Ok(meta) = serde_json::from_slice::<DiskMeta>(&bytes) else {
+                    continue;
+                };
+                if !domain.is_empty() && !meta.key.to_ascii_lowercase().contains(&domain) {
+                    continue;
+                }
+                let matched = meta.headers.iter().any(|(name, value)| {
+                    if !["surrogate-key", "cache-tag", "x-cache-tag"]
+                        .iter()
+                        .any(|n| name.eq_ignore_ascii_case(n))
+                    {
+                        return false;
+                    }
+                    value
+                        .split(|c: char| c == ',' || c.is_whitespace())
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .any(|t| wanted.iter().any(|w| w == &t.to_ascii_lowercase()))
+                });
+                if matched {
+                    let bin = path.with_extension("bin");
+                    victims.push((path, bin, bytes.len() as u64));
+                }
+            }
+        }
+        let mut removed = 0u64;
+        for (meta_path, bin_path, meta_len) in victims {
+            self.remove_files(&meta_path, &bin_path, meta_len).await;
+            removed += 1;
+        }
+        tracing::info!(removed, "disk cache purge matched tags");
+        removed
+    }
+
     async fn len(&self) -> usize {
         self.entries.load(Ordering::Relaxed)
     }
@@ -449,6 +511,12 @@ impl CacheBackend for HybridCache {
     async fn purge_matching(&self, patterns: &[String]) -> u64 {
         let a = self.mem.purge_matching(patterns).await;
         let b = self.disk.purge_matching(patterns).await;
+        a + b
+    }
+
+    async fn purge_tags(&self, tags: &[String], domain: &str) -> u64 {
+        let a = self.mem.purge_tags(tags, domain).await;
+        let b = self.disk.purge_tags(tags, domain).await;
         a + b
     }
 

@@ -10,6 +10,7 @@ pub struct EdgePurgeRequest {
     pub domain: String,
     pub urls: Option<Vec<String>>,
     pub prefixes: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
     pub purge_all: Option<bool>,
 }
 
@@ -36,8 +37,13 @@ pub async fn purge_handler(
     }
 
     let mut patterns: Vec<String> = Vec::new();
+    let mut had_pattern = false;
     if let Some(urls) = req.urls {
         for u in urls {
+            if u.trim().is_empty() {
+                continue;
+            }
+            had_pattern = true;
             // extract path from URL if absolute
             if let Ok(parsed) = u.parse::<http::Uri>() {
                 if let Some(pq) = parsed.path_and_query() {
@@ -51,16 +57,35 @@ pub async fn purge_handler(
         }
     }
     if let Some(prefixes) = req.prefixes {
-        patterns.extend(prefixes);
+        for prefix in prefixes {
+            if !prefix.trim().is_empty() {
+                had_pattern = true;
+                patterns.push(prefix);
+            }
+        }
     }
+    let tags: Vec<String> = req
+        .tags
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
 
-    // Also match domain host in cache keys (key format: METHOD:host:path)
-    if !req.domain.is_empty() {
+    // Also match domain host in cache keys (key format: METHOD:host:path).
+    // Do not turn a tag-only purge into a domain-wide purge.
+    if had_pattern && !req.domain.is_empty() {
         patterns.push(req.domain.clone());
     }
 
-    let n = state.cache.purge_matching(&patterns).await;
-    tracing::info!(domain = %req.domain, purged = n, patterns = ?patterns, "purge applied");
+    let mut n = 0u64;
+    if !patterns.is_empty() {
+        n += state.cache.purge_matching(&patterns).await;
+    }
+    if !tags.is_empty() {
+        n += state.cache.purge_tags(&tags, &req.domain).await;
+    }
+    tracing::info!(domain = %req.domain, purged = n, patterns = ?patterns, tags = ?tags, "purge applied");
 
     Json(EdgePurgeResponse {
         success: true,

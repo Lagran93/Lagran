@@ -255,6 +255,18 @@
           </div>
         </div>
 
+        <div class="field">
+          <label class="field-label">Origin Shield 地址</label>
+          <input
+            v-model="settings.shield_url"
+            class="input"
+            placeholder="https://shield.example.com（留空关闭）"
+          />
+          <span class="field-hint">
+            可选。配置后边缘优先向 Shield 回源，并保留当前域名 Host；Shield 不可用时自动回退到普通源站。
+          </span>
+        </div>
+
         <div class="field-label" style="margin-top: 24px; font-size: 15px">CC 防御</div>
         <div class="field">
           <label class="check">
@@ -358,6 +370,7 @@ const settings = ref({
   hotlink_allow_referers: '',
   origin_timeout_ms: 10000,
   custom_headers: '',
+  shield_url: '',
   rate_limit_rps: 0,
   rate_limit_burst: 0,
   cc_enabled: false,
@@ -554,6 +567,7 @@ async function openSettings(d: any) {
       hotlink_allow_referers: s.hotlink_allow_referers || '',
       origin_timeout_ms: s.origin_timeout_ms || 10000,
       custom_headers: s.custom_headers || '',
+      shield_url: s.shield_url || '',
       rate_limit_rps: s.rate_limit_rps || 0,
       rate_limit_burst: s.rate_limit_burst || 0,
       cc_enabled: !!s.cc_enabled,

@@ -66,6 +66,19 @@
                 <span class="field-hint">每行一个前缀，匹配该目录下的所有缓存。</span>
               </div>
 
+              <div v-else-if="mode === 'tag'" class="field">
+                <label class="field-label">缓存标签</label>
+                <textarea
+                  v-model="tagsText"
+                  class="textarea"
+                  rows="5"
+                  placeholder="product-123&#10;homepage"
+                />
+                <span class="field-hint">
+                  每行或逗号分隔一个标签，匹配源站响应 `Surrogate-Key` / `Cache-Tag` 中包含该标签的缓存。
+                </span>
+              </div>
+
               <div v-else class="alert alert-danger">
                 <AppIcon name="alert" :size="16" class="icon" />
                 <span>全站刷新会清除该域名在全部节点的缓存，可能造成回源压力，请谨慎使用。</span>
@@ -154,6 +167,10 @@
             </div>
             <div class="tip-row">
               <span class="tip-index">4</span>
+              <span>标签方式匹配源站 `Surrogate-Key` / `Cache-Tag`，适合商品、文章等关联资源批量失效。</span>
+            </div>
+            <div class="tip-row">
+              <span class="tip-index">5</span>
               <span>边缘节点离线时收不到指令，恢复后请再次刷新。</span>
             </div>
           </div>
@@ -186,9 +203,10 @@ const toast = useToast()
 const { ask } = useConfirm()
 
 const domains = ref<any[]>([])
-const mode = ref<'url' | 'prefix' | 'all'>('url')
+const mode = ref<'url' | 'prefix' | 'tag' | 'all'>('url')
 const urlsText = ref('')
 const prefixesText = ref('')
+const tagsText = ref('')
 const loading = ref(false)
 const result = ref<any>(null)
 const form = ref({ domain: '' })
@@ -196,6 +214,7 @@ const form = ref({ domain: '' })
 const modes = [
   { value: 'url', label: '按 URL' },
   { value: 'prefix', label: '按目录' },
+  { value: 'tag', label: '按标签' },
   { value: 'all', label: '全站刷新' },
 ]
 
@@ -221,6 +240,10 @@ async function doPurge() {
     .split('\n')
     .map(s => s.trim())
     .filter(Boolean)
+  const tags = tagsText.value
+    .split(/[\n,]/)
+    .map(s => s.trim())
+    .filter(Boolean)
 
   if (mode.value === 'url' && !urls.length) {
     toast.error('请至少填写一个 URL')
@@ -228,6 +251,10 @@ async function doPurge() {
   }
   if (mode.value === 'prefix' && !prefixes.length) {
     toast.error('请至少填写一个路径前缀')
+    return
+  }
+  if (mode.value === 'tag' && !tags.length) {
+    toast.error('请至少填写一个缓存标签')
     return
   }
   if (mode.value === 'all') {
@@ -246,6 +273,7 @@ async function doPurge() {
       domain: form.value.domain,
       urls: mode.value === 'url' ? urls : undefined,
       prefixes: mode.value === 'prefix' ? prefixes : undefined,
+      tags: mode.value === 'tag' ? tags : undefined,
       purge_all: mode.value === 'all',
     })
     if (result.value?.success) toast.success('刷新指令已下发')

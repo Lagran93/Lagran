@@ -9,4 +9,5 @@ pub mod domain_service;
 pub mod edge_notify;
 pub mod node_service;
 pub mod notify;
+pub mod prefetch;
 pub mod stats_service;

@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
+use hyper::http::HeaderMap;
 use hyper::Request;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -162,6 +163,33 @@ pub async fn post_json_with_headers<B: Serialize>(
         .map_err(|e| format!("notification body error {url}: {e}"))?
         .to_bytes();
     Ok((status, body))
+}
+
+/// Diagnostic GET: returns status/headers/body for cache troubleshooting.
+pub async fn get_response(
+    url: &str,
+    headers: &[(&str, &str)],
+) -> Result<(u16, HeaderMap, Bytes), String> {
+    let mut builder = Request::builder().method("GET").uri(url);
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder
+        .body(Full::new(Bytes::new()))
+        .map_err(|e| format!("build diagnostic request: {e}"))?;
+    let response = tokio::time::timeout(Duration::from_secs(15), client().request(req))
+        .await
+        .map_err(|_| "diagnostic request timed out".to_string())?
+        .map_err(|e| format!("diagnostic request failed: {e}"))?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| format!("diagnostic body error: {e}"))?
+        .to_bytes();
+    Ok((status, headers, body))
 }
 
 fn preview(bytes: &Bytes) -> String {

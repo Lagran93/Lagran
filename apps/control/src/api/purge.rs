@@ -44,6 +44,7 @@ struct EdgePurgeBody {
     domain: String,
     urls: Vec<String>,
     prefixes: Vec<String>,
+    tags: Vec<String>,
     purge_all: bool,
 }
 
@@ -103,6 +104,7 @@ pub async fn purge(
         domain: req.domain.clone(),
         urls: req.urls.clone().unwrap_or_default(),
         prefixes: req.prefixes.clone().unwrap_or_default(),
+        tags: req.tags.clone().unwrap_or_default(),
         purge_all: req.purge_all.unwrap_or(false),
     };
 

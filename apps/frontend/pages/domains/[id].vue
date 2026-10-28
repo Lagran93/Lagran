@@ -184,6 +184,10 @@
                   </span>
                 </div>
                 <div class="kv">
+                  <span class="kv-key">Origin Shield</span>
+                  <span class="kv-val mono">{{ settings.shield_url || '关闭' }}</span>
+                </div>
+                <div class="kv">
                   <span class="kv-key">自定义头</span>
                   <span class="kv-val mono pre">{{ settings.custom_headers || '—' }}</span>
                 </div>

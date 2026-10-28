@@ -8,7 +8,7 @@
 //! WebSocket) are handed to the in-process handler.
 
 use crate::cache::policy::{
-    cache_key_for_request, compute_etag, decide_storage, has_non_clearance_cookie,
+    cache_key_for_request, compute_etag, decide_storage_reason, request_bypass_reason_headers,
     resolve_rule_policy, resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
 };
 use crate::config::registry::{DomainEntry, OriginTarget};
@@ -107,6 +107,7 @@ struct NativePlan {
     origins: Vec<OriginTarget>,
     backup_url: String,
     timeout_ms: u64,
+    cache_reason: Option<&'static str>,
     policy: ResolvedPolicy,
     cors: String,
     custom: String,
@@ -127,10 +128,12 @@ struct ReqCtx {
     referer: String,
     start: Instant,
     cache_label: &'static str,
+    cache_reason: Option<&'static str>,
     status: u16,
     attempt: u8,
     origin_order: Vec<String>,
     current_origin: String,
+    current_host_header: String,
     response_bypass: bool,
     head_body: BytesMut,
     head_headers: Option<ResponseHeader>,
@@ -150,10 +153,12 @@ impl Default for ReqCtx {
             referer: String::new(),
             start: Instant::now(),
             cache_label: "MISS",
+            cache_reason: None,
             status: 0,
             attempt: 0,
             origin_order: Vec::new(),
             current_origin: String::new(),
+            current_host_header: String::new(),
             response_bypass: false,
             head_body: BytesMut::new(),
             head_headers: None,
@@ -339,6 +344,7 @@ impl ProxyHttp for DataPlaneProxy {
                 session.req_header_mut().remove_header("cache-control");
                 session.req_header_mut().remove_header("pragma");
             }
+            ctx.cache_reason = plan.cache_reason;
             ctx.plan = Some(plan);
             return Ok(false);
         }
@@ -422,6 +428,12 @@ impl ProxyHttp for DataPlaneProxy {
         let index = (ctx.attempt as usize).min(ctx.origin_order.len() - 1);
         let url = ctx.origin_order[index].clone();
         ctx.current_origin = url.clone();
+        ctx.current_host_header = plan
+            .origins
+            .iter()
+            .find(|o| o.url == url)
+            .and_then(|o| o.host_header.clone())
+            .unwrap_or_default();
         let (host, port, tls) =
             parse_origin(&url).ok_or_else(|| pingora::Error::new_str("invalid origin URL"))?;
         self.peer_for(&host, port, tls, plan.timeout_ms).await
@@ -487,7 +499,9 @@ impl ProxyHttp for DataPlaneProxy {
     ) -> Result<()> {
         if let Some(plan) = ctx.plan.as_ref() {
             // Keep HTTP Host aligned with the peer actually selected.
-            let host = if !ctx.current_origin.is_empty() {
+            let host = if !ctx.current_host_header.is_empty() {
+                ctx.current_host_header.clone()
+            } else if !ctx.current_origin.is_empty() {
                 parse_origin(&ctx.current_origin)
                     .map(|(h, _, _)| h)
                     .unwrap_or_else(|| plan.origin_host.clone())
@@ -532,6 +546,7 @@ impl ProxyHttp for DataPlaneProxy {
             )));
         }
         if resp.headers.contains_key("set-cookie") {
+            ctx.cache_reason = Some("set-cookie");
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
                 "set-cookie",
             )));
@@ -551,20 +566,25 @@ impl ProxyHttp for DataPlaneProxy {
         );
         if response_policy.action != RuleAction::Cache {
             ctx.response_bypass = true;
+            ctx.cache_reason = Some("content-type-bypass");
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
                 "content-type rule",
             )));
         }
         let headers = header_vec(&resp.headers);
-        let Some(decision) = decide_storage(
+        let decision = match decide_storage_reason(
             resp.status.as_u16(),
             &headers,
             response_policy,
             self.state.default_ttl_secs,
-        ) else {
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
-                "cache policy",
-            )));
+        ) {
+            Ok(decision) => decision,
+            Err(reason) => {
+                ctx.cache_reason = Some(reason);
+                return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                    "cache policy",
+                )));
+            }
         };
         let now = SystemTime::now();
         let meta = CacheMeta::new(
@@ -632,9 +652,13 @@ impl ProxyHttp for DataPlaneProxy {
         ctx.cache_label = label;
         ctx.status = response.status.as_u16();
         response.remove_header(META_HEADER);
+        response.remove_header("x-lagran-cache-reason");
         response.insert_header("x-cache", label)?;
         response.insert_header("x-cache-status", label)?;
         response.insert_header("x-powered-by", "lagran-edge")?;
+        if let Some(reason) = ctx.cache_reason {
+            response.insert_header("x-lagran-cache-reason", reason)?;
+        }
 
         let mut headers = response.headers.clone();
         if plan.cacheable || plan.is_head {
@@ -698,7 +722,7 @@ impl ProxyHttp for DataPlaneProxy {
                     "content-length".to_string(),
                     ctx.head_body.len().to_string(),
                 ));
-                if let Some(decision) = decide_storage(
+                if let Ok(decision) = decide_storage_reason(
                     ctx.head_status,
                     &hdrs,
                     plan.policy,
@@ -790,7 +814,7 @@ impl DataPlaneProxy {
         // HEAD stays on the in-process engine: it fetches GET, returns the real
         // Content-Length, and shares the GET cache entry. Pingora's H1 encoder
         // cannot carry an upstream GET body under a HEAD response.
-        if req.method == Method::HEAD {
+        if req.method == Method::HEAD || req.headers.contains_key("range") {
             return None;
         }
         let host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
@@ -808,7 +832,18 @@ impl DataPlaneProxy {
             req.method.as_str(),
             req.uri.query().unwrap_or(""),
         );
-        let bypasses = request_bypasses(&req.headers, policy.ignore_cookie);
+        let request_reason = if req.method != Method::GET {
+            Some("method")
+        } else {
+            request_bypass_reason_headers(&req.headers, policy.ignore_cookie).or_else(|| {
+                if policy.action != RuleAction::Cache {
+                    Some("rule-bypass")
+                } else {
+                    None
+                }
+            })
+        };
+        let bypasses = request_reason.is_some();
         let is_head = req.method == Method::HEAD && policy.action == RuleAction::Cache && !bypasses;
         let is_websocket = is_websocket_upgrade(&req.headers);
         let cacheable = req.method == Method::GET
@@ -849,6 +884,7 @@ impl DataPlaneProxy {
             } else {
                 domain.origin_timeout_ms
             }),
+            cache_reason: request_reason,
             policy,
             cors: domain.cors_origins.clone(),
             custom: domain.custom_headers.clone(),
@@ -895,18 +931,36 @@ impl DataPlaneProxy {
                 let body = read_body(session, 1024 * 1024).await?;
                 let req: purge::EdgePurgeRequest = match serde_json::from_slice(&body) {
                     Ok(req) => req,
-                    Err(_) => {
-                        write_plain(
-                            session,
-                            400,
-                            "text/plain; charset=utf-8",
-                            Bytes::from_static(b"bad request"),
-                        )
-                        .await;
+                    Err(e) => {
+                        let msg = format!("bad request: {e}");
+                        write_plain(session, 400, "text/plain; charset=utf-8", Bytes::from(msg))
+                            .await;
                         return Ok(true);
                     }
                 };
                 let Json(resp) = purge::purge_handler(State(self.state.clone()), Json(req)).await;
+                write_json(session, 200, &resp).await;
+            }
+            ("POST", "/__lagran/prefetch") => {
+                let body = read_body(session, 1024 * 1024).await?;
+                let req: crate::server::prefetch::EdgePrefetchRequest =
+                    match serde_json::from_slice(&body) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            let msg = format!("bad request: {e}");
+                            write_plain(
+                                session,
+                                400,
+                                "text/plain; charset=utf-8",
+                                Bytes::from(msg),
+                            )
+                            .await;
+                            return Ok(true);
+                        }
+                    };
+                let Json(resp) =
+                    crate::server::prefetch::prefetch_handler(State(self.state.clone()), Json(req))
+                        .await;
                 write_json(session, 200, &resp).await;
             }
             ("PUT", "/__lagran/acme/challenge") => {
@@ -1155,6 +1209,7 @@ impl DataPlaneProxy {
                 weight: 100,
                 priority: 0,
                 enabled: true,
+                host_header: None,
             }];
             if !plan.backup_url.is_empty() {
                 list.push(OriginTarget {
@@ -1162,6 +1217,7 @@ impl DataPlaneProxy {
                     weight: 100,
                     priority: 1,
                     enabled: true,
+                    host_header: None,
                 });
             }
             list
@@ -1409,23 +1465,6 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
     if !end_of_stream {
         let _ = session.write_response_body(Some(bytes), true).await;
     }
-}
-
-fn request_bypasses(headers: &HeaderMap, ignore_cookie: bool) -> bool {
-    if headers.contains_key("authorization")
-        || (!ignore_cookie && has_non_clearance_cookie(headers))
-    {
-        return true;
-    }
-    // `no-cache`/`max-age=0` mean "revalidate", not "skip the cache". Keep the
-    // request cache-eligible so If-None-Match can produce REVALIDATED/304.
-    // Only `no-store` genuinely forbids using or storing a cache entry.
-    if let Some(cc) = headers.get("cache-control").and_then(|v| v.to_str().ok()) {
-        if cc.to_ascii_lowercase().contains("no-store") {
-            return true;
-        }
-    }
-    false
 }
 
 fn request_host(raw: Option<&str>) -> String {

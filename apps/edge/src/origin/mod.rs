@@ -21,6 +21,9 @@ pub struct OriginResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
+    /// Operator-facing cache diagnostic, set by the handler when a response is
+    /// served but not stored.
+    pub cache_reason: Option<&'static str>,
 }
 
 impl OriginResponse {
@@ -241,6 +244,7 @@ impl OriginClient {
             status,
             headers: out_headers,
             body,
+            cache_reason: None,
         })
     }
 }

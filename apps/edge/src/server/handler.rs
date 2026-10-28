@@ -12,8 +12,8 @@
 use crate::agent::origin_health::OriginHealthMap;
 use crate::agent::{ControlClient, NodeControl};
 use crate::cache::policy::{
-    cache_key_for_request, compute_etag, decide_storage, etag_matches, is_uncacheable_header,
-    request_bypasses_cache, request_method_cacheable, resolve_rule_policy,
+    cache_key_for_request, compute_etag, decide_storage_reason, etag_matches,
+    is_uncacheable_header, request_bypass_reason, request_method_cacheable, resolve_rule_policy,
     resolve_rule_policy_for_response, strip_response_headers, CacheRule, CacheStatus,
     ResolvedPolicy, RuleAction, RuleSet,
 };
@@ -96,8 +96,7 @@ struct Effective {
     timeout_ms: u64,
 }
 
-static HANDLER_ORIGIN_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static HANDLER_ORIGIN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Weighted, health-aware origin order for the legacy handler path.
 async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<String> {
@@ -107,6 +106,7 @@ async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<S
             weight: 100,
             priority: 0,
             enabled: true,
+            host_header: None,
         }];
         if !eff.backup_url.is_empty() {
             list.push(OriginTarget {
@@ -114,6 +114,7 @@ async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<S
                 weight: 100,
                 priority: 1,
                 enabled: true,
+                host_header: None,
             });
         }
         list
@@ -202,7 +203,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0.ip());
-    let headers = req.headers().clone();
+    let mut headers = req.headers().clone();
     let header_ip = header_ip_from_headers(&headers);
     let client_ip_addr = if state.trust_proxy_headers {
         header_ip.or(peer_ip)
@@ -249,7 +250,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             &referer,
             0,
             "NODE_DISABLED",
-        &request_id,
+            &request_id,
         )
         .await;
         return default_page::node_disabled_page(&host);
@@ -288,7 +289,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             &referer,
             0,
             CacheStatus::None.as_str(),
-        &request_id,
+            &request_id,
         )
         .await;
         return default_page::unknown_domain_page(display);
@@ -379,14 +380,9 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             .first()
             .cloned()
             .unwrap_or_else(|| eff.origin_url.clone());
-        let resp = websocket::handle_upgrade(
-            req,
-            &ws_origin,
-            &path_and_query,
-            &headers,
-            eff.timeout_ms,
-        )
-        .await;
+        let resp =
+            websocket::handle_upgrade(req, &ws_origin, &path_and_query, &headers, eff.timeout_ms)
+                .await;
         let code = resp.status().as_u16();
         log_access(
             &state.access_log,
@@ -400,18 +396,46 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             &referer,
             0,
             "WS",
-        &request_id,
+            &request_id,
         )
         .await;
         return resp;
     }
 
-    let request_cacheable = request_method_cacheable(&method)
-        && !request_bypasses_cache(&req, eff.policy.ignore_cookie)
-        && eff.policy.action == RuleAction::Cache;
+    let mut request_reason = if !request_method_cacheable(&method) {
+        Some("method")
+    } else {
+        request_bypass_reason(&req, eff.policy.ignore_cookie).or_else(|| {
+            if eff.policy.action != RuleAction::Cache {
+                Some("rule-bypass")
+            } else {
+                None
+            }
+        })
+    };
+    let mut request_cacheable = request_reason.is_none();
+    let mut range_spec = None;
+    if request_cacheable {
+        if let Some(raw) = headers
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+        {
+            match parse_range_spec(&raw) {
+                Some(spec) => {
+                    range_spec = Some(spec);
+                    headers.remove(header::RANGE);
+                }
+                None => {
+                    request_reason = Some("range");
+                    request_cacheable = false;
+                }
+            }
+        }
+    }
 
     if !request_cacheable {
-        return bypass_to_origin(
+        let mut response = bypass_to_origin(
             &state,
             req,
             &eff,
@@ -427,6 +451,8 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             start,
         )
         .await;
+        set_cache_reason(&mut response, request_reason);
+        return response;
     }
 
     let cache_lookup_path = if eff.ignore_query {
@@ -440,6 +466,26 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         method.clone()
     };
     let key = cache_key_for_request(&key_method, &host, &cache_lookup_path, &headers);
+
+    if let Some(spec) = range_spec {
+        return serve_range(
+            &state,
+            &key,
+            &eff,
+            &path_and_query,
+            &headers,
+            &method,
+            &host,
+            &path_only,
+            &client_ip,
+            &user_agent,
+            &referer,
+            &request_id,
+            spec,
+            start,
+        )
+        .await;
+    }
 
     let mut lookup = state.cache.get_result(&key).await;
     let cached_bypass = match &lookup {
@@ -535,7 +581,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         &referer,
                         body_len,
                         CacheStatus::Hit.as_str(),
-                    &request_id,
+                        &request_id,
                     )
                     .await;
                     origin_response(
@@ -600,7 +646,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         &referer,
                         body_len,
                         label.as_str(),
-                    &request_id,
+                        &request_id,
                     )
                     .await;
                     out
@@ -621,7 +667,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                         &referer,
                         0,
                         failure.log_label(),
-                    &request_id,
+                        &request_id,
                     )
                     .await;
                     default_page::origin_error_page(&host, &path_only, failure)
@@ -672,7 +718,7 @@ async fn bypass_to_origin(
                 referer,
                 0,
                 label.as_str(),
-            &request_id,
+                &request_id,
             )
             .await;
             return (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large").into_response();
@@ -682,7 +728,12 @@ async fn bypass_to_origin(
     let attempt = |url: String| {
         let origin = state.origin.clone();
         let method = method.clone();
-        let headers = headers.clone();
+        let mut headers = headers.clone();
+        if let Some(host) = origin_host_override(eff, &url) {
+            if let Ok(value) = HeaderValue::from_str(host) {
+                headers.insert(header::HOST, value);
+            }
+        }
         let path = path_and_query.to_string();
         let body = body.clone();
         async move {
@@ -745,7 +796,7 @@ async fn bypass_to_origin(
                 referer,
                 body_len,
                 label.as_str(),
-            &request_id,
+                &request_id,
             )
             .await;
             out
@@ -766,7 +817,7 @@ async fn bypass_to_origin(
                 referer,
                 0,
                 failure.log_label(),
-            &request_id,
+                &request_id,
             )
             .await;
             default_page::origin_error_page(host, path_only, failure)
@@ -795,18 +846,15 @@ async fn fetch_with_single_flight(
             } else {
                 method.clone()
             };
-            let result =
+            let mut result =
                 fetch_origin(state, eff, host, path_and_query, headers, &origin_method).await;
-            if let Ok(resp) = &result {
+            if let Ok(resp) = &mut result {
                 let content_type = resp
                     .headers
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                let query = path_and_query
-                    .split_once('?')
-                    .map(|(_, q)| q)
-                    .unwrap_or("");
+                let query = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
                 let response_policy = resolve_rule_policy_for_response(
                     &eff.rules,
                     &eff.path,
@@ -814,24 +862,32 @@ async fn fetch_with_single_flight(
                     query,
                     content_type,
                 );
-                if response_policy.action == RuleAction::Cache {
-                    if let Some(decision) = decide_storage(
+                let mut reason = None;
+                if response_policy.action != RuleAction::Cache {
+                    reason = Some("content-type-bypass");
+                } else {
+                    match decide_storage_reason(
                         resp.status.as_u16(),
                         &headers_vec(&resp.headers),
                         response_policy,
                         state.default_ttl_secs,
                     ) {
-                        if resp.body.len() <= state.max_cacheable_body {
-                            let entry = clone_as_entry(resp);
-                            state
-                                .cache
-                                .set_with_swr(key, entry, decision.ttl_secs, decision.swr_secs)
-                                .await;
-                        } else {
-                            tracing::debug!(len = resp.body.len(), %host, "object too large to cache");
+                        Ok(decision) => {
+                            if resp.body.len() <= state.max_cacheable_body {
+                                let entry = clone_as_entry(resp);
+                                state
+                                    .cache
+                                    .set_with_swr(key, entry, decision.ttl_secs, decision.swr_secs)
+                                    .await;
+                            } else {
+                                reason = Some("body-too-large");
+                                tracing::debug!(len = resp.body.len(), %host, "object too large to cache");
+                            }
                         }
+                        Err(r) => reason = Some(r),
                     }
                 }
+                resp.cache_reason = reason;
             }
             leader.finish().await;
             result.map(|r| (Fetched::FromOrigin(r), true))
@@ -848,6 +904,13 @@ async fn fetch_with_single_flight(
             }
         }
     }
+}
+
+fn origin_host_override<'a>(eff: &'a Effective, url: &str) -> Option<&'a str> {
+    eff.origins
+        .iter()
+        .find(|origin| origin.url == url)
+        .and_then(|origin| origin.host_header.as_deref())
 }
 
 async fn fetch_origin(
@@ -867,7 +930,12 @@ async fn fetch_origin(
     let attempt = |url: String| {
         let origin = state.origin.clone();
         let method = method.clone();
-        let headers = headers.clone();
+        let mut headers = headers.clone();
+        if let Some(host) = origin_host_override(eff, &url) {
+            if let Ok(value) = HeaderValue::from_str(host) {
+                headers.insert(header::HOST, value);
+            }
+        }
         let path = path_and_query.to_string();
         async move {
             match tokio::time::timeout(
@@ -933,10 +1001,7 @@ fn spawn_revalidation(
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                let query = path_and_query
-                    .split_once('?')
-                    .map(|(_, q)| q)
-                    .unwrap_or("");
+                let query = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
                 let response_policy = resolve_rule_policy_for_response(
                     &eff.rules,
                     &eff.path,
@@ -945,7 +1010,7 @@ fn spawn_revalidation(
                     content_type,
                 );
                 if response_policy.action == RuleAction::Cache {
-                    if let Some(decision) = decide_storage(
+                    if let Ok(decision) = decide_storage_reason(
                         resp.status.as_u16(),
                         &headers_vec(&resp.headers),
                         response_policy,
@@ -966,6 +1031,155 @@ fn spawn_revalidation(
         }
         leader.finish().await;
     });
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RangeSpec {
+    FromTo(u64, Option<u64>),
+    Suffix(u64),
+}
+
+fn parse_range_spec(raw: &str) -> Option<RangeSpec> {
+    let value = raw.trim().strip_prefix("bytes=")?;
+    if value.contains(',') {
+        return None;
+    }
+    let (start, end) = value.split_once('-')?;
+    let start = start.trim();
+    let end = end.trim();
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        return (suffix > 0).then_some(RangeSpec::Suffix(suffix));
+    }
+    let start = start.parse::<u64>().ok()?;
+    let end = if end.is_empty() {
+        None
+    } else {
+        Some(end.parse::<u64>().ok()?)
+    };
+    if end.is_some_and(|e| e < start) {
+        return None;
+    }
+    Some(RangeSpec::FromTo(start, end))
+}
+
+fn resolve_range(spec: RangeSpec, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let (start, end) = match spec {
+        RangeSpec::FromTo(start, end) => {
+            let start = start as usize;
+            let end = end.unwrap_or(u64::MAX) as usize;
+            (start, end.min(len - 1))
+        }
+        RangeSpec::Suffix(suffix) => {
+            let suffix = suffix as usize;
+            (len.saturating_sub(suffix), len - 1)
+        }
+    };
+    (start < len && start <= end).then_some((start, end))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_range(
+    state: &AppState,
+    key: &str,
+    eff: &Effective,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    method: &Method,
+    host: &str,
+    path_only: &str,
+    client_ip: &str,
+    user_agent: &str,
+    referer: &str,
+    request_id: &str,
+    spec: RangeSpec,
+    start: Instant,
+) -> Response {
+    let lookup = state.cache.get_result(key).await;
+    let expired = matches!(lookup, CacheGetResult::Expired);
+    let (mut origin, label) = match lookup {
+        CacheGetResult::Hit(entry) => (entry_into_origin(entry), CacheStatus::Hit),
+        CacheGetResult::Stale(entry) => (entry_into_origin(entry), CacheStatus::Stale),
+        CacheGetResult::Expired | CacheGetResult::Miss => {
+            let state_arc = Arc::new(state.clone());
+            let fetched = fetch_with_single_flight(
+                &state_arc,
+                key,
+                eff,
+                path_and_query,
+                headers,
+                method,
+                host,
+            )
+            .await;
+            match fetched {
+                Ok((Fetched::FromCache(resp), _)) => (resp, CacheStatus::Hit),
+                Ok((Fetched::FromOrigin(resp), _)) => (
+                    resp,
+                    if expired {
+                        CacheStatus::Expired
+                    } else {
+                        CacheStatus::Miss
+                    },
+                ),
+                Err(e) => return default_page::origin_error_page(host, path_only, e.failure()),
+            }
+        }
+    };
+    let etag = entry_etag(&origin);
+    let total = origin.body.len();
+    let Some((slice_start, slice_end)) = resolve_range(spec, total) else {
+        let mut resp = Response::new(Body::empty());
+        *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
+            resp.headers_mut().insert(header::CONTENT_RANGE, v);
+        }
+        cache_status_headers(resp.headers_mut(), label.as_str());
+        return resp;
+    };
+    let body = origin.body.slice(slice_start..=slice_end);
+    let body_len = body.len() as u64;
+    origin.body = body;
+    origin.status = StatusCode::PARTIAL_CONTENT;
+    origin.headers.remove(header::CONTENT_LENGTH);
+    if let Ok(v) = HeaderValue::from_str(&format!("bytes {slice_start}-{slice_end}/{total}")) {
+        origin.headers.insert(header::CONTENT_RANGE, v);
+    }
+    origin
+        .headers
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+    if label == CacheStatus::Hit || label == CacheStatus::Stale {
+        state.metrics.record_hit(host, body_len).await;
+    } else {
+        state.metrics.record_miss(host, body_len).await;
+    }
+    log_access(
+        &state.access_log,
+        method,
+        host,
+        path_only,
+        206,
+        start,
+        client_ip,
+        user_agent,
+        referer,
+        body_len,
+        label.as_str(),
+        request_id,
+    )
+    .await;
+    origin_response(
+        origin,
+        label.as_str(),
+        &etag,
+        &eff.cors,
+        &eff.custom_headers,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1004,7 +1218,7 @@ async fn serve_cached(
                 referer,
                 0,
                 CacheStatus::Revalidated.as_str(),
-            &request_id,
+                &request_id,
             )
             .await;
             return not_modified_response(&etag);
@@ -1025,7 +1239,7 @@ async fn serve_cached(
         referer,
         bytes,
         label.as_str(),
-    &request_id,
+        &request_id,
     )
     .await;
     entry_to_response(
@@ -1086,14 +1300,8 @@ fn entry_response_bypass(eff: &Effective, entry: &CacheEntry) -> bool {
     if content_type.is_empty() {
         return false;
     }
-    resolve_rule_policy_for_response(
-        &eff.rules,
-        &eff.path,
-        eff.method.as_str(),
-        "",
-        content_type,
-    )
-    .action
+    resolve_rule_policy_for_response(&eff.rules, &eff.path, eff.method.as_str(), "", content_type)
+        .action
         != RuleAction::Cache
 }
 
@@ -1119,6 +1327,7 @@ fn entry_into_origin(entry: CacheEntry) -> OriginResponse {
         status: StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK),
         headers,
         body: entry.body,
+        cache_reason: None,
     }
 }
 
@@ -1186,7 +1395,7 @@ pub(crate) async fn preflight_cacheable(
             &referer,
             0,
             "HTTPS_REDIRECT",
-        &request_id,
+            &request_id,
         )
         .await;
         return Some(https_redirect_response(
@@ -1266,7 +1475,7 @@ pub(crate) async fn preflight_cacheable(
                     &referer,
                     0,
                     if banned { "CC-BAN" } else { "CC" },
-                &request_id,
+                    &request_id,
                 )
                 .await;
                 return Some(cc_too_many(decision.retry_after(), banned));
@@ -1292,7 +1501,7 @@ pub(crate) async fn preflight_cacheable(
             &referer,
             0,
             CacheStatus::None.as_str(),
-        &request_id,
+            &request_id,
         )
         .await;
         return Some(
@@ -1378,7 +1587,7 @@ pub(crate) async fn preflight_cacheable(
                             &referer,
                             0,
                             "CHALLENGE",
-                        &request_id,
+                            &request_id,
                         )
                         .await;
                         let nonce = challenge::issue_nonce(host, &state.challenge_secret);
@@ -1404,7 +1613,7 @@ pub(crate) async fn preflight_cacheable(
                             &referer,
                             0,
                             "WAF",
-                        &request_id,
+                            &request_id,
                         )
                         .await;
                         return Some(default_page::waf_blocked_page(
@@ -1434,7 +1643,7 @@ pub(crate) async fn preflight_cacheable(
             &referer,
             0,
             CacheStatus::None.as_str(),
-        &request_id,
+            &request_id,
         )
         .await;
         return Some((StatusCode::FORBIDDEN, "Hotlink Forbidden").into_response());
@@ -1625,8 +1834,10 @@ fn origin_response(
     custom: &str,
     browser_ttl: Option<u64>,
 ) -> Response {
+    let reason = resp.cache_reason;
     let mut headers = resp.headers;
     strip_response_headers(&mut headers);
+    headers.remove(HeaderName::from_static("x-lagran-pingora-meta"));
     cache_status_headers(&mut headers, cache_status);
     headers.insert(
         HeaderName::from_static("x-powered-by"),
@@ -1643,6 +1854,7 @@ fn origin_response(
     let mut out = Response::new(Body::from(resp.body));
     *out.status_mut() = resp.status;
     *out.headers_mut() = headers;
+    set_cache_reason(&mut out, reason);
     out
 }
 
@@ -1652,8 +1864,10 @@ fn pass_through_response(
     cors: &str,
     custom: &str,
 ) -> Response {
+    let reason = resp.cache_reason;
     let mut headers = resp.headers;
     strip_response_headers(&mut headers);
+    headers.remove(HeaderName::from_static("x-lagran-pingora-meta"));
     cache_status_headers(&mut headers, cache_status);
     headers.insert(
         HeaderName::from_static("x-powered-by"),
@@ -1664,7 +1878,18 @@ fn pass_through_response(
     let mut out = Response::new(Body::from(resp.body));
     *out.status_mut() = resp.status;
     *out.headers_mut() = headers;
+    set_cache_reason(&mut out, reason);
     out
+}
+
+fn set_cache_reason(response: &mut Response, reason: Option<&'static str>) {
+    if let Some(reason) = reason {
+        if let Ok(value) = HeaderValue::from_str(reason) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-lagran-cache-reason"), value);
+        }
+    }
 }
 
 pub(crate) fn cc_too_many(retry_after: u64, banned: bool) -> Response {

@@ -108,6 +108,7 @@ pub struct DomainConfigResponse {
     pub hotlink_allow_referers: String,
     pub origin_timeout_ms: u32,
     pub custom_headers: String,
+    pub shield_url: String,
     pub backup_origin: Option<OriginConfig>,
     pub origins: Vec<OriginConfig>,
     pub waf: Option<WafConfigOut>,
@@ -301,6 +302,7 @@ fn build(
     row.hotlink_allow_referers.hash(&mut h);
     timeout.hash(&mut h);
     row.custom_headers.hash(&mut h);
+    row.shield_url.hash(&mut h);
     row.status.hash(&mut h);
     row.ssl_enabled.hash(&mut h);
     origin.host.hash(&mut h);
@@ -374,6 +376,7 @@ fn build(
         hotlink_allow_referers: row.hotlink_allow_referers.clone(),
         origin_timeout_ms: timeout,
         custom_headers: row.custom_headers.clone(),
+        shield_url: row.shield_url.clone(),
         backup_origin: backup,
         origins,
         waf,

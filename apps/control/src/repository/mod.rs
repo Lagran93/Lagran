@@ -1,7 +1,9 @@
 //! Database access layer
 
 pub mod alert;
+pub mod prefetch;
 pub use alert::*;
+pub use prefetch::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -66,6 +68,8 @@ pub struct DomainRow {
     pub backup_origin_port: i32,
     #[sqlx(default)]
     pub backup_origin_proto: String,
+    #[sqlx(default)]
+    pub shield_url: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -334,7 +338,8 @@ pub async fn get_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<DomainRo
                ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
                COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
-               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url
         FROM domains WHERE id = $1
         "#,
     )
@@ -350,7 +355,8 @@ pub async fn get_domain_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Optio
                ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
                COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
-               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url
         FROM domains WHERE name = $1
         "#,
     )
@@ -392,6 +398,18 @@ pub async fn delete_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
             .await;
     let _ = sqlx::query(
         "DELETE FROM origin_health WHERE domain_name = (SELECT name FROM domains WHERE id = $1)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM prefetch_schedules WHERE domain = (SELECT name FROM domains WHERE id = $1)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM prefetch_tasks WHERE domain = (SELECT name FROM domains WHERE id = $1)",
     )
     .bind(id)
     .execute(pool)
@@ -1720,6 +1738,8 @@ pub struct DomainSettingsRow {
     pub cc_ban_seconds: i32,
     pub cc_mode: String,
     pub cc_allow_ips: String,
+    #[sqlx(default)]
+    pub shield_url: String,
 }
 
 pub async fn get_domain_settings(
@@ -1730,7 +1750,8 @@ pub async fn get_domain_settings(
         r#"
         SELECT ignore_query_string, cors_origins, hotlink_allow_referers,
                origin_timeout_ms, custom_headers, rate_limit_rps, rate_limit_burst,
-               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
+               COALESCE(shield_url, '') AS shield_url
         FROM domains WHERE name = $1
         "#,
     )
@@ -1754,6 +1775,7 @@ type DomainSettingsPatchRow = (
     i32,
     String,
     String,
+    String,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -1774,13 +1796,15 @@ pub async fn update_domain_settings(
     cc_ban_seconds: Option<i32>,
     cc_mode: Option<&str>,
     cc_allow_ips: Option<&str>,
+    shield_url: Option<&str>,
 ) -> sqlx::Result<u64> {
     // load existing then patch
     let row: Option<DomainSettingsPatchRow> = sqlx::query_as(
         r#"
         SELECT ignore_query_string, cors_origins, hotlink_allow_referers,
                origin_timeout_ms, custom_headers, rate_limit_rps, rate_limit_burst,
-               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
+               COALESCE(shield_url, '') AS shield_url
         FROM domains WHERE id = $1
         "#,
     )
@@ -1805,6 +1829,7 @@ pub async fn update_domain_settings(
           cc_ban_seconds = $13,
           cc_mode = $14,
           cc_allow_ips = $15,
+          shield_url = $16,
           updated_at = NOW()
         WHERE id = $1
         "#,
@@ -1824,6 +1849,7 @@ pub async fn update_domain_settings(
     .bind(cc_ban_seconds.unwrap_or(e.11))
     .bind(cc_mode.unwrap_or(&e.12))
     .bind(cc_allow_ips.unwrap_or(&e.13))
+    .bind(shield_url.unwrap_or(&e.14))
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
@@ -2228,6 +2254,8 @@ pub struct DomainFullRow {
     pub cc_ban_seconds: i32,
     pub cc_mode: String,
     pub cc_allow_ips: String,
+    #[sqlx(default)]
+    pub shield_url: String,
 }
 
 pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>> {
@@ -2237,7 +2265,8 @@ pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>
                rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
                COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
-               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
+               COALESCE(shield_url, '') AS shield_url
         FROM domains
         ORDER BY name
         "#,
@@ -2256,7 +2285,8 @@ pub async fn get_domain_full_by_name(
                rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
                COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
-               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
+               COALESCE(shield_url, '') AS shield_url
         FROM domains WHERE name = $1
         "#,
     )

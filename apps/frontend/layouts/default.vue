@@ -21,9 +21,11 @@ const MENU: MenuGroup[] = [
     items: [
       { label: '域名管理', to: '/domains', icon: 'domain' },
       { label: '缓存规则', to: '/rules', icon: 'rules' },
+      { label: '缓存诊断', to: '/cache-debug', icon: 'search' },
       { label: 'WAF 防护', to: '/waf', icon: 'shield' },
       { label: '证书管理', to: '/certs', icon: 'cert' },
       { label: '缓存刷新', to: '/purge', icon: 'purge' },
+      { label: '缓存预热', to: '/prefetch', icon: 'upload' },
     ],
   },
   {

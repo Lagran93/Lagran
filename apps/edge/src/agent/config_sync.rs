@@ -27,7 +27,6 @@ use crate::waf::{
 use serde::Deserialize;
 use std::time::Duration;
 
-
 #[derive(Debug, Clone, Deserialize)]
 struct OriginCfg {
     host: String,
@@ -168,6 +167,8 @@ struct DomainCfg {
     #[serde(default)]
     custom_headers: String,
     #[serde(default)]
+    shield_url: String,
+    #[serde(default)]
     ssl_enabled: bool,
     #[serde(default)]
     backup_origin: Option<OriginCfg>,
@@ -193,6 +194,19 @@ impl DomainCfg {
         } else {
             self.origins.iter().map(origin_target).collect()
         };
+        let shield = self.shield_url.trim();
+        if !shield.is_empty() {
+            origins.insert(
+                0,
+                crate::config::registry::OriginTarget {
+                    url: shield.trim_end_matches('/').to_string(),
+                    weight: 100,
+                    priority: -1,
+                    enabled: true,
+                    host_header: Some(self.domain.clone()),
+                },
+            );
+        }
         origins.sort_by_key(|o| (o.priority, std::cmp::Reverse(o.weight)));
         let origin_url = origins
             .iter()
@@ -397,6 +411,7 @@ fn origin_target(o: &OriginCfg) -> crate::config::registry::OriginTarget {
         weight: if o.weight == 0 { 100 } else { o.weight },
         priority: o.priority,
         enabled: o.enabled,
+        host_header: None,
     }
 }
 

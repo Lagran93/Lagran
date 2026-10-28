@@ -5,6 +5,7 @@ pub mod acme;
 pub mod alert;
 pub mod audit;
 pub mod auth;
+pub mod cache_diag;
 pub mod cc;
 pub mod cert;
 pub mod config;
@@ -86,6 +87,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/domains/:id/status", post(domain::set_status))
                 .route("/rules", get(rule::list).post(rule::create))
                 .route("/rules/test", post(rule::test))
+                .route("/cache/diagnose", post(cache_diag::diagnose))
                 .route("/rules/:id", put(rule::update).delete(rule::delete))
                 .route(
                     "/domains/:id/waf",
@@ -129,6 +131,15 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/certs/edge-sync", get(cert::edge_list_active))
                 .route("/purge", post(purge::purge))
                 .route("/prefetch", get(prefetch::list).post(prefetch::create))
+                .route("/prefetch/tasks", get(prefetch::list_tasks))
+                .route(
+                    "/prefetch/schedules",
+                    get(prefetch::list_schedules).post(prefetch::create_schedule),
+                )
+                .route(
+                    "/prefetch/schedules/:id",
+                    put(prefetch::update_schedule).delete(prefetch::delete_schedule),
+                )
                 .route("/stats/by-domain", get(stats::by_domain))
                 .route("/stats/summary", get(stats::summary))
                 .route("/audit", get(audit::list))

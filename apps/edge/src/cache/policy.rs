@@ -416,28 +416,6 @@ pub fn status_is_cacheable(status: u16) -> bool {
     matches!(status, 200 | 203 | 204 | 300 | 301 | 308)
 }
 
-/// `Vary` is only safe for us when it names fields the cache can safely ignore
-/// or explicitly normalise. `Accept-Encoding` is forced to identity upstream;
-/// `Accept-Language` is part of the cache key; `Cookie` is allowed only when the
-/// matching rule explicitly opts into `ignore_cookie`.
-fn vary_allows_storage(vary: Option<&str>, ignore_cookie: bool) -> bool {
-    match vary {
-        None => true,
-        Some(v) => {
-            let fields: Vec<&str> = v
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            fields.iter().all(|f| {
-                f.eq_ignore_ascii_case("accept-encoding")
-                    || f.eq_ignore_ascii_case("accept-language")
-                    || (ignore_cookie && f.eq_ignore_ascii_case("cookie"))
-            })
-        }
-    }
-}
-
 fn expires_ttl(headers: &[(String, String)]) -> Option<u64> {
     let expires = httpdate::parse_http_date(header_value(headers, "expires")?).ok()?;
     let now = header_value(headers, "date")
@@ -451,31 +429,38 @@ fn expires_ttl(headers: &[(String, String)]) -> Option<u64> {
     )
 }
 
-/// Decide the TTL for a response, or `None` when it must not be stored.
-pub fn decide_storage(
+/// Decide the TTL for a response, or the operator-facing reason it cannot be
+/// stored.
+pub fn decide_storage_reason(
     status: u16,
     headers: &[(String, String)],
     policy: ResolvedPolicy,
     default_ttl_secs: u64,
-) -> Option<CacheDecision> {
+) -> Result<CacheDecision, &'static str> {
     if !status_is_cacheable(status) {
-        return None;
+        return Err("status");
     }
-    if !vary_allows_storage(header_value(headers, "vary"), policy.ignore_cookie) {
-        return None;
+    if header_value(headers, "set-cookie").is_some() {
+        return Err("set-cookie");
+    }
+    if let Some(field) = vary_reject_reason(header_value(headers, "vary"), policy.ignore_cookie) {
+        return Err(field);
     }
 
     let cc = header_value(headers, "cache-control")
         .map(parse_cache_control)
         .unwrap_or_default();
-    if cc.no_store || cc.private {
-        return None;
+    if cc.no_store {
+        return Err("no-store");
+    }
+    if cc.private {
+        return Err("private");
     }
     // `no-cache` means "revalidate", not "never store". An explicit rule TTL is
     // an operator override (for example CSS/JS 7 days), so let it win; without
     // a rule TTL keep the conservative origin behaviour.
     if cc.no_cache && policy.ttl_override.is_none() {
-        return None;
+        return Err("no-cache");
     }
 
     let origin_ttl = cc.s_maxage.or(cc.max_age).or_else(|| expires_ttl(headers));
@@ -486,7 +471,7 @@ pub fn decide_storage(
         None => origin_ttl.unwrap_or(default_ttl_secs),
     };
     if ttl == 0 {
-        return None;
+        return Err("ttl-zero");
     }
 
     let swr = if policy.swr_secs > 0 {
@@ -495,10 +480,42 @@ pub fn decide_storage(
         cc.swr.unwrap_or(0)
     };
 
-    Some(CacheDecision {
+    Ok(CacheDecision {
         ttl_secs: ttl,
         swr_secs: swr,
     })
+}
+
+/// Decide the TTL for a response, or `None` when it must not be stored.
+pub fn decide_storage(
+    status: u16,
+    headers: &[(String, String)],
+    policy: ResolvedPolicy,
+    default_ttl_secs: u64,
+) -> Option<CacheDecision> {
+    decide_storage_reason(status, headers, policy, default_ttl_secs).ok()
+}
+
+fn vary_reject_reason(vary: Option<&str>, ignore_cookie: bool) -> Option<&'static str> {
+    let Some(v) = vary else {
+        return None;
+    };
+    for field in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if field.eq_ignore_ascii_case("accept-encoding")
+            || field.eq_ignore_ascii_case("accept-language")
+            || (ignore_cookie && field.eq_ignore_ascii_case("cookie"))
+        {
+            continue;
+        }
+        if field.eq_ignore_ascii_case("user-agent") {
+            return Some("vary:user-agent");
+        }
+        if field.eq_ignore_ascii_case("cookie") {
+            return Some("vary:cookie");
+        }
+        return Some("vary");
+    }
+    None
 }
 
 pub fn request_method_cacheable(method: &Method) -> bool {
@@ -513,7 +530,11 @@ pub fn has_non_clearance_cookie(headers: &HeaderMap) -> bool {
         return false;
     };
     raw.split(';').any(|part| {
-        let name = part.trim().split_once('=').map(|(k, _)| k.trim()).unwrap_or("");
+        let name = part
+            .trim()
+            .split_once('=')
+            .map(|(k, _)| k.trim())
+            .unwrap_or("");
         !name.is_empty() && !name.eq_ignore_ascii_case("lagran_clearance")
     })
 }
@@ -522,23 +543,35 @@ pub fn has_non_clearance_cookie(headers: &HeaderMap) -> bool {
 /// cache: authenticated or personalised traffic, conditional-range probes, and
 /// explicit `no-store` from the client. `no-cache`/`max-age=0` remain
 /// cache-eligible so they can revalidate an existing entry.
-pub fn request_bypasses_cache<B>(req: &Request<B>, ignore_cookie: bool) -> bool {
-    if req.headers().contains_key(header::AUTHORIZATION)
-        || (!ignore_cookie && has_non_clearance_cookie(req.headers()))
-        || req.headers().contains_key(header::RANGE)
-    {
-        return true;
+/// Why a request bypasses the shared cache. The returned value is exposed as
+/// `X-Lagran-Cache-Reason` for operator diagnostics.
+pub fn request_bypass_reason<B>(req: &Request<B>, ignore_cookie: bool) -> Option<&'static str> {
+    request_bypass_reason_headers(req.headers(), ignore_cookie)
+}
+
+pub fn request_bypass_reason_headers(
+    headers: &HeaderMap,
+    ignore_cookie: bool,
+) -> Option<&'static str> {
+    if headers.contains_key(header::AUTHORIZATION) {
+        return Some("authorization");
     }
-    if let Some(cc) = req
-        .headers()
+    if !ignore_cookie && has_non_clearance_cookie(headers) {
+        return Some("cookie");
+    }
+    if let Some(cc) = headers
         .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
     {
         if cc.to_ascii_lowercase().contains("no-store") {
-            return true;
+            return Some("no-store");
         }
     }
-    false
+    None
+}
+
+pub fn request_bypasses_cache<B>(req: &Request<B>, ignore_cookie: bool) -> bool {
+    request_bypass_reason(req, ignore_cookie).is_some()
 }
 
 pub fn cache_key<B>(req: &Request<B>) -> String {
@@ -695,6 +728,7 @@ pub fn is_uncacheable_header(name: &str) -> bool {
         || n == "age"
         || n == "date"
         || n == "etag"
+        || n == "x-lagran-cache-reason"
         || is_hop_by_hop(&n)
 }
 
@@ -704,7 +738,7 @@ pub fn strip_response_headers(headers: &mut HeaderMap) {
         .keys()
         .filter(|k| {
             let n = k.as_str().to_ascii_lowercase();
-            is_hop_by_hop(&n) || n == "content-length"
+            is_hop_by_hop(&n) || n == "content-length" || n == "x-lagran-cache-reason"
         })
         .map(|k| k.as_str().to_string())
         .collect();
@@ -817,13 +851,8 @@ mod tests {
             RuleAction::Cache
         );
 
-        let html = resolve_rule_policy_for_response(
-            &rules,
-            "/",
-            "GET",
-            "",
-            "text/html; charset=utf-8",
-        );
+        let html =
+            resolve_rule_policy_for_response(&rules, "/", "GET", "", "text/html; charset=utf-8");
         assert_eq!(html.action, RuleAction::Bypass);
 
         let js = resolve_rule_policy_for_response(
@@ -963,33 +992,11 @@ mod tests {
         let mut policy = ResolvedPolicy::default();
         policy.ttl_override = Some(604_800);
         assert!(
-            decide_storage(
-                200,
-                &hdrs(&[("cache-control", "no-cache")]),
-                policy,
-                60
-            )
-            .is_some(),
+            decide_storage(200, &hdrs(&[("cache-control", "no-cache")]), policy, 60).is_some(),
             "CSS/JS rule TTL must override origin no-cache"
         );
-        assert!(
-            decide_storage(
-                200,
-                &hdrs(&[("cache-control", "no-store")]),
-                policy,
-                60
-            )
-            .is_none()
-        );
-        assert!(
-            decide_storage(
-                200,
-                &hdrs(&[("cache-control", "private")]),
-                policy,
-                60
-            )
-            .is_none()
-        );
+        assert!(decide_storage(200, &hdrs(&[("cache-control", "no-store")]), policy, 60).is_none());
+        assert!(decide_storage(200, &hdrs(&[("cache-control", "private")]), policy, 60).is_none());
     }
 
     #[test]
@@ -1008,10 +1015,13 @@ mod tests {
             decide_storage(200, &hdrs(&[("vary", "Cookie")]), policy, 60).is_some(),
             "explicit ignore_cookie must allow Vary: Cookie static assets"
         );
-        assert!(
-            decide_storage(200, &hdrs(&[("vary", "Cookie, Accept-Encoding")]), policy, 60)
-                .is_some()
-        );
+        assert!(decide_storage(
+            200,
+            &hdrs(&[("vary", "Cookie, Accept-Encoding")]),
+            policy,
+            60
+        )
+        .is_some());
     }
 
     #[test]
@@ -1058,7 +1068,6 @@ mod tests {
         for (name, value) in [
             ("authorization", "Bearer x"),
             ("cookie", "sid=1"),
-            ("range", "bytes=0-10"),
             ("cache-control", "no-store"),
         ] {
             let req = Request::builder()
@@ -1068,6 +1077,15 @@ mod tests {
                 .unwrap();
             assert!(request_bypasses_cache(&req, false), "{name} should bypass");
         }
+
+        // Range is handled by the range-slice path, not as a cache bypass.
+        let range = Request::builder()
+            .uri("http://cdn.test/a.js")
+            .header("range", "bytes=0-10")
+            .body(())
+            .unwrap();
+        assert!(!request_bypasses_cache(&range, false));
+        assert_eq!(request_bypass_reason(&range, false), None);
 
         let cookie = Request::builder()
             .uri("http://cdn.test/a.js")
