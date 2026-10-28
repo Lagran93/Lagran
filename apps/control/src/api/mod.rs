@@ -9,6 +9,7 @@ pub mod cache_diag;
 pub mod cc;
 pub mod cert;
 pub mod config;
+pub mod config_release;
 pub mod dns_test;
 pub mod domain;
 pub mod health;
@@ -165,6 +166,38 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/access-logs", get(access_log::list))
                 .route("/access-logs/report", post(access_log::report))
                 .route("/config", get(config::list_all_configs))
+                .route("/config/versions", get(config_release::list_versions))
+                .route("/config/versions/:id", get(config_release::get_version))
+                .route(
+                    "/config/versions/:id/rollback",
+                    post(config_release::rollback_version),
+                )
+                .route(
+                    "/config/domains/:domain/versions",
+                    post(config_release::snapshot_now),
+                )
+                .route(
+                    "/config/releases",
+                    get(config_release::list_releases).post(config_release::create_release),
+                )
+                .route("/config/releases/:id", get(config_release::get_release))
+                .route(
+                    "/config/releases/:id/approve",
+                    post(config_release::approve_release),
+                )
+                .route(
+                    "/config/releases/:id/publish",
+                    post(config_release::publish_release),
+                )
+                .route(
+                    "/config/releases/:id/rollback",
+                    post(config_release::rollback_release),
+                )
+                .route(
+                    "/config/releases/:id/dry-run",
+                    post(config_release::dry_run),
+                )
+                .route("/config/apply-report", post(config_release::apply_report))
                 .route("/config/:domain", get(config::get_domain_config))
                 .route("/cc/bans", get(cc::list).post(cc::report))
                 .route("/cc/bans/all", get(cc::list_admin))

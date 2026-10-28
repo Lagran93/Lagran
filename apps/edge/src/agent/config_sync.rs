@@ -419,6 +419,8 @@ fn origin_target(o: &OriginCfg) -> crate::config::registry::OriginTarget {
 struct AllConfig {
     domains: Vec<DomainCfg>,
     version: String,
+    #[serde(default)]
+    release_id: Option<String>,
 }
 
 pub fn spawn_config_sync(
@@ -432,6 +434,7 @@ pub fn spawn_config_sync(
         tracing::info!(url = %control.endpoint("/api/v1/config"), "domain registry sync started");
         let mut last_version = String::new();
         let mut last_etag: Option<String> = None;
+        let mut last_reported: Option<String> = None;
 
         loop {
             match control
@@ -444,6 +447,7 @@ pub fn spawn_config_sync(
                     }
                     if let Some(cfg) = conditional.value {
                         if cfg.version != last_version {
+                            let release_id = cfg.release_id.clone();
                             let entries: Vec<DomainEntry> =
                                 cfg.domains.into_iter().map(DomainCfg::into_entry).collect();
                             let n = entries.len();
@@ -469,6 +473,27 @@ pub fn spawn_config_sync(
 
                             tracing::info!(domains = n, version = %cfg.version, "domain registry updated");
                             last_version = cfg.version;
+                            if let Some(release_id) = release_id {
+                                let key = format!("{release_id}:{}", last_version);
+                                if last_reported.as_deref() != Some(key.as_str()) {
+                                    let report = serde_json::json!({
+                                        "release_id": release_id,
+                                        "success": true,
+                                        "error": "",
+                                    });
+                                    match control
+                                        .post_json("/api/v1/config/apply-report", &report)
+                                        .await
+                                    {
+                                        Ok(_) => last_reported = Some(key),
+                                        Err(e) => tracing::warn!(
+                                            release = %release_id,
+                                            error = %e,
+                                            "config release apply report failed"
+                                        ),
+                                    }
+                                }
+                            }
                             if last_etag.is_none() {
                                 last_etag = Some(format!("\"{}\"", last_version));
                             }

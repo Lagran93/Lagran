@@ -26,6 +26,7 @@ const MENU: MenuGroup[] = [
       { label: '证书管理', to: '/certs', icon: 'cert' },
       { label: '缓存刷新', to: '/purge', icon: 'purge' },
       { label: '缓存预热', to: '/prefetch', icon: 'upload' },
+      { label: '配置发布', to: '/config-releases', icon: 'upload', admin: true },
     ],
   },
   {

@@ -45,6 +45,26 @@ fn not_found(msg: &str) -> (StatusCode, Json<ErrorBody>) {
     (StatusCode::NOT_FOUND, Json(ErrorBody { error: msg.into() }))
 }
 
+async fn record_waf_version(
+    state: &AppState,
+    domain_id: Uuid,
+    actor: &Actor,
+    action: &str,
+    message: &str,
+) {
+    if let Ok(Some(row)) = repository::get_domain(&state.pool, domain_id).await {
+        let _ = crate::service::config_version::record_domain(
+            &state.pool,
+            row.id,
+            &row.name,
+            &actor.email,
+            action,
+            message,
+        )
+        .await;
+    }
+}
+
 fn bad_request(msg: String) -> (StatusCode, Json<ErrorBody>) {
     (StatusCode::BAD_REQUEST, Json(ErrorBody { error: msg }))
 }
@@ -256,10 +276,9 @@ pub async fn put_settings(
     )
     .await;
 
+    record_waf_version(&state, domain_id, &actor, "waf.settings", "更新 WAF 设置").await;
     Ok(Json(row.into()))
 }
-
-// ------------------------------------------------------------------- rules
 
 #[derive(Serialize)]
 pub struct WafRuleDto {
@@ -420,6 +439,14 @@ pub async fn create_rule(
         ),
     )
     .await;
+    record_waf_version(
+        &state,
+        domain_id,
+        &actor,
+        "waf.rule.create",
+        &format!("新增 WAF 规则 {}", rule.name),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(row.into())))
 }
 
@@ -460,6 +487,14 @@ pub async fn update_rule(
         &row.name,
     )
     .await;
+    record_waf_version(
+        &state,
+        row.domain_id,
+        &actor,
+        "waf.rule.update",
+        &format!("更新 WAF 规则 {}", row.name),
+    )
+    .await;
     Ok(Json(row.into()))
 }
 
@@ -485,6 +520,14 @@ pub async fn delete_rule(
         "waf.rule.delete",
         &existing.domain_id.to_string(),
         &existing.name,
+    )
+    .await;
+    record_waf_version(
+        &state,
+        existing.domain_id,
+        &actor,
+        "waf.rule.delete",
+        &format!("删除 WAF 规则 {}", existing.name),
     )
     .await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
@@ -575,6 +618,14 @@ pub async fn create_ip(
         &format!("{kind} {ip}"),
     )
     .await;
+    record_waf_version(
+        &state,
+        domain_id,
+        &actor,
+        "waf.ip.create",
+        &format!("新增 WAF IP {kind} {ip}"),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(row.into())))
 }
 
@@ -600,6 +651,14 @@ pub async fn delete_ip(
         "waf.ip.delete",
         &existing.domain_id.to_string(),
         &format!("{} {}", existing.kind, existing.ip),
+    )
+    .await;
+    record_waf_version(
+        &state,
+        existing.domain_id,
+        &actor,
+        "waf.ip.delete",
+        &format!("删除 WAF IP {} {}", existing.kind, existing.ip),
     )
     .await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))

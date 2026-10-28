@@ -13,13 +13,14 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use uuid::Uuid;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct OriginConfig {
     pub host: String,
     pub port: u16,
@@ -29,7 +30,7 @@ pub struct OriginConfig {
     pub enabled: bool,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CacheRuleConfig {
     pub path_pattern: String,
     pub match_type: String,
@@ -46,7 +47,7 @@ pub struct CacheRuleConfig {
     pub match_content_type: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct WafManagedOut {
     pub sqli: bool,
     pub xss: bool,
@@ -59,7 +60,7 @@ pub struct WafManagedOut {
     pub crlf: bool,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct WafRuleOut {
     pub name: String,
     pub field: String,
@@ -70,7 +71,7 @@ pub struct WafRuleOut {
     pub enabled: bool,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct WafConfigOut {
     pub enabled: bool,
     pub mode: String,
@@ -83,7 +84,7 @@ pub struct WafConfigOut {
     pub security_level: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CcConfigOut {
     pub enabled: bool,
     pub rps: u32,
@@ -94,7 +95,7 @@ pub struct CcConfigOut {
     pub allow_ips: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DomainConfigResponse {
     pub domain: String,
     pub origin: OriginConfig,
@@ -120,6 +121,8 @@ pub struct DomainConfigResponse {
 pub struct AllDomainsConfigResponse {
     pub domains: Vec<DomainConfigResponse>,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -250,7 +253,7 @@ fn waf_config_from(
     }
 }
 
-fn build(
+pub(crate) fn build(
     row: &repository::DomainFullRow,
     rules: Vec<CacheRuleConfig>,
     waf: Option<WafConfigOut>,
@@ -385,6 +388,36 @@ fn build(
     }
 }
 
+/// Build one domain's edge config snapshot. Used by version history/releases.
+pub async fn snapshot_domain(
+    pool: &PgPool,
+    name: &str,
+) -> sqlx::Result<Option<DomainConfigResponse>> {
+    let Some(row) = repository::get_domain_full_by_name(pool, name).await? else {
+        return Ok(None);
+    };
+    let rules = repository::list_rules_for_domain(pool, row.id)
+        .await
+        .unwrap_or_default();
+    let waf = match repository::get_waf_settings(pool, row.id)
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(settings) => {
+            let waf_rules = repository::list_waf_rules(pool, row.id)
+                .await
+                .unwrap_or_default();
+            let waf_ips = repository::list_waf_ips(pool, row.id)
+                .await
+                .unwrap_or_default();
+            Some(waf_config_from(settings, waf_rules, waf_ips))
+        }
+        None => None,
+    };
+    Ok(Some(build(&row, rule_configs(rules), waf)))
+}
+
 pub async fn get_domain_config(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -482,6 +515,42 @@ pub async fn list_all_configs(
         waf_ips_by.entry(ip.domain_id).or_default().push(ip);
     }
 
+    let node_id = headers
+        .get("x-lagran-node-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let active_release = if node_id.is_empty() {
+        None
+    } else {
+        repository::active_release_for_node(&state.pool, &node_id)
+            .await
+            .unwrap_or(None)
+    };
+    let mut release_snapshots: HashMap<String, DomainConfigResponse> = HashMap::new();
+    let mut release_id = None;
+    if let Some(release) = active_release {
+        if let Some(map) = release.versions.as_object() {
+            for (domain, version_id) in map {
+                let Some(version_id) = version_id.as_str().and_then(|v| Uuid::parse_str(v).ok())
+                else {
+                    continue;
+                };
+                if let Ok(Some(version)) = repository::get_version(&state.pool, version_id).await {
+                    if let Ok(snapshot) =
+                        serde_json::from_value::<DomainConfigResponse>(version.snapshot)
+                    {
+                        release_snapshots.insert(domain.clone(), snapshot);
+                    }
+                }
+            }
+        }
+        if !release_snapshots.is_empty() {
+            release_id = Some(release.id.to_string());
+        }
+    }
+    let mut published_snapshots: HashMap<Uuid, DomainConfigResponse> = HashMap::new();
+
     let mut domains = Vec::with_capacity(rows.len());
     let mut version_parts = Vec::with_capacity(rows.len());
     for row in rows {
@@ -496,14 +565,36 @@ pub async fn list_all_configs(
                 waf_ips_by.remove(&row.id).unwrap_or_default(),
             )
         });
-        let cfg = build(&row, rule_configs(rules), waf);
-        version_parts.push(cfg.version.clone());
+        let mut cfg = build(&row, rule_configs(rules), waf);
+        let mut effective_version = row.published_version_id;
+        if let Some(snapshot) = release_snapshots.remove(&row.name) {
+            cfg = snapshot;
+            effective_version = None;
+        } else if let Some(version_id) = row.published_version_id {
+            if let Some(snapshot) = published_snapshots.get(&version_id) {
+                cfg = snapshot.clone();
+            } else if let Ok(Some(version)) = repository::get_version(&state.pool, version_id).await
+            {
+                if let Ok(snapshot) =
+                    serde_json::from_value::<DomainConfigResponse>(version.snapshot)
+                {
+                    published_snapshots.insert(version_id, snapshot.clone());
+                    cfg = snapshot;
+                }
+            }
+        }
+        version_parts.push(format!(
+            "{}:{:?}",
+            cfg.version,
+            effective_version.or_else(|| release_id.as_ref().map(|_| Uuid::nil()))
+        ));
         domains.push(cfg);
     }
 
     let version = {
         let mut h = DefaultHasher::new();
         version_parts.join("|").hash(&mut h);
+        release_id.hash(&mut h);
         format!("{:x}", h.finish())
     };
 
@@ -511,7 +602,12 @@ pub async fn list_all_configs(
     if if_none_match(&headers, &etag) {
         return Ok(not_modified(&etag));
     }
-    let mut response = Json(AllDomainsConfigResponse { domains, version }).into_response();
+    let mut response = Json(AllDomainsConfigResponse {
+        domains,
+        version,
+        release_id,
+    })
+    .into_response();
     if let Ok(value) = HeaderValue::from_str(&etag) {
         response.headers_mut().insert(header::ETAG, value);
     }

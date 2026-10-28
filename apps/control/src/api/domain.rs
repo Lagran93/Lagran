@@ -27,6 +27,7 @@ pub struct DomainDto {
     pub backup_origin_port: u16,
     pub backup_origin_proto: String,
     pub origins: Vec<repository::DomainOrigin>,
+    pub published_version_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +79,7 @@ pub(crate) fn to_dto(r: repository::DomainRow) -> DomainDto {
             r.backup_origin_proto
         },
         origins,
+        published_version_id: r.published_version_id.map(|u| u.to_string()),
     }
 }
 
@@ -394,6 +396,15 @@ pub async fn create(
         .ok()
         .flatten()
         .unwrap_or(row);
+    let _ = crate::service::config_version::record_domain(
+        &state.pool,
+        row.id,
+        &row.name,
+        &actor.email,
+        "domain.create",
+        "创建域名",
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(to_dto(row))))
 }
 
@@ -607,6 +618,15 @@ pub async fn update(
         .unwrap_or(row);
     let _ =
         repository::insert_audit(&state.pool, &actor.email, "domain.update", &row.name, "").await;
+    let _ = crate::service::config_version::record_domain(
+        &state.pool,
+        row.id,
+        &row.name,
+        &actor.email,
+        "domain.update",
+        "更新域名配置",
+    )
+    .await;
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(to_dto(row)))
 }
@@ -649,6 +669,15 @@ pub async fn set_status(
         "domain.status",
         &row.name,
         &status,
+    )
+    .await;
+    let _ = crate::service::config_version::record_domain(
+        &state.pool,
+        row.id,
+        &row.name,
+        &actor.email,
+        "domain.status",
+        &format!("状态变更为 {status}"),
     )
     .await;
     crate::service::edge_notify::notify_config_reload(&state).await;
@@ -832,6 +861,15 @@ pub async fn put_settings(
         "updated",
     )
     .await;
+    let _ = crate::service::config_version::record_domain(
+        &state.pool,
+        row.id,
+        &row.name,
+        &actor.email,
+        "domain.settings",
+        "更新高级设置",
+    )
+    .await;
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(settings_dto(s)))
 }
@@ -887,6 +925,7 @@ mod tests {
             backup_origin_port: 443,
             backup_origin_proto: "https".into(),
             shield_url: String::new(),
+            published_version_id: None,
         };
         let pool = effective_origins(&row);
         assert_eq!(pool.len(), 2);

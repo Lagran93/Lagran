@@ -27,6 +27,7 @@ pub struct ControlClient {
     client: Arc<HttpsClient>,
     base: Arc<String>,
     token: Arc<String>,
+    node_id: Arc<String>,
 }
 
 impl ControlClient {
@@ -54,6 +55,7 @@ impl ControlClient {
             client: Arc::new(client),
             base: Arc::new(config.control_url.trim_end_matches('/').to_string()),
             token: Arc::new(config.agent_token.clone()),
+            node_id: Arc::new(config.node_id.clone()),
         }
     }
 
@@ -88,6 +90,9 @@ impl ControlClient {
         }
         if !self.token.is_empty() {
             builder = builder.header("x-lagran-agent-token", self.token.as_str());
+        }
+        if !self.node_id.is_empty() {
+            builder = builder.header("x-lagran-node-id", self.node_id.as_str());
         }
         let req = builder
             .body(Full::new(body.unwrap_or_default()))
@@ -154,8 +159,8 @@ impl ControlClient {
         if status == StatusCode::NOT_MODIFIED {
             return Ok(ConditionalJson { etag, value: None });
         }
-        let value = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("invalid JSON from {path}: {e}"))?;
+        let value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from {path}: {e}"))?;
         Ok(ConditionalJson {
             etag,
             value: Some(value),
@@ -175,11 +180,7 @@ impl ControlClient {
     }
 
     /// POST a JSON document compressed with gzip.
-    pub async fn post_gzip_json<B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<(), String> {
+    pub async fn post_gzip_json<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
         let json = serde_json::to_vec(body).map_err(|e| e.to_string())?;
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&json).map_err(|e| e.to_string())?;

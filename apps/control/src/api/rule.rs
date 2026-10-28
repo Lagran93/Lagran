@@ -337,6 +337,15 @@ pub async fn create(
         ),
     )
     .await;
+    let _ = crate::service::config_version::record_domain(
+        &state.pool,
+        domain_id,
+        &domain.name,
+        &actor.email,
+        "rule.create",
+        &format!("新增规则 {}", row.path_pattern),
+    )
+    .await;
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok((
         StatusCode::CREATED,
@@ -431,6 +440,15 @@ pub async fn update(
         &format!("{} action={}", row.path_pattern, row.action),
     )
     .await;
+    let _ = crate::service::config_version::record_domain(
+        &state.pool,
+        current.domain_id,
+        &domain.name,
+        &actor.email,
+        "rule.update",
+        &format!("更新规则 {}", row.path_pattern),
+    )
+    .await;
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(RuleDto::from_row(row, &domain.name)))
 }
@@ -459,6 +477,17 @@ pub async fn delete(
         &rule.domain_id.to_string(),
     )
     .await;
+    if let Ok(Some(domain)) = repository::get_domain(&state.pool, rule.domain_id).await {
+        let _ = crate::service::config_version::record_domain(
+            &state.pool,
+            domain.id,
+            &domain.name,
+            &actor.email,
+            "rule.delete",
+            &format!("删除规则 {}", rule.path_pattern),
+        )
+        .await;
+    }
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
@@ -615,13 +644,7 @@ pub async fn test(
         .to_ascii_uppercase();
     let query = req.query.clone().unwrap_or_default();
 
-    match pick_with_content_type(
-        &rules,
-        path,
-        &method,
-        &query,
-        req.content_type.as_deref(),
-    ) {
+    match pick_with_content_type(&rules, path, &method, &query, req.content_type.as_deref()) {
         Some(rule) => {
             let effective = EffectiveDto {
                 action: rule.action.clone(),

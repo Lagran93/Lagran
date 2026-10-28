@@ -43,6 +43,10 @@
   和大范围 Range 由 Pingora 流式透传，避免视频被整包下载导致回源超时
 - **Origin Shield / 分层缓存**：可选 `shield_url` 优先回源并保留域名 Host，Shield 异常自动回退；边缘支持
   `memory` / `disk` / `hybrid`（L1 内存 + L2 磁盘）分层存储
+- **配置版本与灰度发布**：域名/规则/WAF/高级设置变更自动生成版本快照与字段级 Diff；支持一键回滚、
+  发布单审批、按域名选择版本、按节点灰度、发布前 Dry-run；目标节点全部上报成功后才全量生效，
+  上报失败或 120 秒未上报自动回滚。域名首次发布后会进入“发布版本”模式：后续编辑只产生新版本，
+  需要新的发布单才会切换，避免未审批变更直接生效
 - 统计：总览 / 分域名（24h）、访问日志、操作审计、源站健康
 - 可观测性：`GET /metrics` Prometheus 文本指标（控制面/数据库/域名/节点/源站健康/证书到期/告警）、
   可选 OTLP/HTTP Trace 导出；边缘 `GET /__lagran/metrics` 输出请求/命中/回源/流量指标
@@ -124,6 +128,7 @@ bash tests/integration/dns.sh # 端到端：自研权威 DNS 的 ECS 调度、SO
 bash tests/integration/nodes.sh # 端到端：节点预注册→安装命令→单节点令牌→上下线→删除
 bash tests/integration/cache-rules.sh # 端到端：方法/Query 条件、禁用规则、浏览器 TTL、规则测试器
 bash tests/integration/cache-diagnostics.sh # 端到端：缓存原因头、标签刷新、Range 切片、预热/定时预热、Origin Shield
+bash tests/integration/config-releases.sh # 端到端：版本历史/Diff/回滚、审批、节点灰度、Dry-run、失败自动回滚
 bash tests/integration/waf.sh   # 端到端：WAF 规则、IP 名单、观察/拦截模式与事件
 bash tests/integration/waf-advanced.sh # 端到端：新托管类别、请求头规则、安全级别与统计
 bash tests/integration/ttl.sh   # 端到端：TTL 优先级（规则→s-maxage→max-age→Expires→默认）

@@ -1,8 +1,10 @@
 //! Database access layer
 
 pub mod alert;
+pub mod config_release;
 pub mod prefetch;
 pub use alert::*;
+pub use config_release::*;
 pub use prefetch::*;
 
 use chrono::{DateTime, Utc};
@@ -70,6 +72,8 @@ pub struct DomainRow {
     pub backup_origin_proto: String,
     #[sqlx(default)]
     pub shield_url: String,
+    #[sqlx(default)]
+    pub published_version_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -322,7 +326,9 @@ pub async fn list_domains(pool: &PgPool) -> sqlx::Result<Vec<DomainRow>> {
                ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
                COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
-               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id
         FROM domains
         ORDER BY created_at DESC
         "#,
@@ -339,7 +345,8 @@ pub async fn get_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<DomainRo
                COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
                COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
-               COALESCE(shield_url, '') AS shield_url
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id
         FROM domains WHERE id = $1
         "#,
     )
@@ -356,7 +363,8 @@ pub async fn get_domain_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Optio
                COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
                COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
-               COALESCE(shield_url, '') AS shield_url
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id
         FROM domains WHERE name = $1
         "#,
     )
@@ -1601,7 +1609,9 @@ pub async fn list_domains_by_project(
                ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
                COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
-               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id
         FROM domains WHERE project_id = $1
         ORDER BY created_at DESC
         "#,
@@ -2256,6 +2266,8 @@ pub struct DomainFullRow {
     pub cc_allow_ips: String,
     #[sqlx(default)]
     pub shield_url: String,
+    #[sqlx(default)]
+    pub published_version_id: Option<Uuid>,
 }
 
 pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>> {
@@ -2266,7 +2278,7 @@ pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
                COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
-               COALESCE(shield_url, '') AS shield_url
+               COALESCE(shield_url, '') AS shield_url, published_version_id
         FROM domains
         ORDER BY name
         "#,
@@ -2286,7 +2298,7 @@ pub async fn get_domain_full_by_name(
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
                COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
-               COALESCE(shield_url, '') AS shield_url
+               COALESCE(shield_url, '') AS shield_url, published_version_id
         FROM domains WHERE name = $1
         "#,
     )

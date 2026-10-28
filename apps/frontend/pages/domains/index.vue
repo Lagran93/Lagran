@@ -223,6 +223,11 @@
           <span>保存后边缘节点约 15 秒内自动同步，无需停用或重启。</span>
         </div>
 
+        <div v-if="settingsDomain?.published_version_id" class="alert alert-warning">
+          <AppIcon name="info" :size="16" class="icon" />
+          <span>该域名已启用配置发布：保存后不会立即下发，请在「配置发布」创建并审批发布单后才会切换边缘版本。</span>
+        </div>
+
         <label class="switch" :class="{ on: settings.ignore_query_string }">
           <span class="switch-track" />
           <input v-model="settings.ignore_query_string" type="checkbox" style="display: none" />

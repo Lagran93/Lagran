@@ -111,6 +111,13 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(pool, config);
     control::service::alerting::spawn(state.pool.clone(), alert_eval_secs);
     control::service::prefetch::spawn(state.clone(), 15);
+    control::service::config_release::spawn(state.clone(), 10);
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            control::service::config_version::backfill_missing(&state.pool).await;
+        });
+    }
 
     {
         let state = state.clone();
