@@ -66,6 +66,30 @@ impl OriginHealthMap {
             .unwrap_or(true)
     }
 
+    pub async fn is_origin_healthy(&self, domain: &str, origin_url: &str) -> bool {
+        let map = self.inner.read().await;
+        let key = origin_key(domain, origin_url);
+        if let Some(state) = map.get(&key) {
+            return state.healthy;
+        }
+        // Compatibility with snapshots/reports that only had a domain key.
+        map.get(&domain.to_lowercase())
+            .map(|s| s.healthy)
+            .unwrap_or(true)
+    }
+
+    pub async fn record_origin(
+        &self,
+        domain: &str,
+        origin_url: &str,
+        ok: bool,
+        latency_ms: u32,
+        err: &str,
+    ) -> bool {
+        self.record(&origin_key(domain, origin_url), ok, latency_ms, err)
+            .await
+    }
+
     /// Record a probe result; returns the (possibly updated) healthy flag.
     pub async fn record(&self, domain: &str, ok: bool, latency_ms: u32, err: &str) -> bool {
         let key = domain.to_lowercase();
@@ -124,6 +148,14 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+pub fn origin_key(domain: &str, origin_url: &str) -> String {
+    format!(
+        "{}|{}",
+        domain.to_lowercase(),
+        origin_url.trim_end_matches('/').to_lowercase()
+    )
+}
+
 pub fn spawn_origin_health(
     control: ControlClient,
     registry: DomainRegistry,
@@ -144,52 +176,49 @@ pub fn spawn_origin_health(
 
         loop {
             for entry in registry.snapshot().await {
-                let start = Instant::now();
-                let result = origin
-                    .fetch_from(&entry.origin_url, "/", &HeaderMap::new())
-                    .await;
-                let latency = start.elapsed().as_millis() as u32;
-                let (ok, err) = match result {
-                    Ok((status, _, _)) => {
-                        let ok = status.as_u16() < 500;
-                        (
-                            ok,
-                            if ok {
-                                String::new()
-                            } else {
-                                format!("HTTP {status}")
-                            },
-                        )
-                    }
-                    Err(e) => (false, e.to_string()),
+                let targets: Vec<String> = if entry.origins.is_empty() {
+                    vec![entry.origin_url.clone()]
+                } else {
+                    entry
+                        .origins
+                        .iter()
+                        .filter(|o| o.enabled)
+                        .map(|o| o.url.clone())
+                        .collect()
                 };
-                let healthy = health_map
-                    .record(&entry.domain, ok, latency, &err)
-                    .await;
+                for url in targets {
+                    let start = Instant::now();
+                    let result = origin.fetch_from(&url, "/", &HeaderMap::new()).await;
+                    let latency = start.elapsed().as_millis() as u32;
+                    let (ok, err) = match result {
+                        Ok((status, _, _)) => {
+                            let ok = status.as_u16() < 500;
+                            (
+                                ok,
+                                if ok {
+                                    String::new()
+                                } else {
+                                    format!("HTTP {status}")
+                                },
+                            )
+                        }
+                        Err(e) => (false, e.to_string()),
+                    };
+                    let healthy = health_map
+                        .record_origin(&entry.domain, &url, ok, latency, &err)
+                        .await;
 
-                // Optionally probe backup when primary is down (informational only).
-                let mut backup_ok = None;
-                if !healthy && !entry.backup_origin_url.is_empty() {
-                    backup_ok = Some(
-                        origin
-                            .fetch_from(&entry.backup_origin_url, "/", &HeaderMap::new())
-                            .await
-                            .map(|(s, _, _)| s.as_u16() < 500)
-                            .unwrap_or(false),
-                    );
+                    let body = json!({
+                        "domain_name": entry.domain,
+                        "origin_url": url,
+                        "healthy": healthy,
+                        "latency_ms": latency,
+                        "error": err,
+                    });
+                    let _ = control
+                        .post_json("/api/v1/origin-health/report", &body)
+                        .await;
                 }
-
-                let body = json!({
-                    "domain_name": entry.domain,
-                    "origin_url": entry.origin_url,
-                    "healthy": healthy,
-                    "latency_ms": latency,
-                    "error": err,
-                    "backup_healthy": backup_ok,
-                });
-                let _ = control
-                    .post_json("/api/v1/origin-health/report", &body)
-                    .await;
             }
             tokio::time::sleep(interval).await;
         }

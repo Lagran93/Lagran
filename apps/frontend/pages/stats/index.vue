@@ -113,7 +113,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="h in pagedHealth" :key="h.domain_name">
+            <tr v-for="h in pagedHealth" :key="h.domain_name + h.origin_url">
               <td class="cell-main">{{ h.domain_name }}</td>
               <td class="mono text-2">{{ h.origin_url }}</td>
               <td>

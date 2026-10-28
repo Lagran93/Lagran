@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static ETAG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -22,11 +22,12 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
+    let slow = std::env::var("MOCK_SLOW").is_ok();
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind mock origin");
-    eprintln!("mock origin listening on 127.0.0.1:{port} root_status={root_status}");
+    eprintln!("mock origin listening on 127.0.0.1:{port} root_status={root_status} slow={slow}");
     for stream in listener.incoming().flatten() {
         thread::spawn(move || {
-            if let Err(e) = handle(stream, port, root_status) {
+            if let Err(e) = handle(stream, port, root_status, slow) {
                 eprintln!("mock origin connection error: {e}");
             }
         });
@@ -39,7 +40,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn handle(mut stream: TcpStream, port: u16, root_status: u16) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -222,6 +223,11 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16) -> std::io::Result
             ),
             // No cache headers at all: the domain default (CACHE_TTL) applies.
             "/ttl/default" => (200, b"ttl default".to_vec(), vec![]),
+            "/slow" if slow => {
+                thread::sleep(Duration::from_secs(3));
+                (200, b"slow origin".to_vec(), vec![])
+            }
+            "/slow" => (200, b"fast origin".to_vec(), vec![]),
             "/big" => (200, vec![b'x'; 512 * 1024], vec![]),
             "/html" => (
                 200,

@@ -33,6 +33,20 @@ struct OriginCfg {
     host: String,
     port: u16,
     protocol: String,
+    #[serde(default = "default_origin_weight")]
+    weight: u32,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default = "default_origin_enabled")]
+    enabled: bool,
+}
+
+fn default_origin_weight() -> u32 {
+    100
+}
+
+fn default_origin_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -158,6 +172,8 @@ struct DomainCfg {
     #[serde(default)]
     backup_origin: Option<OriginCfg>,
     #[serde(default)]
+    origins: Vec<OriginCfg>,
+    #[serde(default)]
     waf: Option<WafCfg>,
     #[serde(default)]
     cc: Option<CcCfg>,
@@ -166,7 +182,24 @@ struct DomainCfg {
 
 impl DomainCfg {
     fn into_entry(self) -> DomainEntry {
-        let origin_url = format_origin(&self.origin);
+        let mut origins: Vec<crate::config::registry::OriginTarget> = if self.origins.is_empty() {
+            let mut list = vec![origin_target(&self.origin)];
+            if let Some(ref backup) = self.backup_origin {
+                let mut target = origin_target(backup);
+                target.priority = 1;
+                list.push(target);
+            }
+            list
+        } else {
+            self.origins.iter().map(origin_target).collect()
+        };
+        origins.sort_by_key(|o| (o.priority, std::cmp::Reverse(o.weight)));
+        let origin_url = origins
+            .iter()
+            .find(|o| o.enabled)
+            .or_else(|| origins.first())
+            .map(|o| o.url.clone())
+            .unwrap_or_else(|| format_origin(&self.origin));
         let backup_origin_url = self
             .backup_origin
             .as_ref()
@@ -175,6 +208,7 @@ impl DomainCfg {
         DomainEntry {
             domain: self.domain,
             origin_url,
+            origins,
             rules: self.rules.into_iter().map(RuleCfg::into_rule).collect(),
             version: self.version,
             rate_limit_rps: self.rate_limit_rps,
@@ -355,6 +389,15 @@ fn parse_nets(entries: Vec<String>) -> Vec<IpNet> {
 
 fn format_origin(o: &OriginCfg) -> String {
     format!("{}://{}:{}", o.protocol, o.host, o.port)
+}
+
+fn origin_target(o: &OriginCfg) -> crate::config::registry::OriginTarget {
+    crate::config::registry::OriginTarget {
+        url: format_origin(o),
+        weight: if o.weight == 0 { 100 } else { o.weight },
+        priority: o.priority,
+        enabled: o.enabled,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

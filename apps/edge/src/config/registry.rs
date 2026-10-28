@@ -11,9 +11,44 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
+pub struct OriginTarget {
+    pub url: String,
+    pub weight: u32,
+    pub priority: i32,
+    pub enabled: bool,
+}
+
+impl OriginTarget {
+    /// Smooth weighted round-robin. `seed` rotates the starting slot; retries
+    /// then walk the returned list in order.
+    pub fn weighted_order(candidates: Vec<Self>, seed: u64) -> Vec<Self> {
+        if candidates.is_empty() {
+            return candidates;
+        }
+        let total: u64 = candidates.iter().map(|o| u64::from(o.weight.max(1))).sum();
+        let mut slot = seed % total.max(1);
+        let mut start = 0usize;
+        for (i, origin) in candidates.iter().enumerate() {
+            let weight = u64::from(origin.weight.max(1));
+            if slot < weight {
+                start = i;
+                break;
+            }
+            slot -= weight;
+        }
+        (0..candidates.len())
+            .map(|i| candidates[(start + i) % candidates.len()].clone())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct DomainEntry {
     pub domain: String,
     pub origin_url: String,
+    /// Weighted origin pool. `origin_url` / `backup_origin_url` are kept for
+    /// compatibility with older config snapshots and health reporting.
+    pub origins: Vec<OriginTarget>,
     pub rules: Vec<CacheRule>,
     pub version: String,
     pub rate_limit_rps: u32,
@@ -126,6 +161,12 @@ mod tests {
         DomainEntry {
             domain: name.into(),
             origin_url: "http://origin.test".into(),
+            origins: vec![OriginTarget {
+                url: "http://origin.test".into(),
+                weight: 100,
+                priority: 0,
+                enabled: true,
+            }],
             rules: vec![
                 CacheRule::simple("/*".into(), 60, 0),
                 CacheRule::simple("/api/*".into(), 0, prio),
@@ -166,5 +207,34 @@ mod tests {
         assert_eq!(normalize_host("[::1]:8080"), "::1");
         assert_eq!(normalize_host(" [::1] "), "::1");
         assert!(is_ip_host("127.0.0.1"));
+    }
+
+    #[test]
+    fn weighted_order_respects_weights() {
+        let pool = vec![
+            OriginTarget {
+                url: "http://a".into(),
+                weight: 1,
+                priority: 0,
+                enabled: true,
+            },
+            OriginTarget {
+                url: "http://b".into(),
+                weight: 3,
+                priority: 0,
+                enabled: true,
+            },
+        ];
+        let mut a = 0;
+        let mut b = 0;
+        for seed in 0..40 {
+            match OriginTarget::weighted_order(pool.clone(), seed)[0].url.as_str() {
+                "http://a" => a += 1,
+                "http://b" => b += 1,
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(a, 10);
+        assert_eq!(b, 30);
     }
 }

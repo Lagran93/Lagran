@@ -1,6 +1,7 @@
 //! Database access layer
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -20,6 +21,27 @@ pub struct UserRow {
     pub project_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainOrigin {
+    pub host: String,
+    pub port: u16,
+    pub proto: String,
+    #[serde(default = "default_origin_weight")]
+    pub weight: u32,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default = "default_origin_enabled")]
+    pub enabled: bool,
+}
+
+fn default_origin_weight() -> u32 {
+    100
+}
+
+fn default_origin_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DomainRow {
     pub id: Uuid,
@@ -33,6 +55,8 @@ pub struct DomainRow {
     pub created_at: DateTime<Utc>,
     pub rate_limit_rps: i32,
     pub rate_limit_burst: i32,
+    #[sqlx(default)]
+    pub origins: sqlx::types::Json<Vec<DomainOrigin>>,
     #[sqlx(default)]
     pub backup_origin_host: String,
     #[sqlx(default)]
@@ -289,7 +313,7 @@ pub async fn list_domains(pool: &PgPool) -> sqlx::Result<Vec<DomainRow>> {
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
                ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
-               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
                COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
         FROM domains
@@ -305,7 +329,7 @@ pub async fn get_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<DomainRo
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
                ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
-               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
                COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
         FROM domains WHERE id = $1
@@ -321,7 +345,7 @@ pub async fn get_domain_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Optio
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
                ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
-               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
                COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
         FROM domains WHERE name = $1
@@ -363,6 +387,12 @@ pub async fn delete_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
             .bind(id)
             .execute(pool)
             .await;
+    let _ = sqlx::query(
+        "DELETE FROM origin_health WHERE domain_name = (SELECT name FROM domains WHERE id = $1)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await;
     let r = sqlx::query("DELETE FROM domains WHERE id = $1")
         .bind(id)
         .execute(pool)
@@ -1548,7 +1578,7 @@ pub async fn list_domains_by_project(
         r#"
         SELECT id, project_id, name, origin_host, origin_port, origin_proto,
                ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
-               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
                COALESCE(backup_origin_port, 0) AS backup_origin_port,
                COALESCE(backup_origin_proto, 'http') AS backup_origin_proto
         FROM domains WHERE project_id = $1
@@ -1585,8 +1615,7 @@ pub async fn upsert_origin_health(
         r#"
         INSERT INTO origin_health (domain_name, origin_url, healthy, latency_ms, last_check_at, last_error, consecutive_fails)
         VALUES ($1, $2, $3, $4, NOW(), $5, CASE WHEN $3 THEN 0 ELSE 1 END)
-        ON CONFLICT (domain_name) DO UPDATE SET
-          origin_url = EXCLUDED.origin_url,
+        ON CONFLICT (domain_name, origin_url) DO UPDATE SET
           healthy = EXCLUDED.healthy,
           latency_ms = EXCLUDED.latency_ms,
           last_check_at = NOW(),
@@ -1889,6 +1918,42 @@ pub async fn set_backup_origin(
     Ok(())
 }
 
+pub async fn set_domain_origins(
+    pool: &PgPool,
+    id: Uuid,
+    origins: &[DomainOrigin],
+) -> sqlx::Result<()> {
+    let value = serde_json::to_value(origins).unwrap_or_else(|_| serde_json::json!([]));
+    sqlx::query(
+        r#"
+        UPDATE domains SET origins = $2, updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    let urls: Vec<String> = origins
+        .iter()
+        .map(|o| format!("{}://{}:{}", o.proto, o.host, o.port))
+        .collect();
+    if !urls.is_empty() {
+        let _ = sqlx::query(
+            r#"
+            DELETE FROM origin_health
+            WHERE domain_name = (SELECT name FROM domains WHERE id = $1)
+              AND origin_url <> ALL($2)
+            "#,
+        )
+        .bind(id)
+        .bind(&urls)
+        .execute(pool)
+        .await;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AccessLogRow {
     pub id: i64,
@@ -2148,6 +2213,8 @@ pub struct DomainFullRow {
     pub hotlink_allow_referers: String,
     pub origin_timeout_ms: i32,
     pub custom_headers: String,
+    #[sqlx(default)]
+    pub origins: sqlx::types::Json<Vec<DomainOrigin>>,
     pub backup_origin_host: String,
     pub backup_origin_port: i32,
     pub backup_origin_proto: String,
@@ -2166,7 +2233,7 @@ pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>
         SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
                rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
-               backup_origin_host, backup_origin_port, backup_origin_proto,
+               COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
         FROM domains
         ORDER BY name
@@ -2185,7 +2252,7 @@ pub async fn get_domain_full_by_name(
         SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
                rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
-               backup_origin_host, backup_origin_port, backup_origin_proto,
+               COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips
         FROM domains WHERE name = $1
         "#,

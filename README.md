@@ -17,11 +17,11 @@
 - 注册 / 登录（bcrypt + JWT）、`GET /api/v1/auth/me`、个人资料与改密（`PUT /auth/me`、`PUT /auth/me/password`）
 - 用户管理（admin）：`/api/v1/users` 创建、角色调整、启用/禁用、重置密码、删除；禁止自降权/自禁用并保护最后一个管理员
 - 项目与成员（多租户）：`/api/v1/projects`、`/projects/{id}/members`，支持成员角色调整
-- 域名接入与管理：源站/备源、SSL、限流、CORS、防盗链、回源超时、自定义头
+- 域名接入与管理：多源站池（权重/优先级/启用状态）、SSL、限流、CORS、防盗链、回源超时、自定义头
 - 缓存规则：路径通配 / **正则匹配（按 .css/.js 等后缀）**、**请求方法 / 查询串 / 响应 Content-Type 条件**、TTL、优先级、SWR、
   **动作（cache/bypass/no_store）**、**浏览器 TTL 覆盖**、**按规则忽略 Query / Cookie**、启用/停用与**规则测试器**
-- 域名源站支持主备：备用源站可随时启用/修改/清空，端口留空按协议默认 80/443；
-  主源站不可用时自动回源到备用源站（含 bypass/动态请求）
+- 域名支持多源站池：按优先级分组，同优先级按权重加权轮询；健康检查失败的源站自动跳过，
+  全部异常时仍尝试可用源站；连接失败/读超时按顺序重试，兼容原有主备源站配置
 - 域名 HTTPS：开启后 HTTP 请求 301/308 跳转到 HTTPS（`EDGE_HTTPS_REDIRECT_PORT` 控制端口）
 - 证书：上传、SNI 下发、**Let's Encrypt（ACME v2 / HTTP-01）生产签发**、Staging 调试、自动续期
 - 节点管理：预注册节点 + 一键生成安装命令（二进制/Docker）、单节点令牌、启用/停用（下发边缘立即 503）、删除吊销、心跳与 CPU/内存/版本
@@ -40,7 +40,7 @@
 ### 边缘端 (`apps/edge`)
 - **Pingora 公共网络层**：HTTP/1.1 + HTTP/2、HTTP/HTTPS 监听、SNI 动态证书、连接管理；
   所有域名请求先做 WAF/CC/限流/防盗链/HTTPS 预检；可缓存 GET 走 `pingora-cache` + `upstream_peer`，BYPASS/动态请求和 WebSocket 直接 `upstream_peer` 流式转发；HEAD 由同进程引擎回源 GET 并复用 GET cache key（HTTP/2 返回真实 Content-Length，HTTP/1.1 使用 0 兼容 Pingora H1 编码器）；health/ACME/challenge verify/管理接口由 Pingora 直接响应；未知/旧模式域名在进程内调用旧引擎，无 loopback 监听
-- 多域名反向代理（按 Host/SNI 路由）+ 主备源站
+- 多域名反向代理（按 Host/SNI 路由）+ 多源站加权负载均衡
 - 缓存：`memory`（DashMap + LRU）/ `disk`（文件缓存，按 mtime 淘汰）/ `hybrid`
 - 缓存语义：规则 TTL → `Cache-Control`(`s-maxage`/`max-age`) → `Expires` → 默认 TTL；
   `no-store`/`private`/无规则 TTL 的 `no-cache`/复杂 `Vary` 不写入；显式规则 TTL 可覆盖源站 `no-cache`；
@@ -100,6 +100,7 @@ cargo clippy --workspace --all-targets
 bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（需 Postgres）
 bash tests/integration/users.sh # 端到端：注册、用户管理、禁用、改密、项目成员角色
 bash tests/integration/head-h2.sh # 端到端：HTTP/2 HEAD 真实长度、HTTP/1.1 HEAD 0、GET 不污染
+bash tests/integration/multi-origin.sh # 端到端：多源站权重/优先级/故障接管/逐源站健康
 bash tests/integration/backup-origin.sh # 端到端：备用源站创建/读取/修改/清空与配置下发
 bash tests/integration/failover-https.sh # 端到端：主源站宕机切换备用 + HTTPS 跳转开关
 bash tests/integration/origin-health.sh # 端到端：健康探测标记 down/恢复后主备选择

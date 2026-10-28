@@ -11,7 +11,7 @@ use crate::cache::policy::{
     cache_key_for_request, compute_etag, decide_storage, has_non_clearance_cookie,
     resolve_rule_policy, resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
 };
-use crate::config::registry::DomainEntry;
+use crate::config::registry::{DomainEntry, OriginTarget};
 use crate::config::EdgeConfig;
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
@@ -104,8 +104,7 @@ struct NativePlan {
     domain: Arc<DomainEntry>,
     key: String,
     origin_host: String,
-    origin_port: u16,
-    origin_tls: bool,
+    origins: Vec<OriginTarget>,
     backup_url: String,
     timeout_ms: u64,
     policy: ResolvedPolicy,
@@ -130,6 +129,8 @@ struct ReqCtx {
     cache_label: &'static str,
     status: u16,
     attempt: u8,
+    origin_order: Vec<String>,
+    current_origin: String,
     response_bypass: bool,
     head_body: BytesMut,
     head_headers: Option<ResponseHeader>,
@@ -151,6 +152,8 @@ impl Default for ReqCtx {
             cache_label: "MISS",
             status: 0,
             attempt: 0,
+            origin_order: Vec::new(),
+            current_origin: String::new(),
             response_bypass: false,
             head_body: BytesMut::new(),
             head_headers: None,
@@ -166,6 +169,8 @@ struct DataPlaneProxy {
     storage: Option<&'static NativeStorage>,
     cache_lock: &'static CacheLock,
     management_on_data: bool,
+    /// Weighted round-robin seed for origin selection.
+    origin_counter: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -407,29 +412,18 @@ impl ProxyHttp for DataPlaneProxy {
             .plan
             .as_ref()
             .ok_or_else(|| pingora::Error::new_str("native plan missing"))?;
-        let healthy = self.state.origin_health.is_healthy(&ctx.host).await;
-        if !healthy && !plan.backup_url.is_empty() {
-            tracing::warn!(domain = %ctx.host, backup = %plan.backup_url, "primary origin unhealthy; using backup");
-            ctx.attempt = ctx.attempt.max(1);
-        }
-        let url = if ctx.attempt > 0 && !plan.backup_url.is_empty() {
-            plan.backup_url.as_str()
-        } else {
-            if !healthy {
-                tracing::warn!(domain = %ctx.host, "primary origin unhealthy; no backup configured");
+        if ctx.origin_order.is_empty() {
+            let order = self.origin_order(&ctx.host, plan).await;
+            if order.is_empty() {
+                return Err(pingora::Error::new_str("no origin available"));
             }
-            // For the primary peer these cached values are already parsed.
-            return self
-                .peer_for(
-                    &plan.origin_host,
-                    plan.origin_port,
-                    plan.origin_tls,
-                    plan.timeout_ms,
-                )
-                .await;
-        };
-        let (host, port, tls) = parse_origin(url)
-            .ok_or_else(|| pingora::Error::new_str("invalid backup origin URL"))?;
+            ctx.origin_order = order.into_iter().map(|o| o.url).collect();
+        }
+        let index = (ctx.attempt as usize).min(ctx.origin_order.len() - 1);
+        let url = ctx.origin_order[index].clone();
+        ctx.current_origin = url.clone();
+        let (host, port, tls) = parse_origin(&url)
+            .ok_or_else(|| pingora::Error::new_str("invalid origin URL"))?;
         self.peer_for(&host, port, tls, plan.timeout_ms).await
     }
 
@@ -441,13 +435,46 @@ impl ProxyHttp for DataPlaneProxy {
         e: Box<pingora::Error>,
     ) -> Box<pingora::Error> {
         let mut e = e;
-        if ctx.attempt == 0 {
-            if let Some(plan) = ctx.plan.as_ref() {
-                if !plan.backup_url.is_empty() {
-                    ctx.attempt = 1;
-                    e.set_retry(true);
-                }
-            }
+        if (ctx.attempt as usize) + 1 < ctx.origin_order.len() {
+            ctx.attempt = ctx.attempt.saturating_add(1);
+            e.set_retry(true);
+        }
+        e
+    }
+
+    fn error_while_proxy(
+        &self,
+        _peer: &HttpPeer,
+        session: &mut Session,
+        e: Box<pingora::Error>,
+        ctx: &mut Self::CTX,
+        _client_reused: bool,
+    ) -> Box<pingora::Error> {
+        let mut e = e;
+        let idempotent = session.req_header().method.is_idempotent();
+        let safe_to_retry = ctx
+            .plan
+            .as_ref()
+            .map(|p| p.cacheable || p.is_head)
+            .unwrap_or(false);
+        tracing::debug!(
+            domain = %ctx.host,
+            attempt = ctx.attempt,
+            origins = ctx.origin_order.len(),
+            idempotent,
+            safe_to_retry,
+            error = %e,
+            "proxy error while reading upstream"
+        );
+        if idempotent
+            && safe_to_retry
+            && (ctx.attempt as usize) + 1 < ctx.origin_order.len()
+            && !session.as_ref().retry_buffer_truncated()
+        {
+            ctx.attempt = ctx.attempt.saturating_add(1);
+            e.set_retry(true);
+        } else {
+            e.set_retry(false);
         }
         e
     }
@@ -459,11 +486,9 @@ impl ProxyHttp for DataPlaneProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         if let Some(plan) = ctx.plan.as_ref() {
-            // Keep HTTP Host aligned with the peer actually selected. The
-            // previous code always sent the primary origin Host, so a backup
-            // virtual host received the wrong site name.
-            let host = if ctx.attempt > 0 && !plan.backup_url.is_empty() {
-                parse_origin(&plan.backup_url)
+            // Keep HTTP Host aligned with the peer actually selected.
+            let host = if !ctx.current_origin.is_empty() {
+                parse_origin(&ctx.current_origin)
                     .map(|(h, _, _)| h)
                     .unwrap_or_else(|| plan.origin_host.clone())
             } else {
@@ -797,7 +822,7 @@ impl DataPlaneProxy {
         } else {
             "DYNAMIC"
         };
-        let (origin_host, origin_port, origin_tls) = parse_origin(&domain.origin_url)?;
+        let (origin_host, _, _) = parse_origin(&domain.origin_url)?;
         let ignore_query = policy.ignore_query.unwrap_or(domain.ignore_query_string);
         let lookup_path = if ignore_query {
             path
@@ -817,8 +842,7 @@ impl DataPlaneProxy {
             domain: domain.clone(),
             key,
             origin_host,
-            origin_port,
-            origin_tls,
+            origins: domain.origins.clone(),
             backup_url: domain.backup_origin_url.clone(),
             timeout_ms: u64::from(if domain.origin_timeout_ms == 0 {
                 10_000
@@ -1098,6 +1122,64 @@ impl DataPlaneProxy {
             self.state.metrics.record_miss(&ctx.host, 0).await;
         }
         true
+    }
+
+    async fn origin_order(&self, domain: &str, plan: &NativePlan) -> Vec<OriginTarget> {
+        let mut pool: Vec<OriginTarget> = if plan.origins.is_empty() {
+            let mut list = vec![OriginTarget {
+                url: plan.domain.origin_url.clone(),
+                weight: 100,
+                priority: 0,
+                enabled: true,
+            }];
+            if !plan.backup_url.is_empty() {
+                list.push(OriginTarget {
+                    url: plan.backup_url.clone(),
+                    weight: 100,
+                    priority: 1,
+                    enabled: true,
+                });
+            }
+            list
+        } else {
+            plan.origins.clone()
+        };
+        pool.retain(|o| o.enabled);
+        if pool.is_empty() {
+            return Vec::new();
+        }
+
+        let mut healthy = Vec::with_capacity(pool.len());
+        for origin in &pool {
+            if self
+                .state
+                .origin_health
+                .is_origin_healthy(domain, &origin.url)
+                .await
+            {
+                healthy.push(origin.clone());
+            }
+        }
+        let mut candidates = if healthy.is_empty() {
+            tracing::warn!(domain, "all origins unhealthy; trying best available origin");
+            pool
+        } else {
+            healthy
+        };
+        let min_priority = candidates
+            .iter()
+            .map(|o| o.priority)
+            .min()
+            .unwrap_or_default();
+        candidates.retain(|o| o.priority == min_priority);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let seed = self
+            .origin_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OriginTarget::weighted_order(candidates, seed)
     }
 
     async fn peer_for(
@@ -1461,6 +1543,7 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
         storage,
         cache_lock,
         management_on_data: config.admin_listen_addr.is_none(),
+        origin_counter: std::sync::atomic::AtomicU64::new(0),
     };
     match std::net::TcpListener::bind(&config.listen_addr) {
         Ok(probe) => drop(probe),

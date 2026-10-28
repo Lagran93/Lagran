@@ -24,6 +24,9 @@ pub struct OriginConfig {
     pub host: String,
     pub port: u16,
     pub protocol: String,
+    pub weight: u32,
+    pub priority: i32,
+    pub enabled: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -106,6 +109,7 @@ pub struct DomainConfigResponse {
     pub origin_timeout_ms: u32,
     pub custom_headers: String,
     pub backup_origin: Option<OriginConfig>,
+    pub origins: Vec<OriginConfig>,
     pub waf: Option<WafConfigOut>,
     pub cc: CcConfigOut,
     pub version: String,
@@ -147,7 +151,40 @@ fn origin_config(row: &repository::DomainFullRow) -> OriginConfig {
         host: row.origin_host.clone(),
         port: row.origin_port as u16,
         protocol: row.origin_proto.clone(),
+        weight: 100,
+        priority: 0,
+        enabled: true,
     }
+}
+
+fn origin_pool(row: &repository::DomainFullRow) -> Vec<OriginConfig> {
+    if !row.origins.0.is_empty() {
+        return row
+            .origins
+            .0
+            .iter()
+            .map(|o| OriginConfig {
+                host: o.host.clone(),
+                port: o.port,
+                protocol: o.proto.clone(),
+                weight: o.weight,
+                priority: o.priority,
+                enabled: o.enabled,
+            })
+            .collect();
+    }
+    let mut out = vec![origin_config(row)];
+    if !row.backup_origin_host.is_empty() && row.backup_origin_port > 0 {
+        out.push(OriginConfig {
+            host: row.backup_origin_host.clone(),
+            port: row.backup_origin_port as u16,
+            protocol: row.backup_origin_proto.clone(),
+            weight: 100,
+            priority: 1,
+            enabled: true,
+        });
+    }
+    out
 }
 
 fn backup_config(row: &repository::DomainFullRow) -> Option<OriginConfig> {
@@ -158,6 +195,9 @@ fn backup_config(row: &repository::DomainFullRow) -> Option<OriginConfig> {
         host: row.backup_origin_host.clone(),
         port: row.backup_origin_port as u16,
         protocol: row.backup_origin_proto.clone(),
+        weight: 100,
+        priority: 1,
+        enabled: true,
     })
 }
 
@@ -216,6 +256,7 @@ fn build(
 ) -> DomainConfigResponse {
     let origin = origin_config(row);
     let backup = backup_config(row);
+    let origins = origin_pool(row);
     let timeout = if row.origin_timeout_ms <= 0 {
         10_000
     } else {
@@ -240,6 +281,14 @@ fn build(
     let mut h = DefaultHasher::new();
     rps.hash(&mut h);
     burst.hash(&mut h);
+    for o in &origins {
+        o.host.hash(&mut h);
+        o.port.hash(&mut h);
+        o.protocol.hash(&mut h);
+        o.weight.hash(&mut h);
+        o.priority.hash(&mut h);
+        o.enabled.hash(&mut h);
+    }
     cc.enabled.hash(&mut h);
     cc.rps.hash(&mut h);
     cc.burst.hash(&mut h);
@@ -326,6 +375,7 @@ fn build(
         origin_timeout_ms: timeout,
         custom_headers: row.custom_headers.clone(),
         backup_origin: backup,
+        origins,
         waf,
         cc,
         version: format!("{}-{:x}", row.id, h.finish()),

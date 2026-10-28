@@ -75,7 +75,9 @@
                   <div class="mono text-2">
                     {{ d.origin_proto }}://{{ d.origin_host }}:{{ d.origin_port }}
                   </div>
-                  <div class="cell-sub">主源站</div>
+                  <div class="cell-sub">
+                    {{ d.origins?.length > 1 ? `${d.origins.length} 个源站 · 加权调度` : '主源站' }}
+                  </div>
                 </td>
                 <td>
                   <select
@@ -164,6 +166,7 @@
           <div class="field span-2">
             <label class="field-label">源站主机 <span class="req">*</span></label>
             <input v-model="createForm.origin_host" class="input" placeholder="例如 origin.example.com" />
+            <span class="field-hint">接入后可在「编辑源站配置」中添加更多源站，并设置权重与优先级。</span>
           </div>
           <div class="field span-2">
             <label class="field-label">所属项目</label>
@@ -187,43 +190,62 @@
       @confirm="saveOrigin"
     >
       <div class="form-col">
-        <div class="section-title">主源站</div>
-        <div class="form-grid">
-          <div class="field">
-            <label class="field-label">协议</label>
-            <select v-model="editForm.origin_proto" class="select">
-              <option value="https">HTTPS</option>
-              <option value="http">HTTP</option>
-            </select>
-          </div>
-          <div class="field">
-            <label class="field-label">端口</label>
-            <input v-model.number="editForm.origin_port" class="input" type="number" />
-          </div>
-          <div class="field span-2">
-            <label class="field-label">主机</label>
-            <input v-model="editForm.origin_host" class="input" />
-          </div>
+        <div class="section-title">源站池</div>
+        <div class="origin-row origin-head">
+          <span>协议</span>
+          <span>源站主机</span>
+          <span>端口</span>
+          <span>权重</span>
+          <span>优先级</span>
+          <span>状态</span>
+          <span></span>
         </div>
-
-        <div class="section-title">备用源站（可选）</div>
-        <div class="form-grid">
-          <div class="field">
-            <label class="field-label">协议</label>
-            <select v-model="editForm.backup_origin_proto" class="select">
-              <option value="http">HTTP</option>
-              <option value="https">HTTPS</option>
-            </select>
-          </div>
-          <div class="field">
-            <label class="field-label">端口</label>
-            <input v-model.number="editForm.backup_origin_port" class="input" type="number" />
-          </div>
-          <div class="field span-2">
-            <label class="field-label">主机</label>
-            <input v-model="editForm.backup_origin_host" class="input" placeholder="留空表示不使用备用源站" />
-          </div>
+        <div
+          v-for="(origin, index) in editForm.origins"
+          :key="index"
+          class="origin-row"
+        >
+          <select v-model="origin.proto" class="select">
+            <option value="https">HTTPS</option>
+            <option value="http">HTTP</option>
+          </select>
+          <input v-model="origin.host" class="input" placeholder="源站主机" />
+          <input v-model.number="origin.port" class="input" type="number" placeholder="端口" />
+          <input
+            v-model.number="origin.weight"
+            class="input"
+            type="number"
+            min="1"
+            title="权重"
+            placeholder="权重"
+          />
+          <input
+            v-model.number="origin.priority"
+            class="input"
+            type="number"
+            min="0"
+            title="优先级"
+            placeholder="优先级"
+          />
+          <label class="check origin-check">
+            <input v-model="origin.enabled" type="checkbox" />
+            启用
+          </label>
+          <button
+            class="btn btn-text btn-sm danger"
+            type="button"
+            :disabled="editForm.origins.length <= 1"
+            @click="removeOrigin(index)"
+          >
+            删除
+          </button>
         </div>
+        <button class="btn btn-default btn-sm" type="button" @click="addOrigin">
+          + 添加源站
+        </button>
+        <p class="field-hint">
+          优先级数字越小越优先；同一优先级按权重分配流量。健康检查失败的源站会被自动跳过，全部异常时仍会尝试。
+        </p>
 
         <label class="check">
           <input v-model="editForm.ssl_enabled" type="checkbox" />
@@ -371,13 +393,16 @@ const createForm = ref({
 const editOpen = ref(false)
 const editError = ref('')
 const editDomain = ref<any>(null)
+interface OriginForm {
+  host: string
+  port: number
+  proto: string
+  weight: number
+  priority: number
+  enabled: boolean
+}
 const editForm = ref({
-  origin_host: '',
-  origin_port: 443,
-  origin_proto: 'https',
-  backup_origin_host: '',
-  backup_origin_port: 0,
-  backup_origin_proto: 'http',
+  origins: [] as OriginForm[],
   ssl_enabled: true,
 })
 
@@ -491,43 +516,82 @@ async function onProjectChange(d: any, value: string) {
 function openEdit(d: any) {
   editError.value = ''
   editDomain.value = d
+  const pool: OriginForm[] =
+    Array.isArray(d.origins) && d.origins.length
+      ? d.origins.map((origin: any) => ({
+          host: origin.host,
+          port: origin.port,
+          proto: origin.proto,
+          weight: origin.weight ?? 100,
+          priority: origin.priority ?? 0,
+          enabled: origin.enabled !== false,
+        }))
+      : [
+          {
+            host: d.origin_host,
+            port: d.origin_port,
+            proto: d.origin_proto,
+            weight: 100,
+            priority: 0,
+            enabled: true,
+          },
+        ]
   editForm.value = {
-    origin_host: d.origin_host,
-    origin_port: d.origin_port,
-    origin_proto: d.origin_proto,
-    backup_origin_host: d.backup_origin_host || '',
-    backup_origin_port: d.backup_origin_port || 0,
-    backup_origin_proto: d.backup_origin_proto || 'http',
+    origins: pool,
     ssl_enabled: !!d.ssl_enabled,
   }
   editOpen.value = true
 }
 
+function addOrigin() {
+  editForm.value.origins.push({
+    host: '',
+    port: 443,
+    proto: 'https',
+    weight: 100,
+    priority: 0,
+    enabled: true,
+  })
+}
+
+function removeOrigin(index: number) {
+  if (editForm.value.origins.length <= 1) return
+  editForm.value.origins.splice(index, 1)
+}
+
 async function saveOrigin() {
   editError.value = ''
-  if (!editForm.value.origin_host.trim()) {
-    editError.value = '源站主机不能为空'
+  const pool = editForm.value.origins
+    .map((origin) => ({
+      host: origin.host.trim(),
+      port: Number(origin.port) || (origin.proto === 'https' ? 443 : 80),
+      proto: origin.proto,
+      weight: Math.max(1, Number(origin.weight) || 100),
+      priority: Math.max(0, Number(origin.priority) || 0),
+      enabled: origin.enabled,
+    }))
+    .filter((origin) => origin.host)
+  if (!pool.length) {
+    editError.value = '至少填写一个源站主机'
+    return
+  }
+  if (!pool.some((origin) => origin.enabled)) {
+    editError.value = '至少启用一个源站'
     return
   }
   if (!editDomain.value) return
   submitting.value = true
   try {
-    const backupHost = editForm.value.backup_origin_host.trim()
-    const backupProto = editForm.value.backup_origin_proto || 'http'
-    const backupPort = backupHost
-      ? Number(editForm.value.backup_origin_port) || (backupProto === 'https' ? 443 : 80)
-      : 0
+    const primary = pool.find((origin) => origin.enabled) || pool[0]
     await api.put(`/api/v1/domains/${editDomain.value.id}`, {
-      origin_host: editForm.value.origin_host.trim(),
-      origin_port: Number(editForm.value.origin_port) || 80,
-      origin_proto: editForm.value.origin_proto,
+      origin_host: primary.host,
+      origin_port: primary.port,
+      origin_proto: primary.proto,
       ssl_enabled: editForm.value.ssl_enabled,
-      backup_origin_host: backupHost,
-      backup_origin_port: backupPort,
-      backup_origin_proto: backupProto,
+      origins: pool,
     })
     editOpen.value = false
-    toast.success('源站配置已保存')
+    toast.success('源站池已保存')
     await load()
   } catch (e: any) {
     editError.value = e?.data?.error || '保存失败'
@@ -644,5 +708,47 @@ onMounted(load)
   color: var(--text-2);
   padding-bottom: 6px;
   border-bottom: 1px solid var(--divider);
+}
+
+.origin-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1.7fr) 82px 76px 76px auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.origin-head {
+  font-size: 12px;
+  color: var(--text-3);
+  padding: 0 0 2px;
+}
+
+@media (max-width: 760px) {
+  .origin-head {
+    display: none;
+  }
+}
+
+.origin-row .select,
+.origin-row .input {
+  height: 32px;
+}
+
+.origin-check {
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+@media (max-width: 760px) {
+  .origin-row {
+    grid-template-columns: 1fr 1fr;
+    padding: 10px;
+    border: 1px solid var(--divider);
+    border-radius: 8px;
+  }
+
+  .origin-row .input:first-of-type {
+    grid-column: span 2;
+  }
 }
 </style>

@@ -26,11 +26,13 @@ pub struct DomainDto {
     pub backup_origin_host: String,
     pub backup_origin_port: u16,
     pub backup_origin_proto: String,
+    pub origins: Vec<repository::DomainOrigin>,
 }
 
 #[derive(Deserialize)]
 pub struct CreateDomainRequest {
     pub name: String,
+    #[serde(default)]
     pub origin_host: String,
     pub origin_port: Option<u16>,
     pub origin_proto: Option<String>,
@@ -41,6 +43,7 @@ pub struct CreateDomainRequest {
     pub backup_origin_host: Option<String>,
     pub backup_origin_port: Option<u16>,
     pub backup_origin_proto: Option<String>,
+    pub origins: Option<Vec<repository::DomainOrigin>>,
 }
 
 #[derive(Serialize)]
@@ -55,6 +58,7 @@ pub struct DeleteResponse {
 }
 
 pub(crate) fn to_dto(r: repository::DomainRow) -> DomainDto {
+    let origins = effective_origins(&r);
     DomainDto {
         id: r.id.to_string(),
         name: r.name,
@@ -73,7 +77,92 @@ pub(crate) fn to_dto(r: repository::DomainRow) -> DomainDto {
         } else {
             r.backup_origin_proto
         },
+        origins,
     }
+}
+
+pub(crate) fn effective_origins(r: &repository::DomainRow) -> Vec<repository::DomainOrigin> {
+    if !r.origins.0.is_empty() {
+        return r.origins.0.clone();
+    }
+    let mut out = vec![repository::DomainOrigin {
+        host: r.origin_host.clone(),
+        port: r.origin_port.max(0) as u16,
+        proto: if r.origin_proto.is_empty() {
+            "http".into()
+        } else {
+            r.origin_proto.clone()
+        },
+        weight: 100,
+        priority: 0,
+        enabled: true,
+    }];
+    if !r.backup_origin_host.is_empty() && r.backup_origin_port > 0 {
+        out.push(repository::DomainOrigin {
+            host: r.backup_origin_host.clone(),
+            port: r.backup_origin_port as u16,
+            proto: if r.backup_origin_proto.is_empty() {
+                "http".into()
+            } else {
+                r.backup_origin_proto.clone()
+            },
+            weight: 100,
+            priority: 1,
+            enabled: true,
+        });
+    }
+    out
+}
+
+fn normalize_origins(
+    input: Vec<repository::DomainOrigin>,
+) -> Result<Vec<repository::DomainOrigin>, String> {
+    if input.len() > 16 {
+        return Err("at most 16 origins are allowed".into());
+    }
+    let mut out: Vec<repository::DomainOrigin> = Vec::with_capacity(input.len());
+    for mut origin in input {
+        origin.host = origin.host.trim().to_ascii_lowercase();
+        if origin.host.is_empty() {
+            return Err("origin host cannot be empty".into());
+        }
+        if origin.host.len() > 253 {
+            return Err("origin host is too long".into());
+        }
+        origin.proto = if origin.proto.trim().is_empty() {
+            "http".into()
+        } else {
+            origin.proto.trim().to_ascii_lowercase()
+        };
+        if origin.proto != "http" && origin.proto != "https" {
+            return Err("origin protocol must be http or https".into());
+        }
+        if origin.port == 0 {
+            origin.port = if origin.proto == "https" { 443 } else { 80 };
+        }
+        origin.weight = if origin.weight == 0 {
+            100
+        } else {
+            origin.weight.min(10_000)
+        };
+        origin.priority = origin.priority.clamp(0, 1000);
+        let key = format!("{}:{}:{}", origin.host, origin.port, origin.proto);
+        if out
+            .iter()
+            .any(|o| format!("{}:{}:{}", o.host, o.port, o.proto) == key)
+        {
+            return Err(format!("duplicate origin: {key}"));
+        }
+        out.push(origin);
+    }
+    if out.is_empty() {
+        return Err("at least one origin is required".into());
+    }
+    if !out.iter().any(|o| o.enabled) {
+        return Err("at least one origin must be enabled".into());
+    }
+    out.sort_by_key(|o| (o.priority, std::cmp::Reverse(o.weight)));
+    Ok(out)
 }
 
 /// Validate/normalise the optional backup origin.
@@ -165,22 +254,45 @@ pub async fn create(
     actor: Actor,
     Json(req): Json<CreateDomainRequest>,
 ) -> Result<(StatusCode, Json<DomainDto>), (StatusCode, Json<ErrorBody>)> {
-    if req.name.trim().is_empty() || req.origin_host.trim().is_empty() {
+    let normalized_origins = match req.origins {
+        Some(list) => Some(
+            normalize_origins(list)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?,
+        ),
+        None => None,
+    };
+    let primary = normalized_origins
+        .as_ref()
+        .and_then(|list| list.iter().find(|o| o.enabled).or_else(|| list.first()))
+        .cloned();
+    if req.name.trim().is_empty() || (req.origin_host.trim().is_empty() && primary.is_none()) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
-                error: "name and origin_host required".into(),
+                error: "name and at least one origin are required".into(),
             }),
         ));
     }
-    let port = req.origin_port.unwrap_or(80) as i32;
-    let proto = req.origin_proto.unwrap_or_else(|| {
-        if req.ssl_enabled.unwrap_or(false) {
-            "https".into()
-        } else {
-            "http".into()
-        }
-    });
+    let origin_host = primary
+        .as_ref()
+        .map(|o| o.host.clone())
+        .unwrap_or_else(|| req.origin_host.trim().to_string());
+    let port = primary
+        .as_ref()
+        .map(|o| o.port as i32)
+        .unwrap_or_else(|| req.origin_port.unwrap_or(80) as i32);
+    let proto = primary
+        .as_ref()
+        .map(|o| o.proto.clone())
+        .unwrap_or_else(|| {
+            req.origin_proto.unwrap_or_else(|| {
+                if req.ssl_enabled.unwrap_or(false) {
+                    "https".into()
+                } else {
+                    "http".into()
+                }
+            })
+        });
     let ssl = req.ssl_enabled.unwrap_or(proto == "https");
 
     // Tenancy: admins may leave a domain unassigned (global); everyone else's
@@ -217,7 +329,7 @@ pub async fn create(
     let row = repository::create_domain_with_project(
         &state.pool,
         req.name.trim(),
-        req.origin_host.trim(),
+        &origin_host,
         port,
         &proto,
         ssl,
@@ -244,6 +356,11 @@ pub async fn create(
         )
     })?;
 
+    if let Some(ref origins) = normalized_origins {
+        repository::set_domain_origins(&state.pool, row.id, origins)
+            .await
+            .map_err(|_| db_error())?;
+    }
     if let Some(rps) = req.rate_limit_rps {
         let burst = req.rate_limit_burst.unwrap_or(rps * 2);
         let _ =
@@ -338,6 +455,7 @@ pub struct UpdateDomainRequest {
     pub backup_origin_host: Option<String>,
     pub backup_origin_port: Option<u16>,
     pub backup_origin_proto: Option<String>,
+    pub origins: Option<Vec<repository::DomainOrigin>>,
 }
 
 /// PUT /api/v1/domains/{id}
@@ -368,13 +486,40 @@ pub async fn update(
         .map_err(|_| db_error())?
         .ok_or_else(|| not_found(&id))?;
 
+    let normalized_origins = match req.origins.clone() {
+        Some(list) => Some(
+            normalize_origins(list)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?,
+        ),
+        None => None,
+    };
+    let primary_origin = normalized_origins
+        .as_ref()
+        .and_then(|list| list.iter().find(|o| o.enabled).or_else(|| list.first()))
+        .cloned();
+    let host_arg = primary_origin
+        .as_ref()
+        .map(|o| o.host.clone())
+        .or_else(|| req.origin_host.clone());
+    let port_arg = primary_origin
+        .as_ref()
+        .map(|o| o.port)
+        .or(req.origin_port);
+    let proto_arg = primary_origin
+        .as_ref()
+        .map(|o| o.proto.clone())
+        .or_else(|| req.origin_proto.clone());
+    let ssl_arg = req
+        .ssl_enabled
+        .or_else(|| primary_origin.as_ref().map(|o| o.proto == "https"));
+
     let row = repository::update_domain(
         &state.pool,
         uid,
-        req.origin_host.as_deref(),
-        req.origin_port.map(|p| p as i32),
-        req.origin_proto.as_deref(),
-        req.ssl_enabled,
+        host_arg.as_deref(),
+        port_arg.map(|p| p as i32),
+        proto_arg.as_deref(),
+        ssl_arg,
         req.status.as_deref(),
     )
     .await
@@ -383,6 +528,27 @@ pub async fn update(
         db_error()
     })?
     .ok_or_else(|| not_found(&id))?;
+
+    if let Some(ref origins) = normalized_origins {
+        repository::set_domain_origins(&state.pool, uid, origins)
+            .await
+            .map_err(|_| db_error())?;
+    } else if !before.origins.0.is_empty()
+        && (req.origin_host.is_some()
+            || req.origin_port.is_some()
+            || req.origin_proto.is_some())
+    {
+        // Legacy clients may still edit only the primary fields.
+        let mut pool = before.origins.0.clone();
+        if let Some(first) = pool.iter_mut().find(|o| o.enabled) {
+            first.host = row.origin_host.clone();
+            first.port = row.origin_port.max(0) as u16;
+            first.proto = row.origin_proto.clone();
+        }
+        repository::set_domain_origins(&state.pool, uid, &pool)
+            .await
+            .map_err(|_| db_error())?;
+    }
 
     if req.backup_origin_host.is_some()
         || req.backup_origin_port.is_some()
@@ -654,4 +820,62 @@ pub async fn put_settings(
     .await;
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(settings_dto(s)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin(host: &str, weight: u32, priority: i32) -> repository::DomainOrigin {
+        repository::DomainOrigin {
+            host: host.into(),
+            port: 0,
+            proto: "https".into(),
+            weight,
+            priority,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn origin_pool_sorts_by_priority_and_defaults_port() {
+        let pool = normalize_origins(vec![origin("b.test", 10, 2), origin("a.test", 100, 0)])
+            .expect("valid");
+        assert_eq!(pool[0].host, "a.test");
+        assert_eq!(pool[0].port, 443);
+        assert_eq!(pool[1].priority, 2);
+    }
+
+    #[test]
+    fn origin_pool_rejects_duplicates_and_disabled_only() {
+        assert!(normalize_origins(vec![origin("a.test", 1, 0), origin("a.test", 1, 0)]).is_err());
+        let mut disabled = origin("a.test", 1, 0);
+        disabled.enabled = false;
+        assert!(normalize_origins(vec![disabled]).is_err());
+    }
+
+    #[test]
+    fn legacy_row_expands_to_primary_and_backup() {
+        let row = repository::DomainRow {
+            id: Uuid::nil(),
+            project_id: None,
+            name: "cdn.test".into(),
+            origin_host: "primary.test".into(),
+            origin_port: 80,
+            origin_proto: "http".into(),
+            ssl_enabled: false,
+            status: "active".into(),
+            created_at: chrono::Utc::now(),
+            rate_limit_rps: 0,
+            rate_limit_burst: 0,
+            origins: sqlx::types::Json(Vec::new()),
+            backup_origin_host: "backup.test".into(),
+            backup_origin_port: 443,
+            backup_origin_proto: "https".into(),
+        };
+        let pool = effective_origins(&row);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool[0].host, "primary.test");
+        assert_eq!(pool[1].priority, 1);
+    }
 }

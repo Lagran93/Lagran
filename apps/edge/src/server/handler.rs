@@ -18,7 +18,7 @@ use crate::cache::policy::{
     ResolvedPolicy, RuleAction, RuleSet,
 };
 use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
-use crate::config::registry::{DomainEntry, DomainRegistry};
+use crate::config::registry::{DomainEntry, DomainRegistry, OriginTarget};
 use crate::metrics::EdgeMetrics;
 use crate::origin::{OriginClient, OriginResponse};
 use crate::server::access_log::AccessLog;
@@ -85,6 +85,7 @@ pub struct AppState {
 struct Effective {
     origin_url: String,
     backup_url: String,
+    origins: Vec<OriginTarget>,
     policy: ResolvedPolicy,
     rules: Vec<CacheRule>,
     path: String,
@@ -93,6 +94,63 @@ struct Effective {
     cors: String,
     custom_headers: String,
     timeout_ms: u64,
+}
+
+static HANDLER_ORIGIN_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Weighted, health-aware origin order for the legacy handler path.
+async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<String> {
+    let mut pool = if eff.origins.is_empty() {
+        let mut list = vec![OriginTarget {
+            url: eff.origin_url.clone(),
+            weight: 100,
+            priority: 0,
+            enabled: true,
+        }];
+        if !eff.backup_url.is_empty() {
+            list.push(OriginTarget {
+                url: eff.backup_url.clone(),
+                weight: 100,
+                priority: 1,
+                enabled: true,
+            });
+        }
+        list
+    } else {
+        eff.origins.clone()
+    };
+    pool.retain(|o| o.enabled);
+    if pool.is_empty() {
+        return Vec::new();
+    }
+
+    let mut healthy = Vec::new();
+    for origin in &pool {
+        if state
+            .origin_health
+            .is_origin_healthy(host, &origin.url)
+            .await
+        {
+            healthy.push(origin.clone());
+        }
+    }
+    let mut candidates = if healthy.is_empty() { pool } else { healthy };
+    let min_priority = candidates
+        .iter()
+        .map(|o| o.priority)
+        .min()
+        .unwrap_or_default();
+    candidates.retain(|o| o.priority == min_priority);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let seed = HANDLER_ORIGIN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    OriginTarget::weighted_order(candidates, seed)
+        .into_iter()
+        .map(|o| o.url)
+        .collect()
 }
 
 enum Fetched {
@@ -249,6 +307,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             Effective {
                 origin_url: e.origin_url.clone(),
                 backup_url: e.backup_origin_url.clone(),
+                origins: e.origins.clone(),
                 policy,
                 rules: e.rules.clone(),
                 path: path_only.clone(),
@@ -275,6 +334,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             Effective {
                 origin_url: state.origin.base_url().await,
                 backup_url: String::new(),
+                origins: Vec::new(),
                 ignore_query,
                 policy,
                 rules: Vec::new(),
@@ -314,9 +374,14 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
 
     // WebSocket upgrade → handshake with origin, then raw byte tunnel.
     if websocket::is_websocket_upgrade(&headers) {
+        let ws_origin = origin_sequence(&state, &host, &eff)
+            .await
+            .first()
+            .cloned()
+            .unwrap_or_else(|| eff.origin_url.clone());
         let resp = websocket::handle_upgrade(
             req,
-            &eff.origin_url,
+            &ws_origin,
             &path_and_query,
             &headers,
             eff.timeout_ms,
@@ -415,6 +480,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
                 host.clone(),
                 eff.origin_url.clone(),
                 eff.backup_url.clone(),
+                eff.origins.clone(),
                 path_and_query.clone(),
                 headers.clone(),
                 eff.timeout_ms,
@@ -587,27 +653,6 @@ async fn bypass_to_origin(
         CacheStatus::Dynamic
     };
 
-    // Only fail fast when there is no backup to fall back to.
-    let primary_healthy = state.origin_health.is_healthy(host).await;
-    if !primary_healthy && eff.backup_url.is_empty() {
-        log_access(
-            &state.access_log,
-            method,
-            host,
-            path_only,
-            503,
-            start,
-            client_ip,
-            user_agent,
-            referer,
-            0,
-            OriginFailure::Unhealthy.log_label(),
-        &request_id,
-        )
-        .await;
-        return default_page::origin_error_page(host, path_only, OriginFailure::Unhealthy);
-    }
-
     let body = match Limited::new(req.into_body(), MAX_PROXY_BODY)
         .collect()
         .await
@@ -654,26 +699,33 @@ async fn bypass_to_origin(
         }
     };
 
-    let result = if primary_healthy {
-        match attempt(eff.origin_url.clone()).await {
-            Ok(r) => Ok(r),
-            Err(primary_err) => {
-                if eff.backup_url.is_empty() {
-                    Err(primary_err)
-                } else {
-                    tracing::warn!(
-                        origin = %eff.origin_url,
-                        error = %primary_err,
-                        "primary origin failed, trying backup"
-                    );
-                    attempt(eff.backup_url.clone()).await
-                }
-            }
+    let sequence = origin_sequence(state, host, eff).await;
+    if sequence.is_empty() {
+        log_access(
+            &state.access_log,
+            method,
+            host,
+            path_only,
+            503,
+            start,
+            client_ip,
+            user_agent,
+            referer,
+            0,
+            OriginFailure::Unhealthy.log_label(),
+            request_id,
+        )
+        .await;
+        return default_page::origin_error_page(host, path_only, OriginFailure::Unhealthy);
+    }
+    let mut result = Err(FetchError::Unhealthy);
+    for url in sequence {
+        result = attempt(url.clone()).await;
+        if result.is_ok() {
+            break;
         }
-    } else {
-        tracing::warn!(origin = %eff.origin_url, "primary origin unhealthy, using backup");
-        attempt(eff.backup_url.clone()).await
-    };
+        tracing::warn!(origin = %url, "origin failed, trying next origin");
+    }
 
     match result {
         Ok(resp) => {
@@ -806,8 +858,8 @@ async fn fetch_origin(
     headers: &HeaderMap,
     method: &Method,
 ) -> Result<OriginResponse, FetchError> {
-    let primary_healthy = state.origin_health.is_healthy(host).await;
-    if !primary_healthy && eff.backup_url.is_empty() {
+    let sequence = origin_sequence(state, host, eff).await;
+    if sequence.is_empty() {
         return Err(FetchError::Unhealthy);
     }
 
@@ -831,22 +883,15 @@ async fn fetch_origin(
         }
     };
 
-    let primary = if primary_healthy {
-        attempt(eff.origin_url.clone()).await
-    } else {
-        Err(FetchError::Unhealthy)
-    };
-
-    match primary {
-        Ok(r) => Ok(r),
-        Err(primary_err) => {
-            if eff.backup_url.is_empty() {
-                return Err(primary_err);
-            }
-            tracing::warn!(origin = %eff.origin_url, error = %primary_err, "primary origin failed, trying backup");
-            attempt(eff.backup_url.clone()).await
+    let mut result = Err(FetchError::Unhealthy);
+    for url in sequence {
+        result = attempt(url.clone()).await;
+        if result.is_ok() {
+            break;
         }
+        tracing::warn!(origin = %url, "origin failed, trying next origin");
     }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -856,6 +901,7 @@ fn spawn_revalidation(
     host: String,
     origin_url: String,
     backup_url: String,
+    origins: Vec<OriginTarget>,
     path_and_query: String,
     headers: HeaderMap,
     timeout_ms: u64,
@@ -870,6 +916,7 @@ fn spawn_revalidation(
         let eff = Effective {
             origin_url,
             backup_url,
+            origins,
             policy,
             rules,
             path,
