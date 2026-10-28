@@ -371,4 +371,50 @@ onMounted(() => {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+@media (max-width: 640px) {
+  .profile {
+    flex-wrap: wrap;
+  }
+
+  .profile .flex-1 {
+    min-width: 0;
+  }
+
+  .kv {
+    flex-wrap: wrap;
+    gap: 4px 12px;
+  }
+
+  .kv-key {
+    width: auto;
+    min-width: 72px;
+  }
+
+  .copy-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .copy-row .input {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .copy-row .btn {
+    width: 100%;
+  }
+
+  .flex.gap-8 {
+    flex-wrap: wrap;
+  }
+
+  .info-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .info-value {
+    word-break: break-word;
+  }
+}
 </style>

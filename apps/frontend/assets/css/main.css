@@ -1209,6 +1209,10 @@ textarea {
     padding: 16px 14px 32px;
   }
 
+  .grid-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .form-grid {
     grid-template-columns: minmax(0, 1fr);
   }
