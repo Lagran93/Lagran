@@ -36,6 +36,10 @@
   **控制面统一封禁库与跨节点同步**，控制台「WAF 防护 → 共享封禁」查看/解封
 - 缓存刷新（purge 扇出到在线边缘）、预热任务
 - 统计：总览 / 分域名（24h）、访问日志、操作审计、源站健康
+- 可观测性：`GET /metrics` Prometheus 文本指标（控制面/数据库/域名/节点/源站健康/证书到期/告警）、
+  可选 OTLP/HTTP Trace 导出；边缘 `GET /__lagran/metrics` 输出请求/命中/回源/流量指标
+- 告警中心：源站健康、证书到期、节点离线、缓存命中率、WAF 事件突增规则；邮件 SMTP、Webhook（可选 HMAC-SHA256 签名）、
+  Telegram 通知；事件去重、恢复通知、冷却时间与历史记录
 
 ### 边缘端 (`apps/edge`)
 - **Pingora 公共网络层**：HTTP/1.1 + HTTP/2、HTTP/HTTPS 监听、SNI 动态证书、连接管理；
@@ -59,8 +63,8 @@
 
 ### 前端 (`apps/frontend`)
 - 浅色管理控制台（Ant Design 风格、主色 `#1677ff`）：分组侧边栏 + 面包屑 + 表格/筛选/分页
-- 仪表盘 / 项目（含成员管理）/ 域名 / 域名详情 / 规则 / WAF 防护 / 节点管理（安装、启停、删除）/ 刷新 / 统计 / 访问日志 / 审计 / 证书 / 设置
-- SPA 模式，登录态存 localStorage；管理员额外可见「边缘节点」「操作审计」
+- 仪表盘 / 项目（含成员管理）/ 域名 / 域名详情 / 规则 / WAF 防护 / 节点管理（安装、启停、删除）/ 刷新 / 统计 / 告警中心 / 访问日志 / 审计 / 证书 / 设置
+- SPA 模式，登录态存 localStorage；管理员额外可见「边缘节点」「告警中心」「操作审计」
 
 ## 快速启动
 
@@ -101,6 +105,7 @@ bash tests/integration/smoke.sh # 端到端：控制面+边缘+模拟源站（�
 bash tests/integration/users.sh # 端到端：注册、用户管理、禁用、改密、项目成员角色
 bash tests/integration/head-h2.sh # 端到端：HTTP/2 HEAD 真实长度、HTTP/1.1 HEAD 0、GET 不污染
 bash tests/integration/multi-origin.sh # 端到端：多源站权重/优先级/故障接管/逐源站健康
+bash tests/integration/alerting.sh # 端到端：告警渠道/规则/触发/恢复/Webhook 通知/Prometheus
 bash tests/integration/backup-origin.sh # 端到端：备用源站创建/读取/修改/清空与配置下发
 bash tests/integration/failover-https.sh # 端到端：主源站宕机切换备用 + HTTPS 跳转开关
 bash tests/integration/origin-health.sh # 端到端：健康探测标记 down/恢复后主备选择
@@ -137,6 +142,10 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 | ACME_DIRECTORY_URL | Let's Encrypt 生产 | ACME v2 目录地址 |
 | ACME_STAGING_DIRECTORY_URL | Let's Encrypt Staging | Staging 目录地址 |
 | ACME_CONTACT_EMAIL | 空 | ACME 账户联系邮箱 |
+| ALERT_EVAL_SECS | 30 | 告警规则评估间隔（秒，最小 5） |
+| OTEL_EXPORTER_OTLP_ENDPOINT | 空 | OTLP/HTTP Trace 地址，如 `http://127.0.0.1:4318`；留空关闭导出 |
+| OTEL_SERVICE_NAME | lagran-control | OpenTelemetry service.name |
+| OTEL_TRACES_SAMPLER_ARG | 1.0 | Trace 采样率 0.0–1.0 |
 | EDGE_LISTEN | 0.0.0.0:8081 | Pingora 公共数据面 HTTP 监听 |
 | EDGE_ADMIN_LISTEN | 空 | 管理面监听；设置后 purge/证书/ACME 与管理接口走独立端口（推荐） |
 | EDGE_HTTPS_LISTEN | 空 | Pingora 公共 HTTPS 监听（需证书） |

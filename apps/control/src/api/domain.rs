@@ -501,10 +501,7 @@ pub async fn update(
         .as_ref()
         .map(|o| o.host.clone())
         .or_else(|| req.origin_host.clone());
-    let port_arg = primary_origin
-        .as_ref()
-        .map(|o| o.port)
-        .or(req.origin_port);
+    let port_arg = primary_origin.as_ref().map(|o| o.port).or(req.origin_port);
     let proto_arg = primary_origin
         .as_ref()
         .map(|o| o.proto.clone())
@@ -534,9 +531,7 @@ pub async fn update(
             .await
             .map_err(|_| db_error())?;
     } else if !before.origins.0.is_empty()
-        && (req.origin_host.is_some()
-            || req.origin_port.is_some()
-            || req.origin_proto.is_some())
+        && (req.origin_host.is_some() || req.origin_port.is_some() || req.origin_proto.is_some())
     {
         // Legacy clients may still edit only the primary fields.
         let mut pool = before.origins.0.clone();

@@ -38,6 +38,12 @@ pub struct AppConfig {
     pub require_secure_secrets: bool,
     /// Access/metrics log retention days (0 = never purge).
     pub log_retention_days: i64,
+    /// Alert evaluator interval in seconds.
+    pub alert_eval_secs: u64,
+    /// OTLP/HTTP endpoint. Empty disables trace export.
+    pub otel_endpoint: String,
+    pub otel_service_name: String,
+    pub otel_sample_ratio: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,10 +79,9 @@ impl Default for AppConfig {
                 .unwrap_or_else(|_| "127.0.0.1:53".into()),
             acme_directory_url: std::env::var("ACME_DIRECTORY_URL")
                 .unwrap_or_else(|_| "https://acme-v02.api.letsencrypt.org/directory".into()),
-            acme_staging_directory_url: std::env::var("ACME_STAGING_DIRECTORY_URL")
-                .unwrap_or_else(|_| {
-                    "https://acme-staging-v02.api.letsencrypt.org/directory".into()
-                }),
+            acme_staging_directory_url: std::env::var("ACME_STAGING_DIRECTORY_URL").unwrap_or_else(
+                |_| "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+            ),
             acme_contact_email: std::env::var("ACME_CONTACT_EMAIL").unwrap_or_default(),
             allow_register: env_bool("ALLOW_REGISTER", false),
             seed_demo: env_bool("SEED_DEMO", true),
@@ -85,6 +90,21 @@ impl Default for AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+            alert_eval_secs: std::env::var("ALERT_EVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30)
+                .clamp(5, 3600),
+            otel_endpoint: env_nonempty("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .or_else(|| env_nonempty("OTEL_ENDPOINT"))
+                .unwrap_or_default(),
+            otel_service_name: env_nonempty("OTEL_SERVICE_NAME")
+                .unwrap_or_else(|| "lagran-control".into()),
+            otel_sample_ratio: std::env::var("OTEL_TRACES_SAMPLER_ARG")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0),
         }
     }
 }

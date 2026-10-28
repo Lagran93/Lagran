@@ -1,5 +1,8 @@
 //! Database access layer
 
+pub mod alert;
+pub use alert::*;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -2066,7 +2069,7 @@ pub async fn get_user_role(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Option<
         sqlx::query_as("SELECT role FROM users WHERE id = $1 AND is_active")
             .bind(user_id)
             .fetch_optional(pool)
-        .await?;
+            .await?;
     Ok(row.map(|r| r.0))
 }
 
@@ -2779,7 +2782,6 @@ pub async fn delete_cc_ban(pool: &PgPool, domain: &str, ip: &str) -> sqlx::Resul
         .await?;
     Ok(r.rows_affected())
 }
-
 
 /// Delete access_logs and edge_metrics older than `days` days.
 pub async fn purge_old_telemetry(pool: &PgPool, days: i64) -> sqlx::Result<(u64, u64)> {

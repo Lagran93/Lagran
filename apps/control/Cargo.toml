@@ -40,3 +40,13 @@ rustls = { workspace = true }
 ring = { workspace = true }
 regex = { workspace = true }
 base64 = { workspace = true }
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls-tls",
+] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-json", "reqwest-blocking-client"] }
+tracing-opentelemetry = "0.34"

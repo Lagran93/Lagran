@@ -110,7 +110,9 @@ async fn config_reload_authed(_auth: RequireAgentToken) -> impl IntoResponse {
 async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snaps = state.metrics.take_snapshots_peek().await;
     let mut out = String::from(
-        "# HELP lagran_edge_requests_total Requests handled\n# TYPE lagran_edge_requests_total counter\n",
+        "# HELP lagran_edge_up Edge process up\n# TYPE lagran_edge_up gauge\nlagran_edge_up 1\n\
+         # HELP lagran_edge_domains Domains with traffic counters\n# TYPE lagran_edge_domains gauge\n\
+         # HELP lagran_edge_requests_total Requests handled\n# TYPE lagran_edge_requests_total counter\n",
     );
     let mut hits = String::from(
         "# HELP lagran_edge_cache_hits_total Cache hits\n# TYPE lagran_edge_cache_hits_total counter\n",
@@ -143,6 +145,7 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     out.push_str(&hits);
     out.push_str(&misses);
     out.push_str(&bytes);
+    out.push_str(&format!("lagran_edge_domains {}\n", snaps.len()));
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],

@@ -422,8 +422,8 @@ impl ProxyHttp for DataPlaneProxy {
         let index = (ctx.attempt as usize).min(ctx.origin_order.len() - 1);
         let url = ctx.origin_order[index].clone();
         ctx.current_origin = url.clone();
-        let (host, port, tls) = parse_origin(&url)
-            .ok_or_else(|| pingora::Error::new_str("invalid origin URL"))?;
+        let (host, port, tls) =
+            parse_origin(&url).ok_or_else(|| pingora::Error::new_str("invalid origin URL"))?;
         self.peer_for(&host, port, tls, plan.timeout_ms).await
     }
 
@@ -738,7 +738,7 @@ impl ProxyHttp for DataPlaneProxy {
             &ctx.referer,
             bytes,
             label,
-        &ctx.request_id,
+            &ctx.request_id,
         )
         .await;
         match label {
@@ -971,21 +971,45 @@ impl DataPlaneProxy {
             }
             ("POST", "/__lagran/config/reload") => {
                 crate::agent::config_sync::request_config_reload();
-                write_json(session, 200, &serde_json::json!({ "ok": true, "reloading": true })).await;
+                write_json(
+                    session,
+                    200,
+                    &serde_json::json!({ "ok": true, "reloading": true }),
+                )
+                .await;
             }
             ("GET", "/__lagran/metrics") => {
                 let snaps = self.state.metrics.take_snapshots_peek().await;
-                let mut body = String::from("# TYPE lagran_edge_requests_total counter\n");
+                let mut body = String::from(
+                    "# HELP lagran_edge_requests_total Requests handled by this edge\n\
+                     # TYPE lagran_edge_requests_total counter\n\
+                     # HELP lagran_edge_cache_hits_total Cache hits\n\
+                     # TYPE lagran_edge_cache_hits_total counter\n\
+                     # HELP lagran_edge_cache_misses_total Cache misses\n\
+                     # TYPE lagran_edge_cache_misses_total counter\n\
+                     # HELP lagran_edge_bytes_sent_total Bytes sent\n\
+                     # TYPE lagran_edge_bytes_sent_total counter\n",
+                );
                 for s in snaps {
+                    let d = s.domain.replace('"', "");
                     body.push_str(&format!(
-                        "lagran_edge_requests_total{{domain=\"{d}\"}} {v}\nlagran_edge_cache_hits_total{{domain=\"{d}\"}} {h}\nlagran_edge_cache_misses_total{{domain=\"{d}\"}} {m}\n",
-                        d = s.domain.replace('"', ""),
+                        "lagran_edge_requests_total{{domain=\"{d}\"}} {v}\n\
+                         lagran_edge_cache_hits_total{{domain=\"{d}\"}} {h}\n\
+                         lagran_edge_cache_misses_total{{domain=\"{d}\"}} {m}\n\
+                         lagran_edge_bytes_sent_total{{domain=\"{d}\"}} {b}\n",
                         v = s.requests,
                         h = s.cache_hits,
                         m = s.cache_misses,
+                        b = s.bytes_sent,
                     ));
                 }
-                write_plain(session, 200, "text/plain; version=0.0.4; charset=utf-8", Bytes::from(body)).await;
+                write_plain(
+                    session,
+                    200,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                    Bytes::from(body),
+                )
+                .await;
             }
             ("GET", "/__lagran/access-logs") => {
                 let entries = self.state.access_log.snapshot(200).await;
@@ -1113,7 +1137,7 @@ impl DataPlaneProxy {
             &ctx.referer,
             0,
             cache_label,
-        &ctx.request_id,
+            &ctx.request_id,
         )
         .await;
         if cache_label == "HIT" {
@@ -1161,7 +1185,10 @@ impl DataPlaneProxy {
             }
         }
         let mut candidates = if healthy.is_empty() {
-            tracing::warn!(domain, "all origins unhealthy; trying best available origin");
+            tracing::warn!(
+                domain,
+                "all origins unhealthy; trying best available origin"
+            );
             pool
         } else {
             healthy
@@ -1534,7 +1561,10 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
     let mut server = Server::new(Some(opt))?;
     server.bootstrap();
 
-    let storage = Some(leak_storage_with_limit(state.cache.clone(), state.max_cacheable_body));
+    let storage = Some(leak_storage_with_limit(
+        state.cache.clone(),
+        state.max_cacheable_body,
+    ));
     let cache_lock: &'static CacheLock = Box::leak(CacheLock::new_boxed(Duration::from_secs(10)));
     let proxy = DataPlaneProxy {
         trust_proxy: config.trust_proxy_headers,

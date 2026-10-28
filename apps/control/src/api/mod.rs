@@ -2,6 +2,7 @@
 
 pub mod access_log;
 pub mod acme;
+pub mod alert;
 pub mod audit;
 pub mod auth;
 pub mod cc;
@@ -25,6 +26,7 @@ use crate::state::AppState;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -32,7 +34,7 @@ use axum::{
 use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
-use tower_http::trace::TraceLayer;
+use tracing::Instrument;
 
 pub fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -42,6 +44,7 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health::health))
+        .route("/metrics", get(health::metrics))
         .route("/.well-known/acme-challenge/:token", get(acme::challenge))
         .route("/ready", get(health::ready))
         .nest(
@@ -129,6 +132,25 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/stats/by-domain", get(stats::by_domain))
                 .route("/stats/summary", get(stats::summary))
                 .route("/audit", get(audit::list))
+                .route(
+                    "/alert-channels",
+                    get(alert::list_channels).post(alert::create_channel),
+                )
+                .route(
+                    "/alert-channels/:id",
+                    put(alert::update_channel).delete(alert::delete_channel),
+                )
+                .route("/alert-channels/:id/test", post(alert::test_channel))
+                .route(
+                    "/alert-rules",
+                    get(alert::list_rules).post(alert::create_rule),
+                )
+                .route(
+                    "/alert-rules/:id",
+                    put(alert::update_rule).delete(alert::delete_rule),
+                )
+                .route("/alert-events", get(alert::list_events))
+                .route("/alerts/summary", get(alert::summary))
                 .route("/access-logs", get(access_log::list))
                 .route("/access-logs/report", post(access_log::report))
                 .route("/config", get(config::list_all_configs))
@@ -138,10 +160,31 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/cc/bans/:domain/:ip", delete(cc::remove)),
         )
         .fallback(not_found)
-        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(trace_http_request))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
         .with_state(state)
+}
+
+async fn trace_http_request(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let span = tracing::info_span!(
+        "http.request",
+        "otel.kind" = "server",
+        http.method = %method,
+        url.path = %path,
+        http.status_code = tracing::field::Empty
+    );
+    let started = std::time::Instant::now();
+    let response = next.run(request).instrument(span.clone()).await;
+    span.record("http.status_code", response.status().as_u16());
+    tracing::info!(
+        parent: &span,
+        latency_ms = started.elapsed().as_millis() as u64,
+        "http request completed"
+    );
+    response
 }
 
 async fn not_found(req: Request<Body>) -> Response {

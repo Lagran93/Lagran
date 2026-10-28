@@ -93,19 +93,11 @@ pub async fn request_ok<B: Serialize>(
     })
 }
 
-pub async fn post_json_ok<B: Serialize>(
-    url: &str,
-    body: &B,
-    token: &str,
-) -> Result<(), String> {
+pub async fn post_json_ok<B: Serialize>(url: &str, body: &B, token: &str) -> Result<(), String> {
     request_ok("POST", url, body, token).await
 }
 
-pub async fn put_json_ok<B: Serialize>(
-    url: &str,
-    body: &B,
-    token: &str,
-) -> Result<(), String> {
+pub async fn put_json_ok<B: Serialize>(url: &str, body: &B, token: &str) -> Result<(), String> {
     request_ok("PUT", url, body, token).await
 }
 
@@ -138,6 +130,38 @@ pub async fn request_json<T: DeserializeOwned, B: Serialize>(
     } else {
         last
     })
+}
+
+/// Public callback helper for alert notifications. The caller supplies all
+/// headers; this does not attach an edge agent token.
+pub async fn post_json_with_headers<B: Serialize>(
+    url: &str,
+    body: &B,
+    headers: &[(&str, &str)],
+) -> Result<(u16, Bytes), String> {
+    let bytes = Bytes::from(serde_json::to_vec(body).map_err(|e| e.to_string())?);
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(url)
+        .header("content-type", "application/json");
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder
+        .body(Full::new(bytes))
+        .map_err(|e| format!("build notification request {url}: {e}"))?;
+    let response = tokio::time::timeout(Duration::from_secs(10), client().request(req))
+        .await
+        .map_err(|_| format!("notification timeout: {url}"))?
+        .map_err(|e| format!("notification transport error {url}: {e}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| format!("notification body error {url}: {e}"))?
+        .to_bytes();
+    Ok((status, body))
 }
 
 fn preview(bytes: &Bytes) -> String {
