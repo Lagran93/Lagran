@@ -30,6 +30,8 @@ pub struct AppConfig {
     pub acme_staging_directory_url: String,
     /// Optional ACME account contact email.
     pub acme_contact_email: String,
+    /// Require image CAPTCHA on login and registration (default: true).
+    pub captcha_enabled: bool,
     /// When false, POST /auth/register is disabled (default: false).
     pub allow_register: bool,
     /// Seed demo@lagran.dev on startup (default: true for local dev).
@@ -84,6 +86,7 @@ impl Default for AppConfig {
             ),
             acme_contact_email: std::env::var("ACME_CONTACT_EMAIL").unwrap_or_default(),
             allow_register: env_bool("ALLOW_REGISTER", false),
+            captcha_enabled: env_bool("CAPTCHA_ENABLED", true),
             seed_demo: env_bool("SEED_DEMO", true),
             require_secure_secrets: env_bool("REQUIRE_SECURE_SECRETS", false),
             log_retention_days: std::env::var("LOG_RETENTION_DAYS")

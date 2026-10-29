@@ -39,7 +39,7 @@
         <select v-model="projectFilter" class="select">
           <option value="">全部项目</option>
           <option value="none">未归属项目</option>
-          <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
+          <option v-for="p in projects" :key="p.id" :value="p.id">{{ projectLabel(p) }}</option>
         </select>
         <span class="spacer" />
         <span class="text-muted" style="font-size: 13px">共 {{ filtered.length }} 个域名</span>
@@ -100,7 +100,7 @@
                     :disabled="!auth.isAdmin && !projects.length"
                     @change="onProjectChange(d, ($event.target as HTMLSelectElement).value)">
                     <option v-if="auth.isAdmin" value="">未归属</option>
-                    <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
+                    <option v-for="p in projects" :key="p.id" :value="p.id">{{ projectLabel(p) }}</option>
                   </select>
                 </td>
                 <td>
@@ -175,7 +175,7 @@
             <label class="field-label">所属项目</label>
             <select v-model="createForm.project_id" class="select">
               <option v-if="auth.isAdmin" value="">不关联项目（仅管理员可见）</option>
-              <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
+              <option v-for="p in projects" :key="p.id" :value="p.id">{{ projectLabel(p) }}</option>
             </select>
             <span class="field-hint">普通用户留空时会自动归入自己的「Default」项目。</span>
           </div>
@@ -355,6 +355,11 @@ const loading = ref(false)
 const submitting = ref(false)
 const domains = ref<any[]>([])
 const projects = ref<any[]>([])
+
+function projectLabel(project: any) {
+  const owner = project?.owner_email || project?.owner_name || ''
+  return owner ? `${project.name}（${owner}）` : project.name
+}
 
 const keyword = ref('')
 const statusFilter = ref('')

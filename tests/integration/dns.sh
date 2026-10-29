@@ -51,7 +51,7 @@ JSON
 echo "== control =="
 CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN=test-global-token GEOIP_JSON_PATH="$GEO_FILE" \
 DNS_TEST_SERVER="127.0.0.1:$DNS_PORT" \
-  ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
+  CAPTCHA_ENABLED=false ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
 CONTROL_PID=$!
 PIDS+=("$CONTROL_PID")
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null && break; sleep 0.5; done

@@ -51,7 +51,7 @@ MOCK_SLOW=1 "$MOCK_BIN" "$ORIGIN_A" >"$LOG_DIR/a.log" 2>&1 & A_PID=$!; PIDS+=($A
 "$MOCK_BIN" "$ORIGIN_C" >"$LOG_DIR/c.log" 2>&1 & PIDS+=($!)
 
 echo "== start control =="
-CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN=test-global ./target/debug/lagran-control \
+CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN=test-global CAPTCHA_ENABLED=false ./target/debug/lagran-control \
   >"$LOG_DIR/control.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null && break; sleep 0.5; done
 curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null || { echo "control did not start"; exit 1; }

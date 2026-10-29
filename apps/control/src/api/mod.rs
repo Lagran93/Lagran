@@ -57,6 +57,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/auth/login", post(auth::login))
                 .route("/auth/register", post(auth::register))
                 .route("/auth/config", get(auth::public_config))
+                .route("/auth/captcha", get(auth::captcha))
                 .route("/auth/me", get(auth::me).put(auth::update_me))
                 .route("/auth/me/password", put(auth::change_password))
                 .route("/users", get(user::list).post(user::create))

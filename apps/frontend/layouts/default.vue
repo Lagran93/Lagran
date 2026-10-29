@@ -36,7 +36,7 @@ const MENU: MenuGroup[] = [
       { label: '边缘节点', to: '/nodes', icon: 'node', admin: true },
       { label: '统计分析', to: '/stats', icon: 'stats' },
       { label: '大屏监控', to: '/monitor', icon: 'activity' },
-      { label: '告警中心', to: '/alerts', icon: 'alert', admin: true },
+      { label: '告警中心', to: '/alerts', icon: 'alert' },
       { label: '访问日志', to: '/access-logs', icon: 'logs' },
       { label: '操作审计', to: '/audit', icon: 'audit', admin: true },
     ],

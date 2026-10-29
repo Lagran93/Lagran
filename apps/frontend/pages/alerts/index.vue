@@ -31,12 +31,7 @@
       </div>
     </div>
 
-    <div v-if="!auth.isAdmin" class="card">
-      <EmptyState icon="shield" title="仅管理员可管理告警" text="请联系系统管理员配置告警规则和通知渠道。" />
-    </div>
-
-    <template v-else>
-      <div class="stat-grid">
+    <div class="stat-grid">
         <StatCard label="正在告警" :value="summary.firing" icon="alert" tone="red" />
         <StatCard label="已恢复" :value="summary.resolved" icon="check" tone="green" />
         <StatCard label="告警规则" :value="rules.length" icon="rules" />
@@ -203,7 +198,6 @@
           </div>
         </div>
       </div>
-    </template>
 
     <!-- rule modal -->
     <BaseModal
@@ -401,13 +395,15 @@ const pagedEvents = computed(() => {
   return events.value.slice(start, start + pageSize)
 })
 
-const metricOptions = [
-  { value: 'origin_unhealthy', label: '源站健康异常' },
-  { value: 'cert_expiring', label: '证书即将到期' },
-  { value: 'node_offline', label: '边缘节点离线' },
-  { value: 'cache_hit_ratio', label: '缓存命中率过低' },
-  { value: 'waf_spike', label: 'WAF 事件突增' },
-]
+const metricOptions = computed(() =>
+  [
+    { value: 'origin_unhealthy', label: '源站健康异常' },
+    { value: 'cert_expiring', label: '证书即将到期' },
+    { value: 'node_offline', label: '边缘节点离线' },
+    { value: 'cache_hit_ratio', label: '缓存命中率过低' },
+    { value: 'waf_spike', label: 'WAF 事件突增' },
+  ].filter((m) => auth.isAdmin || m.value !== 'node_offline'),
+)
 
 const ruleOpen = ref(false)
 const ruleEditing = ref<any>(null)

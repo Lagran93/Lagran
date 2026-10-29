@@ -32,7 +32,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CONTROL_BIND="127.0.0.1:$PORT" AGENT_TOKEN= ./target/debug/lagran-control \
+CONTROL_BIND="127.0.0.1:$PORT" AGENT_TOKEN= CAPTCHA_ENABLED=false ./target/debug/lagran-control \
   >"$LOG_DIR/control.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep .2; done

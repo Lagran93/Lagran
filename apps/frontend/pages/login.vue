@@ -80,6 +80,28 @@
             </div>
           </div>
 
+          <div v-if="captchaEnabled" class="field">
+            <label class="field-label" for="captcha">验证码</label>
+            <div class="captcha-row">
+              <input
+                id="captcha"
+                v-model="captchaCode"
+                class="input"
+                maxlength="5"
+                autocomplete="off"
+                placeholder="请输入右侧 5 位验证码"
+                required
+              />
+              <button class="captcha-image" type="button" title="刷新验证码" @click="loadCaptcha">
+                <img v-if="captchaImage" :src="captchaImage" alt="验证码" />
+                <span v-else>加载中…</span>
+              </button>
+              <button class="captcha-refresh" type="button" aria-label="刷新验证码" @click="loadCaptcha">
+                <AppIcon name="refresh" :size="16" />
+              </button>
+            </div>
+          </div>
+
           <div class="login-options">
             <label class="check">
               <input v-model="remember" type="checkbox" />
@@ -120,15 +142,38 @@ const password = ref('')
 const remember = ref(true)
 const showPassword = ref(false)
 const allowRegister = ref(false)
+const captchaEnabled = ref(false)
+const captchaId = ref('')
+const captchaCode = ref('')
+const captchaImage = ref('')
 const loading = ref(false)
 const error = ref('')
 
 const REMEMBER_KEY = 'lagran_last_email'
 
+async function loadCaptcha() {
+  captchaCode.value = ''
+  captchaImage.value = ''
+  try {
+    const res = await $fetch<{ captcha_id: string; image_svg: string; expires_in: number }>(
+      `${apiBase}/api/v1/auth/captcha`,
+    )
+    captchaId.value = res.captcha_id
+    captchaImage.value = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(res.image_svg)}`
+  } catch {
+    captchaId.value = ''
+    captchaImage.value = ''
+  }
+}
+
 async function onSubmit() {
   error.value = ''
   if (!email.value.trim() || !password.value) {
     error.value = '请输入邮箱与密码'
+    return
+  }
+  if (captchaEnabled.value && !captchaCode.value.trim()) {
+    error.value = '请输入验证码'
     return
   }
   loading.value = true
@@ -138,7 +183,12 @@ async function onSubmit() {
       user: { id: string; email: string; name: string; role?: string }
     }>(`${apiBase}/api/v1/auth/login`, {
       method: 'POST',
-      body: { email: email.value.trim(), password: password.value },
+      body: {
+        email: email.value.trim(),
+        password: password.value,
+        captcha_id: captchaId.value,
+        captcha_code: captchaCode.value.trim(),
+      },
     })
     auth.setSession(res.token, res.user)
     if (import.meta.client) {
@@ -152,6 +202,7 @@ async function onSubmit() {
       e?.data?.error ||
       e?.message ||
       '登录失败，请稍后重试'
+    if (captchaEnabled.value) await loadCaptcha()
   } finally {
     loading.value = false
   }
@@ -168,12 +219,16 @@ onMounted(async () => {
     if (saved) email.value = saved
   }
   try {
-    const cfg = await $fetch<{ allow_register: boolean }>(
+    const cfg = await $fetch<{ allow_register: boolean; captcha_enabled?: boolean }>(
       `${apiBase}/api/v1/auth/config`,
     )
     allowRegister.value = !!cfg.allow_register
+    captchaEnabled.value = cfg.captcha_enabled !== false
+    if (captchaEnabled.value) await loadCaptcha()
   } catch {
     allowRegister.value = false
+    captchaEnabled.value = true
+    await loadCaptcha()
   }
 })
 </script>
@@ -385,6 +440,54 @@ onMounted(async () => {
 .password-toggle:hover {
   color: var(--text);
   background: #f2f3f5;
+}
+
+.captcha-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.captcha-row .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.captcha-image {
+  height: 44px;
+  min-width: 132px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #f3f7ff;
+  overflow: hidden;
+  cursor: pointer;
+  flex: none;
+}
+
+.captcha-image img {
+  display: block;
+  width: 132px;
+  height: 44px;
+}
+
+.captcha-refresh {
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  color: var(--text-3);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.captcha-refresh:hover {
+  color: var(--brand);
+  border-color: var(--brand);
 }
 
 .login-options {

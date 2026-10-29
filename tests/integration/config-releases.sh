@@ -44,7 +44,7 @@ fi
 "$MOCK_BIN" "$ORIGIN_PORT" >"$LOG_DIR/origin.log" 2>&1 & PIDS+=($!)
 
 CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN=test-global ALERT_EVAL_SECS=60 \
-  ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 & PIDS+=($!)
+  CAPTCHA_ENABLED=false ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null && break; sleep 0.5; done
 TOKEN=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/login" \
   -H 'content-type: application/json' -d '{"email":"demo@lagran.dev","password":"demo123"}' | jq -r .token)

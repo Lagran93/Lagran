@@ -14,7 +14,7 @@
 
 ### 控制端 (`apps/control`)
 - 健康检查 `GET /health` / `GET /ready`
-- 注册 / 登录（bcrypt + JWT）、`GET /api/v1/auth/me`、个人资料与改密（`PUT /auth/me`、`PUT /auth/me/password`）
+- 注册 / 登录（bcrypt + JWT）、图片验证码（`CAPTCHA_ENABLED`，默认开启）、`GET /api/v1/auth/me`、个人资料与改密（`PUT /auth/me`、`PUT /auth/me/password`）
 - 用户管理（admin）：`/api/v1/users` 创建、角色调整、启用/禁用、重置密码、删除；禁止自降权/自禁用并保护最后一个管理员
 - 项目与成员（多租户）：`/api/v1/projects`、`/projects/{id}/members`，支持成员角色调整
 - 域名接入与管理：多源站池（权重/优先级/启用状态）、SSL、限流、CORS、防盗链、回源超时、自定义头
@@ -56,7 +56,8 @@
 - 可观测性：`GET /metrics` Prometheus 文本指标（控制面/数据库/域名/节点/源站健康/证书到期/告警）、
   可选 OTLP/HTTP Trace 导出；边缘 `GET /__lagran/metrics` 输出请求/命中/回源/流量指标
 - 告警中心：源站健康、证书到期、节点离线、缓存命中率、WAF 事件突增规则；邮件 SMTP、Webhook（可选 HMAC-SHA256 签名）、
-  Telegram 通知；事件去重、恢复通知、冷却时间与历史记录。Telegram 渠道支持自定义 API 反代地址和
+  Telegram 通知；事件去重、恢复通知、冷却时间与历史记录。普通用户可使用告警规则/渠道/事件，
+  但「边缘节点离线」规则仍仅管理员可见可管。Telegram 渠道支持自定义 API 反代地址和
   HTTP(S)/SOCKS5 代理，也会读取 `HTTPS_PROXY` / `ALL_PROXY`，适合无法直连 Telegram 的服务器
 
 ### 边缘端 (`apps/edge`)
@@ -82,7 +83,7 @@
 ### 前端 (`apps/frontend`)
 - 浅色管理控制台（Ant Design 风格、主色 `#1677ff`）：分组侧边栏 + 面包屑 + 表格/筛选/分页
 - 仪表盘 / 项目（含成员管理）/ 域名 / 域名详情 / 规则 / WAF 防护 / 节点管理（安装、启停、删除）/ 刷新 / 统计 / 告警中心 / 访问日志 / 审计 / 证书 / 设置
-- SPA 模式，登录态存 localStorage；管理员额外可见「边缘节点」「告警中心」「操作审计」
+- SPA 模式，登录态存 localStorage；告警中心对普通用户开放（节点离线规则除外），管理员额外可见「边缘节点」「操作审计」
 
 ## 快速启动
 

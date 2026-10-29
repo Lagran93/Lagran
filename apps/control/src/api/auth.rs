@@ -12,6 +12,10 @@ use uuid::Uuid;
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub captcha_id: String,
+    #[serde(default)]
+    pub captcha_code: String,
 }
 
 #[derive(Deserialize)]
@@ -19,6 +23,10 @@ pub struct RegisterRequest {
     pub email: String,
     pub password: String,
     pub name: Option<String>,
+    #[serde(default)]
+    pub captcha_id: String,
+    #[serde(default)]
+    pub captcha_code: String,
 }
 
 #[derive(Serialize)]
@@ -46,6 +54,14 @@ pub struct ErrorBody {
 #[derive(Serialize)]
 pub struct PublicAuthConfig {
     pub allow_register: bool,
+    pub captcha_enabled: bool,
+}
+
+#[derive(Serialize)]
+pub struct CaptchaResponse {
+    pub captcha_id: String,
+    pub image_svg: String,
+    pub expires_in: u64,
 }
 
 #[derive(Deserialize)]
@@ -80,7 +96,37 @@ pub(crate) fn to_user_info(user: repository::UserRow) -> UserInfo {
 pub async fn public_config(State(state): State<AppState>) -> Json<PublicAuthConfig> {
     Json(PublicAuthConfig {
         allow_register: state.config.allow_register,
+        captcha_enabled: state.config.captcha_enabled,
     })
+}
+
+pub async fn captcha(State(state): State<AppState>) -> Json<CaptchaResponse> {
+    let (captcha_id, image_svg, expires_in) = state.captcha.issue();
+    Json(CaptchaResponse {
+        captcha_id,
+        image_svg,
+        expires_in,
+    })
+}
+
+fn check_captcha(
+    state: &AppState,
+    id: &str,
+    code: &str,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if !state.config.captcha_enabled {
+        return Ok(());
+    }
+    if state.captcha.verify(id, code) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "验证码错误或已过期".into(),
+            }),
+        ))
+    }
 }
 
 pub async fn login(
@@ -88,6 +134,7 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorBody>)> {
     let email = normalize_email(&req.email);
+    check_captcha(&state, &req.captcha_id, &req.captcha_code)?;
     let limit_key = format!("login:{email}");
     if !state.login_limiter.check(&limit_key) {
         return Err((
@@ -172,6 +219,7 @@ pub async fn register(
         ));
     }
     let email = normalize_email(&req.email);
+    check_captcha(&state, &req.captcha_id, &req.captcha_code)?;
     if let Err(msg) = validate_email(&email) {
         return Err((
             StatusCode::BAD_REQUEST,

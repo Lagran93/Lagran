@@ -13,6 +13,7 @@ pub struct AppState {
     pub geo: crate::scheduler::GeoTable,
     pub schedule_ttl: u64,
     pub login_limiter: Arc<LoginLimiter>,
+    pub captcha: Arc<crate::service::captcha::CaptchaStore>,
 }
 
 impl AppState {
@@ -25,6 +26,7 @@ impl AppState {
             geo,
             schedule_ttl,
             login_limiter: Arc::new(LoginLimiter::new()),
+            captcha: Arc::new(crate::service::captcha::CaptchaStore::new()),
         }
     }
 }

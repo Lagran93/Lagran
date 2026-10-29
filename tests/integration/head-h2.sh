@@ -54,7 +54,7 @@ fi
 PIDS+=($!)
 
 CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN=test-global \
-  ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
+  CAPTCHA_ENABLED=false ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 80); do curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null && break; sleep 0.5; done
 curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null || { echo "control failed"; exit 1; }

@@ -16,6 +16,8 @@ pub struct ProjectDto {
     pub id: String,
     pub name: String,
     pub owner_id: String,
+    pub owner_email: String,
+    pub owner_name: String,
     pub domain_count: i64,
     pub created_at: String,
 }
@@ -50,11 +52,17 @@ pub struct UpdateMemberRequest {
     pub role: String,
 }
 
-fn to_dto(r: repository::ProjectRow) -> ProjectDto {
+async fn to_dto(state: &AppState, r: repository::ProjectRow) -> ProjectDto {
+    let owner = repository::find_user_by_id(&state.pool, r.owner_id)
+        .await
+        .ok()
+        .flatten();
     ProjectDto {
         id: r.id.to_string(),
         name: r.name,
         owner_id: r.owner_id.to_string(),
+        owner_email: owner.as_ref().map(|u| u.email.clone()).unwrap_or_default(),
+        owner_name: owner.as_ref().map(|u| u.name.clone()).unwrap_or_default(),
         domain_count: r.domain_count.unwrap_or(0),
         created_at: r.created_at.to_rfc3339(),
     }
@@ -102,7 +110,11 @@ pub async fn list(
         tracing::error!(error = %e, "list projects");
         db_error()
     })?;
-    Ok(Json(rows.into_iter().map(to_dto).collect()))
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(to_dto(&state, row).await);
+    }
+    Ok(Json(out))
 }
 
 pub async fn create(
@@ -132,7 +144,7 @@ pub async fn create(
         &row.id.to_string(),
     )
     .await;
-    Ok((StatusCode::CREATED, Json(to_dto(row))))
+    Ok((StatusCode::CREATED, Json(to_dto(&state, row).await)))
 }
 
 pub async fn get(
@@ -155,7 +167,7 @@ pub async fn get(
                 }),
             )
         })?;
-    Ok(Json(to_dto(row)))
+    Ok(Json(to_dto(&state, row).await))
 }
 
 pub async fn delete(

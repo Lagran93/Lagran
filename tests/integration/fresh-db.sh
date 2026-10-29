@@ -37,7 +37,7 @@ trap cleanup EXIT
 
 DATABASE_URL="postgres://$PGUSER:$PGPASS@127.0.0.1:5432/$DBNAME" \
 CONTROL_BIND="127.0.0.1:$PORT" \
-./target/debug/lagran-control >/tmp/lagran-fresh.log 2>&1 &
+CAPTCHA_ENABLED=false ./target/debug/lagran-control >/tmp/lagran-fresh.log 2>&1 &
 PID=$!
 
 for _ in $(seq 1 60); do

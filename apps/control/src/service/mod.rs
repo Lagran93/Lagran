@@ -1,6 +1,8 @@
 //! services
 
 pub mod agent_http;
+pub mod captcha;
+
 pub mod alerting;
 pub mod auth_service;
 pub mod cert_service;
