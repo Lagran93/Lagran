@@ -222,6 +222,22 @@ fn validate_channel(kind: &str, config: &Value) -> Result<(), String> {
             if string("bot_token").is_empty() || string("chat_id").is_empty() {
                 return Err("telegram bot_token and chat_id are required".into());
             }
+            let api_base = string("api_base");
+            if !api_base.is_empty()
+                && !api_base.starts_with("http://")
+                && !api_base.starts_with("https://")
+            {
+                return Err("telegram api_base must start with http:// or https://".into());
+            }
+            let proxy = string("proxy");
+            if !proxy.is_empty()
+                && !proxy.starts_with("http://")
+                && !proxy.starts_with("https://")
+                && !proxy.starts_with("socks5://")
+                && !proxy.starts_with("socks5h://")
+            {
+                return Err("telegram proxy must be an http(s) or socks5 URL".into());
+            }
         }
         "email" => {
             if string("smtp_host").is_empty() || string("from").is_empty() {

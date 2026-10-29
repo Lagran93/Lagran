@@ -34,6 +34,10 @@ pub async fn prefetch_handler(
     }
     let mut warmed = 0;
     let mut failed = 0;
+    let scheme = match state.domains.get(&domain).await {
+        Some(entry) if entry.ssl_enabled => "https",
+        _ => "http",
+    };
     for raw in req.paths {
         let mut path = raw.trim().to_string();
         if path.is_empty() {
@@ -46,6 +50,7 @@ pub async fn prefetch_handler(
             .method("GET")
             .uri(&path)
             .header("host", &domain)
+            .header("x-forwarded-proto", scheme)
             .header("user-agent", "lagran-prefetch/1.0")
             .body(Body::empty())
         {

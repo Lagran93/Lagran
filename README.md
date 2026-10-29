@@ -56,7 +56,8 @@
 - 可观测性：`GET /metrics` Prometheus 文本指标（控制面/数据库/域名/节点/源站健康/证书到期/告警）、
   可选 OTLP/HTTP Trace 导出；边缘 `GET /__lagran/metrics` 输出请求/命中/回源/流量指标
 - 告警中心：源站健康、证书到期、节点离线、缓存命中率、WAF 事件突增规则；邮件 SMTP、Webhook（可选 HMAC-SHA256 签名）、
-  Telegram 通知；事件去重、恢复通知、冷却时间与历史记录
+  Telegram 通知；事件去重、恢复通知、冷却时间与历史记录。Telegram 渠道支持自定义 API 反代地址和
+  HTTP(S)/SOCKS5 代理，也会读取 `HTTPS_PROXY` / `ALL_PROXY`，适合无法直连 Telegram 的服务器
 
 ### 边缘端 (`apps/edge`)
 - **Pingora 公共网络层**：HTTP/1.1 + HTTP/2、HTTP/HTTPS 监听、SNI 动态证书、连接管理；

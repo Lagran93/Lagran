@@ -201,6 +201,23 @@ check "prefetch warmed" "$(printf '%s' "$PREFETCH" | jq -r '.warmed')" "1"
 get "/prefetched" >/dev/null
 check "prefetched path is HIT" "$(hdr x-cache)" "HIT"
 
+echo "== edge prefetch on https domain =="
+TLS_PREFETCH=$(curl -s -X POST "http://127.0.0.1:$EDGE_PORT/__lagran/prefetch" \
+  -H "x-lagran-agent-token: $NODE_TOKEN" -H 'content-type: application/json' \
+  -d "{\"domain\":\"$TLS_DOMAIN\",\"paths\":[\"/tls-prefetched\"]}")
+check "https prefetch warmed" "$(printf '%s' "$TLS_PREFETCH" | jq -r '.warmed')" "1"
+check "https prefetch has no failure" "$(printf '%s' "$TLS_PREFETCH" | jq -r '.failed')" "0"
+api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/prefetch" \
+  -d "{\"domain\":\"$TLS_DOMAIN\",\"paths\":[\"/tls-worker\"]}" >/dev/null
+TLS_TASK=""
+for _ in $(seq 1 30); do
+  TLS_TASK=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/prefetch/tasks" | \
+    jq -r --arg d "$TLS_DOMAIN" '.[] | select(.domain==$d and .url_path=="/tls-worker") | .status' | head -1)
+  [[ "$TLS_TASK" == "done" || "$TLS_TASK" == "failed" ]] && break
+  sleep 1
+done
+check "control https prefetch completes" "$TLS_TASK" "done"
+
 echo "== control prefetch worker =="
 api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/prefetch" \
   -d "{\"domain\":\"$DOMAIN\",\"paths\":[\"/workerwarm\"]}" >/dev/null

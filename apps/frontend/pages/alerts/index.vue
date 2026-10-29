@@ -305,6 +305,24 @@
             <label class="field-label">Chat ID <span class="req">*</span></label>
             <input v-model="channelForm.telegram_chat_id" class="input" placeholder="-1001234567890" />
           </div>
+          <div class="field">
+            <label class="field-label">API 地址（可选）</label>
+            <input
+              v-model="channelForm.telegram_api_base"
+              class="input"
+              placeholder="默认 https://api.telegram.org"
+            />
+            <span class="field-hint">如果服务器无法直连 Telegram，可填写自建反向代理或中转地址。</span>
+          </div>
+          <div class="field">
+            <label class="field-label">代理（可选）</label>
+            <input
+              v-model="channelForm.telegram_proxy"
+              class="input"
+              placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+            />
+            <span class="field-hint">留空时自动读取 HTTPS_PROXY / ALL_PROXY 环境变量。</span>
+          </div>
         </template>
 
         <template v-else>
@@ -413,6 +431,8 @@ const channelForm = ref({
   webhook_secret: '',
   telegram_bot_token: '',
   telegram_chat_id: '',
+  telegram_api_base: '',
+  telegram_proxy: '',
   email_host: '',
   email_port: 587,
   email_tls: 'starttls',
@@ -617,6 +637,8 @@ function resetChannelForm() {
     webhook_secret: '',
     telegram_bot_token: '',
     telegram_chat_id: '',
+    telegram_api_base: '',
+    telegram_proxy: '',
     email_host: '',
     email_port: 587,
     email_tls: 'starttls',
@@ -648,6 +670,8 @@ function openEditChannel(channel: any) {
   } else if (channel.kind === 'telegram') {
     channelForm.value.telegram_bot_token = cfg.bot_token || ''
     channelForm.value.telegram_chat_id = cfg.chat_id || ''
+    channelForm.value.telegram_api_base = cfg.api_base || ''
+    channelForm.value.telegram_proxy = cfg.proxy || ''
   } else {
     channelForm.value.email_host = cfg.smtp_host || ''
     channelForm.value.email_port = cfg.smtp_port || 587
@@ -673,6 +697,8 @@ async function saveChannel() {
     config = {
       bot_token: channelForm.value.telegram_bot_token.trim(),
       chat_id: channelForm.value.telegram_chat_id.trim(),
+      api_base: channelForm.value.telegram_api_base.trim(),
+      proxy: channelForm.value.telegram_proxy.trim(),
     }
   } else {
     config = {

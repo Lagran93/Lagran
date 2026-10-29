@@ -21,6 +21,10 @@ struct WebhookConfig {
 struct TelegramConfig {
     bot_token: String,
     chat_id: String,
+    #[serde(default)]
+    api_base: String,
+    #[serde(default)]
+    proxy: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,10 +119,19 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
     if cfg.bot_token.trim().is_empty() || cfg.chat_id.trim().is_empty() {
         return Err("telegram bot_token and chat_id are required".into());
     }
-    let url = format!(
-        "https://api.telegram.org/bot{}/sendMessage",
-        cfg.bot_token.trim()
-    );
+    let base = if cfg.api_base.trim().is_empty() {
+        std::env::var("TELEGRAM_API_BASE")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "https://api.telegram.org".to_string())
+    } else {
+        cfg.api_base.trim().trim_end_matches('/').to_string()
+    };
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err("telegram api_base must start with http:// or https://".into());
+    }
+    let url = format!("{base}/bot{}/sendMessage", cfg.bot_token.trim());
     let text = format!("<b>{}</b>\n{}", html_escape(subject), html_escape(message));
     let body = json!({
         "chat_id": cfg.chat_id.trim(),
@@ -126,18 +139,46 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
         "parse_mode": "HTML",
         "disable_web_page_preview": true,
     });
-    let (status, body) = agent_http::post_json_with_headers(&url, &body, &[])
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("lagran-control/0.1");
+    let proxy = if cfg.proxy.trim().is_empty() {
+        ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    } else {
+        Some(cfg.proxy.trim().to_string())
+    };
+    if let Some(proxy) = proxy {
+        let proxy = reqwest::Proxy::all(&proxy)
+            .map_err(|e| format!("invalid telegram proxy: {e}"))?;
+        builder = builder.proxy(proxy);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("telegram client error: {e}"))?;
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
         .await
-        .map_err(|_| "telegram request failed".to_string())?;
-    if (200..300).contains(&status) {
+        .map_err(|e| {
+            format!(
+                "telegram request failed: {e}（请检查服务器到 Telegram 的网络，或在渠道中配置代理/API 地址）"
+            )
+        })?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status.is_success() {
         Ok(())
     } else {
         Err(format!(
-            "telegram HTTP {status}: {}",
-            String::from_utf8_lossy(&body)
-                .chars()
-                .take(200)
-                .collect::<String>()
+            "telegram HTTP {}: {}",
+            status.as_u16(),
+            body.chars().take(300).collect::<String>()
         ))
     }
 }
@@ -217,3 +258,36 @@ fn hex(bytes: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn telegram_honors_custom_api_base() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = json!({
+            "bot_token": "123:test",
+            "chat_id": "456",
+            "api_base": format!("http://{addr}"),
+        });
+        send_telegram(&config, "subject", "message").await.unwrap();
+        server.await.unwrap();
+    }
+}
+
