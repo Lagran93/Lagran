@@ -1,16 +1,14 @@
 <template>
-  <div class="monitor-page">
+  <div class="monitor-page analytics-page">
     <div class="monitor-actions">
       <div>
-        <div class="monitor-title">全域实时监控</div>
-        <div class="monitor-sub">近 {{ rangeHours }} 小时 · 每 10 秒刷新 · 最后更新 {{ updatedAt }}</div>
+        <div class="monitor-title">实时监控</div>
+        <div class="monitor-sub">
+          实时 5 分钟 · 近 1 小时趋势 · 每 10 秒刷新 · 最后更新 {{ updatedAt }}
+        </div>
       </div>
       <div class="flex-center gap-8">
-        <select v-model.number="rangeHours" class="select monitor-select" @change="load">
-          <option :value="1">近 1 小时</option>
-          <option :value="24">近 24 小时</option>
-          <option :value="168">近 7 天</option>
-        </select>
+        <span class="live-badge"><i /> LIVE</span>
         <button class="btn btn-default btn-sm" type="button" @click="fullscreen">
           {{ isFull ? '退出全屏' : '全屏' }}
         </button>
@@ -19,40 +17,42 @@
 
     <div class="wall-stats">
       <div class="wall-card">
-        <div class="wall-label">总请求</div>
-        <div class="wall-value">{{ formatNumber(stats.total_requests) }}</div>
-        <div class="wall-hint">命中 {{ formatNumber(stats.cache_hits) }}</div>
+        <div class="wall-label">{{ realtime.enabled ? '实时请求' : '请求 · 近 1 小时' }}</div>
+        <div class="wall-value">{{ formatNumber(live.requests) }}</div>
+        <div class="wall-hint">{{ realtime.enabled ? '近 5 分钟' : '近 1 小时' }} · 1 小时 {{ formatNumber(hourStats.requests) }}</div>
       </div>
       <div class="wall-card">
         <div class="wall-label">缓存命中率</div>
-        <div class="wall-value accent">{{ percent(stats.hit_ratio) }}</div>
-        <div class="wall-hint">未命中 {{ formatNumber(stats.cache_misses) }}</div>
+        <div class="wall-value accent">{{ percent(live.hit_ratio) }}</div>
+        <div class="wall-hint">1 小时 {{ percent(hourStats.hit_ratio) }}</div>
       </div>
       <div class="wall-card">
         <div class="wall-label">出流量</div>
-        <div class="wall-value">{{ formatBytes(stats.bytes_sent) }}</div>
-        <div class="wall-hint">过去 {{ rangeHours }} 小时</div>
+        <div class="wall-value">{{ formatBytes(live.bytes) }}</div>
+        <div class="wall-hint">1 小时 {{ formatBytes(hourStats.bytes) }}</div>
       </div>
       <div class="wall-card">
         <div class="wall-label">在线节点</div>
-        <div class="wall-value accent2">{{ stats.online_nodes }}</div>
-        <div class="wall-hint">加速域名 {{ stats.domain_count }}</div>
+        <div class="wall-value accent2">{{ onlineNodes }}</div>
+        <div class="wall-hint">活跃域名 {{ live.domain_count }}</div>
       </div>
     </div>
 
     <div class="wall-grid">
       <div class="wall-card chart-card">
         <div class="wall-card-head">
-          <span>请求趋势</span>
+          <span>近 1 小时请求趋势</span>
           <span class="wall-legend"><i /> 当前 <i class="prev" /> 上一时段</span>
         </div>
         <TrafficChart :current="series" :previous="previousSeries" metric="requests" :height="300" color="#4b9bff" />
       </div>
 
       <div class="wall-card">
-        <div class="wall-card-head"><span>域名流量 TOP</span></div>
+        <div class="wall-card-head">
+          <span>{{ topIsLive ? '实时域名 TOP · 5 分钟' : '域名流量 TOP · 1 小时' }}</span>
+        </div>
         <div class="top-list">
-          <div v-for="(d, i) in byDomain.slice(0, 8)" :key="d.domain" class="top-row">
+          <div v-for="(d, i) in topDomains.slice(0, 8)" :key="d.domain" class="top-row">
             <span class="rank" :class="{ hot: i < 3 }">{{ i + 1 }}</span>
             <span class="top-domain">{{ d.domain }}</span>
             <span class="top-bar">
@@ -60,7 +60,7 @@
             </span>
             <span class="top-num">{{ formatNumber(d.requests) }}</span>
           </div>
-          <div v-if="!byDomain.length" class="wall-empty">暂无数据</div>
+          <div v-if="!topDomains.length" class="wall-empty">暂无数据</div>
         </div>
       </div>
     </div>
@@ -98,29 +98,72 @@ definePageMeta({ layout: 'monitor' })
 
 const api = useApi()
 
-const rangeHours = ref(24)
-const stats = ref<any>({ total_requests: 0, cache_hits: 0, cache_misses: 0, bytes_sent: 0, hit_ratio: 0, online_nodes: 0, domain_count: 0 })
 const series = ref<any[]>([])
 const previousSeries = ref<any[]>([])
 const byDomain = ref<any[]>([])
+const realtime = ref<any>({
+  enabled: false,
+  minutes: 5,
+  requests: 0,
+  cache_hits: 0,
+  cache_misses: 0,
+  bytes_sent: 0,
+  hit_ratio: 0,
+  domain_count: 0,
+  domains: [],
+})
 const nodes = ref<any[]>([])
 const health = ref<any[]>([])
 const updatedAt = ref('')
 const isFull = ref(false)
 let timer: ReturnType<typeof setInterval> | null = null
 
-const maxDomain = computed(() => Math.max(1, ...byDomain.value.map((d) => d.requests || 0)))
+const hourStats = computed(() => totals(series.value))
+const onlineNodes = computed(() => nodes.value.filter((n) => n.status === 'online').length)
+const topIsLive = computed(() => realtime.value.enabled && realtime.value.domains.length > 0)
+const topDomains = computed(() =>
+  topIsLive.value ? realtime.value.domains : byDomain.value,
+)
+const live = computed(() =>
+  realtime.value.enabled
+    ? {
+        requests: realtime.value.requests,
+        hit_ratio: realtime.value.hit_ratio,
+        bytes: realtime.value.bytes_sent,
+        domain_count: realtime.value.domain_count ?? realtime.value.domains.length,
+      }
+    : {
+        requests: hourStats.value.requests,
+        hit_ratio: hourStats.value.hit_ratio,
+        bytes: hourStats.value.bytes,
+        domain_count: byDomain.value.length,
+      },
+)
+const maxDomain = computed(() => Math.max(1, ...topDomains.value.map((d) => d.requests || 0)))
+
+function totals(points: any[]) {
+  const requests = points.reduce((sum, p) => sum + (p.requests || 0), 0)
+  const hits = points.reduce((sum, p) => sum + (p.cache_hits || 0), 0)
+  const misses = points.reduce((sum, p) => sum + (p.cache_misses || 0), 0)
+  const bytes = points.reduce((sum, p) => sum + (p.bytes_sent || 0), 0)
+  return {
+    requests,
+    hits,
+    misses,
+    bytes,
+    hit_ratio: hits + misses ? hits / (hits + misses) : 0,
+  }
+}
 
 async function load() {
-  const bucket = rangeHours.value <= 1 ? 60 : rangeHours.value <= 24 ? 1800 : 3600
-  const [s, ts, bd, endpoints, hs] = await Promise.all([
-    api.get<any>('/api/v1/stats/summary').catch(() => null),
-    api.get<any>(`/api/v1/stats/timeseries?hours=${rangeHours.value}&bucket=${bucket}&compare=true`).catch(() => null),
-    api.get<any[]>('/api/v1/stats/by-domain').catch(() => []),
+  const [rt, ts, bd, endpoints, hs] = await Promise.all([
+    api.get<any>('/api/v1/stats/realtime?minutes=5').catch(() => null),
+    api.get<any>('/api/v1/stats/timeseries?hours=1&bucket=60&compare=true').catch(() => null),
+    api.get<any[]>('/api/v1/stats/by-domain?hours=1').catch(() => []),
     api.get<any>('/api/v1/edge-endpoints').catch(() => null),
     api.get<any[]>('/api/v1/origin-health').catch(() => []),
   ])
-  if (s) stats.value = s
+  if (rt) realtime.value = rt
   series.value = ts?.current || []
   previousSeries.value = ts?.previous || []
   byDomain.value = bd || []
@@ -175,6 +218,35 @@ onUnmounted(() => {
   margin-top: 4px;
   font-size: 12px;
   color: #7f92ad;
+}
+
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border: 1px solid rgba(61, 220, 132, 0.28);
+  border-radius: 999px;
+  background: rgba(61, 220, 132, 0.08);
+  color: #7ef0b0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.live-badge i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3ddc84;
+  box-shadow: 0 0 8px rgba(61, 220, 132, 0.7);
+  animation: live-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes live-pulse {
+  50% {
+    opacity: 0.35;
+  }
 }
 
 .monitor-select {

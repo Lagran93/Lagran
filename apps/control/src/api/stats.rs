@@ -124,6 +124,7 @@ pub struct RealtimeStats {
     pub cache_misses: u64,
     pub bytes_sent: u64,
     pub hit_ratio: f64,
+    pub domain_count: usize,
     pub domains: Vec<RealtimeDomain>,
 }
 
@@ -198,6 +199,7 @@ pub async fn realtime(
         )
         .collect();
     domain_rows.sort_by(|a, b| b.requests.cmp(&a.requests));
+    let domain_count = domain_rows.len();
     domain_rows.truncate(20);
     Json(RealtimeStats {
         enabled: true,
@@ -211,6 +213,7 @@ pub async fn realtime(
         } else {
             0.0
         },
+        domain_count,
         domains: domain_rows,
     })
 }
@@ -224,6 +227,7 @@ fn empty_realtime(minutes: i64, enabled: bool) -> RealtimeStats {
         cache_misses: 0,
         bytes_sent: 0,
         hit_ratio: 0.0,
+        domain_count: 0,
         domains: Vec::new(),
     }
 }
@@ -316,6 +320,11 @@ fn points(rows: Vec<(chrono::DateTime<chrono::Utc>, i64, i64, i64, i64)>) -> Vec
         .collect()
 }
 
+#[derive(Deserialize)]
+pub struct ByDomainQuery {
+    pub hours: Option<i32>,
+}
+
 #[derive(Serialize)]
 pub struct DomainMetricsDto {
     pub domain: String,
@@ -326,14 +335,19 @@ pub struct DomainMetricsDto {
     pub hit_ratio: f64,
 }
 
-pub async fn by_domain(State(state): State<AppState>, actor: Actor) -> Json<Vec<DomainMetricsDto>> {
+pub async fn by_domain(
+    State(state): State<AppState>,
+    actor: Actor,
+    Query(query): Query<ByDomainQuery>,
+) -> Json<Vec<DomainMetricsDto>> {
+    let hours = query.hours.unwrap_or(24).clamp(1, 168);
     let rows = if actor.admin() {
-        repository::metrics_by_domain(&state.pool)
+        repository::metrics_by_domain(&state.pool, hours)
             .await
             .unwrap_or_default()
     } else {
         let names = visible_names(&state, &actor).await;
-        repository::metrics_by_domain_for(&state.pool, &names)
+        repository::metrics_by_domain_for(&state.pool, &names, hours)
             .await
             .unwrap_or_default()
     };

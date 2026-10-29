@@ -1198,6 +1198,7 @@ pub async fn sum_metrics_for(
 pub async fn metrics_by_domain_for(
     pool: &PgPool,
     hosts: &[String],
+    hours: i32,
 ) -> sqlx::Result<Vec<(String, i64, i64, i64, i64)>> {
     sqlx::query_as(
         r#"
@@ -1207,13 +1208,14 @@ pub async fn metrics_by_domain_for(
                COALESCE(SUM(cache_misses), 0)::bigint,
                COALESCE(SUM(bytes_sent), 0)::bigint
         FROM edge_metrics
-        WHERE reported_at > NOW() - INTERVAL '24 hours'
+        WHERE reported_at > NOW() - make_interval(hours => $2)
           AND domain = ANY($1)
         GROUP BY 1
         ORDER BY 2 DESC
         "#,
     )
     .bind(hosts)
+    .bind(hours)
     .fetch_all(pool)
     .await
 }
@@ -1945,7 +1947,10 @@ pub async fn list_prefetch(
     .await
 }
 
-pub async fn metrics_by_domain(pool: &PgPool) -> sqlx::Result<Vec<(String, i64, i64, i64, i64)>> {
+pub async fn metrics_by_domain(
+    pool: &PgPool,
+    hours: i32,
+) -> sqlx::Result<Vec<(String, i64, i64, i64, i64)>> {
     sqlx::query_as(
         r#"
         SELECT COALESCE(NULLIF(domain, ''), '(unknown)') AS domain,
@@ -1954,11 +1959,12 @@ pub async fn metrics_by_domain(pool: &PgPool) -> sqlx::Result<Vec<(String, i64, 
                COALESCE(SUM(cache_misses), 0)::bigint,
                COALESCE(SUM(bytes_sent), 0)::bigint
         FROM edge_metrics
-        WHERE reported_at > NOW() - INTERVAL '24 hours'
+        WHERE reported_at > NOW() - make_interval(hours => $1)
         GROUP BY 1
         ORDER BY 2 DESC
         "#,
     )
+    .bind(hours)
     .fetch_all(pool)
     .await
 }

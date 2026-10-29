@@ -101,6 +101,9 @@ onUnmounted(() => {
 }
 
 .monitor-content {
+  width: 100%;
+  max-width: 2800px;
+  margin: 0 auto;
   padding: 22px 28px 32px;
 }
 

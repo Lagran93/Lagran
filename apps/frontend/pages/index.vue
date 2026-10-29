@@ -1,5 +1,5 @@
 <template>
-  <div class="page">
+  <div class="page analytics-page">
     <div class="page-head">
       <div>
         <div class="page-title">仪表盘</div>
@@ -107,46 +107,62 @@
         <div class="card">
           <div class="card-head">
             <div>
-              <div class="card-title">源站健康</div>
-              <div class="card-desc">边缘节点每 30 秒探测一次源站可用性</div>
+              <div class="card-title">运行关注</div>
+              <div class="card-desc">只展示需要处理的异常，健康明细请前往实时监控</div>
             </div>
             <div class="card-extra">
-              <NuxtLink to="/stats" class="link-btn">查看统计</NuxtLink>
+              <NuxtLink to="/monitor" class="link-btn">实时监控</NuxtLink>
             </div>
           </div>
-          <div v-if="health.length" class="table-wrap">
-            <table class="table">
-              <thead>
-                <tr>
-                  <th>域名</th>
-                  <th>状态</th>
-                  <th>延迟</th>
-                  <th>最近检查</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="h in health.slice(0, 5)" :key="h.domain_name">
-                  <td>
-                    <div class="cell-main">{{ h.domain_name }}</div>
-                    <div class="cell-sub mono">{{ h.origin_url }}</div>
-                  </td>
-                  <td>
-                    <StatusTag :tone="h.healthy ? 'success' : 'danger'" dot>
-                      {{ h.healthy ? '健康' : '异常' }}
-                    </StatusTag>
-                  </td>
-                  <td class="num">{{ h.latency_ms }} ms</td>
-                  <td class="text-muted">{{ fromNow(h.last_check_at) }}</td>
-                </tr>
-              </tbody>
-            </table>
+          <div class="card-body attention-body">
+            <div class="attention-summary">
+              <div>
+                <span class="attention-num" :class="{ danger: unhealthy.length }">{{ unhealthy.length }}</span>
+                <span>异常源站</span>
+              </div>
+              <div v-if="auth.isAdmin">
+                <span class="attention-num" :class="{ danger: offlineNodes }">{{ offlineNodes }}</span>
+                <span>离线节点</span>
+              </div>
+              <div>
+                <span class="attention-num">{{ health.length }}</span>
+                <span>探测源站</span>
+              </div>
+            </div>
+
+            <div v-if="unhealthy.length || (auth.isAdmin && offlineNodes)" class="attention-list">
+              <NuxtLink
+                v-for="h in unhealthy.slice(0, 3)"
+                :key="h.domain_name + h.origin_url"
+                to="/domains"
+                class="attention-row"
+              >
+                <StatusTag tone="danger" dot>异常</StatusTag>
+                <span class="attention-main">
+                  <strong>{{ h.domain_name }}</strong>
+                  <small>{{ h.origin_url }} · {{ h.last_error || '探测失败' }}</small>
+                </span>
+                <span class="attention-meta">{{ h.latency_ms }} ms</span>
+              </NuxtLink>
+              <NuxtLink
+                v-for="n in auth.isAdmin ? nodes.filter(item => item.status !== 'online').slice(0, 3) : []"
+                :key="n.id"
+                to="/nodes"
+                class="attention-row"
+              >
+                <StatusTag tone="warning" dot>离线</StatusTag>
+                <span class="attention-main">
+                  <strong>{{ n.name }}</strong>
+                  <small>{{ n.region || '默认区域' }} · 节点未上报心跳</small>
+                </span>
+                <span class="attention-meta">{{ n.last_heartbeat ? fromNow(n.last_heartbeat) : '—' }}</span>
+              </NuxtLink>
+            </div>
+            <div v-else class="attention-clear">
+              <AppIcon name="check" :size="16" />
+              当前没有异常源站或离线节点
+            </div>
           </div>
-          <EmptyState
-            v-else
-            icon="shield"
-            title="暂无源站探测数据"
-            text="边缘节点启动并同步到域名后，约 30 秒内会上报源站健康状态。"
-          />
         </div>
       </div>
 
@@ -222,7 +238,7 @@
           </div>
         </div>
 
-        <div class="card">
+        <div v-if="!domains.length" class="card">
           <div class="card-head">
             <div class="card-title">接入提示</div>
           </div>
@@ -266,6 +282,7 @@ const projects = ref<any[]>([])
 
 const onlineNodes = computed(() => nodes.value.filter(n => n.status === 'online').length)
 const offlineNodes = computed(() => nodes.value.filter(n => n.status !== 'online').length)
+const unhealthy = computed(() => health.value.filter(h => !h.healthy))
 
 async function load() {
   loading.value = true
@@ -293,6 +310,96 @@ onMounted(load)
 </script>
 
 <style scoped>
+.attention-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.attention-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 28px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.attention-summary > div {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.attention-num {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.attention-num.danger {
+  color: var(--danger);
+}
+
+.attention-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.attention-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  min-width: 0;
+}
+
+.attention-row:hover {
+  border-color: var(--border-strong);
+  background: var(--bg);
+}
+
+.attention-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.attention-main strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.attention-main small {
+  color: var(--text-3);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attention-meta {
+  color: var(--text-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.attention-clear {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 4px;
+  color: var(--success);
+  font-size: 13px;
+}
+
 .quick-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

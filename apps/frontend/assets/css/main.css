@@ -441,7 +441,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  /* flex-wrap: wrap; */
 }
 
 /* ------------------------------------------------------------------ card */
@@ -1834,5 +1834,85 @@ html[data-theme='dark'] ::-webkit-scrollbar-thumb {
 
   .topbar-right .user-chip>svg {
     display: none;
+  }
+}
+
+/* ------------------------------------------------- analytics pages (2K/4K) */
+
+@media (min-width: 1920px) {
+
+  .analytics-page .page-title,
+  .monitor-page.analytics-page .monitor-title {
+    font-size: 24px;
+  }
+
+  .analytics-page .page-desc,
+  .monitor-page.analytics-page .monitor-sub {
+    font-size: 13px;
+  }
+
+  .analytics-page .card-title {
+    font-size: 15px;
+  }
+
+  .analytics-page .card-desc {
+    font-size: 12px;
+  }
+
+  .analytics-page .stat-value {
+    font-size: 30px;
+  }
+
+  .analytics-page .stat-label {
+    font-size: 13px;
+  }
+
+  .analytics-page .stat-hint {
+    font-size: 12px;
+  }
+
+  .analytics-page .table {
+    font-size: 14px;
+  }
+
+  .monitor-page.analytics-page .wall-value {
+    font-size: 32px;
+  }
+
+  .monitor-page.analytics-page .wall-label,
+  .monitor-page.analytics-page .wall-hint {
+    font-size: 12px;
+  }
+
+  .analytics-page .node-num {
+    font-size: 22px;
+  }
+
+  .stats-page.analytics-page .range-metric>b {
+    font-size: 24px;
+  }
+}
+
+@media (min-width: 2560px) {
+
+  .analytics-page .page-title,
+  .monitor-page.analytics-page .monitor-title {
+    font-size: 26px;
+  }
+
+  .analytics-page .stat-value {
+    font-size: 32px;
+  }
+
+  .monitor-page.analytics-page .wall-value {
+    font-size: 34px;
+  }
+
+  .analytics-page .table {
+    font-size: 15px;
+  }
+
+  .stats-page.analytics-page .range-metric>b {
+    font-size: 26px;
   }
 }
