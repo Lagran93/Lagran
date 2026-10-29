@@ -19,8 +19,16 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedSession {
+    role: String,
+    is_active: bool,
+    token_version: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct Actor {
@@ -71,15 +79,45 @@ impl FromRequestParts<AppState> for Actor {
             .map_err(|_| ActorError::unauthorized("unauthorized"))?;
         let id = Uuid::parse_str(&user.0.sub)
             .map_err(|_| ActorError::unauthorized("invalid token subject"))?;
-        let (role, is_active, token_version) =
-            repository::get_user_session(&state.pool, id)
+        let session_key = format!("lagran:session:{id}");
+        let redis = state.redis.as_deref();
+        let cached = if let Some(redis) = redis {
+            redis.get_json::<CachedSession>(&session_key).await
+        } else {
+            None
+        };
+        let (role, is_active, token_version) = if let Some(cached) = cached {
+            (cached.role, cached.is_active, cached.token_version)
+        } else {
+            let fresh = repository::get_user_session(&state.pool, id)
                 .await
                 .map_err(|_| ActorError::internal())?
                 .ok_or_else(|| ActorError::unauthorized("user no longer exists"))?;
+            if let Some(redis) = redis {
+                let _ = redis
+                    .set_json(
+                        &session_key,
+                        &CachedSession {
+                            role: fresh.0.clone(),
+                            is_active: fresh.1,
+                            token_version: fresh.2,
+                        },
+                        state.config.redis_session_ttl_secs,
+                    )
+                    .await;
+            }
+            fresh
+        };
         if !is_active {
+            if let Some(redis) = redis {
+                redis.del(&session_key).await;
+            }
             return Err(ActorError::unauthorized("account is disabled"));
         }
         if user.0.ver != token_version {
+            if let Some(redis) = redis {
+                redis.del(&session_key).await;
+            }
             return Err(ActorError::unauthorized("session expired"));
         }
         Ok(Actor {

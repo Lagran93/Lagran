@@ -285,6 +285,9 @@ pub async fn update(
     .await
     .map_err(|_| db_error())?
     .ok_or_else(|| not_found())?;
+    if let Some(redis) = state.redis.as_deref() {
+        redis.invalidate_session(uid).await;
+    }
     let _ = repository::insert_audit(
         &state.pool,
         &actor.email,
@@ -321,6 +324,9 @@ pub async fn reset_password(
         .is_none()
     {
         return Err(not_found());
+    }
+    if let Some(redis) = state.redis.as_deref() {
+        redis.invalidate_session(uid).await;
     }
     let _ = repository::insert_audit(
         &state.pool,
@@ -360,6 +366,9 @@ pub async fn delete(
     repository::delete_user(&state.pool, uid)
         .await
         .map_err(|_| db_error())?;
+    if let Some(redis) = state.redis.as_deref() {
+        redis.invalidate_session(uid).await;
+    }
     let _ = repository::insert_audit(
         &state.pool,
         &actor.email,

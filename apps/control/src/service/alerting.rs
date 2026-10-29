@@ -5,8 +5,11 @@ use crate::service::notify;
 use chrono::Utc;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+use crate::service::redis::RedisService;
 
 #[derive(Debug, Clone)]
 struct Finding {
@@ -16,13 +19,38 @@ struct Finding {
     message: String,
 }
 
-pub fn spawn(pool: PgPool, interval_secs: u64) {
+pub fn spawn(
+    pool: PgPool,
+    interval_secs: u64,
+    redis: Option<Arc<RedisService>>,
+) {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_secs.clamp(5, 3600));
         tracing::info!(?interval, "alert evaluator started");
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(e) = run_once(&pool).await {
+            if let Some(redis) = redis.as_ref() {
+                let lock = match redis
+                    .try_lock("lagran:lock:alert-evaluator", Duration::from_secs(120))
+                    .await
+                {
+                    Ok(Some(lock)) => Some(lock),
+                    Ok(None) => {
+                        tracing::debug!("alert evaluator skipped; another replica holds the lock");
+                        continue;
+                    }
+                    Err(()) => {
+                        tracing::warn!("Redis lock unavailable; running evaluator without lock");
+                        None
+                    }
+                };
+                if let Err(e) = run_once(&pool).await {
+                    tracing::warn!(error = %e, "alert evaluation failed");
+                }
+                if let Some(lock) = lock.as_ref() {
+                    redis.unlock(lock).await;
+                }
+            } else if let Err(e) = run_once(&pool).await {
                 tracing::warn!(error = %e, "alert evaluation failed");
             }
         }

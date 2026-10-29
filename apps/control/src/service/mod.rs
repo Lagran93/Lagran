@@ -15,4 +15,5 @@ pub mod config_release;
 pub mod config_version;
 pub mod notify;
 pub mod prefetch;
+pub mod redis;
 pub mod stats_service;

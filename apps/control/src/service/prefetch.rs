@@ -20,7 +20,29 @@ pub fn spawn(state: AppState, interval_secs: u64) {
         tracing::info!(?interval, "prefetch worker started");
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(e) = run_once(&state).await {
+            let redis = state.redis.clone();
+            if let Some(redis) = redis {
+                let lock = match redis
+                    .try_lock("lagran:lock:prefetch-worker", Duration::from_secs(120))
+                    .await
+                {
+                    Ok(Some(lock)) => Some(lock),
+                    Ok(None) => {
+                        tracing::debug!("prefetch worker skipped; another replica holds the lock");
+                        continue;
+                    }
+                    Err(()) => {
+                        tracing::warn!("Redis lock unavailable; running prefetch without lock");
+                        None
+                    }
+                };
+                if let Err(e) = run_once(&state).await {
+                    tracing::warn!(error = %e, "prefetch worker failed");
+                }
+                if let Some(lock) = lock.as_ref() {
+                    redis.unlock(lock).await;
+                }
+            } else if let Err(e) = run_once(&state).await {
                 tracing::warn!(error = %e, "prefetch worker failed");
             }
         }

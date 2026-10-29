@@ -148,6 +148,7 @@ pub fn create_router(state: AppState) -> Router {
                 )
                 .route("/stats/by-domain", get(stats::by_domain))
                 .route("/stats/timeseries", get(stats::timeseries))
+                .route("/stats/realtime", get(stats::realtime))
                 .route("/stats/summary", get(stats::summary))
                 .route("/audit", get(audit::list))
                 .route(

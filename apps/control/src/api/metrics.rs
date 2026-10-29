@@ -59,6 +59,21 @@ pub async fn report(
         tracing::error!(error = %e, "insert metrics");
         return Json(MetricsAck { accepted: false });
     }
+    if let Some(redis) = state.redis.as_deref() {
+        let minute = chrono::Utc::now().timestamp() / 60;
+        let _ = redis
+            .record_realtime_metrics(
+                minute,
+                &[(
+                    domain.to_string(),
+                    req.requests as i64,
+                    req.cache_hits as i64,
+                    req.cache_misses as i64,
+                    req.bytes_sent as i64,
+                )],
+            )
+            .await;
+    }
     tracing::debug!(
         node = %req.node_id,
         domain = %domain,
@@ -94,6 +109,22 @@ pub async fn report_batch(
     if let Err(e) = repository::insert_metrics_batch(&state.pool, &rows).await {
         tracing::error!(error = %e, "insert metrics batch");
         return Json(MetricsBatchAck { accepted: 0 });
+    }
+    if let Some(redis) = state.redis.as_deref() {
+        let minute = chrono::Utc::now().timestamp() / 60;
+        let realtime: Vec<(String, i64, i64, i64, i64)> = rows
+            .iter()
+            .map(|(_, domain, requests, hits, misses, bytes)| {
+                (
+                    domain.clone(),
+                    *requests,
+                    *hits,
+                    *misses,
+                    *bytes,
+                )
+            })
+            .collect();
+        let _ = redis.record_realtime_metrics(minute, &realtime).await;
     }
     tracing::debug!(accepted, "metrics batch accepted");
     Json(MetricsBatchAck { accepted })

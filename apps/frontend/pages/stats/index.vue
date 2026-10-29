@@ -1,9 +1,9 @@
 <template>
-  <div class="page">
+  <div class="page stats-page">
     <div class="page-head">
       <div>
         <div class="page-title">统计分析</div>
-        <div class="page-desc">近 24 小时的请求、命中率与流量分布</div>
+        <div class="page-desc">近 {{ rangeLabel }}的请求、命中率与流量分布</div>
       </div>
       <div class="page-actions">
         <select v-model.number="rangeHours" class="select" style="min-width: 120px" @change="load">
@@ -26,8 +26,8 @@
     <div class="card">
       <div class="card-head">
         <div>
-          <div class="card-title">实时流量</div>
-          <div class="card-desc">每 15 秒自动刷新，可对比上一时间段</div>
+          <div class="card-title">流量趋势</div>
+          <div class="card-desc">近 {{ rangeLabel }} · 每 15 秒自动刷新 · 可对比上一时间段</div>
         </div>
         <div class="card-extra flex-center gap-8">
           <div class="segmented">
@@ -61,6 +61,40 @@
             {{ delta >= 0 ? '+' : '' }}{{ delta.toFixed(1) }}%
           </StatusTag>
           <span class="text-2">命中率 {{ percent(currentTotal.hit_ratio) }}</span>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="realtime.enabled" class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Redis 实时统计</div>
+          <div class="card-desc">最近 {{ realtime.minutes }} 分钟，来自边缘上报的实时计数器</div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="realtime-grid">
+          <div class="realtime-item">
+            <span class="text-muted">请求数</span>
+            <b>{{ formatNumber(realtime.requests) }}</b>
+          </div>
+          <div class="realtime-item">
+            <span class="text-muted">缓存命中率</span>
+            <b>{{ percent(realtime.hit_ratio) }}</b>
+          </div>
+          <div class="realtime-item">
+            <span class="text-muted">出流量</span>
+            <b>{{ formatBytes(realtime.bytes_sent) }}</b>
+          </div>
+          <div class="realtime-item">
+            <span class="text-muted">活跃域名</span>
+            <b>{{ realtime.domains.length }}</b>
+          </div>
+        </div>
+        <div v-if="realtime.domains.length" class="realtime-domains">
+          <span v-for="d in realtime.domains.slice(0, 6)" :key="d.domain" class="tag tag-neutral">
+            {{ d.domain }} · {{ formatNumber(d.requests) }}
+          </span>
         </div>
       </div>
     </div>
@@ -200,10 +234,23 @@ const auth = useAuthStore()
 const loading = ref(false)
 const updatedAt = ref('')
 const rangeHours = ref(24)
+const rangeLabel = computed(() =>
+  rangeHours.value === 1 ? '1 小时' : rangeHours.value === 24 ? '24 小时' : '7 天',
+)
 const chartMetric = ref<'requests' | 'bytes_sent' | 'hit_ratio'>('requests')
 const compare = ref(true)
 const series = ref<any[]>([])
 const previousSeries = ref<any[]>([])
+const realtime = ref<any>({
+  enabled: false,
+  minutes: 5,
+  requests: 0,
+  cache_hits: 0,
+  cache_misses: 0,
+  bytes_sent: 0,
+  hit_ratio: 0,
+  domains: [],
+})
 let timer: ReturnType<typeof setInterval> | null = null
 const stats = ref<any>({
   total_requests: 0,
@@ -280,6 +327,13 @@ async function loadSeries() {
   previousSeries.value = res?.previous || []
 }
 
+async function loadRealtime() {
+  const data = await api
+    .get<any>('/api/v1/stats/realtime?minutes=5')
+    .catch(() => null)
+  if (data) realtime.value = data
+}
+
 async function load() {
   loading.value = true
   try {
@@ -288,6 +342,7 @@ async function load() {
       api.get<any[]>('/api/v1/stats/by-domain').catch(() => []),
       api.get<any[]>('/api/v1/origin-health').catch(() => []),
       loadSeries(),
+      loadRealtime(),
     ])
     if (s) stats.value = s
     byDomain.value = bd || []
@@ -300,7 +355,10 @@ async function load() {
 
 onMounted(() => {
   load()
-  timer = setInterval(loadSeries, 15_000)
+  timer = setInterval(() => {
+    loadSeries()
+    loadRealtime()
+  }, 15_000)
 })
 onUnmounted(() => {
   if (timer) clearInterval(timer)
@@ -320,6 +378,93 @@ onUnmounted(() => {
 
 .compare-strip b {
   color: var(--text);
+}
+
+.realtime-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.realtime-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border-radius: var(--radius);
+}
+
+.realtime-item b {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.realtime-domains {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+/* Keep dashboard typography stable on 2K/4K screens. The global design
+   system intentionally upsizes text, but analytics should stay dense. */
+@media (min-width: 1920px) {
+  .stats-page :deep(.page-title) {
+    font-size: 24px;
+  }
+
+  .stats-page :deep(.page-desc) {
+    font-size: 13px;
+  }
+
+  .stats-page :deep(.stat-value) {
+    font-size: 30px;
+  }
+
+  .stats-page :deep(.stat-label) {
+    font-size: 13px;
+  }
+
+  .stats-page :deep(.stat-hint) {
+    font-size: 12px;
+  }
+
+  .stats-page :deep(.card-title) {
+    font-size: 15px;
+  }
+
+  .stats-page :deep(.card-desc) {
+    font-size: 12px;
+  }
+
+  .stats-page :deep(.table) {
+    font-size: 14px;
+  }
+}
+
+@media (min-width: 2560px) {
+  .stats-page :deep(.page-title) {
+    font-size: 26px;
+  }
+
+  .stats-page :deep(.stat-value) {
+    font-size: 32px;
+  }
+
+  .stats-page :deep(.stat-card) {
+    padding: 20px;
+  }
+}
+
+@media (max-width: 640px) {
+  .realtime-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .compare-strip {
+    gap: 8px 14px;
+  }
 }
 
 @media (max-width: 640px) {

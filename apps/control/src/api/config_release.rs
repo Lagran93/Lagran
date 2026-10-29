@@ -16,6 +16,16 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+async fn clear_config_cache(state: &AppState, release_id: Option<Uuid>) {
+    state.config_cache.clear();
+    if let Some(redis) = state.redis.as_deref() {
+        redis.del("lagran:cfg:global").await;
+        if let Some(id) = release_id {
+            redis.del(&format!("lagran:cfg:release:{id}")).await;
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct ErrorBody {
     pub error: String,
@@ -249,7 +259,7 @@ pub async fn rollback_version(
         &format!("version {} ({uid})", version.version),
     )
     .await;
-    state.config_cache.clear();
+    clear_config_cache(&state, None).await;
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(
         json!({"success": true, "domain": version.domain_name, "version": version.version}),
@@ -492,7 +502,7 @@ pub async fn publish_release(
         &format!("{} target node(s)", targets.len()),
     )
     .await;
-    state.config_cache.clear();
+    clear_config_cache(&state, Some(uid)).await;
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(
         release_dto(&state, release).await.map_err(|_| db_error())?,
@@ -523,7 +533,7 @@ pub async fn rollback_release(
         "",
     )
     .await;
-    state.config_cache.clear();
+    clear_config_cache(&state, Some(uid)).await;
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(
         release_dto(&state, release).await.map_err(|_| db_error())?,
@@ -647,7 +657,7 @@ pub async fn apply_report(
     release_service::report(&state, release_id, &node_id, req.success, req.error.trim())
         .await
         .map_err(|_| db_error())?;
-    state.config_cache.clear();
+    clear_config_cache(&state, Some(release_id)).await;
     Ok(Json(json!({"success": true})))
 }
 

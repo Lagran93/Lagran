@@ -489,21 +489,20 @@ pub async fn list_all_configs(
         None => "global".to_string(),
     };
     if let Some(cached) = state.config_cache.get(&cache_key) {
-        if if_none_match(&headers, &cached.etag) {
-            return Ok(not_modified(&cached.etag));
+        return Ok(cached_response(&headers, &cached.etag, cached.body));
+    }
+    let redis_key = format!("lagran:cfg:{cache_key}");
+    if let Some(redis) = state.redis.as_deref() {
+        if let Some(shared) = redis
+            .get_json::<crate::service::config_cache::SharedConfig>(&redis_key)
+            .await
+        {
+            let body = Bytes::from(shared.body.into_bytes());
+            state
+                .config_cache
+                .put(cache_key.clone(), shared.etag.clone(), body.clone());
+            return Ok(cached_response(&headers, &shared.etag, body));
         }
-        let mut response = Response::new(Body::from(cached.body));
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        if let Ok(value) = HeaderValue::from_str(&cached.etag) {
-            response.headers_mut().insert(header::ETAG, value);
-        }
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        return Ok(response);
     }
 
     let rows = repository::list_domains_full(&state.pool)
@@ -642,6 +641,21 @@ pub async fn list_all_configs(
             }),
         )
     })?;
+    if let Some(redis) = state.redis.as_deref() {
+        if let Ok(text) = std::str::from_utf8(&body) {
+            let shared = crate::service::config_cache::SharedConfig {
+                etag: etag.clone(),
+                body: text.to_string(),
+            };
+            let _ = redis
+                .set_json(
+                    &format!("lagran:cfg:{cache_key}"),
+                    &shared,
+                    state.config.config_cache_ttl_secs,
+                )
+                .await;
+        }
+    }
     state
         .config_cache
         .put(cache_key, etag.clone(), Bytes::from(body.clone()));
@@ -669,6 +683,24 @@ fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
                 part == etag || part.strip_prefix("W/") == Some(etag)
             })
         })
+}
+
+fn cached_response(headers: &HeaderMap, etag: &str, body: Bytes) -> Response {
+    if if_none_match(headers, etag) {
+        return not_modified(etag);
+    }
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 fn not_modified(etag: &str) -> Response {

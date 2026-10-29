@@ -5,11 +5,18 @@
 //! turning Redis/PostgreSQL into a hard dependency for config delivery.
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 const MAX_ENTRIES: usize = 256;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SharedConfig {
+    pub etag: String,
+    pub body: String,
+}
 
 #[derive(Clone)]
 pub struct CachedConfig {

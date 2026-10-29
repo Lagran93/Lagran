@@ -26,6 +26,12 @@ impl CaptchaStore {
 
     /// Issue a new one-time challenge. Returns `(id, svg, expires_in_secs)`.
     pub fn issue(&self) -> (String, String, u64) {
+        let (id, _code, svg, ttl) = self.issue_parts();
+        (id, svg, ttl)
+    }
+
+    /// Issue and return the code so it can also be written to Redis.
+    pub fn issue_parts(&self) -> (String, String, String, u64) {
         let id = Uuid::new_v4().to_string();
         let seed = Uuid::new_v4().into_bytes();
         let mut bytes = [0_u8; 64];
@@ -36,6 +42,11 @@ impl CaptchaStore {
             .map(|i| ALPHABET[bytes[i] as usize % ALPHABET.len()] as char)
             .collect();
         let svg = render_svg(&code, &bytes);
+        self.insert(id.clone(), code.clone());
+        (id, code, svg, TTL.as_secs())
+    }
+
+    pub fn insert(&self, id: String, code: String) {
         let now = Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.retain(|_, entry| entry.expires > now);
@@ -43,13 +54,18 @@ impl CaptchaStore {
             entries.clear();
         }
         entries.insert(
-            id.clone(),
+            id,
             Entry {
                 code,
                 expires: now + TTL,
             },
         );
-        (id, svg, TTL.as_secs())
+    }
+
+    pub fn remove(&self, id: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(id.trim());
+        }
     }
 
     /// Verify and consume a challenge. Always remove it, even on a wrong code,

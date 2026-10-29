@@ -15,10 +15,15 @@ pub struct AppState {
     pub login_limiter: Arc<LoginLimiter>,
     pub captcha: Arc<crate::service::captcha::CaptchaStore>,
     pub config_cache: Arc<crate::service::config_cache::ConfigCache>,
+    pub redis: Option<Arc<crate::service::redis::RedisService>>,
 }
 
 impl AppState {
-    pub fn new(pool: PgPool, config: AppConfig) -> Self {
+    pub fn new(
+        pool: PgPool,
+        config: AppConfig,
+        redis: Option<Arc<crate::service::redis::RedisService>>,
+    ) -> Self {
         let geo = crate::scheduler::GeoTable::load(&config.geoip_path);
         let schedule_ttl = config.schedule_ttl;
         let config_cache_ttl_secs = config.config_cache_ttl_secs;
@@ -32,6 +37,7 @@ impl AppState {
             config_cache: Arc::new(crate::service::config_cache::ConfigCache::new(
                 config_cache_ttl_secs,
             )),
+            redis,
         }
     }
 }

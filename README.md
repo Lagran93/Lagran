@@ -56,6 +56,9 @@
 - 写入与读取优化：访问日志、WAF 事件、边缘指标使用 PostgreSQL `UNNEST` 单语句批量写入；
   批量配置文档带进程内短 TTL 缓存和 ETag；连接池大小、预热连接数、获取超时可配置
   （`DATABASE_MAX_CONNECTIONS` / `DATABASE_MIN_CONNECTIONS` / `DATABASE_ACQUIRE_TIMEOUT_SECS`）
+- 可选 Redis P1（`REDIS_URL`）：共享登录限流、验证码、Actor 会话缓存、批量配置缓存、
+  告警/预热/发布扫描分布式锁，以及边缘指标实时计数器（`GET /stats/realtime`）。
+  Redis 不可用时自动回退到进程内状态/PostgreSQL，不影响主流程
 - 可观测性：`GET /metrics` Prometheus 文本指标（控制面/数据库/域名/节点/源站健康/证书到期/告警）、
   可选 OTLP/HTTP Trace 导出；边缘 `GET /__lagran/metrics` 输出请求/命中/回源/流量指标
 - 告警中心：源站健康、证书到期、节点离线、缓存命中率、WAF 事件突增规则；邮件 SMTP、Webhook（可选 HMAC-SHA256 签名）、

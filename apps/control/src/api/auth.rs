@@ -101,7 +101,16 @@ pub async fn public_config(State(state): State<AppState>) -> Json<PublicAuthConf
 }
 
 pub async fn captcha(State(state): State<AppState>) -> Json<CaptchaResponse> {
-    let (captcha_id, image_svg, expires_in) = state.captcha.issue();
+    let (captcha_id, code, image_svg, expires_in) = state.captcha.issue_parts();
+    if let Some(redis) = state.redis.as_deref() {
+        let _ = redis
+            .set_ex(
+                &format!("lagran:captcha:{captcha_id}"),
+                &code,
+                expires_in,
+            )
+            .await;
+    }
     Json(CaptchaResponse {
         captcha_id,
         image_svg,
@@ -109,7 +118,7 @@ pub async fn captcha(State(state): State<AppState>) -> Json<CaptchaResponse> {
     })
 }
 
-fn check_captcha(
+async fn check_captcha(
     state: &AppState,
     id: &str,
     code: &str,
@@ -117,16 +126,36 @@ fn check_captcha(
     if !state.config.captcha_enabled {
         return Ok(());
     }
-    if state.captcha.verify(id, code) {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody {
-                error: "验证码错误或已过期".into(),
-            }),
-        ))
+    if let Some(redis) = state.redis.as_deref() {
+        match redis
+            .getdel_checked(&format!("lagran:captcha:{}", id.trim()))
+            .await
+        {
+            Ok(Some(saved)) => {
+                state.captcha.remove(id);
+                if saved.eq_ignore_ascii_case(code.trim()) {
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                state.captcha.remove(id);
+            }
+            Err(()) => {
+                // Redis is unavailable; use this instance's local challenge.
+                if state.captcha.verify(id, code) {
+                    return Ok(());
+                }
+            }
+        }
+    } else if state.captcha.verify(id, code) {
+        return Ok(());
     }
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: "验证码错误或已过期".into(),
+        }),
+    ))
 }
 
 pub async fn login(
@@ -134,9 +163,13 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorBody>)> {
     let email = normalize_email(&req.email);
-    check_captcha(&state, &req.captcha_id, &req.captcha_code)?;
+    check_captcha(&state, &req.captcha_id, &req.captcha_code).await?;
     let limit_key = format!("login:{email}");
-    if !state.login_limiter.check(&limit_key) {
+    if !state
+        .login_limiter
+        .check_shared(state.redis.as_deref(), &limit_key)
+        .await
+    {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorBody {
@@ -219,7 +252,7 @@ pub async fn register(
         ));
     }
     let email = normalize_email(&req.email);
-    check_captcha(&state, &req.captcha_id, &req.captcha_code)?;
+    check_captcha(&state, &req.captcha_id, &req.captcha_code).await?;
     if let Err(msg) = validate_email(&email) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -227,7 +260,11 @@ pub async fn register(
         ));
     }
     let limit_key = format!("register:{email}");
-    if !state.login_limiter.check(&limit_key) {
+    if !state
+        .login_limiter
+        .check_shared(state.redis.as_deref(), &limit_key)
+        .await
+    {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorBody {
@@ -476,6 +513,9 @@ pub async fn update_me(
                 }),
             )
         })?;
+    if let Some(redis) = state.redis.as_deref() {
+        redis.invalidate_session(id).await;
+    }
     Ok(Json(to_user_info(user)))
 }
 
@@ -584,6 +624,9 @@ pub async fn change_password(
             }),
         )
     })?;
+    if let Some(redis) = state.redis.as_deref() {
+        redis.invalidate_session(id).await;
+    }
     Ok(Json(ChangePasswordResponse {
         success: true,
         token,

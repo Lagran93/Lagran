@@ -18,6 +18,10 @@ pub struct AppConfig {
     pub database_acquire_timeout_secs: u64,
     /// Process-local cache TTL for the bulk edge config document (default 3s).
     pub config_cache_ttl_secs: u64,
+    /// Optional Redis URL; empty keeps all P1 features on local/DB fallback.
+    pub redis_url: String,
+    /// Session cache TTL in Redis (default 30s).
+    pub redis_session_ttl_secs: u64,
     pub jwt_secret: String,
     pub jwt_expire_hours: i64,
     /// Shared secret for edge agent APIs / DNS schedule (empty = weaker checks)
@@ -88,6 +92,12 @@ impl Default for AppConfig {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(3)
                 .clamp(1, 60),
+            redis_url: std::env::var("REDIS_URL").unwrap_or_default(),
+            redis_session_ttl_secs: std::env::var("REDIS_SESSION_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30)
+                .clamp(5, 300),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "lagran-dev-secret-change-me".into()),
             jwt_expire_hours: jwt_expire_hours(),

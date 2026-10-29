@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::service::redis::RedisService;
+
 const WINDOW: Duration = Duration::from_secs(60);
 const MAX_ATTEMPTS: u32 = 20;
 
@@ -22,6 +24,19 @@ impl LoginLimiter {
         Self {
             inner: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Shared Redis counter when configured, local bucket otherwise.
+    pub async fn check_shared(&self, redis: Option<&RedisService>, key: &str) -> bool {
+        if let Some(redis) = redis {
+            if let Some(count) = redis
+                .incr_with_ttl(&format!("lagran:rl:{key}"), WINDOW.as_secs())
+                .await
+            {
+                return count <= i64::from(MAX_ATTEMPTS);
+            }
+        }
+        self.check(key)
     }
 
     /// Returns false when the key is over the limit.

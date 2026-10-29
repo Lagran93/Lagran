@@ -113,8 +113,27 @@ async fn main() -> anyhow::Result<()> {
     let addr = config.bind_addr();
     let seed_demo = config.seed_demo;
     let alert_eval_secs = config.alert_eval_secs;
-    let state = AppState::new(pool, config);
-    control::service::alerting::spawn(state.pool.clone(), alert_eval_secs);
+    let redis = if config.redis_url.trim().is_empty() {
+        tracing::info!("REDIS_URL not set; using local/PostgreSQL fallbacks");
+        None
+    } else {
+        match control::service::redis::RedisService::connect(config.redis_url.trim()).await {
+            Ok(redis) => {
+                tracing::info!("connected to Redis");
+                Some(std::sync::Arc::new(redis))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Redis unavailable; using local/PostgreSQL fallbacks");
+                None
+            }
+        }
+    };
+    let state = AppState::new(pool, config, redis);
+    control::service::alerting::spawn(
+        state.pool.clone(),
+        alert_eval_secs,
+        state.redis.clone(),
+    );
     control::service::prefetch::spawn(state.clone(), 15);
     control::service::config_release::spawn(state.clone(), 10);
     {

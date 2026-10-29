@@ -11,11 +11,35 @@ pub fn spawn(state: AppState, interval_secs: u64) {
         let interval = Duration::from_secs(interval_secs.clamp(5, 300));
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(e) = sweep(&state).await {
+            let redis = state.redis.clone();
+            if let Some(redis) = redis {
+                let lock = match redis
+                    .try_lock("lagran:lock:config-release-sweep", Duration::from_secs(60))
+                    .await
+                {
+                    Ok(Some(lock)) => Some(lock),
+                    Ok(None) => continue,
+                    Err(()) => None,
+                };
+                if let Err(e) = sweep(&state).await {
+                    tracing::warn!(error = %e, "config release sweep failed");
+                }
+                if let Some(lock) = lock.as_ref() {
+                    redis.unlock(lock).await;
+                }
+            } else if let Err(e) = sweep(&state).await {
                 tracing::warn!(error = %e, "config release sweep failed");
             }
         }
     });
+}
+
+async fn invalidate_config_cache(state: &AppState, release_id: Uuid) {
+    state.config_cache.clear();
+    if let Some(redis) = state.redis.as_deref() {
+        redis.del("lagran:cfg:global").await;
+        redis.del(&format!("lagran:cfg:release:{release_id}")).await;
+    }
 }
 
 async fn sweep(state: &AppState) -> Result<(), sqlx::Error> {
@@ -30,6 +54,7 @@ async fn sweep(state: &AppState) -> Result<(), sqlx::Error> {
         )
         .await;
         let _ = edge_notify::notify_config_reload(state).await;
+        invalidate_config_cache(state, release.id).await;
     }
     Ok(())
 }
