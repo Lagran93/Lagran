@@ -53,6 +53,9 @@
 - **流量观测**：实时流量曲线（15 秒刷新）、请求数/流量/命中率切换、上一时间段对比、
   7 天/24 小时/1 小时范围，以及全屏大屏监控模式
 - 统计：总览 / 分域名（24h）、访问日志、操作审计、源站健康
+- 写入与读取优化：访问日志、WAF 事件、边缘指标使用 PostgreSQL `UNNEST` 单语句批量写入；
+  批量配置文档带进程内短 TTL 缓存和 ETag；连接池大小、预热连接数、获取超时可配置
+  （`DATABASE_MAX_CONNECTIONS` / `DATABASE_MIN_CONNECTIONS` / `DATABASE_ACQUIRE_TIMEOUT_SECS`）
 - 可观测性：`GET /metrics` Prometheus 文本指标（控制面/数据库/域名/节点/源站健康/证书到期/告警）、
   可选 OTLP/HTTP Trace 导出；边缘 `GET /__lagran/metrics` 输出请求/命中/回源/流量指标
 - 告警中心：源站健康、证书到期、节点离线、缓存命中率、WAF 事件突增规则；邮件 SMTP、Webhook（可选 HMAC-SHA256 签名）、

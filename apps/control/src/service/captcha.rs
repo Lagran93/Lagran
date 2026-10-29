@@ -59,8 +59,7 @@ impl CaptchaStore {
         let Some(entry) = entries.remove(id.trim()) else {
             return false;
         };
-        entry.expires > Instant::now()
-            && entry.code.eq_ignore_ascii_case(code.trim())
+        entry.expires > Instant::now() && entry.code.eq_ignore_ascii_case(code.trim())
     }
 
     #[cfg(test)]
@@ -83,9 +82,9 @@ impl CaptchaStore {
 fn render_svg(code: &str, bytes: &[u8]) -> String {
     let mut out = String::with_capacity(1800);
     out.push_str(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="132" height="44" viewBox="0 0 132 44">"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="132" height="44" viewBox="0 0 132 34">"#,
     );
-    out.push_str(r##"<rect width="132" height="44" rx="6" fill="#f3f7ff"/>"##);
+    out.push_str(r##"<rect width="132" height="34" rx="6" fill="#f3f7ff"/>"##);
     for i in 0..4 {
         let x1 = (bytes[4 + i] as usize * 17) % 132;
         let y1 = (bytes[8 + i] as usize * 7) % 44;
@@ -110,7 +109,9 @@ fn render_svg(code: &str, bytes: &[u8]) -> String {
             y + 16
         ));
         for (dx, dy, w, h) in segments(digit, x, y) {
-            out.push_str(&format!(r#"<rect x="{dx}" y="{dy}" width="{w}" height="{h}" rx="1.2"/>"#));
+            out.push_str(&format!(
+                r#"<rect x="{dx}" y="{dy}" width="{w}" height="{h}" rx="1.2"/>"#
+            ));
         }
         out.push_str("</g>");
     }

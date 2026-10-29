@@ -8,11 +8,13 @@ use crate::middleware::agent_auth::AgentAuth;
 use crate::repository;
 use crate::state::AppState;
 use axum::{
+    body::Body,
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
@@ -467,6 +469,43 @@ pub async fn list_all_configs(
     headers: HeaderMap,
     _agent: AgentAuth,
 ) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let node_id = headers
+        .get("x-lagran-node-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let active_release = if node_id.is_empty() {
+        None
+    } else {
+        repository::active_release_for_node(&state.pool, &node_id)
+            .await
+            .unwrap_or(None)
+    };
+    // Nodes without a release share one document. Nodes pinned to the same
+    // release share that release's document. This keeps the cache useful when
+    // hundreds of edges poll on the same 15s interval.
+    let cache_key = match active_release.as_ref() {
+        Some(release) => format!("release:{}", release.id),
+        None => "global".to_string(),
+    };
+    if let Some(cached) = state.config_cache.get(&cache_key) {
+        if if_none_match(&headers, &cached.etag) {
+            return Ok(not_modified(&cached.etag));
+        }
+        let mut response = Response::new(Body::from(cached.body));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        if let Ok(value) = HeaderValue::from_str(&cached.etag) {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        return Ok(response);
+    }
+
     let rows = repository::list_domains_full(&state.pool)
         .await
         .map_err(|e| {
@@ -515,18 +554,6 @@ pub async fn list_all_configs(
         waf_ips_by.entry(ip.domain_id).or_default().push(ip);
     }
 
-    let node_id = headers
-        .get("x-lagran-node-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let active_release = if node_id.is_empty() {
-        None
-    } else {
-        repository::active_release_for_node(&state.pool, &node_id)
-            .await
-            .unwrap_or(None)
-    };
     let mut release_snapshots: HashMap<String, DomainConfigResponse> = HashMap::new();
     let mut release_id = None;
     if let Some(release) = active_release {
@@ -602,12 +629,27 @@ pub async fn list_all_configs(
     if if_none_match(&headers, &etag) {
         return Ok(not_modified(&etag));
     }
-    let mut response = Json(AllDomainsConfigResponse {
+    let body = serde_json::to_vec(&AllDomainsConfigResponse {
         domains,
         version,
         release_id,
     })
-    .into_response();
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "config serialization error".into(),
+            }),
+        )
+    })?;
+    state
+        .config_cache
+        .put(cache_key, etag.clone(), Bytes::from(body.clone()));
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     if let Ok(value) = HeaderValue::from_str(&etag) {
         response.headers_mut().insert(header::ETAG, value);
     }

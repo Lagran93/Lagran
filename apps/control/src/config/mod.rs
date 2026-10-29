@@ -10,6 +10,14 @@ use serde::Deserialize;
 pub struct AppConfig {
     pub server: ServerConfig,
     pub database_url: String,
+    /// Per-process PostgreSQL pool size (default 20).
+    pub database_max_connections: u32,
+    /// Kept warm even when idle (default 2).
+    pub database_min_connections: u32,
+    /// How long a request waits for a pooled connection (default 5s).
+    pub database_acquire_timeout_secs: u64,
+    /// Process-local cache TTL for the bulk edge config document (default 3s).
+    pub config_cache_ttl_secs: u64,
     pub jwt_secret: String,
     pub jwt_expire_hours: i64,
     /// Shared secret for edge agent APIs / DNS schedule (empty = weaker checks)
@@ -61,6 +69,25 @@ impl Default for AppConfig {
             server: ServerConfig { host, port },
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://lagran:lagran@127.0.0.1:5432/lagran".into()),
+            database_max_connections: std::env::var("DATABASE_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(20)
+                .clamp(2, 200),
+            database_min_connections: std::env::var("DATABASE_MIN_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(2),
+            database_acquire_timeout_secs: std::env::var("DATABASE_ACQUIRE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5)
+                .clamp(1, 60),
+            config_cache_ttl_secs: std::env::var("CONFIG_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(3)
+                .clamp(1, 60),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "lagran-dev-secret-change-me".into()),
             jwt_expire_hours: jwt_expire_hours(),

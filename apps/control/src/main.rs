@@ -44,8 +44,13 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("connecting to database...");
 
+    let max_connections = config.database_max_connections.max(2);
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(max_connections)
+        .min_connections(config.database_min_connections.min(max_connections))
+        .acquire_timeout(std::time::Duration::from_secs(
+            config.database_acquire_timeout_secs,
+        ))
         .connect(&config.database_url)
         .await
         .map_err(|e| {

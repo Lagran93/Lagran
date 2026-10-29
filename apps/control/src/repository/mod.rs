@@ -1094,24 +1094,41 @@ pub async fn insert_metrics_batch(
     pool: &PgPool,
     rows: &[(String, String, i64, i64, i64, i64)],
 ) -> sqlx::Result<()> {
-    let mut tx = pool.begin().await?;
-    for (node, domain, requests, hits, misses, bytes) in rows {
-        sqlx::query(
-            r#"
-            INSERT INTO edge_metrics (node_name, domain, requests, cache_hits, cache_misses, bytes_sent)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            "#,
-        )
-        .bind(node)
-        .bind(domain)
-        .bind(requests)
-        .bind(hits)
-        .bind(misses)
-        .bind(bytes)
-        .execute(&mut *tx)
-        .await?;
+    if rows.is_empty() {
+        return Ok(());
     }
-    tx.commit().await?;
+    let mut nodes = Vec::with_capacity(rows.len());
+    let mut domains = Vec::with_capacity(rows.len());
+    let mut requests = Vec::with_capacity(rows.len());
+    let mut hits = Vec::with_capacity(rows.len());
+    let mut misses = Vec::with_capacity(rows.len());
+    let mut bytes = Vec::with_capacity(rows.len());
+    for (node, domain, req, hit, miss, sent) in rows {
+        nodes.push(node.clone());
+        domains.push(domain.clone());
+        requests.push(*req);
+        hits.push(*hit);
+        misses.push(*miss);
+        bytes.push(*sent);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO edge_metrics
+          (node_name, domain, requests, cache_hits, cache_misses, bytes_sent)
+        SELECT t.node_name, t.domain, t.requests, t.cache_hits, t.cache_misses, t.bytes_sent
+        FROM UNNEST(
+          $1::text[], $2::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[]
+        ) AS t(node_name, domain, requests, cache_hits, cache_misses, bytes_sent)
+        "#,
+    )
+    .bind(nodes)
+    .bind(domains)
+    .bind(requests)
+    .bind(hits)
+    .bind(misses)
+    .bind(bytes)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -2059,35 +2076,64 @@ pub async fn insert_access_logs_batch(
         String, // ref
     )],
 ) -> sqlx::Result<u64> {
-    let mut n = 0u64;
-    for e in entries {
-        let r = sqlx::query(
-            r#"
-            INSERT INTO access_logs
-              (ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, user_agent, referer)
-            VALUES (
-              COALESCE($1::timestamptz, NOW()),
-              $2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
-            )
-            "#,
-        )
-        .bind(&e.0)
-        .bind(&e.1)
-        .bind(&e.2)
-        .bind(&e.3)
-        .bind(&e.4)
-        .bind(&e.5)
-        .bind(e.6)
-        .bind(e.7)
-        .bind(e.8)
-        .bind(&e.9)
-        .bind(&e.10)
-        .bind(&e.11)
-        .execute(pool)
-        .await?;
-        n += r.rows_affected();
+    if entries.is_empty() {
+        return Ok(0);
     }
-    Ok(n)
+    let mut ts = Vec::with_capacity(entries.len());
+    let mut nodes = Vec::with_capacity(entries.len());
+    let mut clients = Vec::with_capacity(entries.len());
+    let mut methods = Vec::with_capacity(entries.len());
+    let mut hosts = Vec::with_capacity(entries.len());
+    let mut paths = Vec::with_capacity(entries.len());
+    let mut statuses = Vec::with_capacity(entries.len());
+    let mut bytes = Vec::with_capacity(entries.len());
+    let mut latencies = Vec::with_capacity(entries.len());
+    let mut caches = Vec::with_capacity(entries.len());
+    let mut agents = Vec::with_capacity(entries.len());
+    let mut referers = Vec::with_capacity(entries.len());
+    for e in entries {
+        ts.push(e.0.clone());
+        nodes.push(e.1.clone());
+        clients.push(e.2.clone());
+        methods.push(e.3.clone());
+        hosts.push(e.4.clone());
+        paths.push(e.5.clone());
+        statuses.push(e.6);
+        bytes.push(e.7);
+        latencies.push(e.8);
+        caches.push(e.9.clone());
+        agents.push(e.10.clone());
+        referers.push(e.11.clone());
+    }
+    let result = sqlx::query(
+        r#"
+        INSERT INTO access_logs
+          (ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, user_agent, referer)
+        SELECT
+          COALESCE(NULLIF(t.ts, '')::timestamptz, NOW()),
+          t.node_id, t.client_ip, t.method, t.host, t.path, t.status, t.bytes,
+          t.latency_ms, t.cache_status, t.user_agent, t.referer
+        FROM UNNEST(
+          $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+          $7::int[], $8::bigint[], $9::int[], $10::text[], $11::text[], $12::text[]
+        ) AS t(ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, user_agent, referer)
+        "#,
+    )
+    .bind(ts)
+    .bind(nodes)
+    .bind(clients)
+    .bind(methods)
+    .bind(hosts)
+    .bind(paths)
+    .bind(statuses)
+    .bind(bytes)
+    .bind(latencies)
+    .bind(caches)
+    .bind(agents)
+    .bind(referers)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn list_access_logs(
@@ -2691,29 +2737,53 @@ pub struct WafEventInput {
 }
 
 pub async fn insert_waf_events_batch(pool: &PgPool, events: &[WafEventInput]) -> sqlx::Result<u64> {
-    let mut n = 0u64;
-    for e in events {
-        let r = sqlx::query(
-            r#"
-            INSERT INTO waf_events
-              (domain, node_id, client_ip, method, path, action, category, rule_name, mode)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            "#,
-        )
-        .bind(&e.domain)
-        .bind(&e.node_id)
-        .bind(&e.client_ip)
-        .bind(&e.method)
-        .bind(&e.path)
-        .bind(&e.action)
-        .bind(&e.category)
-        .bind(&e.rule_name)
-        .bind(&e.mode)
-        .execute(pool)
-        .await?;
-        n += r.rows_affected();
+    if events.is_empty() {
+        return Ok(0);
     }
-    Ok(n)
+    let mut domains = Vec::with_capacity(events.len());
+    let mut nodes = Vec::with_capacity(events.len());
+    let mut clients = Vec::with_capacity(events.len());
+    let mut methods = Vec::with_capacity(events.len());
+    let mut paths = Vec::with_capacity(events.len());
+    let mut actions = Vec::with_capacity(events.len());
+    let mut categories = Vec::with_capacity(events.len());
+    let mut rules = Vec::with_capacity(events.len());
+    let mut modes = Vec::with_capacity(events.len());
+    for e in events {
+        domains.push(e.domain.clone());
+        nodes.push(e.node_id.clone());
+        clients.push(e.client_ip.clone());
+        methods.push(e.method.clone());
+        paths.push(e.path.clone());
+        actions.push(e.action.clone());
+        categories.push(e.category.clone());
+        rules.push(e.rule_name.clone());
+        modes.push(e.mode.clone());
+    }
+    let result = sqlx::query(
+        r#"
+        INSERT INTO waf_events
+          (domain, node_id, client_ip, method, path, action, category, rule_name, mode)
+        SELECT t.domain, t.node_id, t.client_ip, t.method, t.path, t.action,
+               t.category, t.rule_name, t.mode
+        FROM UNNEST(
+          $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+          $6::text[], $7::text[], $8::text[], $9::text[]
+        ) AS t(domain, node_id, client_ip, method, path, action, category, rule_name, mode)
+        "#,
+    )
+    .bind(domains)
+    .bind(nodes)
+    .bind(clients)
+    .bind(methods)
+    .bind(paths)
+    .bind(actions)
+    .bind(categories)
+    .bind(rules)
+    .bind(modes)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn list_waf_events(

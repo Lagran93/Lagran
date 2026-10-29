@@ -252,7 +252,7 @@ async fn node_findings(pool: &PgPool, threshold: f64) -> Result<Vec<Finding>, sq
         r#"
         SELECT name, status,
                (EXTRACT(EPOCH FROM (NOW() - COALESCE(last_heartbeat, created_at))) / 60.0)::DOUBLE PRECISION
-        FROM nodes
+        FROM edge_nodes
         WHERE status IN ('offline', 'pending')
           AND EXTRACT(EPOCH FROM (NOW() - COALESCE(last_heartbeat, created_at))) / 60.0 >= $1
         ORDER BY name

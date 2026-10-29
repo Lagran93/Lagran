@@ -249,6 +249,7 @@ pub async fn rollback_version(
         &format!("version {} ({uid})", version.version),
     )
     .await;
+    state.config_cache.clear();
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(
         json!({"success": true, "domain": version.domain_name, "version": version.version}),
@@ -491,6 +492,7 @@ pub async fn publish_release(
         &format!("{} target node(s)", targets.len()),
     )
     .await;
+    state.config_cache.clear();
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(
         release_dto(&state, release).await.map_err(|_| db_error())?,
@@ -521,6 +523,7 @@ pub async fn rollback_release(
         "",
     )
     .await;
+    state.config_cache.clear();
     crate::service::edge_notify::notify_config_reload(&state).await;
     Ok(Json(
         release_dto(&state, release).await.map_err(|_| db_error())?,
@@ -644,6 +647,7 @@ pub async fn apply_report(
     release_service::report(&state, release_id, &node_id, req.success, req.error.trim())
         .await
         .map_err(|_| db_error())?;
+    state.config_cache.clear();
     Ok(Json(json!({"success": true})))
 }
 

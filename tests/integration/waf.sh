@@ -120,10 +120,17 @@ curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf/ip
   -H 'content-type: application/json' \
   -d '{"kind":"allow","ip":"198.51.100.7","note":"监控探针"}' >/dev/null
 
+NODE=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" -H "$AUTH" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"waf-edge-$$\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
+NODE_TOKEN=$(printf '%s' "$NODE" | jq -r '.token // empty')
+[[ -n "$NODE_TOKEN" ]] || { echo "node failed: $NODE"; exit 1; }
+
 echo "== start edge (TRUST_PROXY_HEADERS=true) =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
 AGENT_URL="http://127.0.0.1:$EDGE_PORT" \
+AGENT_TOKEN="$NODE_TOKEN" \
 NODE_ID="waf-edge-$$" \
 CACHE_BACKEND=memory \
 CACHE_TTL=60 \
