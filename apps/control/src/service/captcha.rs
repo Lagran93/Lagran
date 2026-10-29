@@ -82,9 +82,9 @@ impl CaptchaStore {
 fn render_svg(code: &str, bytes: &[u8]) -> String {
     let mut out = String::with_capacity(1800);
     out.push_str(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="132" height="44" viewBox="0 0 132 34">"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="132" height="44" viewBox="0 0 132 44">"#,
     );
-    out.push_str(r##"<rect width="132" height="34" rx="6" fill="#f3f7ff"/>"##);
+    out.push_str(r##"<rect width="132" height="44" rx="6" fill="#f3f7ff"/>"##);
     for i in 0..4 {
         let x1 = (bytes[4 + i] as usize * 17) % 132;
         let y1 = (bytes[8 + i] as usize * 7) % 44;
