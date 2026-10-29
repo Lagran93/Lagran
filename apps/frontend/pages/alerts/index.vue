@@ -473,7 +473,7 @@ function usesWindow(metric: string) {
 }
 
 function metricLabel(metric: string) {
-  return metricOptions.find((m) => m.value === metric)?.label || metric
+  return metricOptions.value.find((m) => m.value === metric)?.label || metric
 }
 
 function kindLabel(kind: string) {
