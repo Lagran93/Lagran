@@ -72,6 +72,7 @@
                   <td>
                     <div class="cell-main">{{ rule.name }}</div>
                     <div class="cell-sub">{{ metricLabel(rule.metric) }}</div>
+                    <div class="cell-sub">{{ projectLabel(rule.project_id) }}</div>
                   </td>
                   <td>
                     <div>{{ conditionText(rule) }}</div>
@@ -125,7 +126,7 @@
                 </div>
                 <div class="flex-1" style="min-width: 0">
                   <div class="cell-main truncate">{{ channel.name }}</div>
-                  <div class="cell-sub">{{ kindLabel(channel.kind) }}</div>
+                  <div class="cell-sub">{{ kindLabel(channel.kind) }} · {{ projectLabel(channel.project_id) }}</div>
                 </div>
                 <StatusTag :tone="channel.enabled ? 'success' : 'neutral'" dot>
                   {{ channel.enabled ? '启用' : '停用' }}
@@ -213,6 +214,14 @@
           <label class="field-label">规则名称 <span class="req">*</span></label>
           <input v-model="ruleForm.name" class="input" placeholder="例如 核心源站健康异常" />
         </div>
+        <div class="field">
+          <label class="field-label">所属项目 <span v-if="!auth.isAdmin" class="req">*</span></label>
+          <select v-model="ruleForm.project_id" class="select" @change="ruleForm.channel_ids = []">
+            <option v-if="auth.isAdmin" value="">全局规则（仅管理员）</option>
+            <option v-for="p in projectOptions" :key="p.id" :value="p.id">{{ projectLabel(p.id) }}</option>
+          </select>
+          <span v-if="!projectOptions.length" class="field-hint">请先创建一个项目，告警规则只能绑定自己创建的项目。</span>
+        </div>
         <div class="form-grid">
           <div class="field">
             <label class="field-label">监控指标</label>
@@ -236,14 +245,14 @@
         </div>
         <div class="field">
           <label class="field-label">通知渠道</label>
-          <div v-if="channels.length" class="channel-select">
-            <label v-for="channel in channels" :key="channel.id" class="check">
+          <div v-if="channelsForRule.length" class="channel-select">
+            <label v-for="channel in channelsForRule" :key="channel.id" class="check">
               <input v-model="ruleForm.channel_ids" type="checkbox" :value="channel.id" />
               {{ channel.name }}
               <span class="text-muted">（{{ kindLabel(channel.kind) }}）</span>
             </label>
           </div>
-          <span v-else class="field-hint">还没有通知渠道，可先在“通知渠道”中添加。</span>
+          <span v-else class="field-hint">当前项目还没有通知渠道，可先在“通知渠道”中添加。</span>
         </div>
         <label class="check">
           <input v-model="ruleForm.enabled" type="checkbox" />
@@ -274,6 +283,13 @@
               <option value="webhook">Webhook</option>
               <option value="telegram">Telegram</option>
               <option value="email">邮件 SMTP</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="field-label">所属项目 <span v-if="!auth.isAdmin" class="req">*</span></label>
+            <select v-model="channelForm.project_id" class="select">
+              <option v-if="auth.isAdmin" value="">全局渠道（仅管理员）</option>
+              <option v-for="p in projectOptions" :key="p.id" :value="p.id">{{ projectLabel(p.id) }}</option>
             </select>
           </div>
         </div>
@@ -386,9 +402,32 @@ const error = ref('')
 const rules = ref<any[]>([])
 const channels = ref<any[]>([])
 const events = ref<any[]>([])
+const projects = ref<any[]>([])
 const summary = ref({ firing: 0, resolved: 0, total: 0 })
 const page = ref(1)
 const pageSize = 10
+
+const projectOptions = computed(() => {
+  if (auth.isAdmin) return projects.value
+  const uid = auth.user?.id
+  return projects.value.filter((p) => p.owner_id === uid)
+})
+
+function projectLabel(projectId?: string | null) {
+  if (!projectId) return '全局（仅管理员）'
+  const project = projects.value.find((p) => p.id === projectId)
+  if (!project) return '未知项目'
+  const owner = project.owner_email || project.owner_name || ''
+  return owner ? `${project.name}（${owner}）` : project.name
+}
+
+const channelsForRule = computed(() =>
+  channels.value.filter((channel) =>
+    auth.isAdmin
+      ? !ruleForm.value.project_id || channel.project_id === ruleForm.value.project_id || !channel.project_id
+      : channel.project_id === ruleForm.value.project_id,
+  ),
+)
 
 const pagedEvents = computed(() => {
   const start = (page.value - 1) * pageSize
@@ -415,6 +454,7 @@ const ruleForm = ref({
   channel_ids: [] as string[],
   enabled: true,
   cooldown_seconds: 900,
+  project_id: '',
 })
 
 const channelOpen = ref(false)
@@ -423,6 +463,7 @@ const channelForm = ref({
   name: '',
   kind: 'webhook',
   enabled: true,
+  project_id: '',
   webhook_url: '',
   webhook_secret: '',
   telegram_bot_token: '',
@@ -528,15 +569,17 @@ function fromNow(value: string) {
 async function load() {
   loading.value = true
   try {
-    const [r, c, e, s] = await Promise.all([
+    const [r, c, e, s, p] = await Promise.all([
       api.get<any[]>('/api/v1/alert-rules').catch(() => []),
       api.get<any[]>('/api/v1/alert-channels').catch(() => []),
       api.get<any[]>('/api/v1/alert-events?limit=200').catch(() => []),
       api.get<any>('/api/v1/alerts/summary').catch(() => ({ firing: 0, resolved: 0, total: 0 })),
+      api.get<any[]>('/api/v1/projects').catch(() => []),
     ])
     rules.value = r || []
     channels.value = c || []
     events.value = e || []
+    projects.value = p || []
     summary.value = s || { firing: 0, resolved: 0, total: 0 }
     page.value = Math.min(page.value, Math.max(1, Math.ceil(events.value.length / pageSize)))
   } finally {
@@ -559,6 +602,7 @@ function openCreateRule() {
     channel_ids: [],
     enabled: true,
     cooldown_seconds: 900,
+    project_id: projectOptions.value[0]?.id || '',
   }
   ruleOpen.value = true
 }
@@ -574,6 +618,7 @@ function openEditRule(rule: any) {
     channel_ids: [...(rule.channel_ids || [])],
     enabled: !!rule.enabled,
     cooldown_seconds: rule.cooldown_seconds ?? 900,
+    project_id: rule.project_id || '',
   }
   ruleOpen.value = true
 }
@@ -584,11 +629,16 @@ async function saveRule() {
     error.value = '请填写规则名称'
     return
   }
+  if (!auth.isAdmin && !ruleForm.value.project_id) {
+    error.value = '请选择自己创建的项目'
+    return
+  }
   saving.value = true
   try {
     const body = {
       ...ruleForm.value,
       name: ruleForm.value.name.trim(),
+      project_id: ruleForm.value.project_id || null,
       window_minutes: Math.max(1, Number(ruleForm.value.window_minutes) || 5),
       cooldown_seconds: Math.max(0, Number(ruleForm.value.cooldown_seconds) || 0),
     }
@@ -629,6 +679,7 @@ function resetChannelForm() {
     name: '',
     kind: 'webhook',
     enabled: true,
+    project_id: '',
     webhook_url: '',
     webhook_secret: '',
     telegram_bot_token: '',
@@ -649,6 +700,7 @@ function openCreateChannel() {
   error.value = ''
   channelEditing.value = null
   resetChannelForm()
+  channelForm.value.project_id = projectOptions.value[0]?.id || ''
   channelOpen.value = true
 }
 
@@ -659,6 +711,7 @@ function openEditChannel(channel: any) {
   channelForm.value.name = channel.name
   channelForm.value.kind = channel.kind
   channelForm.value.enabled = !!channel.enabled
+  channelForm.value.project_id = channel.project_id || ''
   const cfg = channel.config || {}
   if (channel.kind === 'webhook') {
     channelForm.value.webhook_url = cfg.url || ''
@@ -684,6 +737,10 @@ async function saveChannel() {
   error.value = ''
   if (!channelForm.value.name.trim()) {
     error.value = '请填写渠道名称'
+    return
+  }
+  if (!auth.isAdmin && !channelForm.value.project_id) {
+    error.value = '请选择自己创建的项目'
     return
   }
   let config: any
@@ -717,6 +774,7 @@ async function saveChannel() {
       kind: channelForm.value.kind,
       config,
       enabled: channelForm.value.enabled,
+      project_id: channelForm.value.project_id || null,
     }
     if (channelEditing.value) {
       await api.put(`/api/v1/alert-channels/${channelEditing.value.id}`, body)

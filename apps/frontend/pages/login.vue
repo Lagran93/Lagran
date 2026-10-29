@@ -83,15 +83,8 @@
           <div v-if="captchaEnabled" class="field">
             <label class="field-label" for="captcha">验证码</label>
             <div class="captcha-row">
-              <input
-                id="captcha"
-                v-model="captchaCode"
-                class="input"
-                maxlength="5"
-                autocomplete="off"
-                placeholder="请输入右侧 5 位验证码"
-                required
-              />
+              <input id="captcha" v-model="captchaCode" class="input" maxlength="5" autocomplete="off"
+                placeholder="请输入右侧 5 位验证码" required />
               <button class="captcha-image" type="button" title="刷新验证码" @click="loadCaptcha">
                 <img v-if="captchaImage" :src="captchaImage" alt="验证码" />
                 <span v-else>加载中…</span>
@@ -454,7 +447,7 @@ onMounted(async () => {
 }
 
 .captcha-image {
-  height: 44px;
+  height: 34px;
   min-width: 132px;
   padding: 0;
   border: 1px solid var(--border);
@@ -468,7 +461,7 @@ onMounted(async () => {
 .captcha-image img {
   display: block;
   width: 132px;
-  height: 44px;
+  height: 34px;
 }
 
 .captcha-refresh {

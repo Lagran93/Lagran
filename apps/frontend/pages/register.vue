@@ -20,53 +20,25 @@
       </div>
       <div class="field">
         <label class="field-label" for="email">邮箱</label>
-        <input
-          id="email"
-          v-model="email"
-          class="input"
-          type="email"
-          placeholder="you@example.com"
-          autocomplete="username"
-          required
-        />
+        <input id="email" v-model="email" class="input" type="email" placeholder="you@example.com"
+          autocomplete="username" required />
       </div>
       <div class="field">
         <label class="field-label" for="password">密码</label>
-        <input
-          id="password"
-          v-model="password"
-          class="input"
-          type="password"
-          placeholder="至少 8 位，包含字母和数字"
-          autocomplete="new-password"
-          required
-        />
+        <input id="password" v-model="password" class="input" type="password" placeholder="至少 8 位，包含字母和数字"
+          autocomplete="new-password" required />
       </div>
       <div class="field">
         <label class="field-label" for="confirm">确认密码</label>
-        <input
-          id="confirm"
-          v-model="confirm"
-          class="input"
-          type="password"
-          placeholder="再次输入密码"
-          autocomplete="new-password"
-          required
-        />
+        <input id="confirm" v-model="confirm" class="input" type="password" placeholder="再次输入密码"
+          autocomplete="new-password" required />
       </div>
 
       <div v-if="captchaEnabled" class="field">
         <label class="field-label" for="captcha">验证码</label>
         <div class="captcha-row">
-          <input
-            id="captcha"
-            v-model="captchaCode"
-            class="input"
-            maxlength="5"
-            autocomplete="off"
-            placeholder="请输入右侧 5 位验证码"
-            required
-          />
+          <input id="captcha" v-model="captchaCode" class="input" maxlength="5" autocomplete="off"
+            placeholder="请输入右侧 5 位验证码" required />
           <button class="captcha-image" type="button" title="刷新验证码" @click="loadCaptcha">
             <img v-if="captchaImage" :src="captchaImage" alt="验证码" />
             <span v-else>加载中…</span>
@@ -255,7 +227,7 @@ onMounted(async () => {
 }
 
 .captcha-image {
-  height: 44px;
+  height: 34px;
   min-width: 132px;
   padding: 0;
   border: 1px solid var(--border);
@@ -269,7 +241,7 @@ onMounted(async () => {
 .captcha-image img {
   display: block;
   width: 132px;
-  height: 44px;
+  height: 34px;
 }
 
 .captcha-refresh {

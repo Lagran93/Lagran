@@ -6,6 +6,7 @@ use chrono::Utc;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 struct Finding {
@@ -155,8 +156,8 @@ async fn notify_channels(
 
 async fn findings_for(pool: &PgPool, rule: &AlertRuleRow) -> Result<Vec<Finding>, sqlx::Error> {
     match rule.metric.as_str() {
-        "origin_unhealthy" => origin_findings(pool, rule.threshold).await,
-        "cert_expiring" => cert_findings(pool, rule.threshold).await,
+        "origin_unhealthy" => origin_findings(pool, rule.threshold, rule.project_id).await,
+        "cert_expiring" => cert_findings(pool, rule.threshold, rule.project_id).await,
         "node_offline" => node_findings(pool, rule.threshold).await,
         "cache_hit_ratio" => cache_findings(pool, rule).await,
         "waf_spike" => waf_findings(pool, rule).await,
@@ -164,17 +165,27 @@ async fn findings_for(pool: &PgPool, rule: &AlertRuleRow) -> Result<Vec<Finding>
     }
 }
 
-async fn origin_findings(pool: &PgPool, threshold: f64) -> Result<Vec<Finding>, sqlx::Error> {
+async fn origin_findings(
+    pool: &PgPool,
+    threshold: f64,
+    project_id: Option<Uuid>,
+) -> Result<Vec<Finding>, sqlx::Error> {
     let min_fails = threshold.max(1.0) as i32;
     let rows: Vec<(String, String, i32, String)> = sqlx::query_as(
         r#"
-        SELECT domain_name, origin_url, consecutive_fails, last_error
-        FROM origin_health
-        WHERE healthy = FALSE AND consecutive_fails >= $1
-        ORDER BY domain_name, origin_url
+        SELECT oh.domain_name, oh.origin_url, oh.consecutive_fails, oh.last_error
+        FROM origin_health oh
+        WHERE oh.healthy = FALSE AND oh.consecutive_fails >= $1
+          AND (
+            $2::uuid IS NULL OR EXISTS (
+              SELECT 1 FROM domains d WHERE d.name = oh.domain_name AND d.project_id = $2
+            )
+          )
+        ORDER BY oh.domain_name, oh.origin_url
         "#,
     )
     .bind(min_fails)
+    .bind(project_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -195,20 +206,30 @@ async fn origin_findings(pool: &PgPool, threshold: f64) -> Result<Vec<Finding>, 
         .collect())
 }
 
-async fn cert_findings(pool: &PgPool, threshold: f64) -> Result<Vec<Finding>, sqlx::Error> {
+async fn cert_findings(
+    pool: &PgPool,
+    threshold: f64,
+    project_id: Option<Uuid>,
+) -> Result<Vec<Finding>, sqlx::Error> {
     let days = threshold.max(0.0);
     let rows: Vec<(String, f64)> = sqlx::query_as(
         r#"
-        SELECT domain_name,
-               (EXTRACT(EPOCH FROM (not_after - NOW())) / 86400.0)::DOUBLE PRECISION
-        FROM certificates
-        WHERE status = 'active'
-          AND not_after IS NOT NULL
-          AND not_after <= NOW() + make_interval(days => $1::int)
-        ORDER BY not_after
+        SELECT c.domain_name,
+               (EXTRACT(EPOCH FROM (c.not_after - NOW())) / 86400.0)::DOUBLE PRECISION
+        FROM certificates c
+        WHERE c.status = 'active'
+          AND c.not_after IS NOT NULL
+          AND c.not_after <= NOW() + make_interval(days => $1::int)
+          AND (
+            $2::uuid IS NULL OR EXISTS (
+              SELECT 1 FROM domains d WHERE d.name = c.domain_name AND d.project_id = $2
+            )
+          )
+        ORDER BY c.not_after
         "#,
     )
     .bind(days.ceil() as i32)
+    .bind(project_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -258,13 +279,19 @@ async fn cache_findings(pool: &PgPool, rule: &AlertRuleRow) -> Result<Vec<Findin
     let window = rule.window_minutes.clamp(1, 1440);
     let (requests, hits): (i64, i64) = sqlx::query_as(
         r#"
-        SELECT COALESCE(SUM(requests), 0)::BIGINT,
-               COALESCE(SUM(cache_hits), 0)::BIGINT
-        FROM edge_metrics
-        WHERE reported_at > NOW() - make_interval(mins => $1)
+        SELECT COALESCE(SUM(m.requests), 0)::BIGINT,
+               COALESCE(SUM(m.cache_hits), 0)::BIGINT
+        FROM edge_metrics m
+        WHERE m.reported_at > NOW() - make_interval(mins => $1)
+          AND (
+            $2::uuid IS NULL OR EXISTS (
+              SELECT 1 FROM domains d WHERE d.name = m.domain AND d.project_id = $2
+            )
+          )
         "#,
     )
     .bind(window)
+    .bind(rule.project_id)
     .fetch_one(pool)
     .await?;
     if requests <= 0 {
@@ -274,8 +301,12 @@ async fn cache_findings(pool: &PgPool, rule: &AlertRuleRow) -> Result<Vec<Findin
     if ratio >= rule.threshold {
         return Ok(Vec::new());
     }
+    let scope = rule
+        .project_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "global".into());
     Ok(vec![Finding {
-        fingerprint: "global".into(),
+        fingerprint: format!("cache|{scope}"),
         severity: "warning",
         value: ratio,
         message: format!(
@@ -289,18 +320,28 @@ async fn waf_findings(pool: &PgPool, rule: &AlertRuleRow) -> Result<Vec<Finding>
     let window = rule.window_minutes.clamp(1, 1440);
     let count: i64 = sqlx::query_scalar(
         r#"
-        SELECT COUNT(*) FROM waf_events
-        WHERE ts > NOW() - make_interval(mins => $1)
+        SELECT COUNT(*) FROM waf_events w
+        WHERE w.ts > NOW() - make_interval(mins => $1)
+          AND (
+            $2::uuid IS NULL OR EXISTS (
+              SELECT 1 FROM domains d WHERE d.name = w.domain AND d.project_id = $2
+            )
+          )
         "#,
     )
     .bind(window)
+    .bind(rule.project_id)
     .fetch_one(pool)
     .await?;
     if (count as f64) < rule.threshold {
         return Ok(Vec::new());
     }
+    let scope = rule
+        .project_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "global".into());
     Ok(vec![Finding {
-        fingerprint: "global".into(),
+        fingerprint: format!("waf|{scope}"),
         severity: "warning",
         value: count as f64,
         message: format!(

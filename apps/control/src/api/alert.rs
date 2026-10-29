@@ -30,6 +30,7 @@ pub struct AlertChannelDto {
     pub kind: String,
     pub config: Value,
     pub enabled: bool,
+    pub project_id: Option<String>,
     pub created_at: String,
 }
 
@@ -41,6 +42,8 @@ pub struct ChannelInput {
     pub config: Value,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -54,6 +57,7 @@ pub struct AlertRuleDto {
     pub enabled: bool,
     pub cooldown_seconds: u32,
     pub last_triggered_at: Option<String>,
+    pub project_id: Option<String>,
     pub created_at: String,
 }
 
@@ -70,6 +74,8 @@ pub struct RuleInput {
     pub enabled: bool,
     #[serde(default = "default_cooldown")]
     pub cooldown_seconds: u32,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +91,7 @@ pub struct AlertEventDto {
     pub started_at: String,
     pub resolved_at: Option<String>,
     pub notified: bool,
+    pub project_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -112,6 +119,13 @@ fn node_alert_forbidden() -> (StatusCode, Json<Value>) {
     )
 }
 
+fn forbidden_project() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": "project not found or not owned by you"})),
+    )
+}
+
 fn hidden_node_rule_ids(rules: &[AlertRuleRow]) -> HashSet<Uuid> {
     rules
         .iter()
@@ -122,6 +136,7 @@ fn hidden_node_rule_ids(rules: &[AlertRuleRow]) -> HashSet<Uuid> {
 
 fn filter_visible_events(
     actor: &Actor,
+    visible: &Option<HashSet<Uuid>>,
     events: Vec<AlertEventRow>,
     rules: &[AlertRuleRow],
 ) -> Vec<AlertEventRow> {
@@ -132,7 +147,12 @@ fn filter_visible_events(
     events
         .into_iter()
         .filter(|event| {
-            !event.fingerprint.starts_with("node|")
+            let project_ok = event
+                .project_id
+                .map(|id| visible.as_ref().is_some_and(|set| set.contains(&id)))
+                .unwrap_or(false);
+            project_ok
+                && !event.fingerprint.starts_with("node|")
                 && event
                     .rule_id
                     .map(|id| !hidden.contains(&id))
@@ -156,6 +176,40 @@ fn parse_uuid(raw: &str) -> Result<Uuid, (StatusCode, Json<Value>)> {
     Uuid::parse_str(raw).map_err(|_| bad("invalid id"))
 }
 
+fn parse_optional_uuid(raw: &Option<String>) -> Result<Option<Uuid>, (StatusCode, Json<Value>)> {
+    match raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => Uuid::parse_str(value)
+            .map(Some)
+            .map_err(|_| bad("invalid project_id")),
+        None => Ok(None),
+    }
+}
+
+async fn visible_project_ids(
+    state: &AppState,
+    actor: &Actor,
+) -> Result<Option<HashSet<Uuid>>, (StatusCode, Json<Value>)> {
+    if actor.admin() {
+        return Ok(None);
+    }
+    let rows = repository::list_projects_for_user(&state.pool, actor.id)
+        .await
+        .map_err(|_| db_error())?;
+    Ok(Some(
+        rows.into_iter()
+            .filter(|project| project.owner_id == actor.id)
+            .map(|project| project.id)
+            .collect(),
+    ))
+}
+
+fn project_allowed(visible: &Option<HashSet<Uuid>>, project_id: Option<Uuid>) -> bool {
+    match visible {
+        None => true,
+        Some(set) => project_id.is_some_and(|id| set.contains(&id)),
+    }
+}
+
 fn channel_dto(row: AlertChannelRow) -> AlertChannelDto {
     AlertChannelDto {
         id: row.id.to_string(),
@@ -163,6 +217,7 @@ fn channel_dto(row: AlertChannelRow) -> AlertChannelDto {
         kind: row.kind,
         config: mask_config(&row.config.0),
         enabled: row.enabled,
+        project_id: row.project_id.map(|id| id.to_string()),
         created_at: row.created_at.to_rfc3339(),
     }
 }
@@ -178,6 +233,7 @@ fn rule_dto(row: AlertRuleRow) -> AlertRuleDto {
         enabled: row.enabled,
         cooldown_seconds: row.cooldown_seconds.max(0) as u32,
         last_triggered_at: row.last_triggered_at.map(|t| t.to_rfc3339()),
+        project_id: row.project_id.map(|id| id.to_string()),
         created_at: row.created_at.to_rfc3339(),
     }
 }
@@ -195,6 +251,7 @@ fn event_dto(row: AlertEventRow) -> AlertEventDto {
         started_at: row.started_at.to_rfc3339(),
         resolved_at: row.resolved_at.map(|t| t.to_rfc3339()),
         notified: row.notified,
+        project_id: row.project_id.map(|id| id.to_string()),
     }
 }
 
@@ -308,12 +365,18 @@ fn validate_rule(input: &RuleInput) -> Result<(), String> {
 
 pub async fn list_channels(
     State(state): State<AppState>,
-    _actor: Actor,
+    actor: Actor,
 ) -> Result<Json<Vec<AlertChannelDto>>, (StatusCode, Json<Value>)> {
+    let visible = visible_project_ids(&state, &actor).await?;
     let rows = repository::list_alert_channels(&state.pool)
         .await
         .map_err(|_| db_error())?;
-    Ok(Json(rows.into_iter().map(channel_dto).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .filter(|row| project_allowed(&visible, row.project_id))
+            .map(channel_dto)
+            .collect(),
+    ))
 }
 
 pub async fn create_channel(
@@ -321,6 +384,11 @@ pub async fn create_channel(
     actor: Actor,
     Json(mut input): Json<ChannelInput>,
 ) -> Result<(StatusCode, Json<AlertChannelDto>), (StatusCode, Json<Value>)> {
+    let visible = visible_project_ids(&state, &actor).await?;
+    let project_id = parse_optional_uuid(&input.project_id)?;
+    if !project_allowed(&visible, project_id) {
+        return Err(forbidden_project());
+    }
     input.kind = input.kind.trim().to_ascii_lowercase();
     validate_channel(&input.kind, &input.config).map_err(bad)?;
     let row = repository::create_alert_channel(
@@ -329,6 +397,7 @@ pub async fn create_channel(
         &input.kind,
         &input.config,
         input.enabled,
+        project_id,
     )
     .await
     .map_err(|_| db_error())?;
@@ -350,10 +419,18 @@ pub async fn update_channel(
     Json(mut input): Json<ChannelInput>,
 ) -> Result<Json<AlertChannelDto>, (StatusCode, Json<Value>)> {
     let uid = parse_uuid(&id)?;
+    let visible = visible_project_ids(&state, &actor).await?;
     let old = repository::get_alert_channel(&state.pool, uid)
         .await
         .map_err(|_| db_error())?
         .ok_or_else(|| bad("channel not found"))?;
+    if !project_allowed(&visible, old.project_id) {
+        return Err(forbidden_project());
+    }
+    let project_id = parse_optional_uuid(&input.project_id)?;
+    if !project_allowed(&visible, project_id) {
+        return Err(forbidden_project());
+    }
     merge_secrets(&old.config.0, &mut input.config);
     input.kind = input.kind.trim().to_ascii_lowercase();
     validate_channel(&input.kind, &input.config).map_err(bad)?;
@@ -364,6 +441,7 @@ pub async fn update_channel(
         &input.kind,
         &input.config,
         input.enabled,
+        project_id,
     )
     .await
     .map_err(|_| db_error())?
@@ -381,10 +459,18 @@ pub async fn update_channel(
 
 pub async fn delete_channel(
     State(state): State<AppState>,
-    _actor: Actor,
+    actor: Actor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let uid = parse_uuid(&id)?;
+    let visible = visible_project_ids(&state, &actor).await?;
+    let row = repository::get_alert_channel(&state.pool, uid)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| bad("channel not found"))?;
+    if !project_allowed(&visible, row.project_id) {
+        return Err(forbidden_project());
+    }
     repository::delete_alert_channel(&state.pool, uid)
         .await
         .map_err(|_| db_error())?;
@@ -393,14 +479,18 @@ pub async fn delete_channel(
 
 pub async fn test_channel(
     State(state): State<AppState>,
-    _actor: Actor,
+    actor: Actor,
     Path(id): Path<String>,
 ) -> Result<Json<TestResult>, (StatusCode, Json<Value>)> {
     let uid = parse_uuid(&id)?;
+    let visible = visible_project_ids(&state, &actor).await?;
     let row = repository::get_alert_channel(&state.pool, uid)
         .await
         .map_err(|_| db_error())?
         .ok_or_else(|| bad("channel not found"))?;
+    if !project_allowed(&visible, row.project_id) {
+        return Err(forbidden_project());
+    }
     let (subject, message, severity) = notify::test_message();
     let result = notify::send_channel(&row.kind, &row.config.0, subject, message, severity).await;
     Ok(Json(match result {
@@ -415,16 +505,42 @@ pub async fn test_channel(
     }))
 }
 
+async fn validate_rule_channels(
+    state: &AppState,
+    actor: &Actor,
+    project_id: Option<Uuid>,
+    channel_ids: &[String],
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if actor.admin() {
+        return Ok(());
+    }
+    for raw in channel_ids {
+        let uid = parse_uuid(raw)?;
+        let channel = repository::get_alert_channel(&state.pool, uid)
+            .await
+            .map_err(|_| db_error())?
+            .ok_or_else(|| bad("channel not found"))?;
+        if channel.project_id != project_id {
+            return Err(bad("channel belongs to a different project"));
+        }
+    }
+    Ok(())
+}
+
 pub async fn list_rules(
     State(state): State<AppState>,
     actor: Actor,
 ) -> Result<Json<Vec<AlertRuleDto>>, (StatusCode, Json<Value>)> {
+    let visible = visible_project_ids(&state, &actor).await?;
     let rows = repository::list_alert_rules(&state.pool)
         .await
         .map_err(|_| db_error())?;
     Ok(Json(
         rows.into_iter()
-            .filter(|row| actor.admin() || row.metric != "node_offline")
+            .filter(|row| {
+                (actor.admin() || row.metric != "node_offline")
+                    && project_allowed(&visible, row.project_id)
+            })
             .map(rule_dto)
             .collect(),
     ))
@@ -439,6 +555,12 @@ pub async fn create_rule(
     if !actor.admin() && input.metric == "node_offline" {
         return Err(node_alert_forbidden());
     }
+    let visible = visible_project_ids(&state, &actor).await?;
+    let project_id = parse_optional_uuid(&input.project_id)?;
+    if !project_allowed(&visible, project_id) {
+        return Err(forbidden_project());
+    }
+    validate_rule_channels(&state, &actor, project_id, &input.channel_ids).await?;
     let row = repository::create_alert_rule(
         &state.pool,
         input.name.trim(),
@@ -448,6 +570,7 @@ pub async fn create_rule(
         &input.channel_ids,
         input.enabled,
         input.cooldown_seconds as i32,
+        project_id,
     )
     .await
     .map_err(|_| db_error())?;
@@ -470,13 +593,22 @@ pub async fn update_rule(
 ) -> Result<Json<AlertRuleDto>, (StatusCode, Json<Value>)> {
     let uid = parse_uuid(&id)?;
     validate_rule(&input).map_err(bad)?;
+    let visible = visible_project_ids(&state, &actor).await?;
     let existing = repository::get_alert_rule(&state.pool, uid)
         .await
         .map_err(|_| db_error())?
         .ok_or_else(|| bad("rule not found"))?;
+    if !project_allowed(&visible, existing.project_id) {
+        return Err(forbidden_project());
+    }
     if !actor.admin() && (existing.metric == "node_offline" || input.metric == "node_offline") {
         return Err(node_alert_forbidden());
     }
+    let project_id = parse_optional_uuid(&input.project_id)?;
+    if !project_allowed(&visible, project_id) {
+        return Err(forbidden_project());
+    }
+    validate_rule_channels(&state, &actor, project_id, &input.channel_ids).await?;
     let row = repository::update_alert_rule(
         &state.pool,
         uid,
@@ -487,6 +619,7 @@ pub async fn update_rule(
         &input.channel_ids,
         input.enabled,
         input.cooldown_seconds as i32,
+        project_id,
     )
     .await
     .map_err(|_| db_error())?
@@ -508,10 +641,14 @@ pub async fn delete_rule(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let uid = parse_uuid(&id)?;
+    let visible = visible_project_ids(&state, &actor).await?;
     let existing = repository::get_alert_rule(&state.pool, uid)
         .await
         .map_err(|_| db_error())?
         .ok_or_else(|| bad("rule not found"))?;
+    if !project_allowed(&visible, existing.project_id) {
+        return Err(forbidden_project());
+    }
     if !actor.admin() && existing.metric == "node_offline" {
         return Err(node_alert_forbidden());
     }
@@ -536,6 +673,7 @@ pub async fn list_events(
     actor: Actor,
     axum::extract::Query(q): axum::extract::Query<EventQuery>,
 ) -> Result<Json<Vec<AlertEventDto>>, (StatusCode, Json<Value>)> {
+    let visible = visible_project_ids(&state, &actor).await?;
     let rules = repository::list_alert_rules(&state.pool)
         .await
         .map_err(|_| db_error())?;
@@ -543,7 +681,7 @@ pub async fn list_events(
         .await
         .map_err(|_| db_error())?;
     Ok(Json(
-        filter_visible_events(&actor, events, &rules)
+        filter_visible_events(&actor, &visible, events, &rules)
             .into_iter()
             .map(event_dto)
             .collect(),
@@ -554,13 +692,14 @@ pub async fn summary(
     State(state): State<AppState>,
     actor: Actor,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let visible = visible_project_ids(&state, &actor).await?;
     let rules = repository::list_alert_rules(&state.pool)
         .await
         .map_err(|_| db_error())?;
     let events = repository::list_alert_events(&state.pool, 200)
         .await
         .map_err(|_| db_error())?;
-    let events = filter_visible_events(&actor, events, &rules);
+    let events = filter_visible_events(&actor, &visible, events, &rules);
     let firing = events.iter().filter(|e| e.status == "firing").count();
     let resolved = events.iter().filter(|e| e.status == "resolved").count();
     Ok(Json(json!({

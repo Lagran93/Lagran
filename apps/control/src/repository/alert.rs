@@ -13,6 +13,7 @@ pub struct AlertChannelRow {
     pub kind: String,
     pub config: Json<Value>,
     pub enabled: bool,
+    pub project_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -27,6 +28,7 @@ pub struct AlertRuleRow {
     pub enabled: bool,
     pub cooldown_seconds: i32,
     pub last_triggered_at: Option<DateTime<Utc>>,
+    pub project_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -43,13 +45,14 @@ pub struct AlertEventRow {
     pub started_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
     pub notified: bool,
+    pub project_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
 pub async fn list_alert_channels(pool: &PgPool) -> sqlx::Result<Vec<AlertChannelRow>> {
     sqlx::query_as::<_, AlertChannelRow>(
         r#"
-        SELECT id, name, kind, config, enabled, created_at
+        SELECT id, name, kind, config, enabled, project_id, created_at
         FROM alert_channels
         ORDER BY created_at DESC
         "#,
@@ -61,7 +64,7 @@ pub async fn list_alert_channels(pool: &PgPool) -> sqlx::Result<Vec<AlertChannel
 pub async fn get_alert_channel(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<AlertChannelRow>> {
     sqlx::query_as::<_, AlertChannelRow>(
         r#"
-        SELECT id, name, kind, config, enabled, created_at
+        SELECT id, name, kind, config, enabled, project_id, created_at
         FROM alert_channels WHERE id = $1
         "#,
     )
@@ -76,18 +79,20 @@ pub async fn create_alert_channel(
     kind: &str,
     config: &Value,
     enabled: bool,
+    project_id: Option<Uuid>,
 ) -> sqlx::Result<AlertChannelRow> {
     sqlx::query_as::<_, AlertChannelRow>(
         r#"
-        INSERT INTO alert_channels (name, kind, config, enabled)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, name, kind, config, enabled, created_at
+        INSERT INTO alert_channels (name, kind, config, enabled, project_id)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, name, kind, config, enabled, project_id, created_at
         "#,
     )
     .bind(name)
     .bind(kind)
     .bind(config)
     .bind(enabled)
+    .bind(project_id)
     .fetch_one(pool)
     .await
 }
@@ -99,13 +104,14 @@ pub async fn update_alert_channel(
     kind: &str,
     config: &Value,
     enabled: bool,
+    project_id: Option<Uuid>,
 ) -> sqlx::Result<Option<AlertChannelRow>> {
     sqlx::query_as::<_, AlertChannelRow>(
         r#"
         UPDATE alert_channels SET
-            name = $2, kind = $3, config = $4, enabled = $5, updated_at = NOW()
+            name = $2, kind = $3, config = $4, enabled = $5, project_id = $6, updated_at = NOW()
         WHERE id = $1
-        RETURNING id, name, kind, config, enabled, created_at
+        RETURNING id, name, kind, config, enabled, project_id, created_at
         "#,
     )
     .bind(id)
@@ -113,6 +119,7 @@ pub async fn update_alert_channel(
     .bind(kind)
     .bind(config)
     .bind(enabled)
+    .bind(project_id)
     .fetch_optional(pool)
     .await
 }
@@ -129,7 +136,7 @@ pub async fn list_alert_rules(pool: &PgPool) -> sqlx::Result<Vec<AlertRuleRow>> 
     sqlx::query_as::<_, AlertRuleRow>(
         r#"
         SELECT id, name, metric, threshold, window_minutes, channel_ids,
-               enabled, cooldown_seconds, last_triggered_at, created_at
+               enabled, cooldown_seconds, last_triggered_at, project_id, created_at
         FROM alert_rules
         ORDER BY created_at DESC
         "#,
@@ -142,7 +149,7 @@ pub async fn get_alert_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<Aler
     sqlx::query_as::<_, AlertRuleRow>(
         r#"
         SELECT id, name, metric, threshold, window_minutes, channel_ids,
-               enabled, cooldown_seconds, last_triggered_at, created_at
+               enabled, cooldown_seconds, last_triggered_at, project_id, created_at
         FROM alert_rules WHERE id = $1
         "#,
     )
@@ -160,14 +167,15 @@ pub async fn create_alert_rule(
     channel_ids: &[String],
     enabled: bool,
     cooldown_seconds: i32,
+    project_id: Option<Uuid>,
 ) -> sqlx::Result<AlertRuleRow> {
     sqlx::query_as::<_, AlertRuleRow>(
         r#"
         INSERT INTO alert_rules
-            (name, metric, threshold, window_minutes, channel_ids, enabled, cooldown_seconds)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (name, metric, threshold, window_minutes, channel_ids, enabled, cooldown_seconds, project_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id, name, metric, threshold, window_minutes, channel_ids,
-                  enabled, cooldown_seconds, last_triggered_at, created_at
+                  enabled, cooldown_seconds, last_triggered_at, project_id, created_at
         "#,
     )
     .bind(name)
@@ -177,6 +185,7 @@ pub async fn create_alert_rule(
     .bind(Json(channel_ids.to_vec()))
     .bind(enabled)
     .bind(cooldown_seconds)
+    .bind(project_id)
     .fetch_one(pool)
     .await
 }
@@ -191,15 +200,17 @@ pub async fn update_alert_rule(
     channel_ids: &[String],
     enabled: bool,
     cooldown_seconds: i32,
+    project_id: Option<Uuid>,
 ) -> sqlx::Result<Option<AlertRuleRow>> {
     sqlx::query_as::<_, AlertRuleRow>(
         r#"
         UPDATE alert_rules SET
             name = $2, metric = $3, threshold = $4, window_minutes = $5,
-            channel_ids = $6, enabled = $7, cooldown_seconds = $8, updated_at = NOW()
+            channel_ids = $6, enabled = $7, cooldown_seconds = $8, project_id = $9,
+            updated_at = NOW()
         WHERE id = $1
         RETURNING id, name, metric, threshold, window_minutes, channel_ids,
-                  enabled, cooldown_seconds, last_triggered_at, created_at
+                  enabled, cooldown_seconds, last_triggered_at, project_id, created_at
         "#,
     )
     .bind(id)
@@ -210,6 +221,7 @@ pub async fn update_alert_rule(
     .bind(Json(channel_ids.to_vec()))
     .bind(enabled)
     .bind(cooldown_seconds)
+    .bind(project_id)
     .fetch_optional(pool)
     .await
 }
@@ -226,7 +238,7 @@ pub async fn list_alert_events(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<Al
     sqlx::query_as::<_, AlertEventRow>(
         r#"
         SELECT id, rule_id, rule_name, fingerprint, severity, status, value,
-               message, started_at, resolved_at, notified, created_at
+               message, started_at, resolved_at, notified, project_id, created_at
         FROM alert_events
         ORDER BY started_at DESC
         LIMIT $1
@@ -241,7 +253,7 @@ pub async fn active_alert_events(pool: &PgPool, rule_id: Uuid) -> sqlx::Result<V
     sqlx::query_as::<_, AlertEventRow>(
         r#"
         SELECT id, rule_id, rule_name, fingerprint, severity, status, value,
-               message, started_at, resolved_at, notified, created_at
+               message, started_at, resolved_at, notified, project_id, created_at
         FROM alert_events
         WHERE rule_id = $1 AND status = 'firing'
         "#,
@@ -259,7 +271,7 @@ pub async fn find_firing_alert(
     sqlx::query_as::<_, AlertEventRow>(
         r#"
         SELECT id, rule_id, rule_name, fingerprint, severity, status, value,
-               message, started_at, resolved_at, notified, created_at
+               message, started_at, resolved_at, notified, project_id, created_at
         FROM alert_events
         WHERE rule_id = $1 AND fingerprint = $2 AND status = 'firing'
         "#,
@@ -281,10 +293,10 @@ pub async fn insert_alert_event(
     sqlx::query_as::<_, AlertEventRow>(
         r#"
         INSERT INTO alert_events
-            (rule_id, rule_name, fingerprint, severity, status, value, message)
-        VALUES ($1, $2, $3, $4, 'firing', $5, $6)
+            (rule_id, rule_name, fingerprint, severity, status, value, message, project_id)
+        VALUES ($1, $2, $3, $4, 'firing', $5, $6, $7)
         RETURNING id, rule_id, rule_name, fingerprint, severity, status, value,
-                  message, started_at, resolved_at, notified, created_at
+                  message, started_at, resolved_at, notified, project_id, created_at
         "#,
     )
     .bind(rule.id)
@@ -293,6 +305,7 @@ pub async fn insert_alert_event(
     .bind(severity)
     .bind(value)
     .bind(message)
+    .bind(rule.project_id)
     .fetch_one(pool)
     .await
 }
