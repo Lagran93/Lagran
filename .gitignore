@@ -46,3 +46,6 @@ coverage/
 data/
 *.db
 *.sqlite
+
+# docs
+docs/
