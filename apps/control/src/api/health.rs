@@ -77,7 +77,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     }
 
     let nodes: Vec<(String, i64)> =
-        sqlx::query_as("SELECT status, COUNT(*)::BIGINT FROM nodes GROUP BY status")
+        sqlx::query_as("SELECT status, COUNT(*)::BIGINT FROM edge_nodes GROUP BY status")
             .fetch_all(&state.pool)
             .await
             .unwrap_or_default();
@@ -92,7 +92,11 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     }
 
     let origins: Vec<(String, String, bool, i32)> = sqlx::query_as(
-        "SELECT domain_name, origin_url, healthy, consecutive_fails FROM origin_health",
+        r#"
+        SELECT oh.domain_name, oh.origin_url, oh.healthy, oh.consecutive_fails
+        FROM origin_health oh
+        JOIN domains d ON d.name = oh.domain_name
+        "#,
     )
     .fetch_all(&state.pool)
     .await

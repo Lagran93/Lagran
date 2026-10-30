@@ -447,6 +447,12 @@ pub async fn delete(
             tracing::error!(error = %e, %id, "delete domain");
             db_error()
         })?;
+    let _ = repository::resolve_domain_alert_events(&state.pool, &row.name).await;
+    state.config_cache.clear();
+    if let Some(redis) = state.redis.as_deref() {
+        redis.del("lagran:cfg:global").await;
+    }
+    crate::service::edge_notify::notify_config_reload(&state).await;
     let _ =
         repository::insert_audit(&state.pool, &actor.email, "domain.delete", &row.name, "").await;
     tracing::info!(%id, "domain deleted ok");

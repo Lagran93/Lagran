@@ -203,12 +203,9 @@ async fn origin_findings(
         r#"
         SELECT oh.domain_name, oh.origin_url, oh.consecutive_fails, oh.last_error
         FROM origin_health oh
+        JOIN domains d ON d.name = oh.domain_name
         WHERE oh.healthy = FALSE AND oh.consecutive_fails >= $1
-          AND (
-            $2::uuid IS NULL OR EXISTS (
-              SELECT 1 FROM domains d WHERE d.name = oh.domain_name AND d.project_id = $2
-            )
-          )
+          AND ($2::uuid IS NULL OR d.project_id = $2)
         ORDER BY oh.domain_name, oh.origin_url
         "#,
     )

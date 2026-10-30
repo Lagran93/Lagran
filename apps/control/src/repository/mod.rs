@@ -1720,13 +1720,35 @@ pub async fn upsert_origin_health(
 pub async fn list_origin_health(pool: &PgPool) -> sqlx::Result<Vec<OriginHealthRow>> {
     sqlx::query_as::<_, OriginHealthRow>(
         r#"
-        SELECT domain_name, origin_url, healthy, latency_ms, last_check_at, last_error, consecutive_fails
-        FROM origin_health
-        ORDER BY domain_name
+        SELECT oh.domain_name, oh.origin_url, oh.healthy, oh.latency_ms,
+               oh.last_check_at, oh.last_error, oh.consecutive_fails
+        FROM origin_health oh
+        JOIN domains d ON d.name = oh.domain_name
+        ORDER BY oh.domain_name
         "#,
     )
     .fetch_all(pool)
     .await
+}
+
+/// Resolve firing events tied to a domain that is being deleted. Historical
+/// resolved events remain available for audit, but nothing stays "firing".
+pub async fn resolve_domain_alert_events(
+    pool: &PgPool,
+    domain_name: &str,
+) -> sqlx::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE alert_events
+        SET status = 'resolved', resolved_at = NOW()
+        WHERE status = 'firing'
+          AND split_part(fingerprint, '|', 1) = $1
+        "#,
+    )
+    .bind(domain_name)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn get_domain_rate_limit(pool: &PgPool, name: &str) -> sqlx::Result<Option<(i32, i32)>> {

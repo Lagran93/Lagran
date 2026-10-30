@@ -78,9 +78,20 @@ pub async fn report(
     _agent: AgentAuth,
     Json(req): Json<HealthReport>,
 ) -> Json<ReportAck> {
+    // A stale edge config may keep probing a domain that has just been deleted.
+    // Reject those reports instead of recreating an orphan health row.
+    let exists = repository::get_domain_by_name(&state.pool, req.domain_name.trim())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if !exists {
+        tracing::debug!(domain = %req.domain_name, "ignoring origin health for unknown domain");
+        return Json(ReportAck { accepted: false });
+    }
     if let Err(e) = repository::upsert_origin_health(
         &state.pool,
-        &req.domain_name,
+        req.domain_name.trim(),
         &req.origin_url,
         req.healthy,
         req.latency_ms as i32,
