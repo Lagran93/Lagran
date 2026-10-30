@@ -151,6 +151,12 @@ pub struct ManagedRules {
     pub xxe: bool,
     pub log4shell: bool,
     pub crlf: bool,
+    pub ssti: bool,
+    pub nosql: bool,
+    pub ldap: bool,
+    pub java: bool,
+    pub webshell: bool,
+    pub protocol: bool,
 }
 
 impl Default for ManagedRules {
@@ -165,6 +171,12 @@ impl Default for ManagedRules {
             xxe: true,
             log4shell: true,
             crlf: true,
+            ssti: true,
+            nosql: true,
+            ldap: true,
+            java: true,
+            webshell: true,
+            protocol: true,
         }
     }
 }
@@ -293,12 +305,16 @@ const SQLI: &[&str] = &[
     "\" or \"1\"=\"1",
     "or 1=1--",
     "and 1=1--",
+    "or true--",
     "information_schema",
     "sleep(",
+    "pg_sleep(",
+    "waitfor delay",
     "benchmark(",
     "extractvalue(",
     "updatexml(",
     "load_file(",
+    "';drop table",
     "' or 1=1",
 ];
 
@@ -309,48 +325,67 @@ const XSS: &[&str] = &[
     "onerror=",
     "onload=",
     "onmouseover=",
+    "onfocus=",
+    "onclick=",
     "<iframe",
+    "<svg",
+    "<img",
     "srcdoc=",
     "document.cookie",
+    "data:text/html",
+    "&#x3c;script",
+    "&lt;script",
 ];
 
 const TRAVERSAL: &[&str] = &[
     "../",
     "..\\",
+    "....//",
+    "..%2f",
+    "..%5c",
+    "%2e%2e",
+    "%2e%2e%2f",
     "/etc/passwd",
     "/etc/shadow",
     "boot.ini",
     "win.ini",
-    "..%2f",
-    "%2e%2e",
 ];
 
 const SCANNER_UA: &[&str] = &[
-    "sqlmap",
-    "nikto",
-    "nmap",
-    "masscan",
-    "acunetix",
-    "nessus",
-    "dirbuster",
-    "zgrab",
-    "wpscan",
+    "sqlmap", "nikto", "nmap", "masscan", "acunetix", "nessus", "dirbuster", "zgrab", "wpscan",
+    "nuclei", "ffuf", "gobuster", "feroxbuster", "whatweb", "w3af", "commix", "xsstrike",
+    "arachni", "openvas", "zaproxy", "zap/",
 ];
 
 const SCANNER_PATH: &[&str] = &[
     "/.env",
     "/.git/",
+    "/.svn/",
+    "/.aws/credentials",
+    "/.kube/config",
+    "/.ssh/",
+    "/id_rsa",
     "/wp-login.php",
     "/wp-admin",
     "/phpmyadmin",
     "/actuator",
     "/server-status",
     "/.DS_Store",
+    "/web.config",
+    "/config.php",
+    "/docker-compose.yml",
+    "/dockerfile",
+    "/backup.sql",
+    "/.sql",
+    "/.bak",
 ];
 
 const RCE: &[&str] = &[
     ";wget ",
     ";curl ",
+    ";nc ",
+    ";bash",
+    ";sh",
     "|bash",
     "|sh",
     "/bin/sh",
@@ -364,17 +399,32 @@ const RCE: &[&str] = &[
     "exec(",
     "system(",
     "$(",
+    "/dev/tcp/",
+    "mkfifo",
+    "perl -e",
+    "python -c",
+    "ruby -e",
 ];
 
 const SSRF: &[&str] = &[
     "169.254.169.254",
+    "169.254.169.253",
     "metadata.google.internal",
     "metadata.tencentyun.com",
+    "metadata.azure.com",
     "100.100.100.200",
+    "kubernetes.default.svc",
     "file://",
     "gopher://",
     "dict://",
     "ftp://",
+    "ldap://",
+    "ldaps://",
+    "rmi://",
+    "127.0.0.1",
+    "localhost",
+    "[::1]",
+    "0.0.0.0",
 ];
 
 const XXE: &[&str] = &[
@@ -382,11 +432,104 @@ const XXE: &[&str] = &[
     "<!entity",
     "system \"",
     "system '",
+    "public \"",
+    "public '",
     "file:///etc",
+    "expect://",
+    "jar://",
     "expect(",
 ];
 
-const LOG4SHELL: &[&str] = &["${jndi:", "jndi:ldap", "jndi:rmi", "jndi:dns"];
+const LOG4SHELL: &[&str] = &[
+    "${jndi:",
+    "jndi:ldap",
+    "jndi:ldaps",
+    "jndi:rmi",
+    "jndi:dns",
+    "jndi:iiop",
+    "jndi:corba",
+    "${lower:j",
+    "${upper:j",
+];
+
+const SSTI: &[&str] = &[
+    "{{7*7}}",
+    "{{7*'7'}}",
+    "${7*7}",
+    "#{7*7}",
+    "<%= 7*7 %>",
+    "<%=7*7%>",
+    "{{config",
+    "{{self.",
+    "{{cycler",
+    "{{lipsum",
+    "__class__",
+    "__mro__",
+    "__subclasses__",
+    "freemarker.template",
+    "org.apache.velocity",
+    "#set(",
+    "getengine(",
+    "runtime.exec",
+];
+
+const NOSQL: &[&str] = &[
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$regex",
+    "$where",
+    "$exists",
+    "$jsonschema",
+    "\"$ne\"",
+    "\"$gt\"",
+    "';return true;var a='",
+    "' || '1'=='1",
+];
+
+const LDAP: &[&str] = &[
+    "*)(uid=*",
+    "*)(cn=*",
+    ")(|(",
+    ")(&(",
+    "objectclass=*",
+];
+
+const JAVA: &[&str] = &[
+    "java.lang.runtime",
+    "java.lang.processbuilder",
+    "processbuilder",
+    "getruntime().exec",
+    "ognl",
+    "struts",
+    "%{#",
+    "_memberaccess",
+    "class.module.classloader",
+];
+
+const WEBSHELL: &[&str] = &[
+    "<?php",
+    "<?=",
+    "php://",
+    "php://filter",
+    "auto_prepend_file",
+    "auto_append_file",
+    "$_get[",
+    "$_post[",
+    "$_request[",
+    "$_cookie[",
+    "eval(",
+    "assert(",
+    "base64_decode(",
+    "gzinflate(",
+    "str_rot13(",
+    "c99shell",
+    "r57shell",
+    "weevely",
+    "preg_replace(\"/e\"",
+];
 
 /// Static assets are never challenged by security levels.
 const STATIC_EXT: &[&str] = &[
@@ -537,14 +680,14 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     if cfg.managed.rce && contains_any(&haystack, RCE) {
         return Some(verdict("命令执行", "rce"));
     }
+    if cfg.managed.log4shell && contains_any(&haystack, LOG4SHELL) {
+        return Some(verdict("Log4Shell", "log4shell"));
+    }
     if cfg.managed.ssrf && contains_any(&url_part, SSRF) {
         return Some(verdict("SSRF / 云元数据", "ssrf"));
     }
     if cfg.managed.xxe && contains_any(&haystack, XXE) {
         return Some(verdict("XXE 外部实体", "xxe"));
-    }
-    if cfg.managed.log4shell && contains_any(&haystack, LOG4SHELL) {
-        return Some(verdict("Log4Shell", "log4shell"));
     }
     if cfg.managed.crlf
         && (path.contains('\r')
@@ -553,6 +696,31 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
             || query.contains('\n'))
     {
         return Some(verdict("CRLF / 头注入", "crlf"));
+    }
+    if cfg.managed.ssti && contains_any(&haystack, SSTI) {
+        return Some(verdict("模板注入 SSTI", "ssti"));
+    }
+    if cfg.managed.nosql && contains_any(&url_part, NOSQL) {
+        return Some(verdict("NoSQL 注入", "nosql"));
+    }
+    if cfg.managed.ldap && contains_any(&haystack, LDAP) {
+        return Some(verdict("LDAP 注入", "ldap"));
+    }
+    if cfg.managed.java && contains_any(&haystack, JAVA) {
+        return Some(verdict("Java 反序列化 / OGNL", "java"));
+    }
+    if cfg.managed.webshell && contains_any(&haystack, WEBSHELL) {
+        return Some(verdict("WebShell / PHP 注入", "webshell"));
+    }
+    if cfg.managed.protocol
+        && (path.contains('\0')
+            || query.contains('\0')
+            || path.contains("%00")
+            || query.contains("%00")
+            || path.len() > 2048
+            || query.len() > 8192)
+    {
+        return Some(verdict("协议异常 / 超长请求", "protocol"));
     }
 
     // Custom rules: highest priority first, first match wins.
@@ -863,6 +1031,12 @@ mod tests {
             xxe: false,
             log4shell: false,
             crlf: false,
+            ssti: false,
+            nosql: false,
+            ldap: false,
+            java: false,
+            webshell: false,
+            protocol: false,
         };
         c.security_level = SecurityLevel::Medium;
         let h = HeaderMap::new();
@@ -871,6 +1045,39 @@ mod tests {
             "security_level"
         );
         assert!(evaluate(&c, &req(&h, "/", "", "Mozilla/5.0")).is_none());
+    }
+
+    #[test]
+    fn detects_managed_rules_v2() {
+        let c = cfg();
+        let h = HeaderMap::new();
+        let cases = [
+            ("/render", "q=%7B%7B7*7%7D%7D", "ssti"),
+            ("/api", "q=%7B%22%24ne%22%3A%22x%22%7D", "nosql"),
+            ("/login", "user=*%29%28uid%3D*", "ldap"),
+            ("/struts", "q=%25%7B%23_memberAccess%7D", "java"),
+            ("/upload", "q=%3C%3Fphp%20echo", "webshell"),
+            ("/x%00.php", "", "protocol"),
+            ("/.aws/credentials", "", "scanners"),
+            ("/id_rsa", "", "scanners"),
+        ];
+        for (path, query, category) in cases {
+            assert_eq!(
+                evaluate(&c, &req(&h, path, query, "curl"))
+                    .unwrap()
+                    .category,
+                category
+            );
+        }
+        assert!(evaluate(&c, &req(&h, "/products", "page=2&q=shoes", "Mozilla/5.0")).is_none());
+    }
+
+    #[test]
+    fn managed_rules_can_be_disabled_individually() {
+        let mut c = cfg();
+        c.managed.ssti = false;
+        let h = HeaderMap::new();
+        assert!(evaluate(&c, &req(&h, "/render", "q=%7B%7B7*7%7D%7D", "curl")).is_none());
     }
 
     #[test]

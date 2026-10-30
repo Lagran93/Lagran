@@ -106,7 +106,7 @@ done
 
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H "$AUTH" \
   -H 'content-type: application/json' \
-  -d '{"enabled":true,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true,"challenge_difficulty":2,"challenge_ttl_secs":300}' >/dev/null
+  -d '{"enabled":true,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true,"rce":true,"ssrf":true,"xxe":true,"log4shell":true,"crlf":true,"ssti":true,"nosql":true,"ldap":true,"java":true,"webshell":true,"protocol":true,"challenge_difficulty":2,"challenge_ttl_secs":300}' >/dev/null
 curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf/rules" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"name":"拦截后台探测","field":"path","operator":"prefix","value":"/blocked","action":"block","priority":10}' >/dev/null
@@ -155,6 +155,18 @@ contains "block page has error code" "$(cat "$LOG_DIR/headers")" "WAF_BLOCKED"
 
 CODE=$(request "/x?q=%3Cscript%3Ealert(1)%3C/script%3E" -H 'X-Forwarded-For: 198.51.100.1')
 check "XSS query blocked" "$CODE" "403"
+
+for case in \
+  "SSTI|/render?q=%7B%7B7*7%7D%7D" \
+  "NoSQL|/api?q=%7B%22%24ne%22%3A%22x%22%7D" \
+  "LDAP|/login?user=*%29%28uid%3D*" \
+  "Java|/struts?q=%25%7B%23_memberAccess%7D" \
+  "WebShell|/upload?q=%3C%3Fphp%20echo"; do
+  label=${case%%|*}
+  path=${case#*|}
+  CODE=$(request "$path" -H 'X-Forwarded-For: 198.51.100.1')
+  check "$label managed rule blocked" "$CODE" "403"
+done
 
 CODE=$(request "/../../etc/passwd" --path-as-is -H 'X-Forwarded-For: 198.51.100.1')
 check "path traversal blocked" "$CODE" "403"
@@ -233,6 +245,7 @@ else
   fail "block events recorded (got ${BLOCKS:-0})"
 fi
 contains "event carries category" "$EVENTS" '"category":"sqli"'
+contains "event carries extended category" "$EVENTS" '"category":"ssti"'
 contains "event carries rule name" "$EVENTS" '"rule_name":"SQL 注入"'
 contains "challenge event recorded" "$EVENTS" '"action":"challenge"'
 

@@ -29,7 +29,7 @@
   **V2Ray/Loyalsoldier `geoip.dat` 或旧版 JSON** 打分返回主备节点；附 PowerDNS pipe backend 接入示例
 - 自研权威 DNS（`apps/dns`）：UDP/TCP 53、SOA/NS/A/AAAA、EDNS0 + ECS、调度结果缓存、控制面故障时
   用旧结果兜底；可直接作为 `edge.lagran.net` 的权威服务器
-- WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器 / **RCE / SSRF / XXE / Log4Shell / CRLF**）、
+- WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器与敏感文件 / RCE / SSRF / XXE / Log4Shell / CRLF / SSTI / NoSQL / LDAP / Java 反序列化 / WebShell / 协议异常）、
   自定义规则（含**请求头匹配**，拦截/放行/记录/浏览器质询）、IP 黑白名单、观察/拦截模式、
   **安全级别（低/中/高/攻击中）**、事件日志与**统计概览**
 - CC 防御：按域名/IP 限速、突发额度、**连续超限自动封禁 IP**、CIDR 白名单、观察模式与 429 限流响应、

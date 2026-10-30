@@ -2443,6 +2443,12 @@ pub struct WafSettingsRow {
     pub xxe: bool,
     pub log4shell: bool,
     pub crlf: bool,
+    pub ssti: bool,
+    pub nosql: bool,
+    pub ldap: bool,
+    pub java: bool,
+    pub webshell: bool,
+    pub protocol: bool,
     pub challenge_difficulty: i32,
     pub challenge_ttl_secs: i32,
     pub security_level: String,
@@ -2495,6 +2501,7 @@ pub async fn get_waf_settings(
         r#"
         SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
                rce, ssrf, xxe, log4shell, crlf,
+               ssti, nosql, ldap, java, webshell, protocol,
                challenge_difficulty, challenge_ttl_secs, security_level
         FROM waf_settings WHERE domain_id = $1
         "#,
@@ -2519,6 +2526,12 @@ pub async fn upsert_waf_settings(
     xxe: bool,
     log4shell: bool,
     crlf: bool,
+    ssti: bool,
+    nosql: bool,
+    ldap: bool,
+    java: bool,
+    webshell: bool,
+    protocol: bool,
     challenge_difficulty: i32,
     challenge_ttl_secs: i32,
     security_level: &str,
@@ -2528,8 +2541,10 @@ pub async fn upsert_waf_settings(
         INSERT INTO waf_settings
             (domain_id, enabled, mode, sqli, xss, traversal, scanners,
              rce, ssrf, xxe, log4shell, crlf,
+             ssti, nosql, ldap, java, webshell, protocol,
              challenge_difficulty, challenge_ttl_secs, security_level)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18, $19, $20, $21)
         ON CONFLICT (domain_id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
           mode = EXCLUDED.mode,
@@ -2542,12 +2557,19 @@ pub async fn upsert_waf_settings(
           xxe = EXCLUDED.xxe,
           log4shell = EXCLUDED.log4shell,
           crlf = EXCLUDED.crlf,
+          ssti = EXCLUDED.ssti,
+          nosql = EXCLUDED.nosql,
+          ldap = EXCLUDED.ldap,
+          java = EXCLUDED.java,
+          webshell = EXCLUDED.webshell,
+          protocol = EXCLUDED.protocol,
           challenge_difficulty = EXCLUDED.challenge_difficulty,
           challenge_ttl_secs = EXCLUDED.challenge_ttl_secs,
           security_level = EXCLUDED.security_level,
           updated_at = NOW()
         RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners,
                   rce, ssrf, xxe, log4shell, crlf,
+                  ssti, nosql, ldap, java, webshell, protocol,
                   challenge_difficulty, challenge_ttl_secs, security_level
         "#,
     )
@@ -2563,6 +2585,12 @@ pub async fn upsert_waf_settings(
     .bind(xxe)
     .bind(log4shell)
     .bind(crlf)
+    .bind(ssti)
+    .bind(nosql)
+    .bind(ldap)
+    .bind(java)
+    .bind(webshell)
+    .bind(protocol)
     .bind(challenge_difficulty)
     .bind(challenge_ttl_secs)
     .bind(security_level)
@@ -2575,6 +2603,7 @@ pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSetting
         r#"
         SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
                rce, ssrf, xxe, log4shell, crlf,
+               ssti, nosql, ldap, java, webshell, protocol,
                challenge_difficulty, challenge_ttl_secs, security_level
         FROM waf_settings
         "#,

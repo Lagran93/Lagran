@@ -294,6 +294,18 @@ struct WafManagedCfg {
     log4shell: bool,
     #[serde(default = "default_true")]
     crlf: bool,
+    #[serde(default = "default_true")]
+    ssti: bool,
+    #[serde(default = "default_true")]
+    nosql: bool,
+    #[serde(default = "default_true")]
+    ldap: bool,
+    #[serde(default = "default_true")]
+    java: bool,
+    #[serde(default = "default_true")]
+    webshell: bool,
+    #[serde(default = "default_true")]
+    protocol: bool,
 }
 
 impl Default for WafManagedCfg {
@@ -308,6 +320,12 @@ impl Default for WafManagedCfg {
             xxe: true,
             log4shell: true,
             crlf: true,
+            ssti: true,
+            nosql: true,
+            ldap: true,
+            java: true,
+            webshell: true,
+            protocol: true,
         }
     }
 }
@@ -387,6 +405,12 @@ fn into_waf(cfg: Option<WafCfg>) -> WafConfig {
             xxe: cfg.managed.xxe,
             log4shell: cfg.managed.log4shell,
             crlf: cfg.managed.crlf,
+            ssti: cfg.managed.ssti,
+            nosql: cfg.managed.nosql,
+            ldap: cfg.managed.ldap,
+            java: cfg.managed.java,
+            webshell: cfg.managed.webshell,
+            protocol: cfg.managed.protocol,
         },
         rules,
         ip_allow: parse_nets(cfg.ip_allow),

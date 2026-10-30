@@ -60,6 +60,12 @@ pub struct WafManagedOut {
     pub xxe: bool,
     pub log4shell: bool,
     pub crlf: bool,
+    pub ssti: bool,
+    pub nosql: bool,
+    pub ldap: bool,
+    pub java: bool,
+    pub webshell: bool,
+    pub protocol: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -234,6 +240,12 @@ fn waf_config_from(
             xxe: settings.xxe,
             log4shell: settings.log4shell,
             crlf: settings.crlf,
+            ssti: settings.ssti,
+            nosql: settings.nosql,
+            ldap: settings.ldap,
+            java: settings.java,
+            webshell: settings.webshell,
+            protocol: settings.protocol,
         },
         rules: rules
             .into_iter()
@@ -346,6 +358,12 @@ pub(crate) fn build(
             w.managed.xxe.hash(&mut h);
             w.managed.log4shell.hash(&mut h);
             w.managed.crlf.hash(&mut h);
+            w.managed.ssti.hash(&mut h);
+            w.managed.nosql.hash(&mut h);
+            w.managed.ldap.hash(&mut h);
+            w.managed.java.hash(&mut h);
+            w.managed.webshell.hash(&mut h);
+            w.managed.protocol.hash(&mut h);
             w.security_level.hash(&mut h);
             for r in &w.rules {
                 r.name.hash(&mut h);
