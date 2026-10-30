@@ -7,15 +7,15 @@
 ## 从 GitHub 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh \
-  | sudo env LAGRAN_REPO=<owner>/<repo> bash
+curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
+  | sudo env LAGRAN_REPO=Lagran93/Lagran bash
 ```
 
 脚本会下载最新 Release 中的 `lagran-control` / `lagran-edge` / `lagran-dns`、静态前端和配置模板，安装到 `/opt/lagran`，创建本地 PostgreSQL 数据库（或使用 `LAGRAN_DATABASE_URL`），注册 systemd 服务并启动控制面。需要安装边缘节点时：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh \
-  | sudo env LAGRAN_REPO=<owner>/<repo> AGENT_TOKEN=<节点令牌> NODE_ID=edge-01 bash -s -- --with-edge
+curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
+  | sudo env LAGRAN_REPO=Lagran93/Lagran AGENT_TOKEN=<节点令牌> NODE_ID=edge-01 bash -s -- --with-edge
 ```
 
 详细参数：
@@ -30,7 +30,15 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh \
 
 - 构建时由 `build.rs` 注入短 Git hash，版本格式为 `0.1.0+4a5f39b`。
 - `/health`、`/ready`、Prometheus `lagran_control_info`、控制台「系统设置 → 控制面版本」和节点心跳都会显示该版本。
-- [.github/workflows/ci.yml](.github/workflows/ci.yml) 在 push/PR 时执行 Rust 测试和前端静态构建；推送 `v*` 标签时会自动生成 Release 压缩包和 `SHA256SUMS`。
+- [.github/workflows/ci.yml](.github/workflows/ci.yml) 在 push/PR 时执行 Rust 测试和前端静态构建，并始终产出可下载的 `Release bundle artifact`。
+- 真正发布 GitHub Release 需要推送版本 Tag，或在 Actions 页面手动 run workflow 并填写 tag：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+普通分支 push 只构建 artifact，不会自动创建不可审核的 Release，这是有意设计。
 
 > GeoDNS 边缘节点调度流程见 [docs/geodns.md](docs/geodns.md)。  
 > 本地编译、上传并重启服务的脚本见 [deployed.sh](deployed.sh)。

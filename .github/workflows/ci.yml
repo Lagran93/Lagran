@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create from the current commit (e.g. v0.1.0)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -66,36 +71,72 @@ jobs:
           if-no-files-found: error
           path: apps/frontend/.output/public
 
-  release:
-    name: GitHub Release bundle
-    if: startsWith(github.ref, 'refs/tags/v')
+  # Always build a downloadable bundle on branch pushes and PRs. This is the
+  # job users see as "Release bundle artifact"; it is deliberately not gated
+  # on a tag.
+  bundle:
+    name: Release bundle artifact
     needs: [backend, frontend]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
       - name: Build bundle
+        id: bundle
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [[ -n "${INPUT_TAG:-}" ]]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="snapshot-${GITHUB_SHA::7}"
+          fi
+          VERSION="${TAG#v}"
+          if [[ "${TAG}" != snapshot-* && ! "${TAG}" =~ ^v[0-9] ]]; then
+            echo "error: release tag must look like v1.2.3 (got ${TAG})" >&2
+            exit 1
+          fi
           mkdir -p stage/bin stage/web
           cp dist/lagran-binaries/lagran-control stage/bin/
           cp dist/lagran-binaries/lagran-edge stage/bin/
           cp dist/lagran-binaries/lagran-dns stage/bin/
           cp -a dist/lagran-web/. stage/web/
           cp control.env.example edge.env.example dns.env.example install.sh README.md stage/
-          printf '%s\n' "${GITHUB_REF_NAME}" > stage/VERSION
+          printf '%s\n' "${TAG}" > stage/VERSION
           tar -C stage -czf "lagran-cdn-${VERSION}-linux-amd64.tar.gz" .
           sha256sum "lagran-cdn-${VERSION}-linux-amd64.tar.gz" > SHA256SUMS
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           cat SHA256SUMS
-      - name: Publish release assets
-        uses: softprops/action-gh-release@v2
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            lagran-cdn-*-linux-amd64.tar.gz
+          name: lagran-release-bundle
+          if-no-files-found: error
+          path: |
+            lagran-cdn-*.tar.gz
             SHA256SUMS
+
+  # Publishing is intentionally tag-only (or a manual dispatch with a tag).
+  # A plain branch push must not create an unreviewed GitHub Release.
+  publish:
+    name: Publish GitHub Release (tag/manual)
+    needs: [bundle]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lagran-release-bundle
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
+          files: dist/*
           generate_release_notes: true
