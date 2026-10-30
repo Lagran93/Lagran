@@ -105,6 +105,10 @@
             <div class="info-value">Lagran CDN</div>
           </div>
           <div class="info-item">
+            <div class="info-label">控制面版本</div>
+            <div class="info-value mono">{{ controlVersion || '—' }}</div>
+          </div>
+          <div class="info-item">
             <div class="info-label">当前角色</div>
             <div class="info-value">{{ auth.isAdmin ? '系统管理员' : '普通用户' }}</div>
           </div>
@@ -178,6 +182,7 @@ const effectiveApiBase = computed(() => {
 
 const checking = ref(false)
 const healthStatus = ref<{ ok: boolean; at: string; message?: string } | null>(null)
+const controlVersion = ref('')
 
 const profileOpen = ref(false)
 const profileName = ref('')
@@ -261,6 +266,14 @@ async function checkHealth() {
   try {
     const res = await fetch(`${effectiveApiBase.value}/health`)
     const text = await res.text()
+    if (res.ok) {
+      try {
+        const data = JSON.parse(text)
+        if (data.version) controlVersion.value = data.version
+      } catch {
+        // Health may be served by a non-JSON proxy; keep the version blank.
+      }
+    }
     healthStatus.value = {
       ok: res.ok,
       at: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
@@ -279,6 +292,12 @@ async function checkHealth() {
 
 onMounted(() => {
   auth.hydrate()
+  fetch(`${effectiveApiBase.value}/health`)
+    .then((res) => (res.ok ? res.json() : null))
+    .then((data) => {
+      if (data?.version) controlVersion.value = data.version
+    })
+    .catch(() => {})
 })
 </script>
 

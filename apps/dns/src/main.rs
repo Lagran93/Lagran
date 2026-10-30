@@ -28,6 +28,11 @@ fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cfg = DnsConfig::from_env();
+    tracing::info!(
+        version = version::VERSION,
+        git_hash = version::GIT_HASH,
+        "lagran-dns starting"
+    );
     if let Err(e) = server::run(cfg) {
         // Logging may be filtered by the caller; always surface fatal errors.
         tracing::error!(error = %e, "dns server failed");
@@ -35,3 +40,5 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+mod version;

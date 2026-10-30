@@ -3,6 +3,35 @@
 高性能、可自托管的 CDN 系统。
 
 > 完整部署步骤见 [docs/deployment.md](docs/deployment.md)。  
+
+## 从 GitHub 一键安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh \
+  | sudo env LAGRAN_REPO=<owner>/<repo> bash
+```
+
+脚本会下载最新 Release 中的 `lagran-control` / `lagran-edge` / `lagran-dns`、静态前端和配置模板，安装到 `/opt/lagran`，创建本地 PostgreSQL 数据库（或使用 `LAGRAN_DATABASE_URL`），注册 systemd 服务并启动控制面。需要安装边缘节点时：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh \
+  | sudo env LAGRAN_REPO=<owner>/<repo> AGENT_TOKEN=<节点令牌> NODE_ID=edge-01 bash -s -- --with-edge
+```
+
+详细参数：
+
+```bash
+./install.sh --help
+```
+
+前端产物会安装到 `/opt/lagran/web`，使用 Caddy/Nginx 托管并把 `/api/*`、`/health` 反向代理到 `127.0.0.1:8080`。
+
+## 版本与 CI
+
+- 构建时由 `build.rs` 注入短 Git hash，版本格式为 `0.1.0+4a5f39b`。
+- `/health`、`/ready`、Prometheus `lagran_control_info`、控制台「系统设置 → 控制面版本」和节点心跳都会显示该版本。
+- [.github/workflows/ci.yml](.github/workflows/ci.yml) 在 push/PR 时执行 Rust 测试和前端静态构建；推送 `v*` 标签时会自动生成 Release 压缩包和 `SHA256SUMS`。
+
 > GeoDNS 边缘节点调度流程见 [docs/geodns.md](docs/geodns.md)。  
 > 本地编译、上传并重启服务的脚本见 [deployed.sh](deployed.sh)。
 
@@ -216,7 +245,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 - 带 `Cookie` 的请求默认绕过缓存（偏保守）；缓存响应不保存 `Set-Cookie`
 - Range 缓存以完整对象为存储单位（命中完整对象时切片）；未命中 Range 直接透传源站，多段 Range 同样透传
 - 限流为单进程内存态，多实例不共享
-- `crates/lagran-proto` / `proto/` 仍是 gRPC 占位，Redis 未接入
+- `crates/lagran-proto` / `proto/` 仍是 gRPC 占位；Redis 已可选接入，未配置时自动回退到进程内状态/PostgreSQL
 
 ## License
 

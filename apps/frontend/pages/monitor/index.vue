@@ -38,6 +38,29 @@
       </div>
     </div>
 
+    <div class="wall-pulse">
+      <span class="pulse-item">
+        <span class="status-dot" :class="onlineNodes ? 'ok' : 'off'" />
+        节点在线 <b>{{ onlineNodes }}/{{ nodes.length }}</b>
+      </span>
+      <span class="pulse-item">
+        <span class="status-dot" :class="unhealthyOrigins ? 'off' : 'ok'" />
+        源站健康 <b>{{ healthyOrigins }}/{{ health.length }}</b>
+      </span>
+      <span class="pulse-item">
+        <span class="status-dot" :class="wafBlocks ? 'off' : 'ok'" />
+        WAF 24h <b>{{ formatNumber(wafBlocks) }} 次拦截</b>
+      </span>
+      <span class="pulse-item">
+        <span class="status-dot" :class="alertSummary.firing ? 'off' : 'ok'" />
+        告警中 <b>{{ alertSummary.firing }}</b>
+      </span>
+      <span class="pulse-item">
+        <span class="pulse-value">{{ percent(live.hit_ratio) }}</span>
+        缓存命中率
+      </span>
+    </div>
+
     <div class="wall-grid">
       <div class="wall-card chart-card">
         <div class="wall-card-head">
@@ -58,6 +81,7 @@
             <span class="top-bar">
               <i :style="{ width: `${Math.min(100, (d.requests / maxDomain) * 100)}%` }" />
             </span>
+            <span class="top-rate">{{ percent(domainHit(d)) }}</span>
             <span class="top-num">{{ formatNumber(d.requests) }}</span>
           </div>
           <div v-if="!topDomains.length" class="wall-empty">暂无数据</div>
@@ -67,19 +91,22 @@
 
     <div class="wall-grid lower">
       <div class="wall-card">
-        <div class="wall-card-head"><span>节点状态</span></div>
+        <div class="wall-card-head"><span>节点状态 · {{ onlineNodes }}/{{ nodes.length }}</span></div>
         <div class="node-grid-monitor">
           <div v-for="n in nodes.slice(0, 12)" :key="n.id" class="node-pill">
             <span class="status-dot" :class="n.status === 'online' ? 'ok' : 'off'" />
-            <span class="truncate">{{ n.name }}</span>
+            <span class="truncate node-name">{{ n.name }}</span>
             <span class="node-region">{{ n.region || '—' }}</span>
-            <span class="node-load">{{ n.cpu_usage != null ? `${n.cpu_usage.toFixed(0)}%` : '—' }}</span>
+            <span class="node-metrics">
+              <span class="node-metric">CPU {{ n.cpu_usage != null ? `${n.cpu_usage.toFixed(0)}%` : '—' }}</span>
+              <span class="node-metric">MEM {{ n.memory_usage != null ? `${n.memory_usage.toFixed(0)}%` : '—' }}</span>
+            </span>
           </div>
           <div v-if="!nodes.length" class="wall-empty">暂无节点</div>
         </div>
       </div>
       <div class="wall-card">
-        <div class="wall-card-head"><span>源站健康</span></div>
+        <div class="wall-card-head"><span>源站健康 · {{ healthyOrigins }}/{{ health.length }}</span></div>
         <div class="health-list">
           <div v-for="h in health.slice(0, 8)" :key="h.domain_name + h.origin_url" class="health-row">
             <span class="status-dot" :class="h.healthy ? 'ok' : 'off'" />
@@ -87,6 +114,74 @@
             <span class="health-latency">{{ h.latency_ms }} ms</span>
           </div>
           <div v-if="!health.length" class="wall-empty">暂无数据</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="wall-grid ops-grid">
+      <div class="wall-card">
+        <div class="wall-card-head"><span>缓存效率</span><span class="wall-legend">实时窗口</span></div>
+        <div class="cache-body">
+          <div class="cache-rate">
+            <b>{{ percent(live.hit_ratio) }}</b>
+            <span>缓存命中率</span>
+          </div>
+          <div class="cache-bar">
+            <i :style="{ width: `${Math.min(100, live.hit_ratio * 100)}%` }" />
+          </div>
+          <div class="cache-legend">
+            <span>命中 {{ formatNumber(live.hits) }}</span>
+            <span>未命中 {{ formatNumber(live.misses) }}</span>
+          </div>
+          <div class="cache-foot">
+            <span>请求 {{ formatNumber(live.requests) }}</span>
+            <span>出流量 {{ formatBytes(live.bytes) }}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="wall-card">
+        <div class="wall-card-head">
+          <span>WAF 实时拦截</span>
+          <span class="wall-legend">{{ formatNumber(wafBlocks) }} 次 / 24h</span>
+        </div>
+        <div class="event-list">
+          <div v-for="e in wafEvents.slice(0, 6)" :key="e.id" class="event-row">
+            <span class="event-action" :class="e.action === 'block' ? 'block' : 'observe'">
+              {{ e.action === 'block' ? '拦截' : '观察' }}
+            </span>
+            <span class="event-main">
+              <strong>{{ e.category }}</strong>
+              <small>{{ e.path }}</small>
+            </span>
+            <span class="event-time">{{ fromNow(e.ts) }}</span>
+          </div>
+          <div v-if="!wafEvents.length" class="wall-empty">暂无 WAF 事件</div>
+        </div>
+      </div>
+
+      <div class="wall-card">
+        <div class="wall-card-head">
+          <span>告警中心</span>
+          <span class="wall-legend">{{ alertSummary.firing }} 正在告警</span>
+        </div>
+        <div class="alert-body">
+          <div class="alert-counts">
+            <div><b class="danger">{{ alertSummary.firing }}</b><span>告警中</span></div>
+            <div><b class="ok">{{ alertSummary.resolved }}</b><span>已恢复</span></div>
+            <div><b>{{ alertSummary.total }}</b><span>总事件</span></div>
+          </div>
+          <div class="event-list">
+            <div v-for="e in alertEvents.slice(0, 4)" :key="e.id" class="event-row alert-event">
+              <span class="status-dot" :class="e.status === 'firing' ? 'off' : 'ok'" />
+              <span class="event-main">
+                <strong>{{ e.rule_name }}</strong>
+                <small>{{ e.fingerprint }}</small>
+              </span>
+              <span class="event-time">{{ e.status === 'firing' ? '告警中' : '已恢复' }}</span>
+            </div>
+            <div v-if="!alertEvents.length" class="wall-empty">暂无告警</div>
+          </div>
         </div>
       </div>
     </div>
@@ -114,12 +209,21 @@ const realtime = ref<any>({
 })
 const nodes = ref<any[]>([])
 const health = ref<any[]>([])
+const wafStats = ref<any>({ total: 0, by_action: [], by_category: [] })
+const wafEvents = ref<any[]>([])
+const alertSummary = ref<any>({ firing: 0, resolved: 0, total: 0 })
+const alertEvents = ref<any[]>([])
 const updatedAt = ref('')
 const isFull = ref(false)
 let timer: ReturnType<typeof setInterval> | null = null
 
 const hourStats = computed(() => totals(series.value))
 const onlineNodes = computed(() => nodes.value.filter((n) => n.status === 'online').length)
+const healthyOrigins = computed(() => health.value.filter((h) => h.healthy).length)
+const unhealthyOrigins = computed(() => health.value.length - healthyOrigins.value)
+const wafBlocks = computed(
+  () => wafStats.value.by_action?.find((r: any) => r.key === 'block')?.count || 0,
+)
 const topIsLive = computed(() => realtime.value.enabled && realtime.value.domains.length > 0)
 const topDomains = computed(() =>
   topIsLive.value ? realtime.value.domains : byDomain.value,
@@ -128,18 +232,28 @@ const live = computed(() =>
   realtime.value.enabled
     ? {
         requests: realtime.value.requests,
+        hits: realtime.value.cache_hits,
+        misses: realtime.value.cache_misses,
         hit_ratio: realtime.value.hit_ratio,
         bytes: realtime.value.bytes_sent,
         domain_count: realtime.value.domain_count ?? realtime.value.domains.length,
       }
     : {
         requests: hourStats.value.requests,
+        hits: hourStats.value.hits,
+        misses: hourStats.value.misses,
         hit_ratio: hourStats.value.hit_ratio,
         bytes: hourStats.value.bytes,
         domain_count: byDomain.value.length,
       },
 )
 const maxDomain = computed(() => Math.max(1, ...topDomains.value.map((d) => d.requests || 0)))
+
+function domainHit(d: any) {
+  if (typeof d.hit_ratio === 'number') return d.hit_ratio
+  const total = (d.cache_hits || 0) + (d.cache_misses || 0)
+  return total ? (d.cache_hits || 0) / total : 0
+}
 
 function totals(points: any[]) {
   const requests = points.reduce((sum, p) => sum + (p.requests || 0), 0)
@@ -156,12 +270,16 @@ function totals(points: any[]) {
 }
 
 async function load() {
-  const [rt, ts, bd, endpoints, hs] = await Promise.all([
+  const [rt, ts, bd, endpoints, hs, ws, we, als, ale] = await Promise.all([
     api.get<any>('/api/v1/stats/realtime?minutes=5').catch(() => null),
     api.get<any>('/api/v1/stats/timeseries?hours=1&bucket=60&compare=true').catch(() => null),
     api.get<any[]>('/api/v1/stats/by-domain?hours=1').catch(() => []),
     api.get<any>('/api/v1/edge-endpoints').catch(() => null),
     api.get<any[]>('/api/v1/origin-health').catch(() => []),
+    api.get<any>('/api/v1/waf/stats?days=1').catch(() => null),
+    api.get<any[]>('/api/v1/waf/events?limit=20').catch(() => []),
+    api.get<any>('/api/v1/alerts/summary').catch(() => null),
+    api.get<any[]>('/api/v1/alert-events?limit=6').catch(() => []),
   ])
   if (rt) realtime.value = rt
   series.value = ts?.current || []
@@ -169,6 +287,10 @@ async function load() {
   byDomain.value = bd || []
   nodes.value = endpoints?.nodes || []
   health.value = hs || []
+  if (ws) wafStats.value = ws
+  wafEvents.value = we || []
+  if (als) alertSummary.value = als
+  alertEvents.value = ale || []
   updatedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
 }
 
@@ -463,12 +585,234 @@ onUnmounted(() => {
   padding: 20px 0;
 }
 
+.wall-pulse {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 11px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 10px;
+  background: rgba(10, 24, 41, 0.46);
+}
+
+.pulse-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #7890ac;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.pulse-item b {
+  color: #d6e7fa;
+  font-weight: 600;
+}
+
+.pulse-value {
+  color: #4bd8ff;
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.ops-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.node-pill {
+  flex-wrap: wrap;
+  align-content: center;
+}
+
+.node-name {
+  flex: 1;
+}
+
+.node-metrics {
+  width: 100%;
+  display: flex;
+  gap: 10px;
+  padding-left: 17px;
+}
+
+.node-metric {
+  color: #667d98;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.top-rate {
+  width: 46px;
+  text-align: right;
+  color: #6f8fae;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cache-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.cache-rate {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+
+.cache-rate b {
+  color: #3ddc84;
+  font-size: 30px;
+  line-height: 1;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.cache-rate span {
+  color: #7f92ad;
+  font-size: 10px;
+}
+
+.cache-bar {
+  height: 7px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #172131;
+}
+
+.cache-bar i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #1677ff, #3ddc84);
+}
+
+.cache-legend,
+.cache-foot {
+  display: flex;
+  justify-content: space-between;
+  color: #7890ac;
+  font-size: 10px;
+}
+
+.cache-foot {
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.event-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.event-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.event-action {
+  flex: none;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.event-action.block {
+  color: #ff9b9b;
+  background: rgba(255, 107, 107, 0.13);
+}
+
+.event-action.observe {
+  color: #ffd479;
+  background: rgba(255, 196, 77, 0.12);
+}
+
+.event-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.event-main strong {
+  color: #c8d9ec;
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.event-main small {
+  color: #627b98;
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.event-time {
+  flex: none;
+  color: #5f7894;
+  font-size: 9px;
+}
+
+.alert-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.alert-counts {
+  display: flex;
+  gap: 22px;
+  padding: 4px 0 9px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.alert-counts > div {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.alert-counts b {
+  color: #d6e7fa;
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.alert-counts b.danger {
+  color: #ff7a7a;
+}
+
+.alert-counts b.ok {
+  color: #3ddc84;
+}
+
+.alert-counts span {
+  color: #6f87a1;
+  font-size: 9px;
+}
+
+.alert-event .event-time {
+  color: #7f92ad;
+}
+
 @media (max-width: 1100px) {
   .wall-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .wall-grid,
-  .wall-grid.lower {
+  .wall-grid.lower,
+  .ops-grid {
     grid-template-columns: 1fr;
   }
 }

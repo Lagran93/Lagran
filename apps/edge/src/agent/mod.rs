@@ -71,7 +71,7 @@ pub fn spawn_heartbeat(config: EdgeConfig, control: ControlClient, node_control:
         tracing::info!(
             target = %control.endpoint("/api/v1/nodes/heartbeat"),
             node_id = %config.node_id,
-            version = env!("CARGO_PKG_VERSION"),
+            version = crate::version::VERSION,
             "heartbeat agent started"
         );
 
@@ -82,7 +82,7 @@ pub fn spawn_heartbeat(config: EdgeConfig, control: ControlClient, node_control:
                 "ip": config.listen_addr,
                 "agent_url": config.agent_url,
                 "public_ip": config.public_ip,
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": crate::version::VERSION,
                 "cpu_usage": cpu_usage(),
                 "memory_usage": memory_usage(),
             });

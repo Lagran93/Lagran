@@ -9,3 +9,5 @@ pub mod scheduler;
 pub mod service;
 pub mod state;
 pub mod utils;
+
+pub mod version;

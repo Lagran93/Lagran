@@ -8,3 +8,5 @@ pub mod origin;
 pub mod pingora_edge;
 pub mod server;
 pub mod waf;
+
+pub mod version;

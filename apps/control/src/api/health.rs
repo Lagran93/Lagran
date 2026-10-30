@@ -23,7 +23,7 @@ pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "lagran-control",
-        version: env!("CARGO_PKG_VERSION"),
+        version: crate::version::VERSION,
     })
 }
 
@@ -32,7 +32,7 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<ReadyResponse>,
         Ok(_) => Ok(Json(ReadyResponse {
             status: "ready",
             service: "lagran-control",
-            version: env!("CARGO_PKG_VERSION"),
+            version: crate::version::VERSION,
             database: "ok",
         })),
         Err(e) => {
@@ -55,7 +55,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     out.push_str("# HELP lagran_control_up Control plane process up\n# TYPE lagran_control_up gauge\nlagran_control_up 1\n");
     out.push_str(&format!(
         "# HELP lagran_control_info Build information\n# TYPE lagran_control_info gauge\nlagran_control_info{{version=\"{}\"}} 1\n",
-        env!("CARGO_PKG_VERSION")
+        crate::version::VERSION
     ));
     out.push_str(&format!(
         "# HELP lagran_control_db_up Database reachable\n# TYPE lagran_control_db_up gauge\nlagran_control_db_up {db_up}\n"
