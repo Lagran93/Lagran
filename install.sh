@@ -1,52 +1,80 @@
 #!/usr/bin/env bash
 #
-# Lagran CDN one-click installer / deployment bootstrap.
+# Lagran CDN component installer.
 #
-# Examples:
+# Usage:
+#   install.sh control
+#   install.sh edge
+#   install.sh dns
+#   install.sh frontend
+#
+# Remote one-line:
 #   curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
-#     | LAGRAN_REPO=Lagran93/Lagran bash
+#     | sudo env LAGRAN_REPO=Lagran93/Lagran bash -s -- control
 #
-#   sudo LAGRAN_REPO=Lagran93/Lagran bash install.sh --version v1.2.3
-#   sudo LAGRAN_REPO=Lagran93/Lagran bash install.sh --with-edge
-#
-# The script downloads a release bundle from GitHub, installs the control
-# binary and static frontend, creates a local PostgreSQL database if needed,
-# and starts the control plane under systemd.
+# Each component is installed independently. A release bundle is downloaded
+# once, but only the selected binary/config/service is installed.
 set -Eeuo pipefail
 
 REPO="${LAGRAN_REPO:-${GITHUB_REPOSITORY:-Lagran93/Lagran}}"
 VERSION="${LAGRAN_VERSION:-latest}"
 PREFIX="${LAGRAN_PREFIX:-/opt/lagran}"
+BIN_DIR="${LAGRAN_BIN_DIR:-$PREFIX/bin}"
+WEB_DIR="${LAGRAN_WEB_DIR:-$PREFIX/web}"
 CONF_DIR="${LAGRAN_CONF_DIR:-/etc/lagran}"
 DATA_DIR="${LAGRAN_DATA_DIR:-/var/lib/lagran}"
 LOG_DIR="${LAGRAN_LOG_DIR:-/var/log/lagran}"
-WITH_EDGE=0
 START_SERVICE=1
+WITH_CADDY=0
+COMPONENT=""
+STAGE=""
+TMP=""
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [options]
+Usage: install.sh <control|edge|dns|frontend> [options]
+
+Components:
+  control    install lagran-control, database bootstrap, systemd service
+  edge       install lagran-edge and edge.env, systemd service
+  dns        install lagran-dns and dns.env, systemd service
+  frontend   install static Nuxt output into /opt/lagran/web
 
 Options:
   --repo <owner/repo>   GitHub repository (or LAGRAN_REPO)
   --version <tag>       Release tag, e.g. v1.2.3; default: latest
   --prefix <dir>        Install prefix; default: /opt/lagran
-  --with-edge           Install and start lagran-edge (requires AGENT_TOKEN)
-  --no-start            Install files/units but do not start services
+  --with-caddy          frontend only: write a Caddyfile example
+  --no-start            install files/units but do not start systemd
   -h, --help
 
 Environment:
   LAGRAN_REPO=<owner/repo>       GitHub repository
   LAGRAN_VERSION=v1.2.3          Release tag
-  LAGRAN_DATABASE_URL=...        Existing PostgreSQL URL
-  LAGRAN_DB_PASSWORD=...         Password for a newly created lagran DB role
-  LAGRAN_REDIS_URL=...           Optional Redis URL
-  LAGRAN_SEED_DEMO=true|false    Seed demo account on first boot (default true)
-  LAGRAN_CONTROL_BIND=...        Default 0.0.0.0:8080
-  LAGRAN_JWT_SECRET=...          Override generated JWT secret
-  AGENT_TOKEN=...                Edge node token for --with-edge
-  NODE_ID=...                    Edge node id; default hostname
-  CONTROL_URL=...                Edge control URL; default http://127.0.0.1:8080
+  LAGRAN_PREFIX=/opt/lagran      Install prefix
+  LAGRAN_DATABASE_URL=...        control: existing PostgreSQL URL
+  LAGRAN_DB_PASSWORD=...         control: password for new lagran role
+  LAGRAN_DB_NAME=lagran          control: database name
+  LAGRAN_DB_USER=lagran          control: role name
+  LAGRAN_JWT_SECRET=...          control: override generated JWT secret
+  LAGRAN_AGENT_TOKEN=...         control: global DNS/agent token
+  LAGRAN_REDIS_URL=...           control: optional Redis URL
+  LAGRAN_SEED_DEMO=true|false    control: seed demo account (default true)
+  LAGRAN_CONTROL_BIND=...        control: default 0.0.0.0:8080
+  LAGRAN_CONTROL_PUBLIC_URL=...  control: public HTTPS URL
+
+  AGENT_TOKEN=...                edge/dns: required node/global token
+  NODE_ID=...                    edge: node id, default hostname
+  CONTROL_URL=...                edge/dns: default http://127.0.0.1:8080
+  AGENT_URL=...                  edge: control callback URL
+  EDGE_LISTEN=...                edge: default 0.0.0.0:8081
+  EDGE_ADMIN_LISTEN=...          edge: default 127.0.0.1:8082
+  PUBLIC_IP=...                  edge: public IP for GeoDNS
+  NODE_REGION=...                edge: region label
+  DNS_ZONE=...                   dns: default edge.lagran.net
+  DNS_NS_NAME=...                dns: NS names
+  DNS_NS_IP=...                  dns: glue IPs
+  DNS_LISTEN=...                 dns: default 0.0.0.0:53
 EOF
 }
 
@@ -55,6 +83,12 @@ log() { printf '\n==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 
 parse_args() {
+  [[ $# -ge 1 ]] || { usage; exit 1; }
+  case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    control|edge|dns|frontend) COMPONENT="$1"; shift ;;
+    *) die "expected one of: control, edge, dns, frontend" ;;
+  esac
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo) REPO="${2:-}"; shift 2 ;;
@@ -63,12 +97,14 @@ parse_args() {
       --version=*) VERSION="${1#*=}"; shift ;;
       --prefix) PREFIX="${2:-}"; shift 2 ;;
       --prefix=*) PREFIX="${1#*=}"; shift ;;
-      --with-edge) WITH_EDGE=1; shift ;;
+      --with-caddy) WITH_CADDY=1; shift ;;
       --no-start) START_SERVICE=0; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown option: $1" ;;
     esac
   done
+  BIN_DIR="${LAGRAN_BIN_DIR:-$PREFIX/bin}"
+  WEB_DIR="${LAGRAN_WEB_DIR:-$PREFIX/web}"
 }
 
 rand_hex() {
@@ -122,33 +158,56 @@ SQL
   printf 'postgres://%s:%s@127.0.0.1:5432/%s' "$db_user" "$db_pass" "$db_name"
 }
 
-install_files() {
-  local stage=$1
-  [[ -x "$stage/bin/lagran-control" ]] || die "bundle does not contain lagran-control"
-  install -d -m 0755 "$PREFIX/bin" "$PREFIX/web" "$DATA_DIR" "$LOG_DIR" "$CONF_DIR"
-  for binary in lagran-control lagran-edge lagran-dns; do
-    if [[ -f "$stage/bin/$binary" ]]; then
-      install -m 0755 "$stage/bin/$binary" "$PREFIX/bin/$binary"
-    fi
-  done
-  if [[ -d "$stage/web" ]]; then
-    if command -v rsync >/dev/null 2>&1; then
-      rsync -a --delete "$stage/web/" "$PREFIX/web/"
-    else
-      cp -a "$stage/web/." "$PREFIX/web/"
-    fi
-  fi
-  for file in control.env.example edge.env.example dns.env.example; do
-    [[ -f "$stage/$file" ]] && cp -n "$stage/$file" "$CONF_DIR/"
-  done
-  install -m 0755 "$stage/install.sh" "$PREFIX/install.sh" 2>/dev/null || true
+ensure_dirs() {
+  install -d -m 0755 "$PREFIX" "$BIN_DIR" "$CONF_DIR" "$DATA_DIR" "$LOG_DIR"
 }
 
-create_user() {
+ensure_user() {
   getent group lagran >/dev/null 2>&1 || groupadd --system lagran
   id -u lagran >/dev/null 2>&1 || \
     useradd --system --gid lagran --home-dir "$DATA_DIR" --shell /usr/sbin/nologin lagran
-  chown -R lagran:lagran "$DATA_DIR" "$LOG_DIR" "$PREFIX/web" 2>/dev/null || true
+  chown -R lagran:lagran "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
+}
+
+install_env_example() {
+  local name=$1
+  if [[ -f "$STAGE/$name" ]]; then
+    install -m 0644 "$STAGE/$name" "$CONF_DIR/$name"
+  fi
+}
+
+install_binary() {
+  local name=$1
+  [[ -x "$STAGE/bin/$name" ]] || die "release does not contain bin/$name"
+  install -m 0755 "$STAGE/bin/$name" "$BIN_DIR/$name"
+}
+
+resolve_release() {
+  log "Resolving release"
+  if [[ "$VERSION" == "latest" ]]; then
+    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    [[ -n "$VERSION" ]] || die "could not resolve latest release for $REPO"
+  fi
+  case "$(uname -m)" in
+    x86_64|amd64) ARCH=amd64 ;;
+    aarch64|arm64) die "prebuilt arm64 bundle is not published; build locally" ;;
+    *) die "unsupported architecture: $(uname -m)" ;;
+  esac
+  local asset="lagran-cdn-${VERSION#v}-linux-${ARCH}.tar.gz"
+  local base="https://github.com/${REPO}/releases/download/${VERSION}"
+  log "Downloading ${asset}"
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "${TMP:-}"' EXIT
+  curl -fL --retry 3 --retry-delay 2 "$base/$asset" -o "$TMP/$asset"
+  if curl -fsSL "$base/SHA256SUMS" -o "$TMP/SHA256SUMS"; then
+    (cd "$TMP" && grep "  ${asset}\$" SHA256SUMS | sha256sum -c -)
+  else
+    warn "SHA256SUMS not found; continuing without checksum verification"
+  fi
+  STAGE="$TMP/stage"
+  mkdir -p "$STAGE"
+  tar -xzf "$TMP/$asset" -C "$STAGE"
 }
 
 write_control_env() {
@@ -160,18 +219,29 @@ write_control_env() {
   local database_url
   database_url="$(setup_database)"
   local jwt_secret="${LAGRAN_JWT_SECRET:-$(rand_hex 32)}"
+  local agent_token="${LAGRAN_AGENT_TOKEN:-$(rand_hex 24)}"
   local bind="${LAGRAN_CONTROL_BIND:-0.0.0.0:8080}"
   local seed_demo="${LAGRAN_SEED_DEMO:-true}"
+  local public_url="${LAGRAN_CONTROL_PUBLIC_URL:-}"
   umask 077
   cat > "$env_file" <<EOF
 CONTROL_BIND=${bind}
+CONTROL_PUBLIC_URL=${public_url}
 DATABASE_URL=${database_url}
-JWT_SECRET=${jwt_secret}
-SEED_DEMO=${seed_demo}
-LOG_RETENTION_DAYS=14
 DATABASE_MAX_CONNECTIONS=20
-CONFIG_CACHE_TTL_SECS=3
+DATABASE_MIN_CONNECTIONS=2
+DATABASE_ACQUIRE_TIMEOUT_SECS=5
+JWT_SECRET=${jwt_secret}
+REQUIRE_SECURE_SECRETS=true
+AGENT_TOKEN=${agent_token}
+SEED_DEMO=${seed_demo}
+ALLOW_REGISTER=false
+CAPTCHA_ENABLED=true
 REDIS_URL=${LAGRAN_REDIS_URL:-}
+REDIS_SESSION_TTL_SECS=30
+CONFIG_CACHE_TTL_SECS=3
+LOG_RETENTION_DAYS=14
+ALERT_EVAL_SECS=30
 EOF
   chown root:lagran "$env_file"
   chmod 0640 "$env_file"
@@ -191,8 +261,8 @@ Wants=network-online.target
 Type=simple
 User=lagran
 Group=lagran
-EnvironmentFile=/etc/lagran/control.env
-ExecStart=${PREFIX}/bin/lagran-control
+EnvironmentFile=${CONF_DIR}/control.env
+ExecStart=${BIN_DIR}/lagran-control
 WorkingDirectory=${DATA_DIR}
 Restart=always
 RestartSec=3
@@ -206,50 +276,229 @@ EOF
 }
 
 write_edge_env() {
-  [[ "$WITH_EDGE" == "1" ]] || return 0
-  [[ -n "${AGENT_TOKEN:-}" ]] || die "--with-edge requires AGENT_TOKEN (create a node in the console first)"
   local env_file="$CONF_DIR/edge.env"
   if [[ -f "$env_file" ]]; then
     log "Keeping existing $env_file"
     return
   fi
+  [[ -n "${AGENT_TOKEN:-}" ]] || die "edge install requires AGENT_TOKEN (create a node in the console first)"
   local node_id="${NODE_ID:-$(hostname -s)}"
   local control_url="${CONTROL_URL:-http://127.0.0.1:8080}"
+  local edge_listen="${EDGE_LISTEN:-0.0.0.0:8081}"
+  local admin_listen="${EDGE_ADMIN_LISTEN:-127.0.0.1:8082}"
+  local agent_url="${AGENT_URL:-http://127.0.0.1:8082}"
   umask 077
   cat > "$env_file" <<EOF
-EDGE_LISTEN=0.0.0.0:8081
-CONTROL_URL=${control_url}
-AGENT_URL=http://127.0.0.1:8081
+EDGE_LISTEN=${edge_listen}
+EDGE_ADMIN_LISTEN=${admin_listen}
 NODE_ID=${node_id}
+NODE_REGION=${NODE_REGION:-local}
+PUBLIC_IP=${PUBLIC_IP:-}
+CONTROL_URL=${control_url}
+AGENT_URL=${agent_url}
 AGENT_TOKEN=${AGENT_TOKEN}
 CACHE_BACKEND=memory
+CACHE_TTL=60
+CHALLENGE_SECRET=${CHALLENGE_SECRET:-}
 EOF
   chown root:lagran "$env_file"
   chmod 0640 "$env_file"
 }
 
 write_edge_unit() {
-  [[ "$WITH_EDGE" == "1" ]] || return 0
   cat > /etc/systemd/system/lagran-edge.service <<EOF
 [Unit]
 Description=Lagran CDN Edge Node
-After=network-online.target lagran-control.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=lagran
 Group=lagran
-EnvironmentFile=/etc/lagran/edge.env
-ExecStart=${PREFIX}/bin/lagran-edge
+EnvironmentFile=${CONF_DIR}/edge.env
+ExecStart=${BIN_DIR}/lagran-edge
 WorkingDirectory=${DATA_DIR}
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
-NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
+EOF
+}
+
+write_dns_env() {
+  local env_file="$CONF_DIR/dns.env"
+  if [[ -f "$env_file" ]]; then
+    log "Keeping existing $env_file"
+    return
+  fi
+  local agent_token="${AGENT_TOKEN:-}"
+  if [[ -z "$agent_token" && -f "$CONF_DIR/control.env" ]]; then
+    agent_token="$(sed -n 's/^AGENT_TOKEN=//p' "$CONF_DIR/control.env" | tail -1)"
+  fi
+  [[ -n "$agent_token" ]] || warn "AGENT_TOKEN is empty; DNS /schedule requests may be rejected"
+  umask 077
+  cat > "$env_file" <<EOF
+DNS_LISTEN=${DNS_LISTEN:-0.0.0.0:53}
+DNS_ZONE=${DNS_ZONE:-edge.lagran.net}
+DNS_NS_NAME=${DNS_NS_NAME:-ns1.edge.lagran.net}
+DNS_NS_IP=${DNS_NS_IP:-127.0.0.1}
+DNS_TTL=${DNS_TTL:-30}
+DNS_TCP=${DNS_TCP:-true}
+DNS_WORKERS=${DNS_WORKERS:-8}
+CONTROL_URL=${CONTROL_URL:-http://127.0.0.1:8080}
+AGENT_TOKEN=${agent_token}
+DNS_CACHE_SECS=${DNS_CACHE_SECS:-5}
+DNS_STALE_SECS=${DNS_STALE_SECS:-300}
+DNS_CONTROL_TIMEOUT_MS=${DNS_CONTROL_TIMEOUT_MS:-800}
+DNS_FALLBACK_IP=${DNS_FALLBACK_IP:-}
+EOF
+  chown root:lagran "$env_file"
+  chmod 0640 "$env_file"
+}
+
+write_dns_unit() {
+  cat > /etc/systemd/system/lagran-dns.service <<EOF
+[Unit]
+Description=Lagran CDN Authoritative DNS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lagran
+Group=lagran
+EnvironmentFile=${CONF_DIR}/dns.env
+ExecStart=${BIN_DIR}/lagran-dns
+WorkingDirectory=${DATA_DIR}
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_frontend() {
+  [[ -f "$STAGE/web/index.html" ]] || die "release does not contain web/index.html"
+  install -d -m 0755 "$WEB_DIR"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete "$STAGE/web/" "$WEB_DIR/"
+  else
+    cp -a "$STAGE/web/." "$WEB_DIR/"
+  fi
+  chmod -R a+rX "$WEB_DIR"
+  install_env_example frontend.env.example
+  if [[ "$WITH_CADDY" == "1" ]]; then
+    cat > "$CONF_DIR/Caddyfile.lagran" <<EOF
+:80 {
+    root * ${WEB_DIR}
+    encode gzip
+    @api path /api/* /health /ready
+    handle @api {
+        reverse_proxy 127.0.0.1:8080
+    }
+    handle {
+        try_files {path} /index.html
+        file_server
+    }
+}
+EOF
+    log "Wrote ${CONF_DIR}/Caddyfile.lagran"
+  fi
+}
+
+enable_service() {
+  local service=$1
+  if [[ "$START_SERVICE" != "1" ]]; then
+    log "Installed ${service}.service; start with: systemctl enable --now ${service}"
+    return
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemd not available; start ${BIN_DIR}/${service} manually"
+    return
+  fi
+  systemctl daemon-reload
+  systemctl enable --now "${service}.service"
+}
+
+main_control() {
+  install_binary lagran-control
+  ensure_user
+  install_env_example control.env.example
+  write_control_env
+  write_control_unit
+  enable_service lagran-control
+  local control_port
+  control_port="$(sed -n 's/^CONTROL_BIND=//p' "$CONF_DIR/control.env" | tail -1)"
+  control_port="${control_port##*:}"
+  control_port="${control_port:-8080}"
+  if command -v systemctl >/dev/null 2>&1 && [[ "$START_SERVICE" == "1" ]]; then
+    for _ in $(seq 1 30); do
+      if curl -fsS "http://127.0.0.1:${control_port}/health" >/dev/null 2>&1; then break; fi
+      sleep 1
+    done
+    curl -fsS "http://127.0.0.1:${control_port}/health" || warn "control health check failed; see journalctl -u lagran-control"
+  fi
+  cat <<EOF
+
+Control installed.
+  binary : ${BIN_DIR}/lagran-control
+  env    : ${CONF_DIR}/control.env
+  health : http://127.0.0.1:${control_port}/health
+  demo   : demo@lagran.dev / demo123 (if SEED_DEMO=true)
+EOF
+}
+
+main_edge() {
+  install_binary lagran-edge
+  ensure_user
+  install_env_example edge.env.example
+  write_edge_env
+  write_edge_unit
+  enable_service lagran-edge
+  cat <<EOF
+
+Edge installed.
+  binary : ${BIN_DIR}/lagran-edge
+  env    : ${CONF_DIR}/edge.env
+  health : http://127.0.0.1:8082/__lagran/health
+EOF
+}
+
+main_dns() {
+  install_binary lagran-dns
+  ensure_user
+  install_env_example dns.env.example
+  write_dns_env
+  write_dns_unit
+  enable_service lagran-dns
+  cat <<EOF
+
+DNS installed.
+  binary : ${BIN_DIR}/lagran-dns
+  env    : ${CONF_DIR}/dns.env
+  test   : dig @127.0.0.1 -p 53 <domain> A
+EOF
+}
+
+main_frontend() {
+  install_frontend
+  cat <<EOF
+
+Frontend installed.
+  web    : ${WEB_DIR}
+  caddy  : ${CONF_DIR}/Caddyfile.lagran (if --with-caddy)
+
+Serve it with Caddy/Nginx and proxy /api/*, /health, /ready
+to the control plane at 127.0.0.1:8080.
 EOF
 }
 
@@ -258,73 +507,22 @@ main() {
   [[ "$EUID" -eq 0 ]] || die "run as root (use sudo)"
   command -v curl >/dev/null 2>&1 || die "curl is required"
   command -v tar >/dev/null 2>&1 || die "tar is required"
+  if [[ "$WITH_CADDY" == "1" && "$COMPONENT" != "frontend" ]]; then
+    die "--with-caddy is only valid for frontend"
+  fi
 
-  local arch
-  case "$(uname -m)" in
-    x86_64|amd64) arch=amd64 ;;
-    aarch64|arm64) die "prebuilt arm64 bundle is not published; build locally" ;;
-    *) die "unsupported architecture: $(uname -m)" ;;
+  resolve_release
+  ensure_dirs
+  if [[ -f "$STAGE/LICENSE" ]]; then
+    install -m 0644 "$STAGE/LICENSE" "$PREFIX/LICENSE"
+  fi
+  case "$COMPONENT" in
+    control) main_control ;;
+    edge) main_edge ;;
+    dns) main_dns ;;
+    frontend) main_frontend ;;
+    *) die "unknown component: $COMPONENT" ;;
   esac
-
-  log "Resolving release"
-  if [[ "$VERSION" == "latest" ]]; then
-    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-    [[ -n "$VERSION" ]] || die "could not resolve latest release for $REPO"
-  fi
-  local asset="lagran-cdn-${VERSION#v}-linux-${arch}.tar.gz"
-  local base="https://github.com/${REPO}/releases/download/${VERSION}"
-  log "Downloading ${asset}"
-  local tmp
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
-  curl -fL --retry 3 --retry-delay 2 "$base/$asset" -o "$tmp/$asset"
-  if curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"; then
-    (cd "$tmp" && grep "  ${asset}\$" SHA256SUMS | sha256sum -c -)
-  else
-    warn "SHA256SUMS not found; continuing without checksum verification"
-  fi
-  mkdir -p "$tmp/stage"
-  tar -xzf "$tmp/$asset" -C "$tmp/stage"
-
-  install_files "$tmp/stage"
-  create_user
-  write_control_env
-  write_control_unit
-  write_edge_env
-  write_edge_unit
-
-  if [[ "$START_SERVICE" == "1" ]] && command -v systemctl >/dev/null 2>&1; then
-    log "Enabling services"
-    systemctl daemon-reload
-    systemctl enable --now lagran-control
-    [[ "$WITH_EDGE" == "1" ]] && systemctl enable --now lagran-edge
-    for _ in $(seq 1 30); do
-      if curl -fsS "http://127.0.0.1:8080/health" >/dev/null 2>&1; then
-        break
-      fi
-      sleep 1
-    done
-    curl -fsS "http://127.0.0.1:8080/health" || warn "control health check failed; see journalctl -u lagran-control"
-  else
-    log "Files installed; start with: systemctl enable --now lagran-control"
-  fi
-
-  cat <<EOF
-
-Lagran CDN installed.
-
-  version : ${VERSION}
-  binaries: ${PREFIX}/bin
-  config  : ${CONF_DIR}/control.env
-  web     : ${PREFIX}/web
-  health  : http://127.0.0.1:8080/health
-
-Frontend static files are in ${PREFIX}/web. Serve them with Caddy/Nginx and
-reverse proxy /api/* and /health to 127.0.0.1:8080.
-
-If SEED_DEMO=true, sign in with demo@lagran.dev / demo123 and change it now.
-EOF
 }
 
 main "$@"

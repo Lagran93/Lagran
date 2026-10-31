@@ -109,6 +109,19 @@
             <div class="info-value mono">{{ controlVersion || '—' }}</div>
           </div>
           <div class="info-item">
+            <div class="info-label">开源许可</div>
+            <div class="info-value">
+              <a
+                href="https://github.com/Lagran93/Lagran"
+                target="_blank"
+                rel="noopener"
+                style="color: var(--brand)"
+              >
+                AGPL-3.0-only · 源代码
+              </a>
+            </div>
+          </div>
+          <div class="info-item">
             <div class="info-label">当前角色</div>
             <div class="info-value">{{ auth.isAdmin ? '系统管理员' : '普通用户' }}</div>
           </div>

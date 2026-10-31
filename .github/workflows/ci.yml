@@ -106,7 +106,7 @@ jobs:
           cp dist/lagran-binaries/lagran-edge stage/bin/
           cp dist/lagran-binaries/lagran-dns stage/bin/
           cp -a dist/lagran-web/. stage/web/
-          cp control.env.example edge.env.example dns.env.example install.sh README.md stage/
+          cp control.env.example edge.env.example dns.env.example install.sh README.md LICENSE stage/
           printf '%s\n' "${TAG}" > stage/VERSION
           tar -C stage -czf "lagran-cdn-${VERSION}-linux-amd64.tar.gz" .
           sha256sum "lagran-cdn-${VERSION}-linux-amd64.tar.gz" > SHA256SUMS

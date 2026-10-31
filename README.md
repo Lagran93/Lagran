@@ -6,17 +6,34 @@
 
 ## 从 GitHub 一键安装
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
-  | sudo env LAGRAN_REPO=Lagran93/Lagran bash
-```
-
-脚本会下载最新 Release 中的 `lagran-control` / `lagran-edge` / `lagran-dns`、静态前端和配置模板，安装到 `/opt/lagran`，创建本地 PostgreSQL 数据库（或使用 `LAGRAN_DATABASE_URL`），注册 systemd 服务并启动控制面。需要安装边缘节点时：
+安装器现在按组件独立执行：
 
 ```bash
+# 控制面（含数据库初始化、systemd、首次启动）
 curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
-  | sudo env LAGRAN_REPO=Lagran93/Lagran AGENT_TOKEN=<节点令牌> NODE_ID=edge-01 bash -s -- --with-edge
+  | sudo env LAGRAN_REPO=Lagran93/Lagran bash -s -- control
+
+# 边缘节点（需要先在控制台创建节点并取得节点令牌）
+curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
+  | sudo env LAGRAN_REPO=Lagran93/Lagran \
+      AGENT_TOKEN=<节点令牌> NODE_ID=edge-01 \
+      bash -s -- edge
+
+# 权威 DNS
+curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
+  | sudo env LAGRAN_REPO=Lagran93/Lagran bash -s -- dns
+
+# 前端静态文件（可选 --with-caddy 生成 Caddyfile 示例）
+curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
+  | sudo env LAGRAN_REPO=Lagran93/Lagran bash -s -- frontend --with-caddy
 ```
+
+每个组件只安装自己的二进制、env 和 systemd 服务：
+
+- `control`：创建/复用 PostgreSQL 数据库，生成 `control.env`，启动 `lagran-control`。
+- `edge`：必须提供节点 `AGENT_TOKEN`，写入 `edge.env`，启动 `lagran-edge`。
+- `dns`：写入 `dns.env`，启动 `lagran-dns`；同机安装时会自动复用 `control.env` 的全局 `AGENT_TOKEN`。
+- `frontend`：安装静态产物到 `/opt/lagran/web`，不启动后端服务。
 
 详细参数：
 
@@ -24,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
 ./install.sh --help
 ```
 
-前端产物会安装到 `/opt/lagran/web`，使用 Caddy/Nginx 托管并把 `/api/*`、`/health` 反向代理到 `127.0.0.1:8080`。
+前端产物会安装到 `/opt/lagran/web`，使用 Caddy/Nginx 托管并把 `/api/*`、`/health`、`/ready` 反向代理到 `127.0.0.1:8080`。
 
 ## 版本与 CI
 
@@ -226,6 +243,38 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 - 限流为单进程内存态，多实例不共享
 - `crates/lagran-proto` / `proto/` 仍是 gRPC 占位；Redis 已可选接入，未配置时自动回退到进程内状态/PostgreSQL
 
+## 加密货币捐赠
+
+Lagran CDN 的持续开发、测试基础设施和节点运维接受加密货币捐赠。捐赠完全自愿，不影响软件许可，也不附带服务等级或商业承诺。
+
+> **维护者提示：跨链或错误网络转账可能永久丢失。**
+
+| 网络 | 资产 | 地址 |
+|---|---|---|
+| Bitcoin | BTC | `bc1qgh9dvqa4d0skn82n7t423jnxy7mh3prgxcxc0z` |
+| Ethereum | ETH / ERC-20 USDT / USDC | `0xCFf627A0D499e898b209300cA7192F55f01bAB2F` |
+| TRON | TRX / TRC-20 USDT | `TFRZmHNyp54fg9BsCXaJH2UVq1B2yUNN8S` |
+| Solana | SOL / SPL USDC | `AkpkuUTaReYb4QSgwFfbHZv6CwoesqfGAKPodDxa6x3T` |
+| BNB Smart Chain | BNB / BEP-20 USDT | `0xCFf627A0D499e898b209300cA7192F55f01bAB2F` |
+| Polygon | POL / polygon USDT | `0xCFf627A0D499e898b209300cA7192F55f01bAB2F` |
+
+注意事项：
+
+- 请只向对应网络转账；ERC-20、TRC-20、BEP-20 等资产必须使用匹配的网络。
+- 捐赠地址仅从本仓库 README 或官方发布页获取，谨防仿冒地址。
+- 加密货币交易不可逆，转错网络或地址无法退款。
+- 如捐赠用于特定目标，请在转账备注/邮件中说明；链上交易本身无法备注。
+
 ## License
 
-MIT
+Lagran CDN 使用 **GNU Affero General Public License v3.0 only**（`AGPL-3.0-only`）。
+
+- 完整许可文本：[LICENSE](LICENSE)
+- 允许商业使用、修改和分发；
+- 如果修改后通过网络向用户提供服务，必须按 AGPL 第 13 条向这些用户提供对应的完整源代码；
+- 分发时必须保留版权与许可声明，并以 AGPL-3.0-only 授权整个衍生作品；
+- 本软件不提供任何明示或默示担保。
+
+Copyright (C) 2026 Lagran CDN contributors.
+
+> 在本次许可变更前已经按 MIT 发布的版本，仍适用其当时附带的 MIT 许可；本次变更不影响那些历史副本的既有授权。

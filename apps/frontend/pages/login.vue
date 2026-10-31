@@ -53,7 +53,17 @@
         </li>
       </ul>
 
-      <div class="brand-foot">© 2026 Lagran · 自托管 CDN 系统</div>
+      <div class="brand-foot">
+        © 2026 Lagran · 自托管 CDN 系统 ·
+        <a
+          href="https://github.com/Lagran93/Lagran"
+          target="_blank"
+          rel="noopener"
+          style="color: inherit; text-decoration: underline"
+        >
+          AGPL-3.0 源代码
+        </a>
+      </div>
     </section>
 
     <section class="login-panel">
