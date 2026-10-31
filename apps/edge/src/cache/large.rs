@@ -28,6 +28,16 @@ pub struct LargeMeta {
     pub stale_until: u64,
     pub stored_at: u64,
     pub complete: bool,
+    /// Inclusive byte ranges that have been fully written. Empty for legacy
+    /// complete objects (where `complete` means 0..content_length-1).
+    #[serde(default)]
+    pub segments: Vec<(u64, u64)>,
+}
+
+impl LargeMeta {
+    pub fn covers(&self, start: u64, end: u64) -> bool {
+        self.complete || self.segments.iter().any(|(s, e)| *s <= start && *e >= end)
+    }
 }
 
 pub struct LargeEntry {
@@ -38,6 +48,10 @@ pub struct LargeEntry {
 impl LargeEntry {
     pub fn content_length(&self) -> u64 {
         self.meta.content_length
+    }
+
+    pub fn covers(&self, start: u64, end: u64) -> bool {
+        self.meta.covers(start, end)
     }
 
     pub async fn read_at(&mut self, pos: u64, max: usize) -> std::io::Result<Option<Bytes>> {
@@ -151,6 +165,96 @@ impl Drop for LargeWriter {
     }
 }
 
+/// Writes one byte range (normally from an origin 206 response) into an
+/// existing or new partial object. Only fully received ranges are recorded in
+/// the sidecar metadata.
+pub struct RangeWriter {
+    cache: Arc<LargeCache>,
+    meta: LargeMeta,
+    file: File,
+    data_path: PathBuf,
+    meta_path: PathBuf,
+    start: u64,
+    end: u64,
+    written: u64,
+    new_entry: bool,
+    committed: bool,
+}
+
+impl RangeWriter {
+    pub async fn write_all(&mut self, data: &[u8]) {
+        if self.written + data.len() as u64 > self.end - self.start + 1 {
+            return;
+        }
+        if self.file.write_all(data).await.is_ok() {
+            self.written += data.len() as u64;
+        }
+    }
+
+    pub async fn commit(mut self) -> bool {
+        let expected = self.end - self.start + 1;
+        if self.written != expected {
+            self.abort().await;
+            return false;
+        }
+        if self.file.flush().await.is_err() || self.file.sync_all().await.is_err() {
+            self.abort().await;
+            return false;
+        }
+        self.meta.segments.push((self.start, self.end));
+        self.meta.segments.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.meta.segments.len());
+        for (start, end) in self.meta.segments.drain(..) {
+            if let Some((_, prev_end)) = merged.last_mut() {
+                if start <= prev_end.saturating_add(1) {
+                    *prev_end = (*prev_end).max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        self.meta.segments = merged;
+        self.meta.complete = self
+            .meta
+            .covers(0, self.meta.content_length.saturating_sub(1));
+        self.meta.stored_at = now_unix();
+        let Ok(meta_bytes) = serde_json::to_vec(&self.meta) else {
+            self.abort().await;
+            return false;
+        };
+        if write_atomic(&self.meta_path, &meta_bytes).await.is_err() {
+            self.abort().await;
+            return false;
+        }
+        if self.new_entry {
+            self.cache.used_bytes.fetch_add(
+                self.meta.content_length + meta_bytes.len() as u64,
+                Ordering::Relaxed,
+            );
+            self.cache.entries.fetch_add(1, Ordering::Relaxed);
+        }
+        self.committed = true;
+        self.cache.evict_overflow().await;
+        true
+    }
+
+    async fn abort(&mut self) {
+        if self.new_entry {
+            let _ = fs::remove_file(&self.data_path).await;
+            let _ = fs::remove_file(&self.meta_path).await;
+        }
+    }
+}
+
+impl Drop for RangeWriter {
+    fn drop(&mut self) {
+        if self.new_entry && !self.committed {
+            let _ = std::fs::remove_file(&self.data_path);
+            let _ = std::fs::remove_file(&self.meta_path);
+        }
+    }
+}
+
 pub struct LargeCache {
     root: PathBuf,
     min_object_bytes: u64,
@@ -198,6 +302,20 @@ impl LargeCache {
         len >= self.min_object_bytes && len <= self.max_object_bytes
     }
 
+    pub async fn has(&self, key: &str) -> bool {
+        let (data_path, meta_path) = self.paths_for_key(key);
+        let Ok(meta_bytes) = fs::read(&meta_path).await else {
+            return false;
+        };
+        let Ok(meta) = serde_json::from_slice::<LargeMeta>(&meta_bytes) else {
+            return false;
+        };
+        meta.complete
+            && meta.key == key
+            && now_unix() <= meta.stale_until
+            && fs::metadata(&data_path).await.is_ok()
+    }
+
     pub fn max_object_bytes(&self) -> u64 {
         self.max_object_bytes
     }
@@ -222,10 +340,15 @@ impl LargeCache {
     }
 
     pub async fn get(&self, key: &str) -> Option<LargeEntry> {
+        let entry = self.get_any(key).await?;
+        entry.meta.complete.then_some(entry)
+    }
+
+    pub async fn get_any(&self, key: &str) -> Option<LargeEntry> {
         let (data_path, meta_path) = self.paths_for_key(key);
         let meta_bytes = fs::read(&meta_path).await.ok()?;
         let meta: LargeMeta = serde_json::from_slice(&meta_bytes).ok()?;
-        if !meta.complete || meta.key != key || now_unix() > meta.stale_until {
+        if meta.key != key || now_unix() > meta.stale_until {
             let data_len = fs::metadata(&data_path).await.map(|m| m.len()).unwrap_or(0);
             if fs::remove_file(&data_path).await.is_ok() {
                 self.release_bytes(data_len + meta_bytes.len() as u64);
@@ -285,6 +408,7 @@ impl LargeCache {
             stale_until: now + fresh + swr_secs,
             stored_at: 0,
             complete: false,
+            segments: Vec::new(),
         };
         Some(LargeWriter {
             cache: self.clone(),
@@ -295,6 +419,88 @@ impl LargeCache {
             meta_path,
             written: 0,
             failed: false,
+        })
+    }
+
+    pub async fn begin_range(
+        self: &Arc<Self>,
+        key: &str,
+        status: u16,
+        headers: Vec<(String, String)>,
+        content_length: u64,
+        start: u64,
+        end: u64,
+        fresh_secs: u64,
+        swr_secs: u64,
+    ) -> Option<RangeWriter> {
+        if content_length == 0
+            || !self.accepts(content_length)
+            || start > end
+            || end >= content_length
+        {
+            return None;
+        }
+        let (data_path, meta_path) = self.paths_for_key(key);
+        let parent = data_path.parent()?;
+        if fs::create_dir_all(parent).await.is_err() {
+            return None;
+        }
+        let data_ok = fs::metadata(&data_path)
+            .await
+            .map(|m| m.len() >= content_length)
+            .unwrap_or(false);
+        let existing = match fs::read(&meta_path).await {
+            Ok(bytes) => serde_json::from_slice::<LargeMeta>(&bytes)
+                .ok()
+                .filter(|m| data_ok && m.key == key && m.content_length == content_length),
+            Err(_) => None,
+        };
+        if let Some(meta) = &existing {
+            if meta.covers(start, end) {
+                return None;
+            }
+        }
+        let new_entry = existing.is_none();
+        if new_entry {
+            let _ = fs::remove_file(&data_path).await;
+            let _ = fs::remove_file(&meta_path).await;
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&data_path)
+            .await
+            .ok()?;
+        if new_entry && file.set_len(content_length).await.is_err() {
+            return None;
+        }
+        file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
+        let now = now_unix();
+        let fresh = fresh_secs.max(1);
+        let meta = existing.unwrap_or_else(|| LargeMeta {
+            key: key.to_string(),
+            status,
+            headers,
+            content_length,
+            fresh_until: now + fresh,
+            stale_until: now + fresh + swr_secs,
+            stored_at: 0,
+            complete: false,
+            segments: Vec::new(),
+        });
+        Some(RangeWriter {
+            cache: self.clone(),
+            meta,
+            file,
+            data_path,
+            meta_path,
+            start,
+            end,
+            written: 0,
+            new_entry,
+            committed: false,
         })
     }
 
@@ -527,6 +733,65 @@ mod tests {
 
         assert_eq!(cache.purge_patterns(&["large.test".into()]).await, 1);
         assert!(cache.get(key).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn partial_ranges_accumulate_and_become_complete() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-partial-cache-test-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = LargeCache::open(&dir, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let key = "GET:video.test:/movie.mp4";
+        let total = 2_u64 * 1024 * 1024;
+
+        let mut first = cache
+            .begin_range(
+                key,
+                200,
+                vec![("content-type".into(), "video/mp4".into())],
+                total,
+                0,
+                1023,
+                60,
+                0,
+            )
+            .await
+            .expect("first range");
+        first.write_all(&vec![1_u8; 1024]).await;
+        assert!(first.commit().await);
+
+        let entry = cache.get_any(key).await.expect("partial entry");
+        assert!(entry.covers(0, 1023));
+        assert!(!entry.covers(0, 1024));
+
+        let mut second = cache
+            .begin_range(key, 200, Vec::new(), total, 1024, 2047, 60, 0)
+            .await
+            .expect("second range");
+        second.write_all(&vec![2_u8; 1024]).await;
+        assert!(second.commit().await);
+
+        let entry = cache.get_any(key).await.expect("accumulated entry");
+        assert!(entry.covers(0, 2047));
+        assert!(!entry.covers(0, total - 1));
+
+        let mut last = cache
+            .begin_range(key, 200, Vec::new(), total, 2048, total - 1, 60, 0)
+            .await
+            .expect("last range");
+        last.write_all(&vec![3_u8; (total - 2048) as usize]).await;
+        assert!(last.commit().await);
+
+        let mut entry = cache.get(key).await.expect("complete entry");
+        assert_eq!(entry.meta.segments, vec![(0, total - 1)]);
+        let chunk = entry.read_at(2048, 16).await.unwrap().unwrap();
+        assert_eq!(&chunk[..], &[3_u8; 16]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

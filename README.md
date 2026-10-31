@@ -105,9 +105,10 @@ git push origin v0.1.0
   `Range: bytes=0-0` 探测，不会整包下载。域名诊断在服务器漏发中间证书时会通过 AIA 自动补全证书链
 - **Range 缓存**：完整对象已缓存时按小段 Range 切片返回 206 / `Content-Range`；开放范围（`bytes=0-`）
   和大范围 Range 由 Pingora 流式透传，避免视频被整包下载导致回源超时
-- **大对象流式缓存（Phase 2，可选）**：`LARGE_CACHE_ENABLED=true` 后，带 `Content-Length` 的
+- **大对象流式缓存（Phase 2/3，可选）**：`LARGE_CACHE_ENABLED=true` 后，带 `Content-Length` 的
   200 响应会以分块方式直接写入独立磁盘目录，命中时按块流式读回，不再把 100MB～1GB 对象整体放进
-  `Bytes`/`BytesMut`。当前阶段只缓存完整对象，尚未实现 partial/Range chunk bitmap。
+  `Bytes`/`BytesMut`。首次 Range 请求会落盘实际请求的 segment，后续被已缓存 segment 覆盖的 Range
+  直接命中；segment 合并覆盖完整对象后自动转为完整缓存。
 - **Origin Shield / 分层缓存**：可选 `shield_url` 优先回源并保留域名 Host，Shield 异常自动回退；边缘支持
   `memory` / `disk` / `hybrid`（L1 内存 + L2 磁盘）分层存储
 - **配置版本与灰度发布**：域名/规则/WAF/高级设置变更自动生成版本快照与字段级 Diff；支持一键回滚、
@@ -252,7 +253,7 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 
 - 带 `Cookie` 的请求默认绕过缓存（偏保守）；缓存响应不保存 `Set-Cookie`
 - Range 缓存以完整对象为存储单位（命中完整对象时切片）；未命中 Range 直接透传源站，多段 Range 同样透传
-- 大对象缓存当前只缓存完整 200 响应，不支持仅缓存部分 Range/chunk；100MB～1GB 文件建议开启 `LARGE_CACHE_*` 或使用 HLS/分片对象
+- 大对象缓存按 Range 覆盖区间记录已缓存 segment；首次 Range 只缓存实际请求范围，不会补齐未请求部分；多段 Range 仍回源
 - 限流为单进程内存态，多实例不共享
 - `crates/lagran-proto` / `proto/` 仍是 gRPC 占位；Redis 已可选接入，未配置时自动回退到进程内状态/PostgreSQL
 

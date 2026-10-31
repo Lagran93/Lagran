@@ -20,9 +20,7 @@ use crate::server::handler::{
     apply_browser_ttl, apply_cors_and_custom, apply_security_headers, log_access,
     policy_browser_ttl, preflight_cacheable, proxy_handler, AppState,
 };
-use crate::server::native_cache::{
-    leak_storage_with_large, NativeStorage, META_HEADER,
-};
+use crate::server::native_cache::{leak_storage_with_large, NativeStorage, META_HEADER};
 use crate::server::purge;
 use async_trait::async_trait;
 use axum::body::Body;
@@ -119,6 +117,21 @@ struct NativePlan {
     label: &'static str,
 }
 
+struct RangeFill {
+    key: String,
+}
+
+enum RangeMsg {
+    Chunk(Bytes),
+    End,
+}
+
+struct RangeSink {
+    tx: tokio::sync::mpsc::UnboundedSender<RangeMsg>,
+    offset: u64,
+    queued: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
 struct ReqCtx {
     plan: Option<NativePlan>,
     host: String,
@@ -140,6 +153,8 @@ struct ReqCtx {
     head_body: BytesMut,
     head_headers: Option<ResponseHeader>,
     head_status: u16,
+    range_fill: Option<RangeFill>,
+    range_sink: Option<RangeSink>,
 }
 
 impl Default for ReqCtx {
@@ -165,6 +180,8 @@ impl Default for ReqCtx {
             head_body: BytesMut::new(),
             head_headers: None,
             head_status: 0,
+            range_fill: None,
+            range_sink: None,
         }
     }
 }
@@ -335,6 +352,50 @@ impl ProxyHttp for DataPlaneProxy {
             {
                 write_axum_response(session, resp, false).await;
                 return Ok(true);
+            }
+            // A Range request can be answered from the large-object cache when
+            // the requested bytes are already covered. Otherwise stream the
+            // origin response and fill the partial object in the background.
+            // If-Range is left to the origin to preserve validator semantics.
+            if plan.cache_reason == Some("range-bypass")
+                && !headers.contains_key("if-range")
+                && self.state.large_cache.is_some()
+            {
+                let raw_range = headers
+                    .get("range")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if let Some(raw_range) = raw_range {
+                    if let Some(large) = self.state.large_cache.as_ref() {
+                        if let Some(mut entry) = large.get_any(&plan.key).await {
+                            let total = entry.content_length();
+                            if let Some((start, end)) = parse_single_range(&raw_range, total) {
+                                if entry.covers(start, end)
+                                    && self
+                                        .serve_large_range(
+                                            session, &mut entry, start, end, total, &plan,
+                                        )
+                                        .await
+                                {
+                                    ctx.cache_label = "HIT";
+                                    ctx.cache_reason = Some("range-large-cache");
+                                    ctx.status = StatusCode::PARTIAL_CONTENT.as_u16();
+                                    ctx.plan = Some(plan);
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                    if is_single_range_syntax(&raw_range) {
+                        ctx.range_fill = Some(RangeFill {
+                            key: plan.key.clone(),
+                        });
+                        ctx.cache_label = "MISS";
+                        ctx.cache_reason = Some("range-fill");
+                        ctx.plan = Some(plan);
+                        return Ok(false);
+                    }
+                }
             }
             if plan.is_head && self.serve_head_cache(session, &plan, ctx).await {
                 return Ok(true);
@@ -683,6 +744,79 @@ impl ProxyHttp for DataPlaneProxy {
             ctx.head_headers = Some(response.clone());
             ctx.head_status = response.status.as_u16();
         }
+        if let Some(fill) = ctx.range_fill.take() {
+            if response.status == StatusCode::PARTIAL_CONTENT.as_u16() {
+                if let Some((start, end, total)) = response
+                    .headers
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_content_range)
+                {
+                    if let Some(large) = self.state.large_cache.as_ref() {
+                        let mut hdrs = header_vec(&response.headers);
+                        hdrs.retain(|(name, _)| {
+                            !name.eq_ignore_ascii_case("content-range")
+                                && !name.eq_ignore_ascii_case("content-length")
+                                && !name.eq_ignore_ascii_case("transfer-encoding")
+                                && !name.eq_ignore_ascii_case("connection")
+                                && !name.eq_ignore_ascii_case("x-cache")
+                                && !name.eq_ignore_ascii_case("x-cache-status")
+                                && !name.eq_ignore_ascii_case("x-lagran-cache-reason")
+                                && !name.eq_ignore_ascii_case("x-powered-by")
+                        });
+                        if let Ok(decision) = decide_storage_reason(
+                            200,
+                            &hdrs,
+                            response_policy,
+                            self.state.default_ttl_secs,
+                        ) {
+                            if let Some(writer) = large
+                                .begin_range(
+                                    &fill.key,
+                                    200,
+                                    hdrs,
+                                    total,
+                                    start,
+                                    end,
+                                    decision.ttl_secs,
+                                    decision.swr_secs,
+                                )
+                                .await
+                            {
+                                let (tx, mut rx) =
+                                    tokio::sync::mpsc::unbounded_channel::<RangeMsg>();
+                                let queued =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                                let writer_queued = queued.clone();
+                                tokio::spawn(async move {
+                                    let mut writer = writer;
+                                    while let Some(msg) = rx.recv().await {
+                                        match msg {
+                                            RangeMsg::Chunk(data) => {
+                                                writer_queued.fetch_sub(
+                                                    data.len() as u64,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                writer.write_all(&data).await;
+                                            }
+                                            RangeMsg::End => {
+                                                let _ = writer.commit().await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                                ctx.range_sink = Some(RangeSink {
+                                    tx,
+                                    offset: start,
+                                    queued,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -690,9 +824,33 @@ impl ProxyHttp for DataPlaneProxy {
         &self,
         _session: &mut Session,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        if let Some(sink) = ctx.range_sink.as_mut() {
+            if let Some(chunk) = body.as_ref() {
+                let queued = sink
+                    .queued
+                    .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                    + chunk.len() as u64;
+                if queued > 64 * 1024 * 1024
+                    || sink.tx.send(RangeMsg::Chunk(chunk.clone())).is_err()
+                {
+                    // Disk writer is slower than the origin. Drop the fill
+                    // rather than growing an unbounded queue; the client body
+                    // is still forwarded unchanged.
+                    ctx.range_sink = None;
+                    return Ok(None);
+                }
+                sink.offset = sink.offset.saturating_add(chunk.len() as u64);
+            }
+            if end_of_stream {
+                if let Some(sink) = ctx.range_sink.take() {
+                    let _ = sink.tx.send(RangeMsg::End);
+                }
+            }
+            return Ok(None);
+        }
         if ctx.plan.as_ref().is_some_and(|p| p.is_head) {
             if let Some(chunk) = body.take() {
                 ctx.head_body.extend_from_slice(&chunk);
@@ -820,12 +978,11 @@ impl DataPlaneProxy {
             return None;
         }
         let has_range = req.headers.contains_key("range");
-        // Small bounded ranges can use the in-process slice cache. Open-ended
-        // ranges (`bytes=0-`) and large ranges must stay on Pingora's streaming
-        // path; buffering them would download the whole video and time out.
-        if has_range && range_is_small_bounded(&req.headers) {
-            return None;
-        }
+        let small_range = has_range && range_is_small_bounded(&req.headers);
+        // Small bounded ranges normally use the in-process slice cache. When
+        // the complete object is already in the large-object cache, keep the
+        // request on the Pingora path so it can be served directly from disk.
+        // Open-ended ranges (`bytes=0-`) stay streaming as before.
         let host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
         if host.is_empty() {
             return None;
@@ -887,6 +1044,11 @@ impl DataPlaneProxy {
             req.method.clone()
         };
         let key = cache_key_for_request(&key_method, &host, &lookup_path, &req.headers);
+        // Small ranges still use the in-process slice path unless the large
+        // cache is enabled, in which case Pingora also fills partial ranges.
+        if has_range && small_range && self.state.large_cache.is_none() {
+            return None;
+        }
         Some(NativePlan {
             domain: domain.clone(),
             key,
@@ -907,6 +1069,105 @@ impl DataPlaneProxy {
             is_websocket,
             label,
         })
+    }
+
+    async fn serve_large_range(
+        &self,
+        session: &mut Session,
+        entry: &mut crate::cache::large::LargeEntry,
+        start: u64,
+        end: u64,
+        total: u64,
+        plan: &NativePlan,
+    ) -> bool {
+        let len = end.saturating_sub(start).saturating_add(1);
+        if len == 0 || len > usize::MAX as u64 {
+            return false;
+        }
+        let Ok(mut response) =
+            ResponseHeader::build(StatusCode::PARTIAL_CONTENT.as_u16(), Some(len as usize))
+        else {
+            return false;
+        };
+        for (name, value) in &entry.meta.headers {
+            if name.eq_ignore_ascii_case(META_HEADER)
+                || name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("content-range")
+                || is_hop_by_hop(name)
+            {
+                continue;
+            }
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                if response.append_header(name, value).is_err() {
+                    return false;
+                }
+            }
+        }
+        if response
+            .insert_header("content-range", format!("bytes {start}-{end}/{total}"))
+            .is_err()
+            || response
+                .insert_header("content-length", len.to_string())
+                .is_err()
+            || response.insert_header("accept-ranges", "bytes").is_err()
+            || response.insert_header("x-cache", "HIT").is_err()
+            || response.insert_header("x-cache-status", "HIT").is_err()
+        {
+            return false;
+        }
+        let mut final_headers = response.headers.clone();
+        apply_security_headers(&mut final_headers);
+        apply_cors_and_custom(&mut final_headers, &plan.cors, &plan.custom);
+        let _ = final_headers.insert("x-powered-by", HeaderValue::from_static("lagran-edge"));
+        for (name, value) in final_headers.iter() {
+            if response.insert_header(name.clone(), value.clone()).is_err() {
+                return false;
+            }
+        }
+        if entry.meta.stored_at > 0 {
+            let age = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs().saturating_sub(entry.meta.stored_at))
+                .unwrap_or(0);
+            let _ = response.insert_header("age", age.to_string());
+        }
+        if session
+            .write_response_header(Box::new(response), false)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        const CHUNK: u64 = 8 * 1024 * 1024;
+        let mut pos = start;
+        while pos <= end {
+            let want = (end - pos + 1).min(CHUNK) as usize;
+            let Ok(Some(chunk)) = entry.read_at(pos, want).await else {
+                // Headers are already on the wire; closing the stream is safer
+                // than appending a contradictory error response.
+                return true;
+            };
+            if chunk.is_empty() {
+                return true;
+            }
+            pos += chunk.len() as u64;
+            let done = pos > end;
+            if session
+                .write_response_body(Some(chunk), done)
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            if done {
+                break;
+            }
+        }
+        true
     }
 
     async fn handle_management(&self, session: &mut Session, path: &str) -> Result<bool> {
@@ -1503,6 +1764,66 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
     }
 }
 
+fn parse_content_range(raw: &str) -> Option<(u64, u64, u64)> {
+    let rest = raw.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    if total.trim() == "*" {
+        return None;
+    }
+    let total: u64 = total.trim().parse().ok()?;
+    let (start, end) = range.trim().split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    (start <= end && end < total).then_some((start, end, total))
+}
+
+fn is_single_range_syntax(raw: &str) -> bool {
+    let Some(value) = raw.trim().strip_prefix("bytes=") else {
+        return false;
+    };
+    if value.contains(',') {
+        return false;
+    }
+    let Some((start, end)) = value.split_once('-') else {
+        return false;
+    };
+    let start = start.trim();
+    let end = end.trim();
+    if start.is_empty() && end.is_empty() {
+        return false;
+    }
+    (start.is_empty() || start.parse::<u64>().is_ok())
+        && (end.is_empty() || end.parse::<u64>().is_ok())
+}
+
+fn parse_single_range(raw: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let value = raw.trim().strip_prefix("bytes=")?;
+    if value.contains(',') {
+        return None;
+    }
+    let (start, end) = value.split_once('-')?;
+    let (start, end) = (start.trim(), end.trim());
+    let (start, end) = if start.is_empty() {
+        let suffix: u64 = end.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        (total.saturating_sub(suffix), total - 1)
+    } else {
+        let start: u64 = start.parse().ok()?;
+        let end = if end.is_empty() {
+            total - 1
+        } else {
+            end.parse::<u64>().ok()?.min(total - 1)
+        };
+        (start, end)
+    };
+    (start <= end && start < total).then_some((start, end))
+}
+
 fn range_is_small_bounded(headers: &HeaderMap) -> bool {
     const MAX_SLICE: u64 = 1024 * 1024;
     let Some(raw) = headers.get("range").and_then(|v| v.to_str().ok()) else {
@@ -1705,12 +2026,24 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 
 #[cfg(test)]
 mod tests {
-    use super::head_content_length_for_protocol;
+    use super::{head_content_length_for_protocol, parse_single_range};
 
     #[test]
     fn head_length_is_http2_only() {
         assert_eq!(head_content_length_for_protocol(true, 1234), "1234");
         assert_eq!(head_content_length_for_protocol(false, 1234), "0");
         assert_eq!(head_content_length_for_protocol(true, 0), "0");
+    }
+
+    #[test]
+    fn single_byte_ranges_for_large_cache() {
+        assert_eq!(parse_single_range("bytes=0-1023", 4096), Some((0, 1023)));
+        assert_eq!(parse_single_range("bytes=1000-", 4096), Some((1000, 4095)));
+        assert_eq!(parse_single_range("bytes=-512", 4096), Some((3584, 4095)));
+        assert_eq!(parse_single_range("bytes=0-999999", 4096), Some((0, 4095)));
+        assert_eq!(parse_single_range("bytes=0-1,4-5", 4096), None);
+        assert_eq!(parse_single_range("bytes=5000-", 4096), None);
+        assert_eq!(parse_single_range("bytes=-0", 4096), None);
+        assert_eq!(parse_single_range("items=0-1", 4096), None);
     }
 }
