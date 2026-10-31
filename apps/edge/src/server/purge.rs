@@ -26,8 +26,16 @@ pub async fn purge_handler(
     Json(req): Json<EdgePurgeRequest>,
 ) -> Json<EdgePurgeResponse> {
     if req.purge_all.unwrap_or(false) {
-        let before = state.cache.len().await;
+        let before = state.cache.len().await
+            + state
+                .large_cache
+                .as_ref()
+                .map(|cache| cache.len())
+                .unwrap_or(0);
         state.cache.clear().await;
+        if let Some(large) = state.large_cache.as_ref() {
+            large.clear().await;
+        }
         tracing::info!(domain = %req.domain, purged = before, "purge_all");
         return Json(EdgePurgeResponse {
             success: true,
@@ -81,6 +89,9 @@ pub async fn purge_handler(
     let mut n = 0u64;
     if !patterns.is_empty() {
         n += state.cache.purge_matching(&patterns).await;
+        if let Some(large) = state.large_cache.as_ref() {
+            n += large.purge_patterns(&patterns).await;
+        }
     }
     if !tags.is_empty() {
         n += state.cache.purge_tags(&tags, &req.domain).await;

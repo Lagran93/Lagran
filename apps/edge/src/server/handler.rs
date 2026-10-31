@@ -17,7 +17,7 @@ use crate::cache::policy::{
     resolve_rule_policy_for_response, strip_response_headers, CacheRule, CacheStatus,
     ResolvedPolicy, RuleAction, RuleSet,
 };
-use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
+use crate::cache::{CacheEntry, CacheGetResult, LargeCache, SharedCache};
 use crate::config::registry::{DomainEntry, DomainRegistry, OriginTarget};
 use crate::metrics::EdgeMetrics;
 use crate::origin::{OriginClient, OriginResponse};
@@ -53,6 +53,8 @@ const FETCH_WAIT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct AppState {
     pub cache: SharedCache,
+    /// Separate streaming disk cache for large objects; disabled when None.
+    pub large_cache: Option<Arc<LargeCache>>,
     pub origin: OriginClient,
     pub default_ttl_secs: u64,
     pub rules: RuleSet,

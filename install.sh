@@ -69,6 +69,9 @@ Environment:
   AGENT_URL=...                  edge: control callback URL
   EDGE_LISTEN=...                edge: default 0.0.0.0:8081
   EDGE_ADMIN_LISTEN=...          edge: default 127.0.0.1:8082
+  LARGE_CACHE_ENABLED=true|false edge: large-object disk cache (default false)
+  LARGE_CACHE_DIR=...            edge: default /var/lib/lagran/large-cache
+  LARGE_CACHE_MAX_OBJECT_BYTES=  edge: default 1 GiB
   PUBLIC_IP=...                  edge: public IP for GeoDNS
   NODE_REGION=...                edge: region label
   DNS_ZONE=...                   dns: default edge.lagran.net
@@ -299,6 +302,11 @@ AGENT_URL=${agent_url}
 AGENT_TOKEN=${AGENT_TOKEN}
 CACHE_BACKEND=memory
 CACHE_TTL=60
+LARGE_CACHE_ENABLED=${LARGE_CACHE_ENABLED:-false}
+LARGE_CACHE_DIR=${LARGE_CACHE_DIR:-${DATA_DIR}/large-cache}
+LARGE_CACHE_MIN_OBJECT_BYTES=${LARGE_CACHE_MIN_OBJECT_BYTES:-8388608}
+LARGE_CACHE_MAX_OBJECT_BYTES=${LARGE_CACHE_MAX_OBJECT_BYTES:-1073741824}
+LARGE_CACHE_MAX_BYTES=${LARGE_CACHE_MAX_BYTES:-21474836480}
 CHALLENGE_SECRET=${CHALLENGE_SECRET:-}
 EOF
   chown root:lagran "$env_file"

@@ -1,9 +1,11 @@
 //! Edge cache layer
 
 pub mod disk;
+pub mod large;
 pub mod policy;
 
 pub use disk::{DiskCache, HybridCache};
+pub use large::LargeCache;
 pub use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult, MemoryCache, SharedCache};
 
 use crate::config::EdgeConfig;

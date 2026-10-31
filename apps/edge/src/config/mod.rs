@@ -49,6 +49,12 @@ pub struct EdgeConfig {
     /// Max response body size stored in cache (bytes). Larger responses are
     /// still proxied but not written to cache.
     pub max_cacheable_body: usize,
+    /// Optional streaming disk cache for large objects (Phase 2).
+    pub large_cache_enabled: bool,
+    pub large_cache_dir: String,
+    pub large_cache_min_object_bytes: u64,
+    pub large_cache_max_object_bytes: u64,
+    pub large_cache_max_bytes: u64,
     /// How often the edge pulls domain config from control (seconds).
     pub config_sync_interval_secs: u64,
 }
@@ -153,6 +159,25 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8 * 1024 * 1024)
                 .clamp(64 * 1024, 64 * 1024 * 1024),
+            large_cache_enabled: bool_env("LARGE_CACHE_ENABLED", false),
+            large_cache_dir: std::env::var("LARGE_CACHE_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "./data/large-cache".into()),
+            large_cache_min_object_bytes: std::env::var("LARGE_CACHE_MIN_OBJECT_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8 * 1024 * 1024)
+                .clamp(1024 * 1024, 1024 * 1024 * 1024),
+            large_cache_max_object_bytes: std::env::var("LARGE_CACHE_MAX_OBJECT_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024 * 1024 * 1024)
+                .clamp(1024 * 1024, 4 * 1024 * 1024 * 1024),
+            large_cache_max_bytes: std::env::var("LARGE_CACHE_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20 * 1024 * 1024 * 1024),
             config_sync_interval_secs: std::env::var("CONFIG_SYNC_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

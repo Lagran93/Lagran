@@ -28,6 +28,19 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let cache = cache::build_cache(&config).await?;
+    let large_cache = if config.large_cache_enabled {
+        Some(
+            edge::cache::LargeCache::open(
+                &config.large_cache_dir,
+                config.large_cache_min_object_bytes,
+                config.large_cache_max_object_bytes,
+                config.large_cache_max_bytes,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let origin = OriginClient::new(config.origin_url.clone());
     let rules = RuleSet::new();
     let metrics = EdgeMetrics::new();
@@ -104,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         cache,
+        large_cache,
         origin,
         default_ttl_secs: config.default_ttl_secs,
         rules,

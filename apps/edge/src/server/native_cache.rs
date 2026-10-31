@@ -7,6 +7,7 @@
 //! disk/hybrid persistence working without a separate metadata sidecar.
 
 use crate::cache::policy::compute_etag;
+use crate::cache::large::{LargeCache, LargeEntry, LargeWriter};
 use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
 use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
@@ -19,6 +20,7 @@ use pingora_cache::storage::{
 };
 use pingora_cache::trace::SpanHandle;
 use pingora_cache::CacheKey;
+use std::sync::Arc;
 
 pub const META_HEADER: &str = "x-lagran-pingora-meta";
 
@@ -27,6 +29,7 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL
 pub struct NativeStorage {
     cache: SharedCache,
     max_body: usize,
+    large: Option<Arc<LargeCache>>,
 }
 
 impl NativeStorage {
@@ -35,9 +38,18 @@ impl NativeStorage {
     }
 
     pub fn with_max_body(cache: SharedCache, max_body: usize) -> Self {
+        Self::with_large(cache, max_body, None)
+    }
+
+    pub fn with_large(
+        cache: SharedCache,
+        max_body: usize,
+        large: Option<Arc<LargeCache>>,
+    ) -> Self {
         Self {
             cache,
             max_body: max_body.clamp(64 * 1024, 64 * 1024 * 1024),
+            large,
         }
     }
 
@@ -115,6 +127,66 @@ impl HandleHit for EntryHit {
     }
 }
 
+struct LargeEntryHit {
+    entry: LargeEntry,
+    pos: u64,
+    end: u64,
+}
+
+#[async_trait]
+impl HandleHit for LargeEntryHit {
+    async fn read_body(&mut self) -> pingora::Result<Option<Bytes>> {
+        if self.pos >= self.end {
+            return Ok(None);
+        }
+        let want = (self.end - self.pos).min(8 * 1024 * 1024) as usize;
+        let chunk = self
+            .entry
+            .read_at(self.pos, want)
+            .await
+            .map_err(|e| pingora::Error::because(
+                pingora::ErrorType::InternalError,
+                "large cache read",
+                e,
+            ))?;
+        if let Some(chunk) = chunk {
+            self.pos += chunk.len() as u64;
+            Ok(Some(chunk))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn can_seek(&self) -> bool {
+        true
+    }
+
+    fn seek(&mut self, start: usize, end: Option<usize>) -> pingora::Result<()> {
+        let total = self.entry.content_length() as usize;
+        let end = end.unwrap_or(total).min(total);
+        self.pos = start.min(end) as u64;
+        self.end = end as u64;
+        Ok(())
+    }
+
+    async fn finish(
+        self: Box<Self>,
+        _storage: &'static (dyn Storage + Sync),
+        _key: &CacheKey,
+        _trace: &SpanHandle,
+    ) -> pingora::Result<()> {
+        Ok(())
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut (dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+}
+
 struct EntryMiss {
     cache: SharedCache,
     key: String,
@@ -164,11 +236,65 @@ impl HandleMiss for EntryMiss {
     }
 }
 
+struct LargeMiss {
+    writer: LargeWriter,
+    written: u64,
+}
+
+#[async_trait]
+impl HandleMiss for LargeMiss {
+    async fn write_body(&mut self, data: Bytes, _eof: bool) -> pingora::Result<()> {
+        if !self.writer.failed() {
+            self.writer.write_all(&data).await;
+            self.written += data.len() as u64;
+        }
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> pingora::Result<MissFinishType> {
+        let len = self.written;
+        if self.writer.commit().await {
+            Ok(MissFinishType::Created(len as usize))
+        } else {
+            Ok(MissFinishType::Created(0))
+        }
+    }
+}
+
+/// Discards oversized/unknown-size bodies without buffering them.
+struct NoopMiss;
+
+#[async_trait]
+impl HandleMiss for NoopMiss {
+    async fn write_body(&mut self, _data: Bytes, _eof: bool) -> pingora::Result<()> {
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> pingora::Result<MissFinishType> {
+        Ok(MissFinishType::Created(0))
+    }
+}
+
+fn header_content_length(headers: &[(String, String)]) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse().ok())
+}
+
 use std::time::{Duration, SystemTime};
 
 fn derive_meta(entry: &CacheEntry) -> pingora::Result<CacheMeta> {
-    let mut header = pingora::http::ResponseHeader::build(entry.status, Some(entry.body.len()))?;
-    for (name, value) in &entry.headers {
+    derive_meta_parts(entry.status, &entry.headers, entry.body.len())
+}
+
+fn derive_meta_parts(
+    status: u16,
+    headers: &[(String, String)],
+    content_length: usize,
+) -> pingora::Result<CacheMeta> {
+    let mut header = pingora::http::ResponseHeader::build(status, Some(content_length))?;
+    for (name, value) in headers {
         if name.eq_ignore_ascii_case(META_HEADER) || name.eq_ignore_ascii_case("content-length") {
             continue;
         }
@@ -179,7 +305,7 @@ fn derive_meta(entry: &CacheEntry) -> pingora::Result<CacheMeta> {
             header.append_header(name, value)?;
         }
     }
-    header.insert_header("content-length", entry.body.len().to_string())?;
+    header.insert_header("content-length", content_length.to_string())?;
     let now = SystemTime::now();
     Ok(CacheMeta::new(
         now + Duration::from_secs(3600),
@@ -219,6 +345,42 @@ impl Storage for NativeStorage {
         let Some(key) = Self::key_str(key) else {
             return Ok(None);
         };
+        if let Some(large) = self.large.as_ref() {
+            if let Some(entry) = large.get(key).await {
+                let len = entry.content_length() as usize;
+                let mut meta = if let Some(encoded) = entry
+                    .meta
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(META_HEADER))
+                    .map(|(_, v)| v.as_str())
+                {
+                    decode_meta(encoded)
+                        .unwrap_or(derive_meta_parts(entry.meta.status, &entry.meta.headers, len)?)
+                } else {
+                    derive_meta_parts(entry.meta.status, &entry.meta.headers, len)?
+                };
+                if let Some(etag) = entry
+                    .meta
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+                    .map(|(_, v)| v)
+                {
+                    if !meta.response_header().headers.contains_key("etag") {
+                        meta.response_header_mut().insert_header("etag", etag)?;
+                    }
+                }
+                return Ok(Some((
+                    meta,
+                    Box::new(LargeEntryHit {
+                        entry,
+                        pos: 0,
+                        end: len as u64,
+                    }) as HitHandler,
+                )));
+            }
+        }
         let entry = match self.cache.get_result(key).await {
             CacheGetResult::Hit(entry) | CacheGetResult::Stale(entry) => entry,
             CacheGetResult::Expired | CacheGetResult::Miss => return Ok(None),
@@ -261,15 +423,45 @@ impl Storage for NativeStorage {
     ) -> pingora::Result<MissHandler> {
         let key = Self::key_str(key).unwrap_or_default().to_string();
         let encoded_meta = encode_meta(meta)?;
+        let status = meta.response_header().status.as_u16();
+        let headers = headers_vec(meta.response_header());
+        let content_length = header_content_length(&headers);
+        let fresh_secs = meta.fresh_sec();
+        let swr_secs = u64::from(meta.stale_while_revalidate_sec());
+
+        if status == 200 {
+            if let (Some(large), Some(len)) = (self.large.as_ref(), content_length) {
+                if large.accepts(len) {
+                    let mut stored_headers = headers.clone();
+                    stored_headers.push((META_HEADER.to_string(), encoded_meta.clone()));
+                    if let Some(writer) = large
+                        .begin(&key, status, stored_headers, len, fresh_secs, swr_secs)
+                        .await
+                    {
+                        return Ok(Box::new(LargeMiss {
+                            writer,
+                            written: 0,
+                        }) as MissHandler);
+                    }
+                }
+            }
+        }
+
+        // Do not accumulate an object larger than the small-object limit in
+        // memory when the large cache is disabled or the object is too big.
+        if content_length.is_some_and(|len| len > self.max_body as u64) {
+            return Ok(Box::new(NoopMiss) as MissHandler);
+        }
+
         Ok(Box::new(EntryMiss {
             cache: self.cache.clone(),
             key,
-            status: meta.response_header().status.as_u16(),
-            headers: headers_vec(meta.response_header()),
+            status,
+            headers,
             encoded_meta,
             body: BytesMut::new(),
-            fresh_secs: meta.fresh_sec(),
-            swr_secs: u64::from(meta.stale_while_revalidate_sec()),
+            fresh_secs,
+            swr_secs,
             max_body: self.max_body,
             too_large: false,
         }) as MissHandler)
@@ -306,4 +498,12 @@ pub fn leak_storage(cache: SharedCache) -> &'static NativeStorage {
 
 pub fn leak_storage_with_limit(cache: SharedCache, max_body: usize) -> &'static NativeStorage {
     Box::leak(Box::new(NativeStorage::with_max_body(cache, max_body)))
+}
+
+pub fn leak_storage_with_large(
+    cache: SharedCache,
+    max_body: usize,
+    large: Option<Arc<LargeCache>>,
+) -> &'static NativeStorage {
+    Box::leak(Box::new(NativeStorage::with_large(cache, max_body, large)))
 }

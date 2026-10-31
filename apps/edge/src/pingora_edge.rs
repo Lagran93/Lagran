@@ -20,7 +20,9 @@ use crate::server::handler::{
     apply_browser_ttl, apply_cors_and_custom, apply_security_headers, log_access,
     policy_browser_ttl, preflight_cacheable, proxy_handler, AppState,
 };
-use crate::server::native_cache::{leak_storage_with_limit, NativeStorage, META_HEADER};
+use crate::server::native_cache::{
+    leak_storage_with_large, NativeStorage, META_HEADER,
+};
 use crate::server::purge;
 use async_trait::async_trait;
 use axum::body::Body;
@@ -1654,11 +1656,14 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
     let mut server = Server::new(Some(opt))?;
     server.bootstrap();
 
-    let storage = Some(leak_storage_with_limit(
+    let storage = Some(leak_storage_with_large(
         state.cache.clone(),
         state.max_cacheable_body,
+        state.large_cache.clone(),
     ));
-    let cache_lock: &'static CacheLock = Box::leak(CacheLock::new_boxed(Duration::from_secs(10)));
+    let cache_lock_secs = if state.large_cache.is_some() { 300 } else { 10 };
+    let cache_lock: &'static CacheLock =
+        Box::leak(CacheLock::new_boxed(Duration::from_secs(cache_lock_secs)));
     let proxy = DataPlaneProxy {
         trust_proxy: config.trust_proxy_headers,
         state,
