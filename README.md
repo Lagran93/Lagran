@@ -190,51 +190,22 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 
 ## 环境变量
 
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| DATABASE_URL | postgres://lagran:lagran@127.0.0.1:5432/lagran | 控制面数据库 |
-| CONTROL_BIND | 0.0.0.0:8080 | 控制面监听（兼容 CONTROL_HOST/CONTROL_PORT） |
-| JWT_SECRET | lagran-dev-secret-change-me | JWT 签名密钥，生产必须修改 |
-| JWT_EXPIRE_HOURS | 24 | Token 有效期（小时；优先于 JWT_EXPIRES_SECS） |
-| JWT_EXPIRES_SECS | 空 | 兼容旧配置的 Token 秒数；仅当 JWT_EXPIRE_HOURS 未设置时生效 |
-| AGENT_TOKEN | 空 | 全局 token：DNS `/schedule` 使用；边缘配置/心跳必须使用节点 `auth_token` |
-| CONTROL_PUBLIC_URL | 空 | 控制面公网地址，用于生成节点安装命令；留空按请求 Host 推导 |
-| GEOIP_PATH | ./data/geoip.dat | 调度用 GeoIP：支持 V2Ray/Loyalsoldier `geoip.dat` 或旧版 CIDR JSON；缺失时按权重/负载调度 |
-| GEOIP_JSON_PATH | 空 | 兼容旧配置的 JSON 路径别名；新部署建议使用 `GEOIP_PATH` |
-| GEOIP_DAT_PATH | 空 | 兼容旧配置的 protobuf 路径别名；GEOIP_PATH 优先 |
-| SCHEDULE_TTL | 30 | `/api/v1/schedule` 返回的 DNS TTL（秒） |
-| ACME_DIRECTORY_URL | Let's Encrypt 生产 | ACME v2 目录地址 |
-| ACME_STAGING_DIRECTORY_URL | Let's Encrypt Staging | Staging 目录地址 |
-| ACME_CONTACT_EMAIL | 空 | ACME 账户联系邮箱 |
-| ALERT_EVAL_SECS | 30 | 告警规则评估间隔（秒，最小 5） |
-| OTEL_EXPORTER_OTLP_ENDPOINT | 空 | OTLP/HTTP Trace 地址，如 `http://127.0.0.1:4318`；留空关闭导出 |
-| OTEL_SERVICE_NAME | lagran-control | OpenTelemetry service.name |
-| OTEL_TRACES_SAMPLER_ARG | 1.0 | Trace 采样率 0.0–1.0 |
-| EDGE_LISTEN | 0.0.0.0:8081 | Pingora 公共数据面 HTTP 监听 |
-| EDGE_ADMIN_LISTEN | 空 | 管理面监听；设置后 purge/证书/ACME 与管理接口走独立端口（推荐） |
-| EDGE_HTTPS_LISTEN | 空 | Pingora 公共 HTTPS 监听（需证书） |
-| ORIGIN_URL | https://example.com | 默认源站（未接入域名时兜底） |
-| CONTROL_URL | http://127.0.0.1:8080 | 控制面地址，支持 https |
-| CACHE_TTL | 60 | 未命中规则时的默认 TTL |
-| CACHE_CAPACITY | 10000 | 内存缓存条目上限（0=不限） |
-| CACHE_BACKEND | memory | memory / disk / hybrid |
-| TRUST_PROXY_HEADERS | false | 是否信任前置代理的 `X-Forwarded-For`；false 时 Pingora 用真实对端 IP 覆盖伪造值 |
-| EDGE_HTTPS_REDIRECT_PORT | 空 | 域名开启 HTTPS 后，HTTP→HTTPS 跳转使用的端口；留空取 HTTPS 监听端口，443 时省略 |
-| PUBLIC_IP | 空 | 节点公网 IP，随心跳上报给控制面用于 GeoDNS 调度 |
-| DNS_LISTEN | 0.0.0.0:53 | 权威 DNS 监听地址（UDP/TCP 同端口） |
-| DNS_ZONE | edge.lagran.net | 权威 Zone（客户域名 CNAME 到这里） |
-| DNS_NS_NAME | ns1.$zone | 一个或多个 NS 名，逗号分隔（如 ns1,ns2） |
-| DNS_NS_IP | 127.0.0.1 | 与 NS 名一一对应的 glue IP，逗号分隔 |
-| DNS_TTL | 30 | 调度 A 记录的 TTL（秒） |
-| DNS_CACHE_SECS / DNS_STALE_SECS | 5 / 300 | 调度结果缓存与故障时允许的旧结果时间 |
-| DNS_FALLBACK_IP | 空 | 控制面不可用且无缓存时返回的兜底 IP |
-| DNS_TEST_SERVER | 127.0.0.1:53 | 控制台「DNS 测试」查询的权威 DNS 地址 |
-| WAF_REPORT_INTERVAL | 5 | WAF 事件上报间隔（秒），`WAF_REPORT=false` 可关闭 |
-| CHALLENGE_SECRET | 空 | 质询 nonce / 免质询 Cookie 的 HMAC 密钥；多节点部署必须一致，留空用 AGENT_TOKEN 派生或随机 |
-| RATE_LIMIT_RPS / BURST | 0 | 全局默认限流（0=不限） |
-| CC_SYNC_INTERVAL | 5 | 跨节点共享 CC 封禁拉取间隔（秒，最小 2） |
+环境变量按应用拆分，完整默认值、取值范围、安全说明均写在对应文件中：
 
-完整列表见 `.env.example`。
+| 文件 | 应用 | 内容 |
+|---|---|---|
+| [control.env.example](control.env.example) | control | 监听、PostgreSQL、Redis、JWT、ACME、GeoIP、OTel、告警、Telegram |
+| [edge.env.example](edge.env.example) | edge | 监听、节点令牌、回源/缓存、TLS、WAF、限流、健康检查、访问日志 |
+| [dns.env.example](dns.env.example) | dns | 监听、权威 Zone/NS/SOA、控制面调度、缓存与兜底 |
+| [frontend.env.example](frontend.env.example) | frontend | Nuxt API 地址、构建期/运行时说明 |
+
+使用原则：
+
+- 每个进程只加载自己对应的 env 文件；
+- 生产环境不要沿用示例中的开发密码、JWT 密钥和节点令牌；
+- `NUXT_PUBLIC_API_BASE` 是构建期公开变量，修改后必须重新 generate/build；
+- Redis 未配置时，P1 功能自动回退到进程内状态/PostgreSQL；
+- 完整变量说明以四份 env 文件为准，本文不再维护重复表格。
 
 ## 角色与多租户
 
