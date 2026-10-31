@@ -245,6 +245,10 @@ REDIS_SESSION_TTL_SECS=30
 CONFIG_CACHE_TTL_SECS=3
 LOG_RETENTION_DAYS=14
 ALERT_EVAL_SECS=30
+LAGRAN_UPDATE_REPO=${REPO}
+LAGRAN_UPDATE_HELPER=${BIN_DIR}/lagran-update
+LAGRAN_UPDATE_REQUEST_PATH=${DATA_DIR}/update.request
+LAGRAN_UPDATE_STATUS_PATH=${DATA_DIR}/update.status
 EOF
   chown root:lagran "$env_file"
   chmod 0640 "$env_file"
@@ -276,6 +280,49 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+install_update_helper() {
+  [[ -f "$STAGE/update.sh" ]] || return 0
+  install -m 0755 "$STAGE/update.sh" "$BIN_DIR/lagran-update"
+  cat > "$CONF_DIR/update.env" <<EOF
+LAGRAN_PREFIX=${PREFIX}
+LAGRAN_DATA_DIR=${DATA_DIR}
+LAGRAN_UPDATE_REPO=${REPO}
+LAGRAN_UPDATE_REQUEST_PATH=${DATA_DIR}/update.request
+LAGRAN_UPDATE_STATUS_PATH=${DATA_DIR}/update.status
+EOF
+  chmod 0644 "$CONF_DIR/update.env"
+  cat > /etc/systemd/system/lagran-update.service <<EOF
+[Unit]
+Description=Lagran CDN privileged updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_DIR}/lagran-update
+TimeoutStartSec=600
+EOF
+  cat > /etc/systemd/system/lagran-update.path <<EOF
+[Unit]
+Description=Watch for Lagran CDN update requests
+
+[Path]
+PathExists=${DATA_DIR}/update.request
+Unit=lagran-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    if [[ "$START_SERVICE" == "1" ]]; then
+      systemctl enable --now lagran-update.path
+    else
+      systemctl enable lagran-update.path
+    fi
+  fi
 }
 
 write_edge_env() {
@@ -443,6 +490,7 @@ main_control() {
   install_env_example control.env.example
   write_control_env
   write_control_unit
+  install_update_helper
   enable_service lagran-control
   local control_port
   control_port="$(sed -n 's/^CONTROL_BIND=//p' "$CONF_DIR/control.env" | tail -1)"

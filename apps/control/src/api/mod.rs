@@ -23,6 +23,7 @@ pub mod project;
 pub mod purge;
 pub mod rule;
 pub mod stats;
+pub mod system;
 pub mod user;
 pub mod waf;
 
@@ -60,6 +61,12 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/auth/captcha", get(auth::captcha))
                 .route("/auth/me", get(auth::me).put(auth::update_me))
                 .route("/auth/me/password", put(auth::change_password))
+                .route("/system/donation", get(system::donation))
+                .route(
+                    "/system/update",
+                    get(system::check_update).post(system::apply_update),
+                )
+                .route("/system/update/status", get(system::update_status))
                 .route("/users", get(user::list).post(user::create))
                 .route(
                     "/users/:id",
