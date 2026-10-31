@@ -48,6 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
 - 构建时由 `build.rs` 注入短 Git hash，版本格式为 `0.1.0+4a5f39b`。
 - `/health`、`/ready`、Prometheus `lagran_control_info`、控制台「系统设置 → 控制面版本」和节点心跳都会显示该版本。
 - [.github/workflows/ci.yml](.github/workflows/ci.yml) 在 push/PR 时执行 Rust 测试和前端静态构建，并始终产出可下载的 `Release bundle artifact`。
+- 后端 Release 使用 `x86_64-unknown-linux-musl` 静态编译，生成的 `lagran-control` / `lagran-edge` / `lagran-dns` 不依赖目标机 glibc 版本。
 - 真正发布 GitHub Release 需要推送版本 Tag，或在 Actions 页面手动 run workflow 并填写 tag：
 
 ```bash

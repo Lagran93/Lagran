@@ -31,22 +31,36 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-x86_64
       - name: Unit tests
         run: cargo test --workspace
-      - name: Release build
+      - name: Release build (static musl)
         env:
           LAGRAN_GIT_HASH: ${{ github.sha }}
-        run: cargo build --release -p control -p edge -p lagran-dns
+        run: cargo build --release --target x86_64-unknown-linux-musl -p control -p edge -p lagran-dns
+      - name: Verify static binaries
+        run: |
+          set -euo pipefail
+          for bin in lagran-control lagran-edge lagran-dns; do
+            file "target/x86_64-unknown-linux-musl/release/${bin}"
+            ldd "target/x86_64-unknown-linux-musl/release/${bin}" 2>&1 || true
+          done
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: lagran-binaries
           if-no-files-found: error
           path: |
-            target/release/lagran-control
-            target/release/lagran-edge
-            target/release/lagran-dns
+            target/x86_64-unknown-linux-musl/release/lagran-control
+            target/x86_64-unknown-linux-musl/release/lagran-edge
+            target/x86_64-unknown-linux-musl/release/lagran-dns
 
   frontend:
     name: Frontend (static generate)
