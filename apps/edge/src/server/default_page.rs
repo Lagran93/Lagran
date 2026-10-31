@@ -97,6 +97,11 @@ const CARD_CSS: &str = r#"
       font-size: 12px; color: #9a8b78; position: relative; z-index: 1;
     }
     .foot { margin: 18px 0 0; text-align: center; font-size: 12px; color: #a29380; letter-spacing: .06em; }
+    .foot a {
+      color: #9c3b31; text-decoration: none; border-bottom: 1px solid rgba(156,59,49,.35);
+      margin-left: 6px; font-weight: 600;
+    }
+    .foot a:hover { color: #7f2d25; border-bottom-color: currentColor; }
     @media (min-width: 1920px) {
       .wrap { width: min(820px, 100%); }
       .card { padding: 52px 56px; }
@@ -253,6 +258,50 @@ pub fn waf_blocked_page(host: &str, path: &str, rule: &str, category: &str) -> R
     response
 }
 
+/// Page returned when the edge rate limiter or CC protection rejects a request.
+pub fn rate_limited_page(
+    host: &str,
+    path: &str,
+    retry_after: u64,
+    banned: bool,
+) -> Response {
+    let host_esc = html_escape(host);
+    let path_esc = html_escape(&truncate(path, 160));
+    let reason = if banned {
+        "该客户端触发了 CC 防护，已被临时封禁。"
+    } else {
+        "当前请求频率超过了该域名允许的上限。"
+    };
+    let body = format!(
+        r#"<h1>请求过于频繁</h1>
+    <p>{reason}</p>
+    <p>请求信息：域名 <code>{host_esc}</code> · 路径 <code>{path_esc}</code></p>
+    <p>建议：</p>
+    <ul>
+      <li>等待约 {retry_after} 秒后重试</li>
+      <li>降低请求频率，或检查是否有脚本/爬虫在短时间内重复访问</li>
+      <li>如果你是站点管理员，可在控制台调整限流或 CC 策略</li>
+    </ul>"#
+    );
+    let mut response = render_page(
+        StatusCode::TOO_MANY_REQUESTS,
+        "访问受限",
+        "请求过于频繁",
+        &body,
+        if banned { "CC_BLOCKED" } else { "RATE_LIMITED" },
+        true,
+    );
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
+        headers.insert(header::RETRY_AFTER, value);
+    }
+    headers.insert(
+        HeaderName::from_static("x-lagran-cc"),
+        HeaderValue::from_static(if banned { "banned" } else { "limit" }),
+    );
+    response
+}
+
 /// Page returned while an admin has disabled this edge node.
 pub fn node_disabled_page(host: &str) -> Response {
     let host_esc = html_escape(host);
@@ -339,7 +388,7 @@ fn render_page(
       {body_html}
       <div class="meta"><span>错误码</span><code>{code}</code></div>
     </div>
-    <p class="foot">Lagran Edge · 为每一次访问保驾护航</p>
+    <p class="foot">Lagran Edge · 为每一次访问保驾护航 · <a href="https://t.me/lagranedge" target="_blank" rel="noopener noreferrer">获取技术支持</a></p>
   </div>
 </body>
 </html>"##,
@@ -442,5 +491,24 @@ mod tests {
             "DOMAIN_NOT_ONBOARDED"
         );
         assert!(resp.headers().get("retry-after").is_none());
+    }
+
+    #[tokio::test]
+    async fn all_edge_error_pages_include_support_link() {
+        use http_body_util::BodyExt;
+
+        let pages = [
+            origin_error_page("cdn.test", "/a", OriginFailure::Unreachable),
+            waf_blocked_page("cdn.test", "/search", "SQL 注入", "sqli"),
+            node_disabled_page("cdn.test"),
+            rate_limited_page("cdn.test", "/api", 7, false),
+            unknown_domain_page("not-onboarded.test"),
+        ];
+        for response in pages {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let html = String::from_utf8_lossy(&body);
+            assert!(html.contains("https://t.me/lagranedge"), "missing Telegram URL");
+            assert!(html.contains("获取技术支持"), "missing support link text");
+        }
     }
 }

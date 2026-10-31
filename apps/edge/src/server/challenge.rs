@@ -332,8 +332,9 @@ fn error_page(title: &str, message: &str) -> Response {
 <title>{title} | Lagran CDN</title>
 <style>body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f5f7fa;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#1d2129}}
 .card{{max-width:440px;padding:32px;background:#fff;border:1px solid #e5e6eb;border-radius:12px;box-shadow:0 8px 24px rgba(29,33,41,.08);text-align:center}}
-h1{{font-size:18px;margin:0 0 8px}}p{{color:#4e5969;font-size:14px;line-height:1.7;margin:0}}</style></head>
-<body><div class="card"><h1>{title}</h1><p>{message}</p></div></body></html>"#
+h1{{font-size:18px;margin:0 0 8px}}p{{color:#4e5969;font-size:14px;line-height:1.7;margin:0}}
+.support{{display:inline-block;margin-top:14px;color:#1677ff;text-decoration:none;font-size:13px;border-bottom:1px solid rgba(22,119,255,.35)}}</style></head>
+<body><div class="card"><h1>{title}</h1><p>{message}</p><a class="support" href="https://t.me/lagranedge" target="_blank" rel="noopener noreferrer">获取技术支持</a></div></body></html>"#
     );
     let mut response = (StatusCode::FORBIDDEN, Html(html)).into_response();
     response
@@ -365,6 +366,7 @@ const PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
   .bar { height: 100%; width: 8%; background: #1677ff; border-radius: 3px; transition: width .2s ease; }
   .status { font-size: 12px; color: #86909c; }
   .foot { margin-top: 18px; font-size: 12px; color: #86909c; }
+  .foot a { color: #1677ff; text-decoration: none; border-bottom: 1px solid rgba(22,119,255,.35); margin-left: 6px; }
   noscript { display: block; margin-top: 16px; color: #f53f3f; font-size: 13px; }
 </style>
 </head>
@@ -375,7 +377,7 @@ const PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
     <p>正在确认你的浏览器，完成后会自动跳转。通常只需要几秒钟。</p>
     <div class="progress"><div class="bar" id="bar"></div></div>
     <div class="status" id="status">计算中…</div>
-    <div class="foot">Lagran CDN · 由 WAF 质询保护</div>
+    <div class="foot">Lagran CDN · 由 WAF 质询保护 · <a href="https://t.me/lagranedge" target="_blank" rel="noopener noreferrer">获取技术支持</a></div>
     <noscript>当前浏览器禁用了 JavaScript，无法完成安全验证。请启用后刷新页面。</noscript>
   </div>
 <script>

@@ -265,6 +265,10 @@ Lagran CDN 的持续开发、测试基础设施和节点运维接受加密货币
 - 加密货币交易不可逆，转错网络或地址无法退款。
 - 如捐赠用于特定目标，请在转账备注/邮件中说明；链上交易本身无法备注。
 
+## 获取技术支持
+
+Telegram Group: https://t.me/lagranedge
+
 ## License
 
 Lagran CDN 使用 **GNU Affero General Public License v3.0 only**（`AGPL-3.0-only`）。

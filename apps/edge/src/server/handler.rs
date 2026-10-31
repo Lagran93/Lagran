@@ -1500,7 +1500,7 @@ pub(crate) async fn preflight_cacheable(
                     &request_id,
                 )
                 .await;
-                return Some(cc_too_many(decision.retry_after(), banned));
+                return Some(cc_too_many(host, path_only, decision.retry_after(), banned));
             }
         }
     }
@@ -1526,14 +1526,12 @@ pub(crate) async fn preflight_cacheable(
             &request_id,
         )
         .await;
-        return Some(
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", "1")],
-                "Too Many Requests",
-            )
-                .into_response(),
-        );
+        return Some(default_page::rate_limited_page(
+            host,
+            path_only,
+            1,
+            false,
+        ));
     }
 
     if domain.waf.enabled {
@@ -1914,18 +1912,8 @@ fn set_cache_reason(response: &mut Response, reason: Option<&'static str>) {
     }
 }
 
-pub(crate) fn cc_too_many(retry_after: u64, banned: bool) -> Response {
-    let mut resp = (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").into_response();
-    let headers = resp.headers_mut();
-    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
-        headers.insert(header::RETRY_AFTER, value);
-    }
-    headers.insert(
-        "x-lagran-cc",
-        HeaderValue::from_static(if banned { "banned" } else { "limit" }),
-    );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
+pub(crate) fn cc_too_many(host: &str, path: &str, retry_after: u64, banned: bool) -> Response {
+    default_page::rate_limited_page(host, path, retry_after, banned)
 }
 
 fn not_modified_response(etag: &str) -> Response {
