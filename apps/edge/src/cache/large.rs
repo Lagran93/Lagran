@@ -322,7 +322,7 @@ impl LargeCache {
 
     fn release_bytes(&self, bytes: u64) {
         self.used_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 Some(used.saturating_sub(bytes))
             })
             .ok();
@@ -353,7 +353,7 @@ impl LargeCache {
             if fs::remove_file(&data_path).await.is_ok() {
                 self.release_bytes(data_len + meta_bytes.len() as u64);
                 self.entries
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         Some(n.saturating_sub(1))
                     })
                     .ok();
@@ -551,7 +551,7 @@ impl LargeCache {
                 n += 1;
                 self.release_bytes(data_len + meta_len);
                 self.entries
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         Some(n.saturating_sub(1))
                     })
                     .ok();
@@ -627,7 +627,7 @@ impl LargeCache {
         }
         self.release_bytes(freed);
         self.entries
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(victims))
             })
             .ok();
