@@ -4,6 +4,15 @@ pub mod registry;
 
 use serde::Deserialize;
 
+fn normalize_control_url(raw: &str) -> String {
+    let value = raw.trim().trim_end_matches('/');
+    if value.is_empty() {
+        "http://127.0.0.1:8080".into()
+    } else {
+        value.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EdgeConfig {
     pub listen_addr: String,
@@ -116,8 +125,7 @@ impl Default for EdgeConfig {
             node_id: std::env::var("NODE_ID").unwrap_or_else(|_| "edge-001".into()),
             region: std::env::var("NODE_REGION").unwrap_or_else(|_| "local".into()),
             public_ip: std::env::var("PUBLIC_IP").unwrap_or_default(),
-            control_url: std::env::var("CONTROL_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
+            control_url: normalize_control_url(&std::env::var("CONTROL_URL").unwrap_or_default()),
             agent_url,
             heartbeat_interval_secs: std::env::var("HEARTBEAT_INTERVAL")
                 .ok()
@@ -208,5 +216,19 @@ impl EdgeConfig {
     pub fn load() -> Self {
         let _ = dotenvy::dotenv();
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_url_is_normalized() {
+        assert_eq!(
+            normalize_control_url("  https://control.example.com/  "),
+            "https://control.example.com"
+        );
+        assert_eq!(normalize_control_url("   "), "http://127.0.0.1:8080");
     }
 }

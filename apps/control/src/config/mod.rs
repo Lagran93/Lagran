@@ -6,6 +6,10 @@
 
 use serde::Deserialize;
 
+fn normalize_public_url(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -104,7 +108,9 @@ impl Default for AppConfig {
             agent_token: env_nonempty("AGENT_TOKEN")
                 .or_else(|| env_nonempty("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
-            public_url: std::env::var("CONTROL_PUBLIC_URL").unwrap_or_default(),
+            public_url: normalize_public_url(
+                &std::env::var("CONTROL_PUBLIC_URL").unwrap_or_default(),
+            ),
             geoip_path: env_nonempty("GEOIP_PATH")
                 .or_else(|| env_nonempty("GEOIP_DAT_PATH"))
                 .or_else(|| env_nonempty("GEOIP_JSON_PATH"))
@@ -223,5 +229,14 @@ mod tests {
     fn bind_parses_host_and_port() {
         // unit smoke: defaults construct without panic
         let _ = AppConfig::default();
+    }
+
+    #[test]
+    fn public_url_is_trimmed() {
+        assert_eq!(
+            normalize_public_url("  https://console.example.com/  "),
+            "https://console.example.com"
+        );
+        assert_eq!(normalize_public_url(""), "");
     }
 }

@@ -7,6 +7,13 @@
 - 控制台：Nuxt 4 + Pinia
 - 许可：AGPL-3.0-only
 
+## Demo
+
+- 在线演示：https://demo.lagrancdn.com
+- 管理员用户名：`admin@lagrancdn.com`
+- 管理员密码：`admin123`
+
+
 ## 快速导航
 
 | 内容 | 文档 |
@@ -195,6 +202,8 @@ X-Lagran-Cache-Reason: <缓存原因>
 - `EDGE_ADMIN_LISTEN` 不要暴露公网
 - `NUXT_PUBLIC_API_BASE` 是构建期公开变量，修改后必须重新 `npm run generate`
 - Redis 未配置时，相关能力回退到进程内状态/PostgreSQL
+
+> `CONTROL_PUBLIC_URL` 只由 Control 读取，用于生成节点安装命令；Edge/DNS 访问控制面使用 `CONTROL_URL`，两者不可混用。
 
 ---
 

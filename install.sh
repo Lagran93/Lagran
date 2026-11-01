@@ -61,7 +61,7 @@ Environment:
   LAGRAN_REDIS_URL=...           control: optional Redis URL
   LAGRAN_SEED_DEMO=true|false    control: seed demo account (default true)
   LAGRAN_CONTROL_BIND=...        control: default 0.0.0.0:8080
-  LAGRAN_CONTROL_PUBLIC_URL=...  control: public HTTPS URL
+  LAGRAN_CONTROL_PUBLIC_URL=...  control: public HTTPS URL (alias: CONTROL_PUBLIC_URL)
 
   AGENT_TOKEN=...                edge/dns: required node/global token
   NODE_ID=...                    edge: node id, default hostname
@@ -227,7 +227,7 @@ write_control_env() {
   local agent_token="${LAGRAN_AGENT_TOKEN:-$(rand_hex 24)}"
   local bind="${LAGRAN_CONTROL_BIND:-0.0.0.0:8080}"
   local seed_demo="${LAGRAN_SEED_DEMO:-true}"
-  local public_url="${LAGRAN_CONTROL_PUBLIC_URL:-}"
+  local public_url="${LAGRAN_CONTROL_PUBLIC_URL:-${CONTROL_PUBLIC_URL:-}}"
   umask 077
   cat > "$env_file" <<EOF
 CONTROL_BIND=${bind}

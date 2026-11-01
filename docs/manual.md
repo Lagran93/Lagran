@@ -418,12 +418,38 @@ systemctl restart lagran-edge
 systemctl restart lagran-dns
 ```
 
+### 4.1.1 `CONTROL_PUBLIC_URL` 与 `CONTROL_URL` 的关系
+
+这两个变量属于不同进程，不能混用：
+
+| 变量 | 读取进程 | 作用 |
+|---|---|---|
+| `CONTROL_PUBLIC_URL` | `lagran-control` | 控制面公网根地址，用于生成节点安装命令中的 `CONTROL_URL` |
+| `CONTROL_URL` | `lagran-edge` / `lagran-dns` | Edge/DNS 访问控制面的 API 根地址 |
+
+关系：
+
+```text
+Control 的 CONTROL_PUBLIC_URL
+  → 生成节点安装命令
+  → 写入 Edge/DNS 的 CONTROL_URL
+```
+
+注意：
+
+- 两个变量都必须以 `http://` 或 `https://` 开头，末尾 `/` 会自动去除。
+- `CONTROL_PUBLIC_URL` 留空时，Control 按安装请求的 `Host` / `X-Forwarded-Proto` 推断。
+- `CONTROL_URL` 留空时，Edge/DNS 使用默认 `http://127.0.0.1:8080`。
+- Control 进程不会读取 `CONTROL_URL`；Edge/DNS 不会读取 `CONTROL_PUBLIC_URL`。
+- 控制面回调 Edge 使用的是节点自己的 `AGENT_URL`，不是 `CONTROL_PUBLIC_URL`。
+- 如果控制面在反向代理的子路径下，`CONTROL_URL` 可以带路径；Edge/DNS 会在后面追加 `/api/v1/...`。
+
 ### 4.2 Control 关键变量
 
 | 变量 | 说明 |
 |---|---|
 | `CONTROL_BIND` | 控制面监听，默认 `0.0.0.0:8080` |
-| `CONTROL_PUBLIC_URL` | 对外 HTTPS 根地址，影响安装命令/回调 |
+| `CONTROL_PUBLIC_URL` | 对外 HTTPS 根地址，用于生成节点安装命令中的 `CONTROL_URL`；为空时按请求 Host 推断 |
 | `DATABASE_URL` | PostgreSQL 连接串，必填 |
 | `DATABASE_MAX_CONNECTIONS` | 连接池上限 |
 | `REDIS_URL` | 可选，Redis 共享状态 |

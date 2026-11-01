@@ -12,6 +12,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+fn is_http_url(value: &str) -> bool {
+    (value.starts_with("http://") || value.starts_with("https://"))
+        && !value.chars().any(char::is_whitespace)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env BEFORE EnvFilter reads RUST_LOG
@@ -19,6 +24,12 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = EdgeConfig::load();
+    if !is_http_url(&config.control_url) {
+        anyhow::bail!(
+            "CONTROL_URL must start with http:// or https:// (got {:?})",
+            config.control_url
+        );
+    }
     tracing::info!(
         http = %config.listen_addr,
         https = ?config.https_listen_addr,

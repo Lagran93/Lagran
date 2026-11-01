@@ -11,6 +11,11 @@ use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+fn is_http_url(value: &str) -> bool {
+    (value.starts_with("http://") || value.starts_with("https://"))
+        && !value.chars().any(char::is_whitespace)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls may be built with multiple provider features (ring + aws-lc-rs),
@@ -22,6 +27,12 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     let config = AppConfig::load();
+    if !config.public_url.is_empty() && !is_http_url(&config.public_url) {
+        anyhow::bail!(
+            "CONTROL_PUBLIC_URL must start with http:// or https:// (got {:?})",
+            config.public_url
+        );
+    }
     let tracer_provider = init_tracing(&config);
     const DEFAULT_JWT: &str = "lagran-dev-secret-change-me";
     if config.jwt_secret == DEFAULT_JWT || config.jwt_secret.len() < 16 {

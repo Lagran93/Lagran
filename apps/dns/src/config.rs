@@ -3,6 +3,15 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+fn normalize_control_url(raw: &str) -> String {
+    let value = raw.trim().trim_end_matches('/');
+    if value.is_empty() {
+        "http://127.0.0.1:8080".into()
+    } else {
+        value.to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
     pub listen: String,
@@ -78,8 +87,7 @@ impl DnsConfig {
             ns_ips,
             soa_mname,
             soa_rname,
-            control_url: std::env::var("CONTROL_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
+            control_url: normalize_control_url(&std::env::var("CONTROL_URL").unwrap_or_default()),
             agent_token: std::env::var("AGENT_TOKEN").unwrap_or_default(),
             cache_secs: std::env::var("DNS_CACHE_SECS")
                 .ok()
@@ -118,4 +126,18 @@ fn env_nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_url_is_normalized() {
+        assert_eq!(
+            normalize_control_url("  https://control.example.com/  "),
+            "https://control.example.com"
+        );
+        assert_eq!(normalize_control_url("   "), "http://127.0.0.1:8080");
+    }
 }
