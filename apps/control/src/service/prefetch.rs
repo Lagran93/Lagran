@@ -111,7 +111,15 @@ async fn process_task(state: &AppState, task: &PrefetchTaskRow, nodes: &[reposit
             "domain": task.domain,
             "paths": [task.url_path],
         });
-        match agent_http::request_json::<EdgePrefetchReply, _>("POST", &url, &body, &token).await {
+        match agent_http::request_json_timeout::<EdgePrefetchReply, _>(
+            "POST",
+            &url,
+            &body,
+            &token,
+            Duration::from_secs(60),
+        )
+        .await
+        {
             Ok(reply) => {
                 if reply.success || reply.warmed > 0 {
                     any = true;

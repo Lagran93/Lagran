@@ -14,6 +14,7 @@ use axum::{
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Deserialize)]
 pub struct EdgeDiagRequest {
@@ -109,7 +110,22 @@ pub async fn diag_handler(
         );
     }
 
-    let response = proxy_handler(State(state), request).await;
+    let response = match tokio::time::timeout(
+        Duration::from_secs(10),
+        proxy_handler(State(state), request),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            return Json(EdgeDiagResponse {
+                status: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                headers: vec![],
+                body_preview: "cache diagnostic timed out after 10s (large origin response?)"
+                    .into(),
+            })
+        }
+    };
     let status = response.status().as_u16();
     let selected = [
         "x-cache",
@@ -124,11 +140,7 @@ pub async fn diag_handler(
     ];
     let mut headers = Vec::new();
     for name in selected {
-        if let Some(value) = response
-            .headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-        {
+        if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok()) {
             headers.push((name.to_string(), value.to_string()));
         }
     }

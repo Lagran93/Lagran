@@ -138,6 +138,7 @@ definePageMeta({ layout: 'auth' })
 const config = useRuntimeConfig()
 const apiBase = config.public.apiBase as string
 const auth = useAuthStore()
+const route = useRoute()
 const toast = useToast()
 
 const email = ref('')
@@ -213,6 +214,12 @@ async function onSubmit() {
 
 onMounted(async () => {
   auth.hydrate()
+  if (route.query.expired === '1') {
+    // Never keep a dead token on the login page: it would make the global
+    // middleware bounce straight back to the console.
+    auth.logout()
+    error.value = '登录已过期，请重新登录'
+  }
   if (auth.isAuthenticated) {
     navigateTo('/')
     return

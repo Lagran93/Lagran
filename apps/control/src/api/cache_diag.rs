@@ -8,6 +8,7 @@ use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 #[derive(Deserialize)]
 pub struct DiagnoseRequest {
@@ -121,8 +122,14 @@ pub async fn diagnose(
         } else {
             node.auth_token.clone()
         };
-        match agent_http::request_json::<EdgeDiagReply, _>("POST", &endpoint, &payload, &token)
-            .await
+        match agent_http::request_json_timeout::<EdgeDiagReply, _>(
+            "POST",
+            &endpoint,
+            &payload,
+            &token,
+            Duration::from_secs(20),
+        )
+        .await
         {
             Ok(reply) => {
                 return Ok(Json(build_response(
@@ -269,11 +276,21 @@ fn build_response(
 }
 
 fn is_stream_path(path: &str) -> bool {
-    let path = path.split('?').next().unwrap_or(path).to_ascii_lowercase();
-    path.contains("/stream")
-        || [".mp4", ".m4v", ".mov", ".webm", ".mkv", ".ts", ".m3u8", ".mp3", ".flac"]
-            .iter()
-            .any(|ext| path.ends_with(ext))
+    let lower = path.to_ascii_lowercase();
+    let path_only = lower.split('?').next().unwrap_or(&lower);
+    let query = lower.split_once('?').map(|(_, q)| q).unwrap_or("");
+    path_only.contains("/stream")
+        || path_only.contains("/download")
+        || path_only.contains("/file/")
+        || query.contains("download")
+        || query.contains("file=")
+        || [
+            ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".ts", ".m3u8", ".mp3", ".flac", ".zip",
+            ".tar", ".gz", ".tgz", ".xz", ".iso", ".apk", ".exe", ".pdf", ".rar", ".7z", ".bin",
+            ".img",
+        ]
+        .iter()
+        .any(|ext| path_only.ends_with(ext))
 }
 
 fn advice_for(reason: &str) -> String {
@@ -300,5 +317,18 @@ fn advice_for(reason: &str) -> String {
         "body-too-large" => "响应体超过边缘缓存单对象上限，未写入缓存。".into(),
         "stored-or-miss" => "请求已完成回源；若未存储，请查看响应头中的 Cache-Control/Vary 或规则动作。".into(),
         _ => "未识别具体原因，请检查规则、源站 Cache-Control/Vary 与请求头。".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stream_path;
+
+    #[test]
+    fn detects_download_and_large_file_paths() {
+        assert!(is_stream_path("/api/file/download?code=abc"));
+        assert!(is_stream_path("/files/archive.zip"));
+        assert!(is_stream_path("/movie.mp4"));
+        assert!(!is_stream_path("/api/v1/domains"));
     }
 }

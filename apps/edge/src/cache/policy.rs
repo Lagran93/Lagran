@@ -503,6 +503,10 @@ fn vary_reject_reason(vary: Option<&str>, ignore_cookie: bool) -> Option<&'stati
     for field in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if field.eq_ignore_ascii_case("accept-encoding")
             || field.eq_ignore_ascii_case("accept-language")
+            || field.eq_ignore_ascii_case("origin")
+            || field.eq_ignore_ascii_case("access-control-request-method")
+            || field.eq_ignore_ascii_case("access-control-request-headers")
+            || field.eq_ignore_ascii_case("access-control-request-private-network")
             || (ignore_cookie && field.eq_ignore_ascii_case("cookie"))
         {
             continue;
@@ -595,35 +599,49 @@ pub fn cache_key_opts<B>(req: &Request<B>, ignore_query: bool) -> String {
     cache_key_for_request(req.method(), host, &path, req.headers())
 }
 
-/// Stable cache key including the normalized `Accept-Language` value.
-///
-/// `Vary: Accept-Language` is accepted by the storage policy, so the key must
-/// include the language to avoid serving a Chinese object to an English client
-/// (or vice versa). The tag is hashed to keep keys bounded and purge-friendly.
+/// Stable cache key including request headers covered by accepted `Vary`
+/// fields. `Accept-Language` and CORS request headers are hashed into the key
+/// so `Vary: Origin`/preflight variants can be stored without leaking a
+/// response to a different origin.
 pub fn cache_key_for_request(
     method: &Method,
     host: &str,
     path: &str,
     headers: &HeaderMap,
 ) -> String {
-    let base = cache_key_for(method, host, path);
-    let Some(lang) = headers
+    let mut key = cache_key_for(method, host, path);
+    if let Some(lang) = headers
         .get(header::ACCEPT_LANGUAGE)
         .and_then(|v| v.to_str().ok())
-    else {
-        return base;
-    };
-    let normalized = lang
-        .split(',')
-        .map(|tag| tag.trim().to_ascii_lowercase())
-        .filter(|tag| !tag.is_empty())
-        .collect::<Vec<_>>()
-        .join(",");
-    if normalized.is_empty() {
-        base
-    } else {
-        format!("{base}|lang={:x}", fnv1a64(normalized.as_bytes()))
+    {
+        let normalized = normalize_vary_value(lang);
+        if !normalized.is_empty() {
+            key.push_str(&format!("|lang={:x}", fnv1a64(normalized.as_bytes())));
+        }
     }
+    for (name, label) in [
+        ("origin", "origin"),
+        ("access-control-request-method", "acrm"),
+        ("access-control-request-headers", "acrh"),
+        ("access-control-request-private-network", "acrpn"),
+    ] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            let normalized = normalize_vary_value(value);
+            if !normalized.is_empty() {
+                key.push_str(&format!("|{label}={:x}", fnv1a64(normalized.as_bytes())));
+            }
+        }
+    }
+    key
+}
+
+fn normalize_vary_value(value: &str) -> String {
+    value
+        .split(',')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Stable cache key: `METHOD:host:path[?query]` (host lowercased, port stripped).
@@ -1004,6 +1022,36 @@ mod tests {
         let policy = ResolvedPolicy::default();
         assert!(decide_storage(200, &hdrs(&[("vary", "Accept-Encoding")]), policy, 60).is_some());
         assert!(decide_storage(200, &hdrs(&[("vary", "User-Agent")]), policy, 60).is_none());
+    }
+
+    #[test]
+    fn cors_vary_is_allowed_and_cache_keyed() {
+        let policy = ResolvedPolicy::default();
+        assert!(
+            decide_storage(
+                200,
+                &hdrs(&[(
+                    "vary",
+                    "origin, access-control-request-method, access-control-request-headers"
+                )]),
+                policy,
+                60
+            )
+            .is_some(),
+            "CORS Vary fields must be cacheable when the key carries them"
+        );
+
+        let method = Method::GET;
+        let mut first = HeaderMap::new();
+        first.insert("origin", "https://a.example".parse().unwrap());
+        let mut second = HeaderMap::new();
+        second.insert("origin", "https://b.example".parse().unwrap());
+        let a = cache_key_for_request(&method, "cdn.test", "/file.mp4", &first);
+        let b = cache_key_for_request(&method, "cdn.test", "/file.mp4", &second);
+        assert_ne!(a, b);
+        assert!(a.contains("|origin="));
+        let plain = cache_key_for_request(&method, "cdn.test", "/file.mp4", &HeaderMap::new());
+        assert_ne!(plain, a);
     }
 
     #[test]

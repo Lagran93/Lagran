@@ -45,6 +45,16 @@ async fn send_once(
     body: Bytes,
     token: &str,
 ) -> Result<(u16, Bytes), String> {
+    send_once_timeout(method, url, body, token, ATTEMPT_TIMEOUT).await
+}
+
+async fn send_once_timeout(
+    method: &str,
+    url: &str,
+    body: Bytes,
+    token: &str,
+    timeout: Duration,
+) -> Result<(u16, Bytes), String> {
     let req = Request::builder()
         .method(method)
         .uri(url)
@@ -52,9 +62,9 @@ async fn send_once(
         .header("x-lagran-agent-token", token)
         .body(Full::new(body))
         .map_err(|e| format!("build callback request {url}: {e}"))?;
-    let response = tokio::time::timeout(ATTEMPT_TIMEOUT, client().request(req))
+    let response = tokio::time::timeout(timeout, client().request(req))
         .await
-        .map_err(|_| format!("callback timeout after {ATTEMPT_TIMEOUT:?}: {url}"))?
+        .map_err(|_| format!("callback timeout after {timeout:?}: {url}"))?
         .map_err(|e| format!("callback transport error {url}: {e}"))?;
     let status = response.status().as_u16();
     let bytes = response
@@ -131,6 +141,23 @@ pub async fn request_json<T: DeserializeOwned, B: Serialize>(
     } else {
         last
     })
+}
+
+/// Same as `request_json`, but with a caller-supplied deadline and no retry.
+/// Cache diagnostics may legitimately wait for a slow origin/range probe.
+pub async fn request_json_timeout<T: DeserializeOwned, B: Serialize>(
+    method: &str,
+    url: &str,
+    body: &B,
+    token: &str,
+    timeout: Duration,
+) -> Result<T, String> {
+    let bytes = Bytes::from(serde_json::to_vec(body).map_err(|e| e.to_string())?);
+    let (status, response) = send_once_timeout(method, url, bytes, token, timeout).await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}: {}", preview(&response)));
+    }
+    serde_json::from_slice(&response).map_err(|e| format!("invalid callback JSON from {url}: {e}"))
 }
 
 /// Public callback helper for alert notifications. The caller supplies all

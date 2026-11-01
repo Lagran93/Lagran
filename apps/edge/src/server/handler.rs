@@ -14,8 +14,8 @@ use crate::agent::{ControlClient, NodeControl};
 use crate::cache::policy::{
     cache_key_for_request, compute_etag, decide_storage_reason, etag_matches,
     is_uncacheable_header, request_bypass_reason, request_method_cacheable, resolve_rule_policy,
-    resolve_rule_policy_for_response, strip_response_headers, CacheRule, CacheStatus,
-    ResolvedPolicy, RuleAction, RuleSet,
+    resolve_rule_policy_for_response, strip_response_headers, CacheDecision, CacheRule,
+    CacheStatus, ResolvedPolicy, RuleAction, RuleSet,
 };
 use crate::cache::{CacheEntry, CacheGetResult, LargeCache, SharedCache};
 use crate::config::registry::{DomainEntry, DomainRegistry, OriginTarget};
@@ -934,7 +934,7 @@ async fn fetch_with_single_flight(
                                     .cache
                                     .set_with_swr(key, entry, decision.ttl_secs, decision.swr_secs)
                                     .await;
-                            } else {
+                            } else if !store_large_response(state, key, resp, decision).await {
                                 reason = Some("body-too-large");
                                 tracing::debug!(len = resp.body.len(), %host, "object too large to cache");
                             }
@@ -1078,6 +1078,8 @@ fn spawn_revalidation(
                                 .set_with_swr(&key, entry, decision.ttl_secs, decision.swr_secs)
                                 .await;
                             tracing::debug!(%key, "revalidated stale entry");
+                        } else {
+                            store_large_response(&state, &key, &resp, decision).await;
                         }
                     }
                 }
@@ -1334,6 +1336,51 @@ fn clone_as_entry(resp: &OriginResponse) -> CacheEntry {
         headers_vec(&resp.headers),
         resp.body.clone(),
     )
+}
+
+/// Store an already-buffered origin response in the streaming large-object
+/// cache. The legacy handler (and therefore the prefetch endpoint) does not use
+/// Pingora's `HandleMiss`, so it needs this bridge to warm large objects.
+async fn store_large_response(
+    state: &AppState,
+    key: &str,
+    resp: &OriginResponse,
+    decision: CacheDecision,
+) -> bool {
+    let Some(large) = state.large_cache.as_ref() else {
+        return false;
+    };
+    if resp.status != StatusCode::OK {
+        return false;
+    }
+    let len = resp.body.len();
+    if !large.accepts(len as u64) {
+        return false;
+    }
+    let Some(mut writer) = large
+        .begin(
+            key,
+            resp.status.as_u16(),
+            headers_vec(&resp.headers),
+            len as u64,
+            decision.ttl_secs,
+            decision.swr_secs,
+        )
+        .await
+    else {
+        return false;
+    };
+    writer.write_all(&resp.body).await;
+    match writer.commit().await {
+        true => {
+            tracing::debug!(%key, len, "stored large object from legacy handler");
+            true
+        }
+        false => {
+            tracing::warn!(%key, len, "large object cache commit failed");
+            false
+        }
+    }
 }
 
 fn entry_into_origin(entry: CacheEntry) -> OriginResponse {

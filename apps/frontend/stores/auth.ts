@@ -50,7 +50,16 @@ export const useAuthStore = defineStore('auth', {
         })
         this.setSession(this.token, me)
       } catch {
-        // Token expired/invalid: the route middleware will redirect on next nav.
+        // Token expired/invalid. Clear it immediately so route guards and the
+        // API client do not keep using a dead JWT.
+        this.logout()
+        if (
+          import.meta.client &&
+          window.location.pathname !== '/login' &&
+          window.location.pathname !== '/register'
+        ) {
+          window.location.replace('/login?expired=1')
+        }
       }
     },
     logout() {

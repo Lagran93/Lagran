@@ -360,6 +360,8 @@ impl ProxyHttp for DataPlaneProxy {
             if plan.cache_reason == Some("range-bypass")
                 && !headers.contains_key("if-range")
                 && self.state.large_cache.is_some()
+                && plan.policy.action == RuleAction::Cache
+                && request_bypass_reason_headers(&headers, plan.policy.ignore_cookie).is_none()
             {
                 let raw_range = headers
                     .get("range")
@@ -745,7 +747,9 @@ impl ProxyHttp for DataPlaneProxy {
             ctx.head_status = response.status.as_u16();
         }
         if let Some(fill) = ctx.range_fill.take() {
-            if response.status == StatusCode::PARTIAL_CONTENT.as_u16() {
+            if response_policy.action == RuleAction::Cache
+                && response.status == StatusCode::PARTIAL_CONTENT.as_u16()
+            {
                 if let Some((start, end, total)) = response
                     .headers
                     .get("content-range")

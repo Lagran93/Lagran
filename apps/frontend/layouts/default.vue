@@ -149,9 +149,19 @@ watch(
   },
 )
 
+let authRefreshTimer: ReturnType<typeof setInterval> | undefined
+
 onMounted(async () => {
   auth.hydrate()
   await auth.refresh()
+  // Detect revocations/expiry even when the user is idle on one page.
+  authRefreshTimer = setInterval(() => {
+    void auth.refresh()
+  }, 60_000)
+})
+
+onUnmounted(() => {
+  if (authRefreshTimer) clearInterval(authRefreshTimer)
 })
 </script>
 
