@@ -23,6 +23,7 @@ use crate::metrics::EdgeMetrics;
 use crate::origin::{OriginClient, OriginResponse};
 use crate::server::access_log::AccessLog;
 use crate::server::acme_challenge::ChallengeStore;
+use crate::server::bot_guard;
 use crate::server::cc::{CcDecision, CcMode, CcProtector};
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
@@ -1176,9 +1177,7 @@ async fn serve_range_entry(
         "content-range".into(),
         format!("bytes {slice_start}-{slice_end}/{total}"),
     ));
-    entry
-        .headers
-        .push(("accept-ranges".into(), "bytes".into()));
+    entry.headers.push(("accept-ranges".into(), "bytes".into()));
 
     state.metrics.record_hit(host, body_len).await;
     log_access(
@@ -1430,14 +1429,78 @@ pub(crate) async fn preflight_cacheable(
         ));
     }
 
+    let cleared = challenge::has_clearance(
+        headers,
+        host,
+        domain.waf.challenge_ttl_secs,
+        &state.challenge_secret,
+    );
+    if bot_guard::enabled()
+        && !cleared
+        && challenge_accepts_html(method, headers)
+        && matches!(
+            crate::server::cc::classify_path(path_only),
+            crate::server::cc::CcPathClass::Dynamic | crate::server::cc::CcPathClass::Auth
+        )
+    {
+        let score = bot_guard::score(headers);
+        if score >= bot_guard::threshold() {
+            state
+                .waf_log
+                .push(
+                    host,
+                    client_ip,
+                    method.as_str(),
+                    path_and_query,
+                    "challenge",
+                    "bot",
+                    "behavior-score",
+                    "block",
+                )
+                .await;
+            log_access(
+                &state.access_log,
+                method,
+                host,
+                path_only,
+                403,
+                start,
+                client_ip,
+                &user_agent,
+                &referer,
+                0,
+                "BOT-CHALLENGE",
+                &request_id,
+            )
+            .await;
+            let nonce = challenge::issue_nonce(host, &state.challenge_secret);
+            return Some(challenge::page(
+                host,
+                &nonce,
+                path_and_query,
+                domain.waf.challenge_difficulty,
+                is_https,
+            ));
+        }
+    }
+
     if let Some(ip) = client_ip_addr {
-        let decision = state.cc.check(host, ip, &domain.cc).await;
+        let decision = state
+            .cc
+            .check(host, path_only, ip, &domain.cc, cleared)
+            .await;
         if decision != CcDecision::Allow {
             let banned = decision.is_banned();
+            let challenge_needed = domain.cc.mode == CcMode::Block
+                && matches!(decision, CcDecision::Limit { .. })
+                && !cleared
+                && challenge_accepts_html(method, headers);
             let action = if domain.cc.mode == CcMode::Monitor {
                 "log"
             } else if banned {
                 "cc-ban"
+            } else if challenge_needed {
+                "challenge"
             } else {
                 "cc-limit"
             };
@@ -1452,6 +1515,8 @@ pub(crate) async fn preflight_cacheable(
                     "cc",
                     if banned {
                         "cc-auto-ban"
+                    } else if challenge_needed {
+                        "cc-challenge"
                     } else {
                         "cc-rate-limit"
                     },
@@ -1462,6 +1527,31 @@ pub(crate) async fn preflight_cacheable(
                     },
                 )
                 .await;
+            if challenge_needed {
+                log_access(
+                    &state.access_log,
+                    method,
+                    host,
+                    path_only,
+                    403,
+                    start,
+                    client_ip,
+                    &user_agent,
+                    &referer,
+                    0,
+                    "CC-CHALLENGE",
+                    &request_id,
+                )
+                .await;
+                let nonce = challenge::issue_nonce(host, &state.challenge_secret);
+                return Some(challenge::page(
+                    host,
+                    &nonce,
+                    path_and_query,
+                    domain.waf.challenge_difficulty,
+                    is_https,
+                ));
+            }
             if domain.cc.mode == CcMode::Block {
                 if let CcDecision::Banned {
                     newly_banned: true, ..
@@ -1507,33 +1597,32 @@ pub(crate) async fn preflight_cacheable(
         }
     }
 
-    let rl_key = if host.is_empty() { "default" } else { host };
-    if !state
-        .rate_limiter
-        .check(rl_key, domain.rate_limit_rps, domain.rate_limit_burst)
-        .await
-    {
-        log_access(
-            &state.access_log,
-            method,
-            host,
-            path_only,
-            429,
-            start,
-            client_ip,
-            &user_agent,
-            &referer,
-            0,
-            CacheStatus::None.as_str(),
-            &request_id,
-        )
-        .await;
-        return Some(default_page::rate_limited_page(
-            host,
-            path_only,
-            1,
-            false,
-        ));
+    let skip_rate_limit =
+        domain.cc.enabled && domain.cc.mode == CcMode::Block && domain.cc.global_rps > 0;
+    if !skip_rate_limit {
+        let rl_key = if host.is_empty() { "default" } else { host };
+        if !state
+            .rate_limiter
+            .check(rl_key, domain.rate_limit_rps, domain.rate_limit_burst)
+            .await
+        {
+            log_access(
+                &state.access_log,
+                method,
+                host,
+                path_only,
+                429,
+                start,
+                client_ip,
+                &user_agent,
+                &referer,
+                0,
+                CacheStatus::None.as_str(),
+                &request_id,
+            )
+            .await;
+            return Some(default_page::rate_limited_page(host, path_only, 1, false));
+        }
     }
 
     if domain.waf.enabled {

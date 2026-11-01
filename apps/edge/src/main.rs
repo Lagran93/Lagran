@@ -115,6 +115,21 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let cc = if config.redis_url.trim().is_empty() {
+        edge::server::cc::CcProtector::new()
+    } else {
+        match edge::server::cc::RedisCc::connect(&config.redis_url).await {
+            Ok(redis) => {
+                tracing::info!("CC distributed sliding-window counter enabled");
+                edge::server::cc::CcProtector::with_redis(Some(redis))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "CC Redis unavailable; falling back to in-process counters");
+                edge::server::cc::CcProtector::new()
+            }
+        }
+    };
+
     let state = Arc::new(AppState {
         cache,
         large_cache,
@@ -127,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         domains,
         access_log,
         rate_limiter,
-        cc: edge::server::cc::CcProtector::new(),
+        cc,
         control: control.clone(),
         origin_health: origin_health_map,
         agent_token: config.agent_token.clone(),

@@ -140,6 +140,8 @@ impl CcCfg {
             ban_seconds: self.ban_seconds,
             mode: crate::server::cc::CcMode::parse(&self.mode),
             allow_ips,
+            global_rps: 0,
+            global_burst: 0,
         }
     }
 }
@@ -219,14 +221,19 @@ impl DomainCfg {
             .as_ref()
             .map(format_origin)
             .unwrap_or_default();
+        let global_rps = self.rate_limit_rps;
+        let global_burst = self.rate_limit_burst;
+        let mut cc = self.cc.map(CcCfg::into_config).unwrap_or_default();
+        cc.global_rps = global_rps;
+        cc.global_burst = global_burst;
         DomainEntry {
             domain: self.domain,
             origin_url,
             origins,
             rules: self.rules.into_iter().map(RuleCfg::into_rule).collect(),
             version: self.version,
-            rate_limit_rps: self.rate_limit_rps,
-            rate_limit_burst: self.rate_limit_burst,
+            rate_limit_rps: global_rps,
+            rate_limit_burst: global_burst,
             ignore_query_string: self.ignore_query_string,
             cors_origins: self.cors_origins,
             hotlink_allow_referers: self.hotlink_allow_referers,
@@ -239,7 +246,7 @@ impl DomainCfg {
             backup_origin_url,
             ssl_enabled: self.ssl_enabled,
             waf: into_waf(self.waf),
-            cc: self.cc.map(CcCfg::into_config).unwrap_or_default(),
+            cc,
         }
     }
 }

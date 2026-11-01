@@ -95,8 +95,15 @@ git push origin v0.1.0
 - WAF：按域名开启，托管规则（SQL 注入 / XSS / 路径穿越 / 扫描器与敏感文件 / RCE / SSRF / XXE / Log4Shell / CRLF / SSTI / NoSQL / LDAP / Java 反序列化 / WebShell / 协议异常）、
   自定义规则（含**请求头匹配**，拦截/放行/记录/浏览器质询）、IP 黑白名单、观察/拦截模式、
   **安全级别（低/中/高/攻击中）**、事件日志与**统计概览**
-- CC 防御：按域名/IP 限速、突发额度、**连续超限自动封禁 IP**、CIDR 白名单、观察模式与 429 限流响应、
-  **控制面统一封禁库与跨节点同步**，控制台「WAF 防护 → 共享封禁」查看/解封
+- CC 防御：按域名 + 客户端聚合组限速（IPv4 /24、IPv6 /64）、突发额度、**连续超限自动封禁**、CIDR 白名单、
+  观察模式与 429 限流响应；配置 `REDIS_URL` 后使用 Redis 滑动窗口在多个 Edge 间共享计数，未配置时回退到
+  进程内固定窗口；登录/API/静态/下载路径使用独立预算（静态 8x、下载 2x、登录 1/2，API 与动态 1x）；
+  **域名全局限流 RPS** 触发 60 秒自动攻击模式，客户端限额减半；HTML 浏览器首次超限返回 PoW 挑战，
+  通过 clearance 后获得 2x 临时预算，持续超限才 429/封禁；
+  **控制面统一封禁库与跨节点同步**，支持管理员手动添加 IP/CIDR 封禁、解封、审计记录，
+  控制台「WAF 防护 → 共享封禁」展示 24h 限流/挑战/封禁统计与当前封禁列表；
+  可选 `CC_BEHAVIOR_ENABLED=true` 启用轻量行为评分（UA / Accept-Language / Sec-CH-UA /
+  Sec-Fetch-Mode / Cookie），可疑 HTML 请求先进入 PoW 挑战而不是直接封禁
 - 缓存刷新（purge 扇出到在线边缘），支持按 URL / 路径前缀 / **缓存标签（Surrogate-Key / Cache-Tag）** 批量刷新；
   **预热任务**与**定时预热**（控制面按间隔创建任务并分发到在线边缘）
 - 缓存诊断：响应头 `X-Lagran-Cache-Reason` 给出 cookie / authorization / no-store / no-cache /
@@ -268,7 +275,9 @@ POST 透传、purge、按域名规则隔离与多租户隔离。模拟源站见 
 - 带 `Cookie` 的请求默认绕过缓存（偏保守）；缓存响应不保存 `Set-Cookie`
 - Range 缓存以完整对象为存储单位（命中完整对象时切片）；未命中 Range 直接透传源站，多段 Range 同样透传
 - 大对象缓存按 Range 覆盖区间记录已缓存 segment；首次 Range 只缓存实际请求范围，不会补齐未请求部分；多段 Range 仍回源
-- 限流为单进程内存态，多实例不共享
+- 普通域名限流为单进程内存态，多实例不共享；CC 防御配置 `REDIS_URL` 后可跨 Edge 共享滑动窗口计数
+- CC 为 L7 请求层防护；SYN/UDP/连接耗尽等 L4 流量型攻击仍需云清洗、上游清洗或 nftables/运营商联动
+- `CC_BEHAVIOR_ENABLED` 为轻量启发式评分，不是完整设备指纹；默认关闭，需按业务验证误报
 - `crates/lagran-proto` / `proto/` 仍是 gRPC 占位；Redis 已可选接入，未配置时自动回退到进程内状态/PostgreSQL
 
 ## 加密货币捐赠

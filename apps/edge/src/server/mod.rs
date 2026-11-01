@@ -5,6 +5,7 @@ pub mod cache_diag;
 pub mod cc;
 pub mod cert_store;
 pub mod challenge;
+pub mod bot_guard;
 pub mod default_page;
 pub mod handler;
 pub mod host_util;

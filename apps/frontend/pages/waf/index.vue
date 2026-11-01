@@ -390,7 +390,18 @@
               <AppIcon name="refresh" :size="14" />
               刷新
             </button>
+            <button class="btn btn-primary btn-sm" type="button" @click="openBanModal">
+              <AppIcon name="plus" :size="14" />
+              添加封禁
+            </button>
             <span class="text-muted" style="font-size: 13px">{{ bans.length }} 个封禁</span>
+          </div>
+
+          <div v-if="ccStats" class="cc-stat-row">
+            <span class="cc-stat"><b>{{ ccStats.active_bans }}</b> 活动封禁</span>
+            <span class="cc-stat"><b>{{ ccStats.limited_24h }}</b> 24h 限流</span>
+            <span class="cc-stat"><b>{{ ccStats.challenged_24h }}</b> 24h 挑战</span>
+            <span class="cc-stat"><b>{{ ccStats.banned_24h }}</b> 24h 封禁</span>
           </div>
 
           <div v-if="bans.length" class="table-wrap">
@@ -597,6 +608,40 @@
         <p v-if="ipError" class="text-danger" style="font-size: 13px">{{ ipError }}</p>
       </div>
     </BaseModal>
+
+    <BaseModal
+      v-model="banModalOpen"
+      title="添加共享封禁"
+      confirm-text="封禁"
+      :loading="saving"
+      @confirm="saveBan"
+    >
+      <div class="form-col">
+        <div class="field">
+          <label class="field-label">域名 <span class="req">*</span></label>
+          <select v-model="banForm.domain" class="select">
+            <option value="">选择域名</option>
+            <option v-for="d in domains" :key="d.id" :value="d.name">{{ d.name }}</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="field-label">IP 或 CIDR <span class="req">*</span></label>
+          <input v-model="banForm.ip" class="input" placeholder="203.0.113.10 或 203.0.113.0/24" />
+          <span class="field-hint">支持 IPv4/IPv6 单 IP 与 CIDR；边缘按域名 + 网段匹配。</span>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label class="field-label">封禁时长（秒）</label>
+            <input v-model.number="banForm.seconds" class="input" type="number" min="1" max="86400" />
+          </div>
+          <div class="field">
+            <label class="field-label">原因</label>
+            <input v-model="banForm.reason" class="input" placeholder="例如：持续 CC 攻击" />
+          </div>
+        </div>
+        <p v-if="banError" class="text-danger" style="font-size: 13px">{{ banError }}</p>
+      </div>
+    </BaseModal>
   </div>
 </template>
 
@@ -702,6 +747,7 @@ const eventLimit = ref(100)
 const bans = ref<any[]>([])
 const bansLoading = ref(false)
 const banDomainFilter = ref('')
+const ccStats = ref<any>(null)
 
 const ruleModalOpen = ref(false)
 const editingRule = ref<any>(null)
@@ -720,6 +766,10 @@ const ruleForm = ref({
 const ipModalOpen = ref(false)
 const ipError = ref('')
 const ipForm = ref({ kind: 'deny', ip: '', note: '' })
+
+const banModalOpen = ref(false)
+const banError = ref('')
+const banForm = ref({ domain: '', ip: '', seconds: 3600, reason: 'manual-cc-ban' })
 
 const managedRules = [
   { key: 'sqli', label: 'SQL 注入', desc: 'union select、or 1=1、sleep() 等特征' },
@@ -950,6 +1000,7 @@ async function loadEvents() {
 async function loadBans() {
   if (!auth.isAdmin) {
     bans.value = []
+    ccStats.value = null
     return
   }
   bansLoading.value = true
@@ -957,12 +1008,57 @@ async function loadBans() {
     const q = new URLSearchParams()
     if (banDomainFilter.value) q.set('domain', banDomainFilter.value)
     const suffix = q.toString() ? `?${q.toString()}` : ''
-    const res = await api.get<{ bans: any[] }>(`/api/v1/cc/bans/all${suffix}`)
+    const [res, statsRes] = await Promise.all([
+      api.get<{ bans: any[] }>(`/api/v1/cc/bans/all${suffix}`),
+      api.get<any>(`/api/v1/cc/stats${suffix}`).catch(() => null),
+    ])
     bans.value = res.bans || []
+    ccStats.value = statsRes
   } catch {
     bans.value = []
+    ccStats.value = null
   } finally {
     bansLoading.value = false
+  }
+}
+
+function openBanModal() {
+  banError.value = ''
+  const selected = domains.value.find((d) => d.id === domainId.value)
+  banForm.value = {
+    domain: selected?.name || '',
+    ip: '',
+    seconds: 3600,
+    reason: 'manual-cc-ban',
+  }
+  banModalOpen.value = true
+}
+
+async function saveBan() {
+  banError.value = ''
+  if (!banForm.value.domain.trim()) {
+    banError.value = '请选择域名'
+    return
+  }
+  if (!banForm.value.ip.trim()) {
+    banError.value = '请填写 IP 或 CIDR'
+    return
+  }
+  saving.value = true
+  try {
+    await api.post('/api/v1/cc/bans/manual', {
+      domain: banForm.value.domain.trim(),
+      ip: banForm.value.ip.trim(),
+      seconds: Number(banForm.value.seconds) || 3600,
+      reason: banForm.value.reason.trim(),
+    })
+    banModalOpen.value = false
+    toast.success('已添加共享封禁，边缘约 5 秒内同步')
+    await loadBans()
+  } catch (e: any) {
+    banError.value = e?.data?.error || '添加封禁失败'
+  } finally {
+    saving.value = false
   }
 }
 
@@ -982,9 +1078,10 @@ async function unbanIp(ban: any) {
   })
   if (!ok) return
   try {
-    await api.del(
-      `/api/v1/cc/bans/${encodeURIComponent(ban.domain)}/${encodeURIComponent(ban.ip)}`
-    )
+    await api.post('/api/v1/cc/bans/unban', {
+      domain: ban.domain,
+      ip: ban.ip,
+    })
     toast.success('已解封，边缘节点将在约 5 秒内同步')
     await loadBans()
   } catch (e: any) {
@@ -1205,6 +1302,29 @@ onMounted(reload)
 </script>
 
 <style scoped>
+.cc-stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--bg);
+}
+
+.cc-stat {
+  color: var(--text-3);
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
+}
+
+.cc-stat b {
+  color: var(--text);
+  margin-right: 3px;
+}
+
 .waf-toolbar {
   padding: 14px 18px;
   margin-bottom: 16px;

@@ -27,6 +27,9 @@ pub struct EdgeConfig {
     pub heartbeat_interval_secs: u64,
     /// How often to pull the shared CC ban list from the control plane.
     pub cc_sync_interval_secs: u64,
+    /// Optional Redis URL for distributed CC sliding-window counters.
+    /// Empty keeps CC fully in-process.
+    pub redis_url: String,
     pub domain: String,
     pub access_log_path: Option<String>,
     pub agent_token: String,
@@ -124,6 +127,7 @@ impl Default for EdgeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5),
+            redis_url: env_nonempty("REDIS_URL").unwrap_or_default(),
             domain: std::env::var("EDGE_DOMAIN").unwrap_or_default(),
             access_log_path: std::env::var("ACCESS_LOG_PATH")
                 .ok()

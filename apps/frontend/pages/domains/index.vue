@@ -272,11 +272,11 @@
             <input v-model.number="settings.origin_timeout_ms" class="input" type="number" />
           </div>
           <div class="field">
-            <label class="field-label">限流 RPS（0 = 不限）</label>
+            <label class="field-label">全局限流 RPS（0 = 不限）</label>
             <input v-model.number="settings.rate_limit_rps" class="input" type="number" />
           </div>
           <div class="field">
-            <label class="field-label">限流突发</label>
+            <label class="field-label">全局限流突发</label>
             <input v-model.number="settings.rate_limit_burst" class="input" type="number" />
           </div>
         </div>
@@ -297,10 +297,11 @@
         <div class="field">
           <label class="check">
             <input v-model="settings.cc_enabled" type="checkbox" />
-            启用 CC 防御（按客户端 IP 限速，超限自动封禁）
+            启用 CC 防御（按客户端聚合组限速，超限自动挑战/封禁）
           </label>
           <span class="field-hint">
-            统计窗口为 1 秒；连续超限达到次数后临时封禁该 IP，封禁状态在边缘内存中，重启后清空。
+            全局限流 RPS 是域名总阈值：超过后自动进入 60 秒攻击模式，客户端限额减半；HTML 浏览器首次超限
+            进入 PoW 挑战，验证通过后获得临时 2x 预算，持续超限才封禁。
           </span>
         </div>
         <div class="form-grid">
