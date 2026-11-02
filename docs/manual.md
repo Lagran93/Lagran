@@ -251,15 +251,89 @@ systemctl status lagran-dns --no-pager
 | 忽略 Cookie | 允许带 Cookie 的请求共享缓存 |
 | Content-Type | 可按响应类型匹配，响应头到达后判定 |
 
+> **Content-Type 规则只在响应阶段生效。**
+>
+> 请求阶段先按路径/方法/Query 选择规则；如果此时命中了 `bypass` 或 `no_store` 兜底规则，
+> 即使响应是 `video/mp4`，也不会读写缓存。
+>
+> 需要让视频可缓存时，必须额外添加一条**不带 Content-Type 条件**的路径 `cache` 规则，并给予高于兜底规则
+> 的优先级。规则测试可清空 Content-Type 字段来查看请求阶段实际命中的规则。
+
 动作语义：
 
 ```text
 cache     读取并写入缓存
 bypass    不读不写，直接回源
-no_store  可读已有缓存，但本次响应不写入
+no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 ```
 
 > 修改规则不会自动删除已有缓存对象。需要配合缓存刷新/purge，或等待 TTL 过期。
+
+#### 请求阶段与响应阶段
+
+规则匹配分两个阶段，可以理解为两道门：
+
+```text
+请求阶段（已知 URL / Method / Query / Headers）
+  是否允许进入缓存系统？
+        │
+        ├─ bypass / no_store → 不读缓存，直接回源
+        └─ cache → 查缓存 / 回源
+
+响应阶段（源站返回后，已知 Content-Type 等响应头）
+  这个响应是否允许保存？
+        │
+        ├─ cache → 保存，使用该规则 TTL/SWR
+        └─ bypass / no_store → 不保存
+```
+
+关键区别：
+
+| 阶段 | 已知信息 | 是否会考虑 Content-Type 规则 |
+|---|---|---|
+| 请求阶段 | 域名、路径、方法、Query、请求头 | **不会** |
+| 响应阶段 | 再加上源站状态码和响应头 | 会 |
+
+因此：
+
+- Content-Type 规则不能决定“是否读取缓存”。
+- 请求阶段命中 bypass 后，响应阶段再命中 cache，也不能恢复缓存。
+- 路径 cache 规则是“总开关”，Content-Type 规则只是响应阶段的细化。
+- 缓存命中后，响应 Content-Type 仍可让 Edge 强制 miss，避免类型不符的旧对象继续被使用。
+
+示例：
+
+```text
+规则 A: /*                    bypass  priority 0
+规则 B: /api/file/stream*     cache   priority 20   （无 Content-Type）
+规则 C: /api/file/stream*     cache   priority 30   Content-Type=video/mp4
+规则 D: /api/file/stream*     bypass  priority 30   Content-Type=text/html
+```
+
+请求 `/api/file/stream?code=x`：
+
+```text
+请求阶段：A 和 B 可参与，B 优先级更高 → B cache
+响应 video/mp4：C 优先级最高 → cache，使用 C 的 TTL
+响应 text/html：D 优先级最高 → bypass，不保存
+```
+
+如果删除 B：
+
+```text
+请求阶段：只有 A 可参与 → A bypass
+响应 video/mp4：C 命中，但请求阶段已经 bypass
+→ 不会读缓存，也不会保存
+```
+
+这就是“规则测试显示 priority 30 Content-Type cache，但实际不缓存”的原因。
+
+设计规则时建议：
+
+1. 先配置一条**不带 Content-Type**的路径规则，确保请求阶段是 `cache`。
+2. 再用 Content-Type 规则细化 TTL、SWR 或特殊类型 bypass。
+3. 请求阶段路径规则的优先级必须高于路径兜底 bypass 规则。
+4. 规则测试清空 Content-Type 看请求阶段，再填入 Content-Type 看响应阶段。
 
 ### 3.4 高级设置
 
@@ -703,6 +777,63 @@ Partial 对象不能响应完整 GET。完整 GET 需要：
 ```json
 "complete": true
 ```
+
+#### Age、TTL 与 SWR
+
+`Age` 表示对象从写入缓存到现在的时间，不是剩余 TTL：
+
+```text
+Age = now - stored_at
+```
+
+缓存生命周期：
+
+```text
+fresh_until = stored_at + TTL
+stale_until = stored_at + TTL + SWR
+```
+
+例如：
+
+```text
+规则 TTL = 10 秒
+源站 Cache-Control: stale-while-revalidate=60
+```
+
+实际生命周期：
+
+```text
+0–10 秒：fresh
+10–70 秒：stale，可在 SWR 窗口继续返回
+>70 秒：删除并重新回源/填充
+```
+
+因此看到：
+
+```http
+Age: 63
+X-Cache: STALE
+```
+
+并不矛盾：对象已经过期，但仍处于 SWR 窗口。
+
+当前大对象 Range 命中会区分：
+
+```text
+Age <= TTL      → X-Cache: HIT
+Age > TTL       → X-Cache: STALE
+                 X-Lagran-Cache-Reason: stale-range
+```
+
+旧版本可能把 stale 的大对象 Range 也标成 `HIT`，此时只能通过 `Age` 和 `TTL` 判断。
+
+如果希望视频严格只保留 10 秒，需要：
+
+- 不继承源站 SWR（当前规则 SWR=0 表示继承，不能强制关闭）
+- 或把 TTL 设置得覆盖实际播放会话
+- 修改后 purge 旧 segment
+
+对 700MB 级视频，TTL=10 通常过短，会在播放过程中不断失效。
 
 ### 5.8 缓存预热
 
@@ -1251,6 +1382,33 @@ curl -i -H "X-Lagran-Agent-Token: $AGENT_TOKEN" \
 ```
 
 ### 9.11 HTTPS/TLS 诊断失败
+
+#### CNAME 配错
+
+如果客户域名 CNAME 指向了源站、其他 CDN 或旧 Edge，域名诊断会显示类似：
+
+```text
+DNS 未解析出任何地址
+解析到 203.0.113.10，但不在当前在线 Edge 地址 198.51.100.20 中
+```
+
+或：
+
+```text
+解析到 ...；当前没有在线 Edge 节点
+```
+
+处理：
+
+1. 在控制台确认统一接入地址。
+2. 检查客户 DNS 是否还有冲突的 A/AAAA/CNAME 记录。
+3. 检查 CNAME 链是否最终指向当前在线 Edge IP。
+4. 等待 DNS TTL 生效。
+5. 确认节点 `status=online` 且 `public_ip` 非空。
+
+诊断接口现在会并发执行 DNS/TLS/回源/缓存检查，并对每项设置超时，避免错误 CNAME 导致接口长时间挂起或直接返回“诊断失败”。
+
+#### TLS 证书错误
 
 控制台域名诊断可能显示：
 

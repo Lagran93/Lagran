@@ -238,7 +238,9 @@ async function diagnose() {
   try {
     diag.value = await api.post<any>(`/api/v1/domains/${domainId.value}/diagnose`, {})
   } catch (e: any) {
-    toast.error(e?.data?.error || '诊断失败')
+    toast.error(
+      `${e?.data?.error || '诊断失败'}；请检查 CNAME 是否指向控制台给出的接入地址，而不是源站或其他 CDN`
+    )
   } finally {
     diagnosing.value = false
   }

@@ -276,9 +276,16 @@ async function runDiagnose() {
   try {
     diag.value = await api.post<any>(`/api/v1/domains/${id.value}/diagnose`, {})
   } catch (e: any) {
+    const message = e?.data?.error || '请求失败'
     diag.value = {
       overall: false,
-      checks: [{ key: 'error', label: '诊断失败', ok: false, detail: e?.data?.error || '请求失败', latency_ms: 0 }],
+      checks: [{
+        key: 'error',
+        label: '诊断请求失败',
+        ok: false,
+        detail: `${message}。请检查控制面/边缘连通性；如果 CNAME 配错，请确认它指向当前统一接入地址，而不是源站或其他 CDN。`,
+        latency_ms: 0,
+      }],
       resolved_ips: [],
       edge_ips: [],
     }

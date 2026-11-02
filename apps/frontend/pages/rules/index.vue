@@ -47,6 +47,10 @@
           {{ testing ? '测试中…' : '测试' }}
         </button>
       </div>
+      <div class="text-muted" style="font-size: 12px; margin-top: 8px; line-height: 1.6">
+        提示：Content-Type 条件只在源站响应返回后生效。若请求阶段命中了 `/api/*` 等 bypass
+        兜底规则，即使响应是 video/mp4，也不会读写缓存；需要额外添加一条不带 Content-Type 的路径 cache 规则。
+      </div>
 
       <div v-if="testResult" class="test-result">
         <div v-if="testResult.matched" class="test-hit">

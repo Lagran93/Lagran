@@ -19,9 +19,7 @@ use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio_rustls::rustls::{
-    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
-};
+use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 
@@ -95,7 +93,9 @@ pub async fn diagnose(
         return Err(bad("domain name is empty"));
     }
     let domain = row.name.clone();
-    let nodes = repository::list_nodes(&state.pool).await.unwrap_or_default();
+    let nodes = repository::list_nodes(&state.pool)
+        .await
+        .unwrap_or_default();
     let mut edge_ips: Vec<String> = Vec::new();
     for node in nodes.iter().filter(|n| n.status == "online") {
         for raw in [&node.public_ip, &node.ip] {
@@ -109,45 +109,80 @@ pub async fn diagnose(
 
     let dns_start = Instant::now();
     let lookup_name = domain.clone();
-    let resolved = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((lookup_name.as_str(), 443)),
-    )
-    .await;
-    let resolved_ips: Vec<String> = match resolved {
-        Ok(Ok(addrs)) => {
-            let mut out: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
-            out.sort();
-            out.dedup();
-            out
+    let dns_future = async move {
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::lookup_host((lookup_name.as_str(), 443)),
+        )
+        .await;
+        match resolved {
+            Ok(Ok(addrs)) => {
+                let mut out: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
+                out.sort();
+                out.dedup();
+                out
+            }
+            _ => Vec::new(),
         }
-        _ => Vec::new(),
     };
+
+    let tls_start = Instant::now();
+    let origin_start = Instant::now();
+    let cache_start = Instant::now();
+    // Run all independent probes concurrently so a wrong CNAME/timeout cannot
+    // make the whole diagnostic API exceed the control-plane proxy timeout.
+    let (resolved_ips, tls_result, origin_result, cache_result) = tokio::join!(
+        dns_future,
+        tokio::time::timeout(Duration::from_secs(9), check_tls(&domain)),
+        tokio::time::timeout(
+            Duration::from_secs(7),
+            check_origin(&row.origin_host, row.origin_port.max(0) as u16)
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(7),
+            check_cache(&state, &domain, row.ssl_enabled, &nodes)
+        )
+    );
     let dns_ok = !resolved_ips.is_empty();
-    let dns_match = edge_ips.is_empty()
-        || resolved_ips.iter().any(|ip| edge_ips.iter().any(|edge| edge == ip));
+    let dns_match = !edge_ips.is_empty()
+        && resolved_ips
+            .iter()
+            .any(|ip| edge_ips.iter().any(|edge| edge == ip));
     let dns_detail = if !dns_ok {
-        "DNS 未解析出任何地址".to_string()
+        "DNS 未解析出任何地址。请检查 CNAME 是否填写正确、是否存在 CNAME 循环、CNAME 目标是否已生效，以及权威 DNS 是否可达。".to_string()
     } else if edge_ips.is_empty() {
-        format!("解析到 {}", resolved_ips.join(", "))
+        format!(
+            "解析到 {}；当前没有在线 Edge 节点（或节点未填写 public_ip），无法判断 CNAME 是否正确。请先在控制台启用节点并填写公网 IP。",
+            resolved_ips.join(", ")
+        )
     } else if dns_match {
         format!("解析到边缘节点地址：{}", resolved_ips.join(", "))
     } else {
         format!(
-            "解析到 {}，但当前在线节点地址为 {}；如果使用 CNAME，请检查上游解析",
+            "解析到 {}，但不在当前在线 Edge 地址 {} 中。请检查 CNAME 是否错误地指向源站、其他 CDN 或旧边缘，或是否有多余的 A/CNAME 记录。",
             resolved_ips.join(", "),
             edge_ips.join(", ")
         )
     };
 
-    let tls_start = Instant::now();
-    let (tls_ok, tls_detail) = check_tls(&domain).await;
-    let origin_start = Instant::now();
-    let (origin_ok, origin_detail) = check_origin(&row.origin_host, row.origin_port.max(0) as u16).await;
-
-    let cache_start = Instant::now();
-    let (cache_ok, cache_detail) =
-        check_cache(&state, &domain, row.ssl_enabled, &nodes).await;
+    let (tls_ok, tls_detail) = match tls_result {
+        Ok(value) => value,
+        Err(_) => (
+            false,
+            "TLS 检查超时。请检查 CNAME 是否指向可从控制面访问的 HTTPS 地址，或证书服务器是否响应 443。".to_string(),
+        ),
+    };
+    let (origin_ok, origin_detail) = match origin_result {
+        Ok(value) => value,
+        Err(_) => (false, "回源 TCP 检查超时".to_string()),
+    };
+    let (cache_ok, cache_detail) = match cache_result {
+        Ok(value) => value,
+        Err(_) => (
+            false,
+            "边缘缓存探测超时（请检查 CNAME 与节点 AGENT_URL）".to_string(),
+        ),
+    };
 
     let checks = vec![
         Check {
@@ -231,11 +266,8 @@ async fn strict_tls(domain: &str, roots: RootCertStore) -> (bool, String) {
     let Ok(name) = ServerName::try_from(domain.to_string()) else {
         return (false, "域名不能用于 TLS SNI".into());
     };
-    let tcp = match tokio::time::timeout(
-        Duration::from_secs(6),
-        TcpStream::connect((domain, 443)),
-    )
-    .await
+    let tcp = match tokio::time::timeout(Duration::from_secs(6), TcpStream::connect((domain, 443)))
+        .await
     {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => return (false, format!("无法连接 443：{e}")),
@@ -265,11 +297,8 @@ async fn insecure_leaf_aia(domain: &str) -> Vec<String> {
     let Ok(name) = ServerName::try_from(domain.to_string()) else {
         return Vec::new();
     };
-    let Ok(Ok(tcp)) = tokio::time::timeout(
-        Duration::from_secs(6),
-        TcpStream::connect((domain, 443)),
-    )
-    .await
+    let Ok(Ok(tcp)) =
+        tokio::time::timeout(Duration::from_secs(6), TcpStream::connect((domain, 443))).await
     else {
         return Vec::new();
     };
@@ -383,12 +412,7 @@ async fn check_origin(host: &str, port: u16) -> (bool, String) {
     if host.trim().is_empty() || port == 0 {
         return (false, "源站地址或端口为空".into());
     }
-    match tokio::time::timeout(
-        Duration::from_secs(6),
-        TcpStream::connect((host, port)),
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_secs(6), TcpStream::connect((host, port))).await {
         Ok(Ok(_)) => (true, format!("TCP 连接 {host}:{port} 成功")),
         Ok(Err(e)) => (false, format!("TCP 连接 {host}:{port} 失败：{e}")),
         Err(_) => (false, format!("TCP 连接 {host}:{port} 超时")),
@@ -439,10 +463,7 @@ async fn check_cache(
                     }
                 })
             };
-            let status = value
-                .get("status")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+            let status = value.get("status").and_then(Value::as_u64).unwrap_or(0);
             let cache = get("x-cache-status")
                 .or_else(|| get("x-cache"))
                 .unwrap_or_else(|| "UNKNOWN".into());

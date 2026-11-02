@@ -644,19 +644,57 @@ pub async fn test(
         .to_ascii_uppercase();
     let query = req.query.clone().unwrap_or_default();
 
+    let request_rule = pick_with_content_type(&rules, path, &method, &query, None);
     match pick_with_content_type(&rules, path, &method, &query, req.content_type.as_deref()) {
         Some(rule) => {
-            let effective = EffectiveDto {
-                action: rule.action.clone(),
-                ttl_seconds: rule.ttl_seconds.max(0) as u64,
-                swr_seconds: rule.swr_seconds.max(0) as u64,
-                browser_ttl_seconds: rule.browser_ttl_seconds.max(0) as u64,
-                ignore_query: rule.ignore_query,
-                ignore_cookie: rule.ignore_cookie,
-                source: "rule".into(),
+            let request_blocks =
+                request_rule.is_some_and(|r| !r.action.eq_ignore_ascii_case("cache"));
+            let content_dependent = !rule.match_content_type.trim().is_empty();
+            let (effective, note) = if request_blocks {
+                let current = request_rule.expect("request_blocks implies a request rule");
+                let effective = EffectiveDto {
+                    action: current.action.clone(),
+                    ttl_seconds: current.ttl_seconds.max(0) as u64,
+                    swr_seconds: current.swr_seconds.max(0) as u64,
+                    browser_ttl_seconds: current.browser_ttl_seconds.max(0) as u64,
+                    ignore_query: current.ignore_query,
+                    ignore_cookie: current.ignore_cookie,
+                    source: "request-rule".into(),
+                };
+                let note = if content_dependent {
+                    format!(
+                        "请求阶段命中优先级 {} 的 {} 规则；Content-Type 规则（优先级 {}）只参与响应阶段，不能覆盖请求阶段策略",
+                        current.priority, current.action, rule.priority
+                    )
+                } else {
+                    format!("命中优先级 {} 的规则", current.priority)
+                };
+                (effective, note)
+            } else {
+                let effective = EffectiveDto {
+                    action: rule.action.clone(),
+                    ttl_seconds: rule.ttl_seconds.max(0) as u64,
+                    swr_seconds: rule.swr_seconds.max(0) as u64,
+                    browser_ttl_seconds: rule.browser_ttl_seconds.max(0) as u64,
+                    ignore_query: rule.ignore_query,
+                    ignore_cookie: rule.ignore_cookie,
+                    source: "rule".into(),
+                };
+                let note = if content_dependent
+                    && request_rule.is_some_and(|r| r.priority != rule.priority)
+                {
+                    format!(
+                        "响应阶段命中优先级 {} 的 Content-Type 规则；请求阶段使用优先级 {} 的规则",
+                        rule.priority,
+                        request_rule.map(|r| r.priority).unwrap_or(rule.priority)
+                    )
+                } else {
+                    format!("命中优先级 {} 的规则", rule.priority)
+                };
+                (effective, note)
             };
             Ok(Json(TestResponse {
-                note: format!("命中优先级 {} 的规则", rule.priority),
+                note,
                 matched: Some(RuleDto::from_row(rule.clone(), &domain.name)),
                 effective,
             }))

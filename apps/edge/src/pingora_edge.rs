@@ -372,18 +372,27 @@ impl ProxyHttp for DataPlaneProxy {
                         if let Some(mut entry) = large.get_any(&plan.key).await {
                             let total = entry.content_length();
                             if let Some((start, end)) = parse_single_range(&raw_range, total) {
-                                if entry.covers(start, end)
-                                    && self
+                                if entry.covers(start, end) {
+                                    let fresh = SystemTime::now()
+                                        .duration_since(SystemTime::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() <= entry.meta.fresh_until)
+                                        .unwrap_or(false);
+                                    if self
                                         .serve_large_range(
-                                            session, &mut entry, start, end, total, &plan,
+                                            session, &mut entry, start, end, total, &plan, fresh,
                                         )
                                         .await
-                                {
-                                    ctx.cache_label = "HIT";
-                                    ctx.cache_reason = Some("range-large-cache");
-                                    ctx.status = StatusCode::PARTIAL_CONTENT.as_u16();
-                                    ctx.plan = Some(plan);
-                                    return Ok(true);
+                                    {
+                                        ctx.cache_label = if fresh { "HIT" } else { "STALE" };
+                                        ctx.cache_reason = Some(if fresh {
+                                            "range-large-cache"
+                                        } else {
+                                            "stale-range"
+                                        });
+                                        ctx.status = StatusCode::PARTIAL_CONTENT.as_u16();
+                                        ctx.plan = Some(plan);
+                                        return Ok(true);
+                                    }
                                 }
                             }
                         }
@@ -930,7 +939,7 @@ impl ProxyHttp for DataPlaneProxy {
         )
         .await;
         match label {
-            "HIT" => self.state.metrics.record_hit(&ctx.host, bytes).await,
+            "HIT" | "STALE" => self.state.metrics.record_hit(&ctx.host, bytes).await,
             "MISS" | "REVALIDATED" => self.state.metrics.record_miss(&ctx.host, bytes).await,
             _ => self.state.metrics.record_bypass(&ctx.host, bytes).await,
         }
@@ -1083,11 +1092,13 @@ impl DataPlaneProxy {
         end: u64,
         total: u64,
         plan: &NativePlan,
+        fresh: bool,
     ) -> bool {
         let len = end.saturating_sub(start).saturating_add(1);
         if len == 0 || len > usize::MAX as u64 {
             return false;
         }
+        let cache_label = if fresh { "HIT" } else { "STALE" };
         let Ok(mut response) =
             ResponseHeader::build(StatusCode::PARTIAL_CONTENT.as_u16(), Some(len as usize))
         else {
@@ -1117,8 +1128,14 @@ impl DataPlaneProxy {
                 .insert_header("content-length", len.to_string())
                 .is_err()
             || response.insert_header("accept-ranges", "bytes").is_err()
-            || response.insert_header("x-cache", "HIT").is_err()
-            || response.insert_header("x-cache-status", "HIT").is_err()
+            || response.insert_header("x-cache", cache_label).is_err()
+            || response
+                .insert_header("x-cache-status", cache_label)
+                .is_err()
+            || (!fresh
+                && response
+                    .insert_header("x-lagran-cache-reason", "stale-range")
+                    .is_err())
         {
             return false;
         }
