@@ -133,6 +133,8 @@
 </template>
 
 <script setup lang="ts">
+import { friendlyErrorMessage } from '~/utils/friendlyError'
+
 definePageMeta({ layout: 'auth' })
 
 const config = useRuntimeConfig()
@@ -202,10 +204,10 @@ async function onSubmit() {
     toast.success('登录成功，正在进入控制台')
     await navigateTo('/')
   } catch (e: any) {
-    error.value =
-      e?.data?.error ||
-      e?.message ||
+    error.value = friendlyErrorMessage(
+      e?.data?.error || e?.message,
       '登录失败，请稍后重试'
+    )
     if (captchaEnabled.value) await loadCaptcha()
   } finally {
     loading.value = false

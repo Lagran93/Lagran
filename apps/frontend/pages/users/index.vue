@@ -181,6 +181,8 @@
 </template>
 
 <script setup lang="ts">
+import { friendlyErrorMessage } from '~/utils/friendlyError'
+
 const api = useApi()
 const auth = useAuthStore()
 const toast = useToast()
@@ -292,7 +294,9 @@ async function createUser() {
     toast.success('用户已创建')
     await load()
   } catch (e: any) {
-    error.value = e?.data?.error || '创建失败'
+    const message = friendlyErrorMessage(e?.data?.error, '创建失败，请稍后重试')
+    error.value = message
+    toast.error(message)
   } finally {
     submitting.value = false
   }
@@ -314,7 +318,9 @@ async function updateUser() {
     await load()
     await auth.refresh()
   } catch (e: any) {
-    error.value = e?.data?.error || '保存失败'
+    const message = friendlyErrorMessage(e?.data?.error, '保存失败，请稍后重试')
+    error.value = message
+    toast.error(message)
   } finally {
     submitting.value = false
   }

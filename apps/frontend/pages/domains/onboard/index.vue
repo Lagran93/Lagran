@@ -167,6 +167,8 @@
 </template>
 
 <script setup lang="ts">
+import { friendlyErrorMessage } from '~/utils/friendlyError'
+
 const api = useApi()
 const toast = useToast()
 
@@ -226,7 +228,9 @@ async function createDomain() {
     step.value = 3
     await loadNodes()
   } catch (e: any) {
-    error.value = e?.data?.error || '创建域名失败'
+    const message = friendlyErrorMessage(e?.data?.error, '创建域名失败，请稍后重试')
+    error.value = message
+    toast.error(message)
   } finally {
     submitting.value = false
   }

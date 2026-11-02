@@ -410,7 +410,12 @@
             <span class="cc-stat"><b>{{ ccStats.banned_24h }}</b> 24h 封禁</span>
           </div>
 
-          <div v-if="filteredBans.length" class="table-wrap">
+          <div v-if="bansError" class="alert alert-warning" style="margin: 12px 16px">
+            <AppIcon name="alert" :size="16" class="icon" />
+            <span>{{ bansError }}</span>
+          </div>
+
+          <div v-if="!bansError && filteredBans.length" class="table-wrap">
             <table class="table">
               <thead>
                 <tr>
@@ -469,13 +474,13 @@
             <div class="skeleton" style="height: 32px; width: 100%" />
           </div>
           <EmptyState
-            v-else
+            v-else-if="!bansError"
             icon="shield"
             :title="bans.length ? '没有匹配的封禁记录' : '暂无共享封禁'"
             :text="
               bans.length
-                ? '调整状态或域名筛选条件后再试。'
-                : 'CC 自动封禁或管理员手动封禁会在这里展示；过期和已解封记录也会保留。'
+                ? '调整状态筛选条件后再试。'
+                : '当前防护域名暂无封禁记录；已过期和已解封记录也会保留。'
             "
           />
         </div>
@@ -679,6 +684,8 @@
 </template>
 
 <script setup lang="ts">
+import { friendlyErrorMessage } from '~/utils/friendlyError'
+
 const api = useApi()
 const toast = useToast()
 const { ask } = useConfirm()
@@ -779,6 +786,7 @@ const eventLimit = ref(100)
 
 const bans = ref<any[]>([])
 const bansLoading = ref(false)
+const bansError = ref('')
 const banStatusFilter = ref('')
 const currentDomainName = computed(
   () => domains.value.find((d) => d.id === domainId.value)?.name || ''
@@ -1036,6 +1044,7 @@ async function loadEvents() {
 }
 
 async function loadBans() {
+  bansError.value = ''
   if (!currentDomainName.value) {
     bans.value = []
     ccStats.value = null
@@ -1055,9 +1064,16 @@ async function loadBans() {
     } else {
       ccStats.value = null
     }
-  } catch {
+  } catch (e: any) {
     bans.value = []
     ccStats.value = null
+    const status = e?.response?.status ?? e?.status
+    bansError.value =
+      status === 404
+        ? '控制面未提供封禁历史接口，请升级并重启 lagran-control。'
+        : status >= 500
+          ? '加载封禁历史失败，请检查控制面日志和数据库迁移是否完成。'
+          : friendlyErrorMessage(e?.data?.error, '加载封禁历史失败，请稍后重试')
   } finally {
     bansLoading.value = false
   }

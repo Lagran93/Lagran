@@ -340,22 +340,21 @@ pub async fn create(
     .await
     .map_err(|e| {
         let msg = e.to_string();
-        if msg.contains("duplicate") || msg.contains("unique") {
+        let duplicate = msg.contains("duplicate") || msg.contains("unique");
+        if duplicate {
             tracing::warn!(name = %req.name, "domain already exists");
         } else {
             tracing::error!(error = %msg, "create domain");
         }
-        let error = if msg.contains("duplicate") || msg.contains("unique") {
-            "domain already exists"
+        let (status, error) = if duplicate {
+            (
+                StatusCode::CONFLICT,
+                "域名已存在，请勿重复添加",
+            )
         } else {
-            "database error"
+            (StatusCode::BAD_REQUEST, "数据库错误，请稍后重试")
         };
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody {
-                error: error.into(),
-            }),
-        )
+        (status, Json(ErrorBody { error: error.into() }))
     })?;
 
     if let Some(ref origins) = normalized_origins {

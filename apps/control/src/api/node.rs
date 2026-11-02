@@ -299,7 +299,7 @@ pub async fn create(
         return Err((
             StatusCode::CONFLICT,
             Json(ErrorBody {
-                error: "node name already exists".into(),
+                error: "节点名称已存在，请更换名称".into(),
             }),
         ));
     }
@@ -437,7 +437,7 @@ pub async fn update(
                 return Err((
                     StatusCode::CONFLICT,
                     Json(ErrorBody {
-                        error: "node name already exists".into(),
+                        error: "节点名称已存在，请更换名称".into(),
                     }),
                 ));
             }

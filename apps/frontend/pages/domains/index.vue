@@ -347,6 +347,8 @@
 </template>
 
 <script setup lang="ts">
+import { friendlyErrorMessage } from '~/utils/friendlyError'
+
 const api = useApi()
 const auth = useAuthStore()
 const toast = useToast()
@@ -538,7 +540,12 @@ async function createDomain() {
     toast.success('域名已接入，等待边缘节点同步（约 15 秒）')
     await load()
   } catch (e: any) {
-    createError.value = e?.data?.error || '接入失败，请检查域名是否已存在'
+    const message = friendlyErrorMessage(
+      e?.data?.error,
+      '接入失败，请检查域名是否已存在'
+    )
+    createError.value = message
+    toast.error(message)
   } finally {
     submitting.value = false
   }

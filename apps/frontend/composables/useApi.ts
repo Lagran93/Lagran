@@ -1,3 +1,5 @@
+import { friendlyErrorMessage } from '~/utils/friendlyError'
+
 export function useApi() {
   const config = useRuntimeConfig()
   const base = config.public.apiBase as string
@@ -40,6 +42,16 @@ export function useApi() {
       return await $fetch<T>(`${base}${path}`, options)
     } catch (error) {
       handleUnauthorized(path, error)
+      // Translate common backend diagnostics once, so every page that reads
+      // `e.data.error` gets a user-friendly Chinese message.
+      try {
+        const data = (error as any)?.data
+        if (data && typeof data.error === 'string') {
+          data.error = friendlyErrorMessage(data.error)
+        }
+      } catch {
+        // Ignore non-writable error objects; the original message is still usable.
+      }
       throw error
     }
   }

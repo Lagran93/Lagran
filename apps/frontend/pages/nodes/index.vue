@@ -594,6 +594,8 @@
 </template>
 
 <script setup lang="ts">
+import { friendlyErrorMessage } from '~/utils/friendlyError'
+
 const api = useApi()
 const toast = useToast()
 const { ask } = useConfirm()
@@ -845,7 +847,9 @@ async function submitForm() {
       await load()
     }
   } catch (e: any) {
-    formError.value = e?.data?.error || '保存失败'
+    const message = friendlyErrorMessage(e?.data?.error, '保存失败，请稍后重试')
+    formError.value = message
+    toast.error(message)
   } finally {
     saving.value = false
   }

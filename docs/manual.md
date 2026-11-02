@@ -971,6 +971,15 @@ GET /api/v1/cc/bans/history?domain=cdn.example.com&limit=500
 - 普通用户可以查看自己项目域名下的封禁历史，并对自己项目下有写权限的域名添加/解封。
 - 管理员可以查看全部历史并执行添加、解封。
 - 「共享封禁」页面直接使用当前「防护域名」的数据，不再单独选择域名。
+- 删除域名时，其封禁记录会软撤销并保留历史，不再物理删除。
+
+历史为空时检查：
+
+1. 当前「防护域名」是否正确。
+2. Control 是否已升级并重启，且 **所有副本** 都是新版本。
+3. `cc_bans` 是否已有 `revoked_at`/`revoked_by` 字段。
+4. 旧版本会在 Edge 轮询时执行 `DELETE FROM cc_bans WHERE expires_at <= NOW()`；升级前被删除的历史无法恢复。
+5. 新版本产生的记录可正常保留为 active/expired/revoked。
 
 ### 6.7 行为评分
 
