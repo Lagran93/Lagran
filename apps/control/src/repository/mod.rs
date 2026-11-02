@@ -399,19 +399,11 @@ pub async fn create_domain(
 }
 
 pub async fn delete_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
-    // Keep CC ban history after the domain is removed. Active bans must stop
-    // syncing to edges, so revoke them instead of deleting the rows.
-    let _ = sqlx::query(
-        r#"
-        UPDATE cc_bans
-        SET revoked_at = NOW(), revoked_by = '域名已删除', updated_at = NOW()
-        WHERE domain = (SELECT name FROM domains WHERE id = $1)
-          AND revoked_at IS NULL
-        "#,
-    )
-    .bind(id)
-    .execute(pool)
-    .await;
+    let _ =
+        sqlx::query("DELETE FROM cc_bans WHERE domain = (SELECT name FROM domains WHERE id = $1)")
+            .bind(id)
+            .execute(pool)
+            .await;
     let _ = sqlx::query(
         "DELETE FROM origin_health WHERE domain_name = (SELECT name FROM domains WHERE id = $1)",
     )
