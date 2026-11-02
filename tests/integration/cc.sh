@@ -153,6 +153,11 @@ DEL=$(api -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/cc/bans/$DOMAIN/127.0
 check "admin deletes shared ban" "$DEL" "1"
 BANS=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/cc/bans/all?domain=$DOMAIN")
 check "ban list is empty after unban" "$(printf '%s' "$BANS" | jq -r '.bans | length')" "0"
+HISTORY=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/cc/bans/history?domain=$DOMAIN")
+check "unbanned record is kept in history" \
+  "$(printf '%s' "$HISTORY" | jq -r '.bans[0].status')" "revoked"
+check "unbanned record has revoker" \
+  "$(printf '%s' "$HISTORY" | jq -r '.bans[0].revoked_by')" "demo@lagran.dev"
 api -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/settings" \
   -d '{"cc_mode":"block"}' >/dev/null
 CLEARED=0

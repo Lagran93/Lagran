@@ -215,6 +215,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/config/:domain", get(config::get_domain_config))
                 .route("/cc/bans", get(cc::list).post(cc::report))
                 .route("/cc/bans/all", get(cc::list_admin))
+                .route("/cc/bans/history", get(cc::list_history))
                 .route("/cc/bans/manual", post(cc::create_manual))
                 .route("/cc/bans/unban", post(cc::unban_manual))
                 .route("/cc/stats", get(cc::stats))

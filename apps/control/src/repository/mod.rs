@@ -1733,10 +1733,7 @@ pub async fn list_origin_health(pool: &PgPool) -> sqlx::Result<Vec<OriginHealthR
 
 /// Resolve firing events tied to a domain that is being deleted. Historical
 /// resolved events remain available for audit, but nothing stays "firing".
-pub async fn resolve_domain_alert_events(
-    pool: &PgPool,
-    domain_name: &str,
-) -> sqlx::Result<u64> {
+pub async fn resolve_domain_alert_events(pool: &PgPool, domain_name: &str) -> sqlx::Result<u64> {
     let result = sqlx::query(
         r#"
         UPDATE alert_events
@@ -2921,7 +2918,10 @@ pub struct CcBanRow {
     pub reason: String,
     pub source: String,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by: String,
 }
 
 pub async fn upsert_cc_ban(
@@ -2940,8 +2940,11 @@ pub async fn upsert_cc_ban(
             expires_at = GREATEST(cc_bans.expires_at, EXCLUDED.expires_at),
             reason = EXCLUDED.reason,
             source = EXCLUDED.source,
+            revoked_at = NULL,
+            revoked_by = '',
             updated_at = NOW()
-        RETURNING domain, ip, reason, source, created_at, expires_at
+        RETURNING domain, ip, reason, source, created_at, updated_at, expires_at,
+                  revoked_at, revoked_by
         "#,
     )
     .bind(domain)
@@ -2957,14 +2960,13 @@ pub async fn list_active_cc_bans(
     pool: &PgPool,
     domain: Option<&str>,
 ) -> sqlx::Result<Vec<CcBanRow>> {
-    let _ = sqlx::query("DELETE FROM cc_bans WHERE expires_at <= NOW()")
-        .execute(pool)
-        .await;
     sqlx::query_as::<_, CcBanRow>(
         r#"
-        SELECT domain, ip, reason, source, created_at, expires_at
+        SELECT domain, ip, reason, source, created_at, updated_at, expires_at,
+               revoked_at, revoked_by
         FROM cc_bans
         WHERE expires_at > NOW()
+          AND revoked_at IS NULL
           AND ($1::text IS NULL OR domain = $1)
         ORDER BY expires_at DESC
         "#,
@@ -2972,6 +2974,48 @@ pub async fn list_active_cc_bans(
     .bind(domain)
     .fetch_all(pool)
     .await
+}
+
+/// Full ban history for the console, including expired and revoked rows.
+pub async fn list_cc_ban_history(
+    pool: &PgPool,
+    domain: Option<&str>,
+    visible_domains: Option<Vec<String>>,
+    limit: i64,
+) -> sqlx::Result<Vec<CcBanRow>> {
+    sqlx::query_as::<_, CcBanRow>(
+        r#"
+        SELECT domain, ip, reason, source, created_at, updated_at, expires_at,
+               revoked_at, revoked_by
+        FROM cc_bans
+        WHERE ($1::text IS NULL OR domain = $1)
+          AND ($2::text[] IS NULL OR domain = ANY($2))
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(domain)
+    .bind(visible_domains)
+    .bind(limit.clamp(1, 1000))
+    .fetch_all(pool)
+    .await
+}
+
+/// Soft-unban: keep the row for history and stop syncing it to edges.
+pub async fn revoke_cc_ban(pool: &PgPool, domain: &str, ip: &str, by: &str) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE cc_bans
+        SET revoked_at = NOW(), revoked_by = $3, updated_at = NOW()
+        WHERE domain = $1 AND ip = $2 AND revoked_at IS NULL
+        "#,
+    )
+    .bind(domain)
+    .bind(ip)
+    .bind(by)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
 }
 
 pub async fn delete_cc_ban(pool: &PgPool, domain: &str, ip: &str) -> sqlx::Result<u64> {

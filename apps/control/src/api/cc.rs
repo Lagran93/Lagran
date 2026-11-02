@@ -22,19 +22,41 @@ pub struct BanDto {
     pub ip: String,
     pub reason: String,
     pub source: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
     pub expires_at: String,
+    pub revoked_at: Option<String>,
+    pub revoked_by: String,
     pub remaining_secs: i64,
 }
 
 impl From<repository::CcBanRow> for BanDto {
     fn from(r: repository::CcBanRow) -> Self {
-        let remaining = (r.expires_at - chrono::Utc::now()).num_seconds().max(1);
+        let now = chrono::Utc::now();
+        let status = if r.revoked_at.is_some() {
+            "revoked"
+        } else if r.expires_at > now {
+            "active"
+        } else {
+            "expired"
+        };
+        let remaining = if status == "active" {
+            (r.expires_at - now).num_seconds().max(1)
+        } else {
+            0
+        };
         Self {
             domain: r.domain,
             ip: r.ip,
             reason: r.reason,
             source: r.source,
+            status: status.to_string(),
+            created_at: r.created_at.to_rfc3339(),
+            updated_at: r.updated_at.to_rfc3339(),
             expires_at: r.expires_at.to_rfc3339(),
+            revoked_at: r.revoked_at.map(|t| t.to_rfc3339()),
+            revoked_by: r.revoked_by,
             remaining_secs: remaining,
         }
     }
@@ -48,6 +70,12 @@ pub struct BanListDto {
 #[derive(Deserialize)]
 pub struct BansQuery {
     pub domain: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct HistoryQuery {
+    pub domain: Option<String>,
+    pub limit: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -178,21 +206,63 @@ pub async fn list_admin(
     }))
 }
 
-/// DELETE /api/v1/cc/bans/:domain/:ip — manual unban.
+/// GET /api/v1/cc/bans/history — admin history including expired/revoked rows.
+pub async fn list_history(
+    State(state): State<AppState>,
+    actor: Actor,
+    Query(q): Query<HistoryQuery>,
+) -> Result<Json<BanListDto>, (StatusCode, Json<serde_json::Value>)> {
+    let domain = q.domain.as_deref().map(normalize_domain);
+    // Admins see the full history. Regular users see only domains they can read.
+    let visible_domains = if actor.is_admin {
+        None
+    } else {
+        let visible = actor.visible_domain_ids(&state).await.unwrap_or_default();
+        let visible: std::collections::HashSet<_> = visible.into_iter().collect();
+        let rows = repository::list_domains(&state.pool)
+            .await
+            .unwrap_or_default();
+        Some(
+            rows.into_iter()
+                .filter(|d| visible.contains(&d.id))
+                .map(|d| d.name)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let rows = repository::list_cc_ban_history(
+        &state.pool,
+        domain.as_deref(),
+        visible_domains,
+        q.limit.unwrap_or(500),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "list cc ban history");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "database error" })),
+        )
+    })?;
+    Ok(Json(BanListDto {
+        bans: rows.into_iter().map(BanDto::from).collect(),
+    }))
+}
+
+/// DELETE /api/v1/cc/bans/:domain/:ip — manual unban (kept in history).
 pub async fn remove(
     State(state): State<AppState>,
     actor: Actor,
     Path((domain, ip)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !actor.is_admin {
+    let domain = normalize_domain(&domain);
+    if !actor.can_write_domain_name(&state, &domain).await {
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
         ));
     }
-    let domain = normalize_domain(&domain);
     let ip: IpAddr = ip.trim().parse().map_err(|_| bad_request("invalid ip"))?;
-    let n = repository::delete_cc_ban(&state.pool, &domain, &ip.to_string())
+    let n = repository::revoke_cc_ban(&state.pool, &domain, &ip.to_string(), &actor.email)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "delete cc ban");
@@ -235,21 +305,21 @@ fn normalize_target(raw: &str) -> Option<String> {
     (prefix <= max).then(|| format!("{ip}/{prefix}"))
 }
 
-/// POST /api/v1/cc/bans/manual — admin-created IP or CIDR ban.
+/// POST /api/v1/cc/bans/manual — create an IP/CIDR ban for a writable domain.
 pub async fn create_manual(
     State(state): State<AppState>,
     actor: Actor,
     Json(req): Json<ManualBanRequest>,
 ) -> Result<(StatusCode, Json<BanDto>), (StatusCode, Json<serde_json::Value>)> {
-    if !actor.is_admin {
+    let domain = normalize_domain(&req.domain);
+    if domain.is_empty() {
+        return Err(bad_request("domain is required"));
+    }
+    if !actor.can_write_domain_name(&state, &domain).await {
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
         ));
-    }
-    let domain = normalize_domain(&req.domain);
-    if domain.is_empty() {
-        return Err(bad_request("domain is required"));
     }
     let target = normalize_target(&req.ip).ok_or_else(|| bad_request("invalid ip or cidr"))?;
     if repository::get_domain_by_name(&state.pool, &domain)
@@ -300,21 +370,24 @@ pub async fn create_manual(
     Ok((StatusCode::CREATED, Json(BanDto::from(row))))
 }
 
-/// POST /api/v1/cc/bans/unban — admin unban for IP or CIDR.
+/// POST /api/v1/cc/bans/unban — unban an IP/CIDR for a writable domain.
 pub async fn unban_manual(
     State(state): State<AppState>,
     actor: Actor,
     Json(req): Json<ManualUnbanRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !actor.is_admin {
+    let domain = normalize_domain(&req.domain);
+    if domain.is_empty() {
+        return Err(bad_request("domain is required"));
+    }
+    if !actor.can_write_domain_name(&state, &domain).await {
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
         ));
     }
-    let domain = normalize_domain(&req.domain);
     let target = normalize_target(&req.ip).ok_or_else(|| bad_request("invalid ip or cidr"))?;
-    let n = repository::delete_cc_ban(&state.pool, &domain, &target)
+    let n = repository::revoke_cc_ban(&state.pool, &domain, &target, &actor.email)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "manual cc unban");

@@ -143,13 +143,17 @@ pub async fn diagnose(
             check_cache(&state, &domain, row.ssl_enabled, &nodes)
         )
     );
+    let cname = std::env::var("EDGE_CNAME")
+        .or_else(|_| std::env::var("EDGE_ACCESS_DOMAIN"))
+        .unwrap_or_default();
     let dns_ok = !resolved_ips.is_empty();
     let dns_match = !edge_ips.is_empty()
         && resolved_ips
             .iter()
             .any(|ip| edge_ips.iter().any(|edge| edge == ip));
     let dns_detail = if !dns_ok {
-        "DNS 未解析出任何地址。请检查 CNAME 是否填写正确、是否存在 CNAME 循环、CNAME 目标是否已生效，以及权威 DNS 是否可达。".to_string()
+        format!("DNS 未解析出任何地址。请检查 CNAME {} 是否填写正确、是否存在 CNAME 循环、CNAME 目标是否已生效，以及权威 DNS 是否可达。", cname)
+        // "DNS 未解析出任何地址。请检查 CNAME 是否填写正确、是否存在 CNAME 循环、CNAME 目标是否已生效，以及权威 DNS 是否可达。".to_string()
     } else if edge_ips.is_empty() {
         format!(
             "解析到 {}；当前没有在线 Edge 节点（或节点未填写 public_ip），无法判断 CNAME 是否正确。请先在控制台启用节点并填写公网 IP。",

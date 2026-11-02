@@ -37,17 +37,12 @@
           <option v-for="m in methodOptions" :key="m" :value="m">{{ m }}</option>
         </select>
         <input v-model="tester.query" class="input" placeholder="查询串（可选）" style="width: 180px" />
-        <input
-          v-model="tester.content_type"
-          class="input"
-          placeholder="Content-Type（可选）"
-          style="width: 190px"
-        />
+        <input v-model="tester.content_type" class="input" placeholder="Content-Type（可选）" style="width: 190px" />
         <button class="btn btn-primary" type="button" :disabled="testing" @click="runTest">
           {{ testing ? '测试中…' : '测试' }}
         </button>
       </div>
-      <div class="text-muted" style="font-size: 12px; margin-top: 8px; line-height: 1.6">
+      <div class="text-muted" style="font-size: 12px; margin: 8px 18px; line-height: 1.6">
         提示：Content-Type 条件只在源站响应返回后生效。若请求阶段命中了 `/api/*` 等 bypass
         兜底规则，即使响应是 video/mp4，也不会读写缓存；需要额外添加一条不带 Content-Type 的路径 cache 规则。
       </div>
@@ -68,15 +63,18 @@
             </div>
             <div class="effective-item">
               <span class="eff-label">边缘 TTL</span>
-              <span class="eff-value">{{ testResult.effective.action === 'cache' ? `${testResult.effective.ttl_seconds} 秒` : '—' }}</span>
+              <span class="eff-value">{{ testResult.effective.action === 'cache' ? `${testResult.effective.ttl_seconds}
+                秒` : '—' }}</span>
             </div>
             <div class="effective-item">
               <span class="eff-label">SWR</span>
-              <span class="eff-value">{{ testResult.effective.swr_seconds ? `${testResult.effective.swr_seconds} 秒` : '—' }}</span>
+              <span class="eff-value">{{ testResult.effective.swr_seconds ? `${testResult.effective.swr_seconds} 秒` :
+                '—' }}</span>
             </div>
             <div class="effective-item">
               <span class="eff-label">浏览器 TTL</span>
-              <span class="eff-value">{{ testResult.effective.browser_ttl_seconds ? `${testResult.effective.browser_ttl_seconds} 秒` : '跟随源站' }}</span>
+              <span class="eff-value">{{ testResult.effective.browser_ttl_seconds ?
+                `${testResult.effective.browser_ttl_seconds} 秒` : '跟随源站' }}</span>
             </div>
             <div class="effective-item">
               <span class="eff-label">Query</span>
@@ -183,12 +181,8 @@
         <div class="skeleton" style="height: 34px; width: 100%" />
       </div>
 
-      <EmptyState
-        v-else
-        icon="rules"
-        :title="rules.length ? '没有匹配的规则' : '还没有缓存规则'"
-        :text="rules.length ? '试试调整筛选条件。' : '默认会按源站缓存头缓存；你可以为静态资源、API 等路径设置更精细的策略。'"
-      >
+      <EmptyState v-else icon="rules" :title="rules.length ? '没有匹配的规则' : '还没有缓存规则'"
+        :text="rules.length ? '试试调整筛选条件。' : '默认会按源站缓存头缓存；你可以为静态资源、API 等路径设置更精细的策略。'">
         <button v-if="!rules.length" class="btn btn-primary btn-sm" type="button" @click="openCreate">
           新建第一条规则
         </button>
@@ -199,24 +193,13 @@
       </div>
     </div>
 
-    <BaseModal
-      v-model="formOpen"
-      :title="editing ? '编辑缓存规则' : '新建缓存规则'"
-      :confirm-text="editing ? '保存修改' : '创建规则'"
-      :loading="submitting"
-      width="640px"
-      @confirm="submit"
-    >
+    <BaseModal v-model="formOpen" :title="editing ? '编辑缓存规则' : '新建缓存规则'" :confirm-text="editing ? '保存修改' : '创建规则'"
+      :loading="submitting" width="640px" @confirm="submit">
       <div class="form-col">
         <div v-if="!editing" class="preset-row">
           <span class="preset-label">快速模板</span>
-          <button
-            v-for="p in presets"
-            :key="p.label"
-            class="btn btn-default btn-xs"
-            type="button"
-            @click="applyPreset(p)"
-          >
+          <button v-for="p in presets" :key="p.label" class="btn btn-default btn-xs" type="button"
+            @click="applyPreset(p)">
             {{ p.label }}
           </button>
         </div>
@@ -243,11 +226,8 @@
 
           <div class="field span-2">
             <label class="field-label">路径 / 正则 <span class="req">*</span></label>
-            <input
-              v-model="form.path_pattern"
-              class="input"
-              :placeholder="form.match_type === 'regex' ? '\\.(css|js)$' : '/static/*'"
-            />
+            <input v-model="form.path_pattern" class="input"
+              :placeholder="form.match_type === 'regex' ? '\\.(css|js)$' : '/static/*'" />
             <span class="field-hint">
               {{ form.match_type === 'regex'
                 ? 'Rust regex 语法；例如 `\\.(css|js)$` 匹配所有 CSS/JS 文件，`^/assets/` 匹配目录前缀。'
@@ -258,14 +238,8 @@
           <div class="field span-2">
             <label class="field-label">请求方法</label>
             <div class="chip-row">
-              <button
-                v-for="m in methodOptions"
-                :key="m"
-                type="button"
-                class="chip"
-                :class="{ on: form.methods.includes(m) }"
-                @click="toggleMethod(m)"
-              >
+              <button v-for="m in methodOptions" :key="m" type="button" class="chip"
+                :class="{ on: form.methods.includes(m) }" @click="toggleMethod(m)">
                 {{ m }}
               </button>
               <span class="field-hint" style="margin-left: 6px">不选表示全部方法</span>
@@ -280,11 +254,7 @@
 
           <div class="field span-2">
             <label class="field-label">响应 Content-Type 包含（可选）</label>
-            <input
-              v-model="form.match_content_type"
-              class="input"
-              placeholder="例如 text/html"
-            />
+            <input v-model="form.match_content_type" class="input" placeholder="例如 text/html" />
             <span class="field-hint">
               响应头 Content-Type 不区分大小写子串匹配；留空匹配所有类型。
               例如用 <code>text/html</code> + 绕过缓存，静态 JS/CSS 仍按高优先级规则缓存。
@@ -294,13 +264,8 @@
           <div class="field span-2">
             <label class="field-label">缓存动作</label>
             <div class="segmented">
-              <button
-                v-for="opt in actionOptions"
-                :key="opt.value"
-                type="button"
-                :class="{ active: form.action === opt.value }"
-                @click="form.action = opt.value"
-              >
+              <button v-for="opt in actionOptions" :key="opt.value" type="button"
+                :class="{ active: form.action === opt.value }" @click="form.action = opt.value">
                 {{ opt.label }}
               </button>
             </div>
@@ -333,7 +298,8 @@
           <div class="field span-2">
             <label class="field-label">Query 缓存键</label>
             <div class="segmented">
-              <button type="button" :class="{ active: form.ignore_query === 'inherit' }" @click="form.ignore_query = 'inherit'">
+              <button type="button" :class="{ active: form.ignore_query === 'inherit' }"
+                @click="form.ignore_query = 'inherit'">
                 继承域名
               </button>
               <button type="button" :class="{ active: form.ignore_query === 'on' }" @click="form.ignore_query = 'on'">

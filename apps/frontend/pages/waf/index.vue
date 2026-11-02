@@ -378,23 +378,29 @@
         <!-- 跨节点共享封禁 -->
         <div v-else-if="tab === 'bans'" class="card-body tight">
           <div class="filter-bar">
-            <select v-model="banDomainFilter" class="select" @change="loadBans">
-              <option value="">全部域名</option>
-              <option v-for="d in domains" :key="d.id" :value="d.name">{{ d.name }}</option>
+            <select v-model="banStatusFilter" class="select">
+              <option value="">全部状态</option>
+              <option value="active">生效中</option>
+              <option value="expired">已过期</option>
+              <option value="revoked">已解封</option>
             </select>
             <span class="text-muted" style="font-size: 13px">
-              控制面统一封禁库；自动封禁会同步到所有边缘，手动解封后边缘下一轮同步解除
+              当前域名 {{ currentDomainName || '—' }}；当前封禁会同步到所有边缘，过期与已解封记录保留用于审计
             </span>
             <span class="spacer" />
             <button class="btn btn-default btn-sm" type="button" :disabled="bansLoading" @click="loadBans">
               <AppIcon name="refresh" :size="14" />
               刷新
             </button>
-            <button class="btn btn-primary btn-sm" type="button" @click="openBanModal">
+            <button
+              class="btn btn-primary btn-sm"
+              type="button"
+              @click="openBanModal"
+            >
               <AppIcon name="plus" :size="14" />
               添加封禁
             </button>
-            <span class="text-muted" style="font-size: 13px">{{ bans.length }} 个封禁</span>
+            <span class="text-muted" style="font-size: 13px">{{ filteredBans.length }} 条记录</span>
           </div>
 
           <div v-if="ccStats" class="cc-stat-row">
@@ -404,32 +410,56 @@
             <span class="cc-stat"><b>{{ ccStats.banned_24h }}</b> 24h 封禁</span>
           </div>
 
-          <div v-if="bans.length" class="table-wrap">
+          <div v-if="filteredBans.length" class="table-wrap">
             <table class="table">
               <thead>
                 <tr>
+                  <th>状态</th>
                   <th>域名</th>
                   <th>客户端 IP</th>
                   <th>原因</th>
                   <th>来源节点</th>
-                  <th>到期时间</th>
+                  <th>创建时间</th>
+                  <th>到期 / 解封</th>
                   <th class="text-right">操作</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="b in bans" :key="`${b.domain}|${b.ip}`">
+                <tr v-for="b in filteredBans" :key="`${b.domain}|${b.ip}`">
+                  <td>
+                    <StatusTag :tone="banTone(b.status)" dot>{{ banStatusLabel(b.status) }}</StatusTag>
+                  </td>
                   <td class="cell-main">{{ b.domain }}</td>
                   <td class="mono">{{ b.ip }}</td>
                   <td class="text-2">{{ b.reason || 'cc-auto-ban' }}</td>
                   <td class="text-2">{{ b.source || '—' }}</td>
                   <td>
-                    <div>{{ formatDateTime(b.expires_at) }}</div>
-                    <div class="cell-sub">剩余 {{ remainingLabel(b.remaining_secs) }}</div>
+                    <div>{{ formatDateTime(b.created_at) }}</div>
+                  </td>
+                  <td>
+                    <template v-if="b.status === 'active'">
+                      <div>{{ formatDateTime(b.expires_at) }}</div>
+                      <div class="cell-sub">剩余 {{ remainingLabel(b.remaining_secs) }}</div>
+                    </template>
+                    <template v-else-if="b.status === 'revoked'">
+                      <div>{{ formatDateTime(b.revoked_at) }}</div>
+                      <div class="cell-sub">由 {{ b.revoked_by || '管理员' }} 解封</div>
+                    </template>
+                    <template v-else>
+                      <div>{{ formatDateTime(b.expires_at) }}</div>
+                      <div class="cell-sub">已过期</div>
+                    </template>
                   </td>
                   <td class="text-right">
-                    <button class="btn btn-text btn-sm danger" type="button" @click="unbanIp(b)">
+                    <button
+                      v-if="b.status === 'active'"
+                      class="btn btn-text btn-sm danger"
+                      type="button"
+                      @click="unbanIp(b)"
+                    >
                       解封
                     </button>
+                    <span v-else class="text-muted" style="font-size: 12px">—</span>
                   </td>
                 </tr>
               </tbody>
@@ -441,8 +471,12 @@
           <EmptyState
             v-else
             icon="shield"
-            title="暂无共享封禁"
-            text="CC 自动封禁或管理员手动封禁会在这里展示；解封后所有边缘节点会在下一轮同步时解除。"
+            :title="bans.length ? '没有匹配的封禁记录' : '暂无共享封禁'"
+            :text="
+              bans.length
+                ? '调整状态或域名筛选条件后再试。'
+                : 'CC 自动封禁或管理员手动封禁会在这里展示；过期和已解封记录也会保留。'
+            "
           />
         </div>
 
@@ -618,11 +652,10 @@
     >
       <div class="form-col">
         <div class="field">
-          <label class="field-label">域名 <span class="req">*</span></label>
-          <select v-model="banForm.domain" class="select">
-            <option value="">选择域名</option>
-            <option v-for="d in domains" :key="d.id" :value="d.name">{{ d.name }}</option>
-          </select>
+          <label class="field-label">域名</label>
+          <div class="input" style="display: flex; align-items: center; background: var(--bg)">
+            {{ currentDomainName || '请先选择防护域名' }}
+          </div>
         </div>
         <div class="field">
           <label class="field-label">IP 或 CIDR <span class="req">*</span></label>
@@ -746,7 +779,14 @@ const eventLimit = ref(100)
 
 const bans = ref<any[]>([])
 const bansLoading = ref(false)
-const banDomainFilter = ref('')
+const banStatusFilter = ref('')
+const currentDomainName = computed(
+  () => domains.value.find((d) => d.id === domainId.value)?.name || ''
+)
+const filteredBans = computed(() => {
+  if (!banStatusFilter.value) return bans.value
+  return bans.value.filter((b) => b.status === banStatusFilter.value)
+})
 const ccStats = ref<any>(null)
 
 const ruleModalOpen = ref(false)
@@ -794,9 +834,7 @@ const tabs = computed(() => [
   { value: 'settings' as Tab, label: '防护设置' },
   { value: 'rules' as Tab, label: '自定义规则', count: rules.value.length },
   { value: 'ips' as Tab, label: 'IP 黑白名单', count: ips.value.length },
-  ...(auth.isAdmin
-    ? [{ value: 'bans' as Tab, label: '共享封禁', count: bans.value.length }]
-    : []),
+  { value: 'bans' as Tab, label: '共享封禁', count: bans.value.length },
   { value: 'events' as Tab, label: '事件日志' },
 ])
 
@@ -998,7 +1036,7 @@ async function loadEvents() {
 }
 
 async function loadBans() {
-  if (!auth.isAdmin) {
+  if (!currentDomainName.value) {
     bans.value = []
     ccStats.value = null
     return
@@ -1006,14 +1044,17 @@ async function loadBans() {
   bansLoading.value = true
   try {
     const q = new URLSearchParams()
-    if (banDomainFilter.value) q.set('domain', banDomainFilter.value)
-    const suffix = q.toString() ? `?${q.toString()}` : ''
-    const [res, statsRes] = await Promise.all([
-      api.get<{ bans: any[] }>(`/api/v1/cc/bans/all${suffix}`),
-      api.get<any>(`/api/v1/cc/stats${suffix}`).catch(() => null),
-    ])
+    q.set('domain', currentDomainName.value)
+    q.set('limit', '500')
+    const suffix = `?${q.toString()}`
+    const res = await api.get<{ bans: any[] }>(`/api/v1/cc/bans/history${suffix}`)
     bans.value = res.bans || []
-    ccStats.value = statsRes
+    if (auth.isAdmin) {
+      const statsSuffix = `?domain=${encodeURIComponent(currentDomainName.value)}`
+      ccStats.value = await api.get<any>(`/api/v1/cc/stats${statsSuffix}`).catch(() => null)
+    } else {
+      ccStats.value = null
+    }
   } catch {
     bans.value = []
     ccStats.value = null
@@ -1024,9 +1065,8 @@ async function loadBans() {
 
 function openBanModal() {
   banError.value = ''
-  const selected = domains.value.find((d) => d.id === domainId.value)
   banForm.value = {
-    domain: selected?.name || '',
+    domain: currentDomainName.value,
     ip: '',
     seconds: 3600,
     reason: 'manual-cc-ban',
@@ -1060,6 +1100,18 @@ async function saveBan() {
   } finally {
     saving.value = false
   }
+}
+
+function banStatusLabel(status: string) {
+  if (status === 'active') return '生效中'
+  if (status === 'revoked') return '已解封'
+  return '已过期'
+}
+
+function banTone(status: string) {
+  if (status === 'active') return 'danger'
+  if (status === 'revoked') return 'info'
+  return 'neutral'
 }
 
 function remainingLabel(seconds: number) {
@@ -1286,7 +1338,7 @@ watch(domainId, async (id) => {
   if (!id) return
   loading.value = true
   try {
-    await Promise.all([loadSettings(), loadRules(), loadIps()])
+    await Promise.all([loadSettings(), loadRules(), loadIps(), loadBans()])
     if (tab.value === 'events') await loadEvents()
     if (tab.value === 'overview') await loadStats()
   } finally {
