@@ -45,6 +45,10 @@ fail() {
   exit 1
 }
 
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
 [[ -f "${REQUEST}" ]] || exit 0
 TAG="$(head -n 1 "${REQUEST}" | tr -d '[:space:]')"
 [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+.][A-Za-z0-9._+-]+)?$ ]] || fail "invalid release tag"
