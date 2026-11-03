@@ -50,6 +50,17 @@ TAG="$(head -n 1 "${REQUEST}" | tr -d '[:space:]')"
 [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+.][A-Za-z0-9._+-]+)?$ ]] || fail "invalid release tag"
 [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "amd64" ]] || fail "only amd64 releases are published"
 
+REPORTED=0
+on_error() {
+  local rc=$? line=${1:-?}
+  [[ "${REPORTED}" == "1" ]] && exit "${rc}"
+  REPORTED=1
+  status "failed" "${TAG:-}" "updater failed at line ${line}" || true
+  rm -f "${REQUEST}"
+  exit "${rc}"
+}
+trap 'on_error $LINENO' ERR
+
 VERSION="${TAG#v}"
 ASSET="lagran-cdn-${VERSION}-linux-amd64.tar.gz"
 BASE="${LAGRAN_UPDATE_BASE:-https://github.com/${REPO}/releases/download/${TAG}}"
@@ -94,6 +105,7 @@ if [[ -d "${PREFIX}/web" ]]; then
 fi
 status "running" "${TAG}" "backup saved to ${BACKUP}"
 
+status "running" "${TAG}" "installing binaries"
 for bin in lagran-control lagran-edge lagran-dns; do
   src="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name "${bin}" -print -quit 2>/dev/null || true)"
   [[ -n "${src}" ]] || continue
@@ -103,11 +115,13 @@ for bin in lagran-control lagran-edge lagran-dns; do
 done
 WEB_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type d -name web -print -quit 2>/dev/null || true)"
 if [[ -n "${WEB_SRC}" && -d "${PREFIX}/web" ]]; then
+  status "running" "${TAG}" "updating web assets"
   cp -a "${WEB_SRC}/." "${PREFIX}/web/" || fail "update web failed"
 fi
 HELPER_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name update.sh -print -quit 2>/dev/null || true)"
 if [[ -n "${HELPER_SRC}" ]]; then
   if grep -q 'updater-schema: 2' "${HELPER_SRC}"; then
+    status "running" "${TAG}" "installing update helper"
     install -m 0755 "${HELPER_SRC}" "${PREFIX}/bin/.lagran-update.new" \
       && mv -f "${PREFIX}/bin/.lagran-update.new" "${PREFIX}/bin/lagran-update" \
       || fail "update helper failed"
@@ -122,7 +136,13 @@ README_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name README.md -print -q
 
 for service in lagran-control lagran-edge lagran-dns; do
   if systemctl is-enabled --quiet "${service}.service" 2>/dev/null; then
-    systemctl restart "${service}.service" || fail "restart ${service} failed"
+    status "running" "${TAG}" "restarting ${service}"
+    if ! timeout 90 systemctl restart "${service}.service"; then
+      fail "restart ${service} failed or timed out"
+    fi
+    if ! timeout 30 systemctl is-active --quiet "${service}.service"; then
+      fail "${service} is not active after restart"
+    fi
   fi
 done
 status "success" "${TAG}" "updated successfully"
