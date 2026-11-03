@@ -183,8 +183,15 @@ install_env_example() {
 
 install_binary() {
   local name=$1
-  [[ -x "$STAGE/bin/$name" ]] || die "release does not contain bin/$name"
-  install -m 0755 "$STAGE/bin/$name" "$BIN_DIR/$name"
+  local src
+  src="$(find "$STAGE" -maxdepth 3 -type f -name "$name" -print -quit 2>/dev/null || true)"
+  if [[ -z "$src" ]]; then
+    local entries
+    entries="$(find "$STAGE" -maxdepth 2 -type f -printf '%P ' 2>/dev/null | cut -c1-400)"
+    die "release does not contain $name${entries:+ (found: $entries)}"
+  fi
+  # GitHub artifact downloads may lose the executable bit; force 0755 here.
+  install -m 0755 "$src" "$BIN_DIR/$name"
 }
 
 resolve_release() {
@@ -213,6 +220,14 @@ resolve_release() {
   STAGE="$TMP/stage"
   mkdir -p "$STAGE"
   tar -xzf "$TMP/$asset" -C "$STAGE"
+  # Some old bundles wrap everything in a top-level directory.
+  if [[ ! -d "$STAGE/bin" && ! -f "$STAGE/lagran-control" ]]; then
+    local nested
+    nested="$(find "$STAGE" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null || true)"
+    if [[ -n "$nested" && ( -d "$nested/bin" || -f "$nested/lagran-control" ) ]]; then
+      STAGE="$nested"
+    fi
+  fi
 }
 
 write_control_env() {
