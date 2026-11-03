@@ -44,6 +44,7 @@ jobs:
       - name: Release build (static musl)
         env:
           LAGRAN_GIT_HASH: ${{ github.sha }}
+          LAGRAN_BUILD_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
         run: cargo build --release --target x86_64-unknown-linux-musl -p control -p edge -p lagran-dns
       - name: Verify static binaries
         run: |
