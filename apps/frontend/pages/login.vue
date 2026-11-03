@@ -55,12 +55,8 @@
 
       <div class="brand-foot">
         © 2026 Lagran · 自托管 CDN 系统 ·
-        <a
-          href="https://github.com/Lagran93/Lagran"
-          target="_blank"
-          rel="noopener"
-          style="color: inherit; text-decoration: underline"
-        >
+        <a href="https://github.com/Lagran93/Lagran" target="_blank" rel="noopener"
+          style="color: inherit; text-decoration: underline">
           AGPL-3.0 源代码
         </a>
       </div>
@@ -83,7 +79,7 @@
             <div class="password-wrap">
               <input id="password" v-model="password" class="input" :type="showPassword ? 'text' : 'password'"
                 autocomplete="current-password" placeholder="请输入密码" required />
-              <button class="password-toggle" type="button" :aria-label="showPassword ? '隐藏密码' : '显示密码'"
+              <button tabindex="-1" class="password-toggle" type="button" :aria-label="showPassword ? '隐藏密码' : '显示密码'"
                 @click="showPassword = !showPassword">
                 <AppIcon :name="showPassword ? 'eye-off' : 'eye'" :size="16" />
               </button>
@@ -95,11 +91,11 @@
             <div class="captcha-row">
               <input id="captcha" v-model="captchaCode" class="input" maxlength="5" autocomplete="off"
                 placeholder="请输入右侧 5 位验证码" required />
-              <button class="captcha-image" type="button" title="刷新验证码" @click="loadCaptcha">
+              <button tabindex="-1" class="captcha-image" type="button" title="刷新验证码" @click="loadCaptcha">
                 <img v-if="captchaImage" :src="captchaImage" alt="验证码" />
                 <span v-else>加载中…</span>
               </button>
-              <button class="captcha-refresh" type="button" aria-label="刷新验证码" @click="loadCaptcha">
+              <button tabindex="-1" class="captcha-refresh" type="button" aria-label="刷新验证码" @click="loadCaptcha">
                 <AppIcon name="refresh" :size="16" />
               </button>
             </div>

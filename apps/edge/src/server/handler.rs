@@ -102,7 +102,7 @@ struct Effective {
 static HANDLER_ORIGIN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Weighted, health-aware origin order for the legacy handler path.
-async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<String> {
+async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<OriginTarget> {
     let mut pool = if eff.origins.is_empty() {
         let mut list = vec![OriginTarget {
             url: eff.origin_url.clone(),
@@ -110,6 +110,7 @@ async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<S
             priority: 0,
             enabled: true,
             host_header: None,
+            sni: None,
         }];
         if !eff.backup_url.is_empty() {
             list.push(OriginTarget {
@@ -118,6 +119,7 @@ async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<S
                 priority: 1,
                 enabled: true,
                 host_header: None,
+                sni: None,
             });
         }
         list
@@ -152,9 +154,6 @@ async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<S
 
     let seed = HANDLER_ORIGIN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     OriginTarget::weighted_order(candidates, seed)
-        .into_iter()
-        .map(|o| o.url)
-        .collect()
 }
 
 enum Fetched {
@@ -381,7 +380,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         let ws_origin = origin_sequence(&state, &host, &eff)
             .await
             .first()
-            .cloned()
+            .map(|o| o.url.clone())
             .unwrap_or_else(|| eff.origin_url.clone());
         let resp =
             websocket::handle_upgrade(req, &ws_origin, &path_and_query, &headers, eff.timeout_ms)
@@ -780,11 +779,11 @@ async fn bypass_to_origin(
         }
     };
 
-    let attempt = |url: String| {
+    let attempt = |target: OriginTarget| {
         let origin = state.origin.clone();
         let method = method.clone();
         let mut headers = headers.clone();
-        if let Some(host) = origin_host_override(eff, &url) {
+        if let Some(host) = target.host_header.as_deref() {
             if let Ok(value) = HeaderValue::from_str(host) {
                 headers.insert(header::HOST, value);
             }
@@ -794,7 +793,15 @@ async fn bypass_to_origin(
         async move {
             match tokio::time::timeout(
                 Duration::from_millis(eff.timeout_ms),
-                origin.request(&url, &method, &path, &headers, Some(body), true),
+                origin.request_with_sni(
+                    &target.url,
+                    &method,
+                    &path,
+                    &headers,
+                    Some(body),
+                    true,
+                    target.sni.as_deref(),
+                ),
             )
             .await
             {
@@ -825,12 +832,12 @@ async fn bypass_to_origin(
         return default_page::origin_error_page(host, path_only, OriginFailure::Unhealthy);
     }
     let mut result = Err(FetchError::Unhealthy);
-    for url in sequence {
-        result = attempt(url.clone()).await;
+    for target in sequence {
+        result = attempt(target.clone()).await;
         if result.is_ok() {
             break;
         }
-        tracing::warn!(origin = %url, "origin failed, trying next origin");
+        tracing::warn!(origin = %target.url, "origin failed, trying next origin");
     }
 
     match result {
@@ -961,13 +968,6 @@ async fn fetch_with_single_flight(
     }
 }
 
-fn origin_host_override<'a>(eff: &'a Effective, url: &str) -> Option<&'a str> {
-    eff.origins
-        .iter()
-        .find(|origin| origin.url == url)
-        .and_then(|origin| origin.host_header.as_deref())
-}
-
 async fn fetch_origin(
     state: &AppState,
     eff: &Effective,
@@ -982,11 +982,11 @@ async fn fetch_origin(
     }
 
     let timeout = Duration::from_millis(eff.timeout_ms);
-    let attempt = |url: String| {
+    let attempt = |target: OriginTarget| {
         let origin = state.origin.clone();
         let method = method.clone();
         let mut headers = headers.clone();
-        if let Some(host) = origin_host_override(eff, &url) {
+        if let Some(host) = target.host_header.as_deref() {
             if let Ok(value) = HeaderValue::from_str(host) {
                 headers.insert(header::HOST, value);
             }
@@ -995,7 +995,15 @@ async fn fetch_origin(
         async move {
             match tokio::time::timeout(
                 timeout,
-                origin.request(&url, &method, &path, &headers, None, false),
+                origin.request_with_sni(
+                    &target.url,
+                    &method,
+                    &path,
+                    &headers,
+                    None,
+                    false,
+                    target.sni.as_deref(),
+                ),
             )
             .await
             {
@@ -1007,12 +1015,12 @@ async fn fetch_origin(
     };
 
     let mut result = Err(FetchError::Unhealthy);
-    for url in sequence {
-        result = attempt(url.clone()).await;
+    for target in sequence {
+        result = attempt(target.clone()).await;
         if result.is_ok() {
             break;
         }
-        tracing::warn!(origin = %url, "origin failed, trying next origin");
+        tracing::warn!(origin = %target.url, "origin failed, trying next origin");
     }
     result
 }

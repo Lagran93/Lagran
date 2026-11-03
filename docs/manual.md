@@ -222,7 +222,20 @@ systemctl status lagran-dns --no-pager
    - 域名，例如 `cdn.example.com`
    - 源站协议、Host、端口
    - 可选备用源站、源站池
+   - 可选「源站 TLS SNI」和「回源 Host」
    - 所属项目
+
+源站主机支持域名或 IP。源站填 IP 且使用 HTTPS 时，证书通常只包含域名 SAN，需要填写：
+
+```text
+源站主机：45.63.84.225
+源站协议：HTTPS
+源站端口：443
+源站 TLS SNI：test-origin.akgo.net
+回源 Host：test-origin.akgo.net
+```
+
+Edge 会用 SNI 建立 TLS 并校验证书，用回源 Host 访问虚拟主机；回源 Host 留空时回退到 SNI，再回退到源站主机。
 2. 配置 DNS：
    - 客户域名 CNAME 到统一边缘接入域名，或
    - 直接 A/AAAA 记录到 Edge 公网 IP。
@@ -348,6 +361,7 @@ no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 - Origin Shield 地址
 - CC 防御
 - 源站池/备用源站
+- 每个源站可独立配置 TLS SNI、回源 Host
 
 开启 CC 后：
 

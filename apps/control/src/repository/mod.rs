@@ -39,6 +39,12 @@ pub struct DomainOrigin {
     pub priority: i32,
     #[serde(default = "default_origin_enabled")]
     pub enabled: bool,
+    /// Optional TLS SNI / certificate hostname when `host` is an IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Optional Host header sent upstream. Falls back to `sni`, then `host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_header: Option<String>,
 }
 
 fn default_origin_weight() -> u32 {

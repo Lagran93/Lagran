@@ -16,8 +16,11 @@ pub struct OriginTarget {
     pub weight: u32,
     pub priority: i32,
     pub enabled: bool,
-    /// Override Host sent upstream. Used by Origin Shield (public domain Host).
+    /// Override Host sent upstream. Used by Origin Shield (public domain Host)
+    /// and by IP origins that need a hostname-based virtual host.
     pub host_header: Option<String>,
+    /// TLS SNI / certificate hostname. `None` uses the URL host.
+    pub sni: Option<String>,
 }
 
 impl OriginTarget {
@@ -169,6 +172,7 @@ mod tests {
                 priority: 0,
                 enabled: true,
                 host_header: None,
+                sni: None,
             }],
             rules: vec![
                 CacheRule::simple("/*".into(), 60, 0),
@@ -221,6 +225,7 @@ mod tests {
                 priority: 0,
                 enabled: true,
                 host_header: None,
+                sni: None,
             },
             OriginTarget {
                 url: "http://b".into(),
@@ -228,6 +233,7 @@ mod tests {
                 priority: 0,
                 enabled: true,
                 host_header: None,
+                sni: None,
             },
         ];
         let mut a = 0;

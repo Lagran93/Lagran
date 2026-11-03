@@ -61,6 +61,15 @@
             <input v-model="form.origin_host" class="input" placeholder="origin.example.com 或 203.0.113.10" />
             <span class="field-hint">支持 IP、域名；端口需对边缘节点网络可达。</span>
           </div>
+          <div class="field">
+            <label class="field-label">源站 TLS SNI（可选）</label>
+            <input v-model="form.origin_sni" class="input" placeholder="例如 origin.example.com" />
+            <span class="field-hint">源站填 IP 且 HTTPS 证书是域名证书时填写。</span>
+          </div>
+          <div class="field">
+            <label class="field-label">回源 Host（可选）</label>
+            <input v-model="form.origin_host_header" class="input" placeholder="留空则使用 SNI / 源站主机" />
+          </div>
         </div>
 
         <div v-else-if="step === 2" class="form-col">
@@ -191,6 +200,8 @@ const form = ref({
   origin_host: '',
   origin_port: 443,
   origin_proto: 'https',
+  origin_sni: '',
+  origin_host_header: '',
   ssl_enabled: true,
   project_id: '',
 })
@@ -222,6 +233,8 @@ async function createDomain() {
       origin_port: form.value.origin_port,
       origin_proto: form.value.origin_proto,
       ssl_enabled: form.value.ssl_enabled,
+      origin_sni: form.value.origin_sni.trim(),
+      origin_host_header: form.value.origin_host_header.trim(),
       project_id: form.value.project_id || undefined,
     })
     domainId.value = row.id

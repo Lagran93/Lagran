@@ -2,7 +2,7 @@
 //! forwarding and connection pooling.
 
 use anyhow::{anyhow, Context, Result};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
@@ -10,6 +10,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use lagran_cache::CacheEntry;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -44,6 +45,9 @@ impl OriginResponse {
 #[derive(Clone)]
 pub struct OriginClient {
     client: Arc<HttpsClient>,
+    /// Clients with a fixed TLS SNI, keyed by SNI hostname. One client per
+    /// certificate hostname lets an IP origin verify against its DNS cert.
+    sni_clients: Arc<RwLock<HashMap<String, Arc<HttpsClient>>>>,
     /// Fallback default origin (legacy single-origin)
     base_url: Arc<RwLock<String>>,
 }
@@ -79,31 +83,58 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+#[allow(deprecated)]
+fn build_client(server_name: Option<&str>) -> HttpsClient {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
+    http.set_connect_timeout(Some(Duration::from_secs(5)));
+
+    let base = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http();
+    let https = match server_name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => base
+            .with_server_name(name.to_string())
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(http),
+        None => base
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(http),
+    };
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(64)
+        .build(https)
+}
+
 impl OriginClient {
     pub fn new(base_url: String) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_nodelay(true);
-        http.set_connect_timeout(Some(Duration::from_secs(5)));
-
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(http);
-
-        let client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(64)
-            .build(https);
-
+        let client = build_client(None);
         Self {
             client: Arc::new(client),
+            sni_clients: Arc::new(RwLock::new(HashMap::new())),
             base_url: Arc::new(RwLock::new(base_url)),
         }
+    }
+
+    async fn client_for(&self, sni: Option<&str>) -> Arc<HttpsClient> {
+        let Some(sni) = sni.map(str::trim).filter(|s| !s.is_empty()) else {
+            return self.client.clone();
+        };
+        let key = sni.to_ascii_lowercase();
+        if let Some(client) = self.sni_clients.read().await.get(&key) {
+            return client.clone();
+        }
+        let client = Arc::new(build_client(Some(&key)));
+        self.sni_clients
+            .write()
+            .await
+            .insert(key, client.clone());
+        client
     }
 
     pub async fn set_base_url(&self, url: String) {
@@ -136,8 +167,27 @@ impl OriginClient {
         path_and_query: &str,
         headers: &HeaderMap,
     ) -> Result<(StatusCode, HeaderMap, Bytes)> {
+        self.fetch_from_with_sni(base_url, path_and_query, headers, None)
+            .await
+    }
+
+    pub async fn fetch_from_with_sni(
+        &self,
+        base_url: &str,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        sni: Option<&str>,
+    ) -> Result<(StatusCode, HeaderMap, Bytes)> {
         let resp = self
-            .request(base_url, &Method::GET, path_and_query, headers, None, false)
+            .request_with_sni(
+                base_url,
+                &Method::GET,
+                path_and_query,
+                headers,
+                None,
+                false,
+                sni,
+            )
             .await?;
         Ok((resp.status, resp.headers, resp.body))
     }
@@ -158,8 +208,27 @@ impl OriginClient {
         path_and_query: &str,
         headers: &HeaderMap,
     ) -> Result<CacheEntry> {
+        self.fetch_as_entry_from_with_sni(base_url, path_and_query, headers, None)
+            .await
+    }
+
+    pub async fn fetch_as_entry_from_with_sni(
+        &self,
+        base_url: &str,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        sni: Option<&str>,
+    ) -> Result<CacheEntry> {
         Ok(self
-            .request(base_url, &Method::GET, path_and_query, headers, None, false)
+            .request_with_sni(
+                base_url,
+                &Method::GET,
+                path_and_query,
+                headers,
+                None,
+                false,
+                sni,
+            )
             .await?
             .into_entry())
     }
@@ -177,6 +246,28 @@ impl OriginClient {
         headers: &HeaderMap,
         body: Option<Bytes>,
         forward_sensitive: bool,
+    ) -> Result<OriginResponse> {
+        self.request_with_sni(
+            base_url,
+            method,
+            path_and_query,
+            headers,
+            body,
+            forward_sensitive,
+            None,
+        )
+        .await
+    }
+
+    pub async fn request_with_sni(
+        &self,
+        base_url: &str,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        body: Option<Bytes>,
+        forward_sensitive: bool,
+        sni: Option<&str>,
     ) -> Result<OriginResponse> {
         let url = build_url(base_url, path_and_query)?;
 
@@ -202,6 +293,13 @@ impl OriginClient {
             builder = builder.header("accept-encoding", "identity");
         }
 
+        // Preserve a configured upstream Host override. `host` is normally
+        // derived from the URI; for IP origins with a DNS certificate this is
+        // the virtual-host name.
+        if let Some(host) = headers.get(header::HOST) {
+            builder = builder.header(header::HOST, host.clone());
+        }
+
         // Preserve the client address for origin-side logging/policies.
         if let Some(xff) = headers.get("x-forwarded-for") {
             builder = builder.header("x-forwarded-for", xff.clone());
@@ -211,8 +309,8 @@ impl OriginClient {
             .body(Full::new(body.unwrap_or_default()))
             .with_context(|| format!("build origin request: {url}"))?;
 
-        let resp = self
-            .client
+        let client = self.client_for(sni).await;
+        let resp = client
             .request(req)
             .await
             .with_context(|| format!("origin request failed: {url}"))?;

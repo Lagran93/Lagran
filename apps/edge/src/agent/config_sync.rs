@@ -38,6 +38,10 @@ struct OriginCfg {
     priority: i32,
     #[serde(default = "default_origin_enabled")]
     enabled: bool,
+    #[serde(default)]
+    sni: Option<String>,
+    #[serde(default)]
+    host_header: Option<String>,
 }
 
 fn default_origin_weight() -> u32 {
@@ -206,6 +210,7 @@ impl DomainCfg {
                     priority: -1,
                     enabled: true,
                     host_header: Some(self.domain.clone()),
+                    sni: None,
                 },
             );
         }
@@ -437,12 +442,20 @@ fn format_origin(o: &OriginCfg) -> String {
 }
 
 fn origin_target(o: &OriginCfg) -> crate::config::registry::OriginTarget {
+    // When an origin is addressed by IP but the certificate is issued for a
+    // hostname, `sni` is also the natural Host header. An explicit host_header
+    // still wins.
+    let host_header = o
+        .host_header
+        .clone()
+        .or_else(|| o.sni.clone());
     crate::config::registry::OriginTarget {
         url: format_origin(o),
         weight: if o.weight == 0 { 100 } else { o.weight },
         priority: o.priority,
         enabled: o.enabled,
-        host_header: None,
+        host_header,
+        sni: o.sni.clone(),
     }
 }
 

@@ -513,9 +513,16 @@ impl ProxyHttp for DataPlaneProxy {
             .find(|o| o.url == url)
             .and_then(|o| o.host_header.clone())
             .unwrap_or_default();
+        let sni = plan
+            .origins
+            .iter()
+            .find(|o| o.url == url)
+            .and_then(|o| o.sni.clone())
+            .unwrap_or_default();
         let (host, port, tls) =
             parse_origin(&url).ok_or_else(|| pingora::Error::new_str("invalid origin URL"))?;
-        self.peer_for(&host, port, tls, plan.timeout_ms).await
+        self.peer_for(&host, port, tls, plan.timeout_ms, if sni.is_empty() { None } else { Some(&sni) })
+            .await
     }
 
     fn fail_to_connect(
@@ -1541,6 +1548,7 @@ impl DataPlaneProxy {
                 priority: 0,
                 enabled: true,
                 host_header: None,
+                sni: None,
             }];
             if !plan.backup_url.is_empty() {
                 list.push(OriginTarget {
@@ -1549,6 +1557,7 @@ impl DataPlaneProxy {
                     priority: 1,
                     enabled: true,
                     host_header: None,
+                    sni: None,
                 });
             }
             list
@@ -1602,6 +1611,7 @@ impl DataPlaneProxy {
         port: u16,
         tls: bool,
         timeout_ms: u64,
+        sni: Option<&str>,
     ) -> Result<Box<HttpPeer>> {
         // HttpPeer::new() unwraps DNS resolution in Pingora 0.9 and panics on
         // NXDOMAIN. Resolve here so a dead/misconfigured origin becomes a
@@ -1618,7 +1628,8 @@ impl DataPlaneProxy {
             .next()
             .ok_or_else(|| pingora::Error::new_str("origin DNS returned no addresses"))?;
         // Passing a resolved SocketAddr avoids the panicking DNS path.
-        let mut peer = HttpPeer::new(addr, tls, host.to_string());
+        let server_name = sni.filter(|s| !s.is_empty()).unwrap_or(host);
+        let mut peer = HttpPeer::new(addr, tls, server_name.to_string());
         peer.options.connection_timeout = Some(Duration::from_millis(timeout_ms));
         peer.options.read_timeout = Some(Duration::from_millis(timeout_ms));
         Ok(Box::new(peer))

@@ -30,6 +30,10 @@ pub struct OriginConfig {
     pub weight: u32,
     pub priority: i32,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_header: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -166,6 +170,8 @@ fn origin_config(row: &repository::DomainFullRow) -> OriginConfig {
         weight: 100,
         priority: 0,
         enabled: true,
+        sni: None,
+        host_header: None,
     }
 }
 
@@ -182,6 +188,8 @@ fn origin_pool(row: &repository::DomainFullRow) -> Vec<OriginConfig> {
                 weight: o.weight,
                 priority: o.priority,
                 enabled: o.enabled,
+                sni: o.sni.clone(),
+                host_header: o.host_header.clone(),
             })
             .collect();
     }
@@ -194,6 +202,8 @@ fn origin_pool(row: &repository::DomainFullRow) -> Vec<OriginConfig> {
             weight: 100,
             priority: 1,
             enabled: true,
+            sni: None,
+            host_header: None,
         });
     }
     out
@@ -210,6 +220,8 @@ fn backup_config(row: &repository::DomainFullRow) -> Option<OriginConfig> {
         weight: 100,
         priority: 1,
         enabled: true,
+        sni: None,
+        host_header: None,
     })
 }
 
@@ -306,6 +318,8 @@ pub(crate) fn build(
         o.weight.hash(&mut h);
         o.priority.hash(&mut h);
         o.enabled.hash(&mut h);
+        o.sni.hash(&mut h);
+        o.host_header.hash(&mut h);
     }
     cc.enabled.hash(&mut h);
     cc.rps.hash(&mut h);
@@ -325,10 +339,14 @@ pub(crate) fn build(
     origin.host.hash(&mut h);
     origin.port.hash(&mut h);
     origin.protocol.hash(&mut h);
+    origin.sni.hash(&mut h);
+    origin.host_header.hash(&mut h);
     if let Some(ref b) = backup {
         b.host.hash(&mut h);
         b.port.hash(&mut h);
         b.protocol.hash(&mut h);
+        b.sni.hash(&mut h);
+        b.host_header.hash(&mut h);
     }
     for r in &rules {
         r.path_pattern.hash(&mut h);

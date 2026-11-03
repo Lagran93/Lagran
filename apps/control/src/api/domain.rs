@@ -45,6 +45,10 @@ pub struct CreateDomainRequest {
     pub backup_origin_port: Option<u16>,
     pub backup_origin_proto: Option<String>,
     pub origins: Option<Vec<repository::DomainOrigin>>,
+    /// Optional TLS SNI / certificate hostname for the primary origin.
+    pub origin_sni: Option<String>,
+    /// Optional Host header for the primary origin.
+    pub origin_host_header: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +102,8 @@ pub(crate) fn effective_origins(r: &repository::DomainRow) -> Vec<repository::Do
         weight: 100,
         priority: 0,
         enabled: true,
+        sni: None,
+        host_header: None,
     }];
     if !r.backup_origin_host.is_empty() && r.backup_origin_port > 0 {
         out.push(repository::DomainOrigin {
@@ -111,9 +117,35 @@ pub(crate) fn effective_origins(r: &repository::DomainRow) -> Vec<repository::Do
             weight: 100,
             priority: 1,
             enabled: true,
+            sni: None,
+            host_header: None,
         });
     }
     out
+}
+
+fn normalize_origin_meta(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 253 {
+        return Err(format!("{field} is too long"));
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '/' || c == '@' || c == ':')
+        || value.contains("://")
+    {
+        return Err(format!("{field} is invalid"));
+    }
+    Ok(Some(value))
 }
 
 fn normalize_origins(
@@ -142,6 +174,8 @@ fn normalize_origins(
         if origin.port == 0 {
             origin.port = if origin.proto == "https" { 443 } else { 80 };
         }
+        origin.sni = normalize_origin_meta(origin.sni, "origin SNI")?;
+        origin.host_header = normalize_origin_meta(origin.host_header, "origin Host header")?;
         origin.weight = if origin.weight == 0 {
             100
         } else {
@@ -256,7 +290,7 @@ pub async fn create(
     actor: Actor,
     Json(req): Json<CreateDomainRequest>,
 ) -> Result<(StatusCode, Json<DomainDto>), (StatusCode, Json<ErrorBody>)> {
-    let normalized_origins = match req.origins {
+    let mut normalized_origins = match req.origins.clone() {
         Some(list) => Some(
             normalize_origins(list)
                 .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?,
@@ -296,6 +330,28 @@ pub async fn create(
             })
         });
     let ssl = req.ssl_enabled.unwrap_or(proto == "https");
+
+    if normalized_origins.is_none() {
+        let sni = normalize_origin_meta(req.origin_sni.clone(), "origin SNI")
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        let host_header = normalize_origin_meta(req.origin_host_header.clone(), "origin Host header")
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        if sni.is_some() || host_header.is_some() {
+            normalized_origins = Some(
+                normalize_origins(vec![repository::DomainOrigin {
+                    host: origin_host.clone(),
+                    port: port as u16,
+                    proto: proto.clone(),
+                    weight: 100,
+                    priority: 0,
+                    enabled: true,
+                    sni,
+                    host_header,
+                }])
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?,
+            );
+        }
+    }
 
     // Tenancy: admins may leave a domain unassigned (global); everyone else's
     // domains always live in a project they can write. When no project is
@@ -472,6 +528,10 @@ pub struct UpdateDomainRequest {
     pub backup_origin_port: Option<u16>,
     pub backup_origin_proto: Option<String>,
     pub origins: Option<Vec<repository::DomainOrigin>>,
+    /// Optional TLS SNI / certificate hostname for the primary origin.
+    pub origin_sni: Option<String>,
+    /// Optional Host header for the primary origin.
+    pub origin_host_header: Option<String>,
 }
 
 /// PUT /api/v1/domains/{id}
@@ -502,7 +562,7 @@ pub async fn update(
         .map_err(|_| db_error())?
         .ok_or_else(|| not_found(&id))?;
 
-    let normalized_origins = match req.origins.clone() {
+    let mut normalized_origins = match req.origins.clone() {
         Some(list) => Some(
             normalize_origins(list)
                 .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?,
@@ -541,6 +601,37 @@ pub async fn update(
         db_error()
     })?
     .ok_or_else(|| not_found(&id))?;
+
+    if normalized_origins.is_none() {
+        let sni = normalize_origin_meta(req.origin_sni.clone(), "origin SNI")
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        let host_header = normalize_origin_meta(req.origin_host_header.clone(), "origin Host header")
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        if req.origin_sni.is_some() || req.origin_host_header.is_some() {
+            let mut pool = if before.origins.0.is_empty() {
+                vec![repository::DomainOrigin {
+                    host: row.origin_host.clone(),
+                    port: row.origin_port.max(0) as u16,
+                    proto: row.origin_proto.clone(),
+                    weight: 100,
+                    priority: 0,
+                    enabled: true,
+                    sni: None,
+                    host_header: None,
+                }]
+            } else {
+                before.origins.0.clone()
+            };
+            if let Some(first) = pool.iter_mut().find(|o| o.enabled) {
+                first.host = row.origin_host.clone();
+                first.port = row.origin_port.max(0) as u16;
+                first.proto = row.origin_proto.clone();
+                first.sni = sni;
+                first.host_header = host_header;
+            }
+            normalized_origins = Some(pool);
+        }
+    }
 
     if let Some(ref origins) = normalized_origins {
         repository::set_domain_origins(&state.pool, uid, origins)
@@ -891,6 +982,8 @@ mod tests {
             weight,
             priority,
             enabled: true,
+            sni: None,
+            host_header: None,
         }
     }
 
@@ -909,6 +1002,16 @@ mod tests {
         let mut disabled = origin("a.test", 1, 0);
         disabled.enabled = false;
         assert!(normalize_origins(vec![disabled]).is_err());
+    }
+
+    #[test]
+    fn origin_sni_and_host_header_are_normalized() {
+        let mut o = origin("45.63.84.225", 100, 0);
+        o.sni = Some("Test-Origin.AKGO.net.".into());
+        o.host_header = Some("Test-Origin.AKGO.net".into());
+        let pool = normalize_origins(vec![o]).expect("valid sni");
+        assert_eq!(pool[0].sni.as_deref(), Some("test-origin.akgo.net"));
+        assert_eq!(pool[0].host_header.as_deref(), Some("test-origin.akgo.net"));
     }
 
     #[test]

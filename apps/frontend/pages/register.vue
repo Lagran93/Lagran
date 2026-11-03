@@ -39,11 +39,11 @@
         <div class="captcha-row">
           <input id="captcha" v-model="captchaCode" class="input" maxlength="5" autocomplete="off"
             placeholder="请输入右侧 5 位验证码" required />
-          <button class="captcha-image" type="button" title="刷新验证码" @click="loadCaptcha">
+          <button tabindex="-1" class="captcha-image" type="button" title="刷新验证码" @click="loadCaptcha">
             <img v-if="captchaImage" :src="captchaImage" alt="验证码" />
             <span v-else>加载中…</span>
           </button>
-          <button class="captcha-refresh" type="button" aria-label="刷新验证码" @click="loadCaptcha">
+          <button tabindex="-1" class="captcha-refresh" type="button" aria-label="刷新验证码" @click="loadCaptcha">
             <AppIcon name="refresh" :size="16" />
           </button>
         </div>

@@ -168,8 +168,18 @@
           </div>
           <div class="field span-2">
             <label class="field-label">源站主机 <span class="req">*</span></label>
-            <input v-model="createForm.origin_host" class="input" placeholder="例如 origin.example.com" />
+            <input v-model="createForm.origin_host" class="input" placeholder="例如 origin.example.com 或 203.0.113.10" />
             <span class="field-hint">接入后可在「编辑源站配置」中添加更多源站，并设置权重与优先级。</span>
+          </div>
+          <div class="field">
+            <label class="field-label">源站 TLS SNI</label>
+            <input v-model="createForm.origin_sni" class="input" placeholder="例如 origin.example.com" />
+            <span class="field-hint">源站填 IP 且 HTTPS 证书是域名证书时填写。</span>
+          </div>
+          <div class="field">
+            <label class="field-label">回源 Host</label>
+            <input v-model="createForm.origin_host_header" class="input" placeholder="留空则使用 SNI" />
+            <span class="field-hint">源站虚拟主机需要的 Host，留空时回退到 SNI/源站主机。</span>
           </div>
           <div class="field span-2">
             <label class="field-label">所属项目</label>
@@ -185,52 +195,100 @@
     </BaseModal>
 
     <!-- 编辑源站 -->
-    <BaseModal v-model="editOpen" title="编辑源站配置" width="720px" confirm-text="保存修改" :loading="submitting"
+    <BaseModal v-model="editOpen" title="编辑源站配置" width="880px" confirm-text="保存修改" :loading="submitting"
       @confirm="saveOrigin">
-      <div class="form-col">
-        <div class="section-title">源站池</div>
-        <div class="origin-row origin-head">
-          <span>协议</span>
-          <span>源站主机</span>
-          <span>端口</span>
-          <span>权重</span>
-          <span>优先级</span>
-          <span>状态</span>
-          <span></span>
-        </div>
-        <div v-for="(origin, index) in editForm.origins" :key="index" class="origin-row">
-          <select v-model="origin.proto" class="select">
-            <option value="https">HTTPS</option>
-            <option value="http">HTTP</option>
-          </select>
-          <input v-model="origin.host" class="input" placeholder="源站主机" />
-          <input v-model.number="origin.port" class="input" type="number" placeholder="端口" />
-          <input v-model.number="origin.weight" class="input" type="number" min="1" title="权重" placeholder="权重" />
-          <input v-model.number="origin.priority" class="input" type="number" min="0" title="优先级" placeholder="优先级" />
-          <label class="check origin-check">
-            <input v-model="origin.enabled" type="checkbox" />
-            启用
-          </label>
-          <button class="btn btn-text btn-sm danger" type="button" :disabled="editForm.origins.length <= 1"
-            @click="removeOrigin(index)">
-            删除
+      <div class="origin-editor">
+        <div class="origin-editor-head">
+          <div>
+            <div class="origin-editor-title">源站池</div>
+            <div class="origin-editor-sub">
+              优先级数字越小越优先；同一优先级按权重分配，健康检查失败会自动跳过。
+            </div>
+          </div>
+          <button class="btn btn-default btn-sm" type="button" @click="addOrigin">
+            <AppIcon name="plus" :size="14" />
+            添加源站
           </button>
         </div>
-        <button class="btn btn-default btn-sm" type="button" @click="addOrigin">
-          + 添加源站
-        </button>
-        <p class="field-hint">
-          优先级数字越小越优先；同一优先级按权重分配流量。健康检查失败的源站会被自动跳过，全部异常时仍会尝试。
-        </p>
 
-        <label class="check">
-          <input v-model="editForm.ssl_enabled" type="checkbox" />
-          启用 HTTPS（需要有效证书）
-        </label>
-        <p class="field-hint" style="margin-top: 4px">
-          开启后该域名的 HTTP 请求会 301/308 跳转到 HTTPS；跳转端口优先取
-          EDGE_HTTPS_REDIRECT_PORT，其次取 HTTPS 监听端口（443 时省略）。
-        </p>
+        <div class="origin-list">
+          <div v-for="(origin, index) in editForm.origins" :key="index" class="origin-card"
+            :class="{ 'is-disabled': !origin.enabled }">
+            <div class="origin-card-head">
+              <div class="origin-identity">
+                <span class="origin-number">{{ index + 1 }}</span>
+                <div class="origin-name-wrap">
+                  <div class="origin-name">{{ origin.host || '未填写源站主机' }}</div>
+                  <div class="origin-meta">
+                    <span>{{ origin.proto.toUpperCase() }}</span>
+                    <span>·</span>
+                    <span>{{ origin.port || '—' }}</span>
+                    <span v-if="origin.enabled" class="origin-live">启用</span>
+                    <span v-else class="origin-paused">停用</span>
+                  </div>
+                </div>
+              </div>
+              <div class="origin-card-actions">
+                <label class="origin-toggle">
+                  <input v-model="origin.enabled" type="checkbox" />
+                  启用
+                </label>
+                <button class="btn btn-text btn-sm danger" type="button"
+                  :disabled="editForm.origins.length <= 1" @click="removeOrigin(index)">
+                  删除
+                </button>
+              </div>
+            </div>
+
+            <div class="origin-grid">
+              <label class="origin-field">
+                <span>协议</span>
+                <select v-model="origin.proto" class="select">
+                  <option value="https">HTTPS</option>
+                  <option value="http">HTTP</option>
+                </select>
+              </label>
+              <label class="origin-field span-2">
+                <span>源站主机 / IP</span>
+                <input v-model="origin.host" class="input" placeholder="origin.example.com 或 203.0.113.10" />
+              </label>
+              <label class="origin-field">
+                <span>端口</span>
+                <input v-model.number="origin.port" class="input" type="number" min="1" max="65535" />
+              </label>
+              <label class="origin-field">
+                <span>权重</span>
+                <input v-model.number="origin.weight" class="input" type="number" min="1" />
+              </label>
+              <label class="origin-field">
+                <span>优先级</span>
+                <input v-model.number="origin.priority" class="input" type="number" min="0" />
+              </label>
+              <label class="origin-field span-2">
+                <span>TLS SNI <em>可选</em></span>
+                <input v-model="origin.sni" class="input" placeholder="证书域名，例如 origin.example.com" />
+              </label>
+              <label class="origin-field span-4">
+                <span>回源 Host <em>可选</em></span>
+                <input v-model="origin.host_header" class="input" placeholder="留空则使用 SNI / 源站主机" />
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="origin-options">
+          <label class="origin-option">
+            <input v-model="editForm.ssl_enabled" type="checkbox" />
+            <span>
+              <b>启用 HTTPS</b>
+              <small>HTTP 请求会 301/308 跳转到 HTTPS，需要有效证书</small>
+            </span>
+          </label>
+          <div class="origin-option-note">
+            源站填 IP 且使用 HTTPS 域名证书时，填写 TLS SNI；多虚拟主机时填写回源 Host。
+          </div>
+        </div>
+
         <p v-if="editError" class="text-danger" style="font-size: 13px">{{ editError }}</p>
       </div>
     </BaseModal>
@@ -283,11 +341,7 @@
 
         <div class="field">
           <label class="field-label">Origin Shield 地址</label>
-          <input
-            v-model="settings.shield_url"
-            class="input"
-            placeholder="https://shield.example.com（留空关闭）"
-          />
+          <input v-model="settings.shield_url" class="input" placeholder="https://shield.example.com（留空关闭）" />
           <span class="field-hint">
             可选。配置后边缘优先向 Shield 回源，并保留当前域名 Host；Shield 不可用时自动回退到普通源站。
           </span>
@@ -377,6 +431,8 @@ const createForm = ref({
   origin_host: '',
   origin_port: 443,
   origin_proto: 'https',
+  origin_sni: '',
+  origin_host_header: '',
   project_id: '',
 })
 
@@ -390,6 +446,8 @@ interface OriginForm {
   weight: number
   priority: number
   enabled: boolean
+  sni?: string
+  host_header?: string
 }
 const editForm = ref({
   origins: [] as OriginForm[],
@@ -514,6 +572,8 @@ function openCreate() {
     origin_host: '',
     origin_port: 443,
     origin_proto: 'https',
+    origin_sni: '',
+    origin_host_header: '',
     project_id: '',
   }
   createOpen.value = true
@@ -533,6 +593,8 @@ async function createDomain() {
       origin_port: createForm.value.origin_port || 80,
       origin_proto: createForm.value.origin_proto,
       ssl_enabled: createForm.value.origin_proto === 'https',
+      origin_sni: createForm.value.origin_sni.trim(),
+      origin_host_header: createForm.value.origin_host_header.trim(),
     }
     if (createForm.value.project_id) body.project_id = createForm.value.project_id
     await api.post('/api/v1/domains', body)
@@ -574,6 +636,8 @@ function openEdit(d: any) {
         weight: origin.weight ?? 100,
         priority: origin.priority ?? 0,
         enabled: origin.enabled !== false,
+        sni: origin.sni || '',
+        host_header: origin.host_header || '',
       }))
       : [
         {
@@ -583,6 +647,8 @@ function openEdit(d: any) {
           weight: 100,
           priority: 0,
           enabled: true,
+          sni: '',
+          host_header: '',
         },
       ]
   editForm.value = {
@@ -600,6 +666,8 @@ function addOrigin() {
     weight: 100,
     priority: 0,
     enabled: true,
+    sni: '',
+    host_header: '',
   })
 }
 
@@ -618,6 +686,8 @@ async function saveOrigin() {
       weight: Math.max(1, Number(origin.weight) || 100),
       priority: Math.max(0, Number(origin.priority) || 0),
       enabled: origin.enabled,
+      sni: origin.sni?.trim() || '',
+      host_header: origin.host_header?.trim() || '',
     }))
     .filter((origin) => origin.host)
   if (!pool.length) {
@@ -629,9 +699,13 @@ async function saveOrigin() {
     return
   }
   if (!editDomain.value) return
+  const primary = pool.find((origin) => origin.enabled) ?? pool[0]
+  if (!primary) {
+    editError.value = '至少填写一个源站主机'
+    return
+  }
   submitting.value = true
   try {
-    const primary = pool.find((origin) => origin.enabled) || pool[0]
     await api.put(`/api/v1/domains/${editDomain.value.id}`, {
       origin_host: primary.host,
       origin_port: primary.port,
@@ -760,27 +834,227 @@ onMounted(load)
   border-bottom: 1px solid var(--divider);
 }
 
-.origin-row {
-  display: grid;
-  grid-template-columns: 88px minmax(160px, 1fr) 82px 78px 78px 64px 56px;
-  gap: 8px;
-  align-items: center;
+.origin-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
-.origin-head {
-  font-size: 12px;
+.origin-editor-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.origin-editor-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.origin-editor-sub {
+  margin-top: 4px;
   color: var(--text-3);
-  padding: 0 0 2px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
-.origin-row .select,
-.origin-row .input {
-  height: 32px;
+.origin-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.origin-card {
+  border: 1px solid var(--divider);
+  border-radius: 12px;
+  background: #fff;
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.origin-card:hover {
+  border-color: var(--border);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+}
+
+.origin-card.is-disabled {
+  background: #fafbfc;
+}
+
+.origin-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--divider);
+  background: #fcfcfd;
+}
+
+.origin-card.is-disabled .origin-card-head {
+  background: #f6f7f9;
+}
+
+.origin-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
 }
 
-.origin-check {
+.origin-number {
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  background: var(--brand-bg);
+  color: var(--brand);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.origin-name-wrap {
+  min-width: 0;
+}
+
+.origin-name {
+  color: var(--text-1);
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.origin-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.origin-live,
+.origin-paused {
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+}
+
+.origin-live {
+  color: #15803d;
+  background: #ecfdf3;
+}
+
+.origin-paused {
+  color: var(--text-3);
+  background: #f1f3f5;
+}
+
+.origin-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.origin-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.origin-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px 12px;
+  padding: 14px;
+}
+
+.origin-field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.origin-field > span {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.origin-field > span em {
+  color: var(--text-3);
+  font-style: normal;
+  font-weight: 400;
+}
+
+.origin-field .input,
+.origin-field .select {
+  height: 34px;
+  width: 100%;
+  min-width: 0;
+}
+
+.origin-field.span-2 {
+  grid-column: span 2;
+}
+
+.origin-field.span-4 {
+  grid-column: span 4;
+}
+
+.origin-options {
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: #fafbfc;
+}
+
+.origin-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.origin-option input {
+  margin-top: 2px;
+}
+
+.origin-option span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.origin-option b {
+  color: var(--text-1);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.origin-option small {
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.origin-option-note {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--divider);
+  color: var(--text-3);
   font-size: 12px;
 }
 
@@ -804,41 +1078,35 @@ onMounted(load)
   color: var(--brand);
 }
 
-@media (max-width: 900px) {
-  .origin-head {
-    display: none;
+@media (max-width: 720px) {
+  .origin-editor-head {
+    flex-direction: column;
   }
 
-  .origin-row {
-    display: flex;
-    flex-wrap: wrap;
-    padding: 12px;
-    border: 1px solid var(--divider);
-    border-radius: 10px;
-    background: #fafbfc;
+  .origin-editor-head .btn {
+    width: 100%;
+    justify-content: center;
   }
 
-  .origin-row .select {
-    width: 84px;
-    flex: none;
+  .origin-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .origin-row .input {
-    flex: 1 1 100px;
-    width: auto;
+  .origin-field.span-2 {
+    grid-column: span 2;
   }
 
-  .origin-row .input:first-of-type {
-    flex: 1 1 100%;
+  .origin-field.span-4 {
+    grid-column: span 2;
   }
 
-  .origin-row .origin-check {
-    flex: none;
+  .origin-card-head {
+    align-items: flex-start;
   }
 
-  .origin-row .btn {
-    flex: none;
-    margin-left: auto;
+  .origin-card-actions {
+    flex-direction: column;
+    align-items: flex-end;
   }
 }
 </style>
