@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# updater-schema: 2
 # Root-only updater triggered by /var/lib/lagran/update.request through the
 # lagran-update.path systemd unit. The control plane only writes the request;
 # this script performs the privileged download, verification and restart.
@@ -66,7 +67,20 @@ curl -fsSL --retry 3 --connect-timeout 15 "${BASE}/SHA256SUMS" \
 
 mkdir -p "${WORK}/stage"
 tar -xzf "${WORK}/${ASSET}" -C "${WORK}/stage" || fail "extract release failed"
-[[ -x "${WORK}/stage/bin/lagran-control" ]] || fail "release has no control binary"
+STAGE_ROOT="${WORK}/stage"
+# Older bundles may wrap everything in a top-level directory. Resolve the real
+# stage root before looking for binaries.
+if [[ ! -d "${STAGE_ROOT}/bin" && ! -f "${STAGE_ROOT}/lagran-control" ]]; then
+  nested="$(find "${STAGE_ROOT}" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null || true)"
+  if [[ -n "${nested}" && ( -d "${nested}/bin" || -f "${nested}/lagran-control" ) ]]; then
+    STAGE_ROOT="${nested}"
+  fi
+fi
+CONTROL_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name lagran-control -print -quit 2>/dev/null || true)"
+if [[ -z "${CONTROL_SRC}" ]]; then
+  entries="$(find "${STAGE_ROOT}" -maxdepth 2 -type f -printf '%P ' 2>/dev/null | cut -c1-400)"
+  fail "release has no control binary${entries:+ (found: ${entries})}"
+fi
 
 BACKUP="${DATA_DIR}/update-backup/${TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "${BACKUP}/bin"
@@ -81,22 +95,30 @@ fi
 status "running" "${TAG}" "backup saved to ${BACKUP}"
 
 for bin in lagran-control lagran-edge lagran-dns; do
-  src="${WORK}/stage/bin/${bin}"
-  [[ -x "${src}" ]] || continue
+  src="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name "${bin}" -print -quit 2>/dev/null || true)"
+  [[ -n "${src}" ]] || continue
   tmp="${PREFIX}/bin/.${bin}.new"
   install -m 0755 "${src}" "${tmp}" || fail "install ${bin} failed"
   mv -f "${tmp}" "${PREFIX}/bin/${bin}" || fail "replace ${bin} failed"
 done
-if [[ -d "${WORK}/stage/web" && -d "${PREFIX}/web" ]]; then
-  cp -a "${WORK}/stage/web/." "${PREFIX}/web/" || fail "update web failed"
+WEB_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type d -name web -print -quit 2>/dev/null || true)"
+if [[ -n "${WEB_SRC}" && -d "${PREFIX}/web" ]]; then
+  cp -a "${WEB_SRC}/." "${PREFIX}/web/" || fail "update web failed"
 fi
-if [[ -f "${WORK}/stage/update.sh" ]]; then
-  install -m 0755 "${WORK}/stage/update.sh" "${PREFIX}/bin/.lagran-update.new" \
-    && mv -f "${PREFIX}/bin/.lagran-update.new" "${PREFIX}/bin/lagran-update" \
-    || fail "update helper failed"
+HELPER_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name update.sh -print -quit 2>/dev/null || true)"
+if [[ -n "${HELPER_SRC}" ]]; then
+  if grep -q 'updater-schema: 2' "${HELPER_SRC}"; then
+    install -m 0755 "${HELPER_SRC}" "${PREFIX}/bin/.lagran-update.new" \
+      && mv -f "${PREFIX}/bin/.lagran-update.new" "${PREFIX}/bin/lagran-update" \
+      || fail "update helper failed"
+  else
+    warn "release contains an older update helper; keeping the installed helper"
+  fi
 fi
-install -m 0644 "${WORK}/stage/LICENSE" "${PREFIX}/LICENSE" 2>/dev/null || true
-install -m 0644 "${WORK}/stage/README.md" "${PREFIX}/README.md" 2>/dev/null || true
+LICENSE_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name LICENSE -print -quit 2>/dev/null || true)"
+[[ -n "${LICENSE_SRC}" ]] && install -m 0644 "${LICENSE_SRC}" "${PREFIX}/LICENSE" 2>/dev/null || true
+README_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name README.md -print -quit 2>/dev/null || true)"
+[[ -n "${README_SRC}" ]] && install -m 0644 "${README_SRC}" "${PREFIX}/README.md" 2>/dev/null || true
 
 for service in lagran-control lagran-edge lagran-dns; do
   if systemctl is-enabled --quiet "${service}.service" 2>/dev/null; then

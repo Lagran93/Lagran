@@ -301,7 +301,11 @@ EOF
 
 install_update_helper() {
   [[ -f "$STAGE/update.sh" ]] || return 0
-  install -m 0755 "$STAGE/update.sh" "$BIN_DIR/lagran-update"
+  if [[ -f "$BIN_DIR/lagran-update" ]] && ! grep -q 'updater-schema: 2' "$STAGE/update.sh"; then
+    warn "release contains an older update helper; keeping the installed helper"
+  else
+    install -m 0755 "$STAGE/update.sh" "$BIN_DIR/lagran-update"
+  fi
   cat > "$CONF_DIR/update.env" <<EOF
 LAGRAN_PREFIX=${PREFIX}
 LAGRAN_DATA_DIR=${DATA_DIR}
