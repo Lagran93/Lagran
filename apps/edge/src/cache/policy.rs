@@ -6,10 +6,13 @@
 //!   3. `Expires` - `Date` (or now, when `Date` is absent)
 //!   4. the domain/default TTL
 //!
-//! `no-store`, `private`, `no-cache` without an explicit rule TTL, `max-age=0`
-//! without a rule, and non-trivial `Vary` prevent storing. A cache rule with an
-//! explicit TTL may override the origin's `no-cache`; `ignore_cookie` also allows
-//! `Vary: Cookie` for deliberately shared static assets.
+//! `no-store`, `private`, `no-cache`, `max-age=0`/`s-maxage=0`, a
+//! `Set-Cookie`, and non-trivial `Vary` prevent storing. `no-cache` is never
+//! overridden by a path rule: a cache may store such a response only if it
+//! revalidates before every reuse, and this edge either serves fresh entries
+//! or bypasses, so it must not be kept as a fresh entry. `s-maxage`,
+//! `must-revalidate` and `proxy-revalidate` disable stale serving.
+//! `ignore_cookie` allows `Vary: Cookie` for deliberately shared static assets.
 
 use axum::http::{header, HeaderMap, Method, Request};
 use lagran_cache::CacheEntry;
@@ -372,6 +375,8 @@ struct CacheControl {
     no_store: bool,
     no_cache: bool,
     private: bool,
+    must_revalidate: bool,
+    proxy_revalidate: bool,
     s_maxage: Option<u64>,
     max_age: Option<u64>,
     swr: Option<u64>,
@@ -395,6 +400,8 @@ fn parse_cache_control(value: &str) -> CacheControl {
             "no-store" => cc.no_store = true,
             "no-cache" => cc.no_cache = true,
             "private" => cc.private = true,
+            "must-revalidate" => cc.must_revalidate = true,
+            "proxy-revalidate" => cc.proxy_revalidate = true,
             "s-maxage" => cc.s_maxage = val.and_then(|v| v.parse().ok()),
             "max-age" => cc.max_age = val.and_then(|v| v.parse().ok()),
             "stale-while-revalidate" => cc.swr = val.and_then(|v| v.parse().ok()),
@@ -402,6 +409,22 @@ fn parse_cache_control(value: &str) -> CacheControl {
         }
     }
     cc
+}
+
+/// Multiple field lines are equivalent to one comma-separated field value
+/// (RFC 9110 §5.3). Cache-Control/Vary must not silently ignore the second line.
+fn joined_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<String> {
+    let values: Vec<&str> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(","))
+    }
 }
 
 pub fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -443,12 +466,15 @@ pub fn decide_storage_reason(
     if header_value(headers, "set-cookie").is_some() {
         return Err("set-cookie");
     }
-    if let Some(field) = vary_reject_reason(header_value(headers, "vary"), policy.ignore_cookie) {
+    if let Some(field) = vary_reject_reason(
+        joined_header_value(headers, "vary").as_deref(),
+        policy.ignore_cookie,
+    ) {
         return Err(field);
     }
 
-    let cc = header_value(headers, "cache-control")
-        .map(parse_cache_control)
+    let cc = joined_header_value(headers, "cache-control")
+        .map(|v| parse_cache_control(&v))
         .unwrap_or_default();
     if cc.no_store {
         return Err("no-store");
@@ -456,14 +482,19 @@ pub fn decide_storage_reason(
     if cc.private {
         return Err("private");
     }
-    // `no-cache` means "revalidate", not "never store". An explicit rule TTL is
-    // an operator override (for example CSS/JS 7 days), so let it win; without
-    // a rule TTL keep the conservative origin behaviour.
-    if cc.no_cache && policy.ttl_override.is_none() {
+    // no-cache means "revalidate before every reuse". This edge does not keep a
+    // separate validator-only entry, so the only standards-correct choice is to
+    // not store it. A path rule must not turn it into a fresh shared object.
+    if cc.no_cache {
         return Err("no-cache");
     }
 
     let origin_ttl = cc.s_maxage.or(cc.max_age).or_else(|| expires_ttl(headers));
+    // Explicit zero lifetime is an origin instruction, not an invitation for a
+    // path rule to make the response fresh.
+    if origin_ttl == Some(0) {
+        return Err("ttl-zero");
+    }
 
     // Explicit rule TTL wins over the origin; otherwise honour the origin.
     let ttl = match policy.ttl_override {
@@ -474,7 +505,12 @@ pub fn decide_storage_reason(
         return Err("ttl-zero");
     }
 
-    let swr = if policy.swr_secs > 0 {
+    // s-maxage implies proxy-revalidate for shared caches. must-revalidate and
+    // proxy-revalidate forbid serving stale on normal cache hits.
+    let must_revalidate = cc.must_revalidate || cc.proxy_revalidate || cc.s_maxage.is_some();
+    let swr = if must_revalidate {
+        0
+    } else if policy.swr_secs > 0 {
         policy.swr_secs
     } else {
         cc.swr.unwrap_or(0)
@@ -544,9 +580,11 @@ pub fn has_non_clearance_cookie(headers: &HeaderMap) -> bool {
 }
 
 /// Requests whose responses must never be served from / stored in the shared
-/// cache: authenticated or personalised traffic, conditional-range probes, and
-/// explicit `no-store` from the client. `no-cache`/`max-age=0` remain
-/// cache-eligible so they can revalidate an existing entry.
+/// cache: authenticated or personalised traffic, client `no-store`/`no-cache`
+/// (including `max-age=0` and `Pragma: no-cache`), conditional-range probes.
+/// A request that demands revalidation bypasses the fresh-hit path; fetching
+/// from origin is standards-correct when this edge has no per-request
+/// revalidation loop.
 /// Why a request bypasses the shared cache. The returned value is exposed as
 /// `X-Lagran-Cache-Reason` for operator diagnostics.
 pub fn request_bypass_reason<B>(req: &Request<B>, ignore_cookie: bool) -> Option<&'static str> {
@@ -563,12 +601,45 @@ pub fn request_bypass_reason_headers(
     if !ignore_cookie && has_non_clearance_cookie(headers) {
         return Some("cookie");
     }
-    if let Some(cc) = headers
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-    {
-        if cc.to_ascii_lowercase().contains("no-store") {
-            return Some("no-store");
+    if let Some(reason) = request_cache_control_reason(headers) {
+        return Some(reason);
+    }
+    None
+}
+
+fn request_cache_control_reason(headers: &HeaderMap) -> Option<&'static str> {
+    for value in headers.get_all(header::CACHE_CONTROL).iter() {
+        let Ok(cc) = value.to_str() else {
+            continue;
+        };
+        for part in cc.split(',') {
+            let part = part.trim();
+            let name = part.split('=').next().unwrap_or(part).trim();
+            if name.eq_ignore_ascii_case("no-store") {
+                return Some("no-store");
+            }
+            if name.eq_ignore_ascii_case("no-cache") {
+                return Some("request-no-cache");
+            }
+            if let Some((name, value)) = part.split_once('=') {
+                if name.trim().eq_ignore_ascii_case("max-age")
+                    && value.trim().trim_matches('"').parse::<u64>().ok() == Some(0)
+                {
+                    return Some("request-max-age-0");
+                }
+            }
+        }
+    }
+    for value in headers.get_all(header::PRAGMA).iter() {
+        let Ok(pragma) = value.to_str() else {
+            continue;
+        };
+        if pragma
+            .split(',')
+            .map(|p| p.trim())
+            .any(|p| p.eq_ignore_ascii_case("no-cache"))
+        {
+            return Some("request-pragma-no-cache");
         }
     }
     None
@@ -1006,15 +1077,41 @@ mod tests {
     }
 
     #[test]
-    fn explicit_rule_ttl_overrides_origin_no_cache() {
+    fn explicit_rule_ttl_cannot_override_origin_no_cache() {
         let mut policy = ResolvedPolicy::default();
         policy.ttl_override = Some(604_800);
         assert!(
-            decide_storage(200, &hdrs(&[("cache-control", "no-cache")]), policy, 60).is_some(),
-            "CSS/JS rule TTL must override origin no-cache"
+            decide_storage(200, &hdrs(&[("cache-control", "no-cache")]), policy, 60).is_none(),
+            "no-cache requires revalidation; a rule TTL must not create a fresh shared entry"
         );
         assert!(decide_storage(200, &hdrs(&[("cache-control", "no-store")]), policy, 60).is_none());
         assert!(decide_storage(200, &hdrs(&[("cache-control", "private")]), policy, 60).is_none());
+        assert!(
+            decide_storage(200, &hdrs(&[("cache-control", "max-age=0")]), policy, 60).is_none(),
+            "explicit zero freshness must not be overridden by a rule TTL"
+        );
+    }
+
+    #[test]
+    fn proxy_revalidation_disables_stale_while_revalidate() {
+        let d = decide_storage(
+            200,
+            &hdrs(&[("cache-control", "s-maxage=60, stale-while-revalidate=120")]),
+            ResolvedPolicy::default(),
+            60,
+        )
+        .unwrap();
+        assert_eq!(d.ttl_secs, 60);
+        assert_eq!(d.swr_secs, 0, "s-maxage implies proxy-revalidate");
+    }
+
+    #[test]
+    fn multiple_cache_control_lines_are_combined() {
+        let headers = hdrs(&[
+            ("cache-control", "max-age=60"),
+            ("cache-control", "no-store"),
+        ]);
+        assert!(decide_storage(200, &headers, ResolvedPolicy::default(), 60).is_none());
     }
 
     #[test]
@@ -1167,7 +1264,11 @@ mod tests {
             .header("cache-control", "max-age=0")
             .body(())
             .unwrap();
-        assert!(!request_bypasses_cache(&reload, false));
+        assert!(request_bypasses_cache(&reload, false));
+        assert_eq!(
+            request_bypass_reason(&reload, false),
+            Some("request-max-age-0")
+        );
 
         let revalidate = Request::builder()
             .uri("http://cdn.test/a.js")
@@ -1175,8 +1276,22 @@ mod tests {
             .body(())
             .unwrap();
         assert!(
-            !request_bypasses_cache(&revalidate, false),
-            "no-cache must revalidate, not bypass"
+            request_bypasses_cache(&revalidate, false),
+            "a request no-cache must not be served a fresh shared entry"
+        );
+        assert_eq!(
+            request_bypass_reason(&revalidate, false),
+            Some("request-no-cache")
+        );
+
+        let pragma = Request::builder()
+            .uri("http://cdn.test/a.js")
+            .header("pragma", "no-cache")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            request_bypass_reason(&pragma, false),
+            Some("request-pragma-no-cache")
         );
     }
 

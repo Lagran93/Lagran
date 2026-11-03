@@ -210,6 +210,7 @@ SQL
 
 ```bash
 psql "postgres://lagran:替换成强密码@127.0.0.1:5432/lagran" -c 'select 1;'
+# 注意：如果密码中含有保留字符（比如@），需要进行 URL 编码（@->%40）
 ```
 
 控制面启动时自动执行 `apps/control/migrations`。

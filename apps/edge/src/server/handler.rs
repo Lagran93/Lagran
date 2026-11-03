@@ -1246,7 +1246,7 @@ async fn serve_cached(
                 &request_id,
             )
             .await;
-            return not_modified_response(&etag);
+            return not_modified_response(&etag, &entry);
         }
     }
 
@@ -1972,6 +1972,13 @@ fn entry_to_response(
         HeaderName::from_static("x-powered-by"),
         HeaderValue::from_static("lagran-edge"),
     );
+    if !headers.contains_key(header::DATE) {
+        if let Ok(date) =
+            HeaderValue::from_str(&httpdate::fmt_http_date(std::time::SystemTime::now()))
+        {
+            headers.insert(header::DATE, date);
+        }
+    }
     if let Ok(v) = HeaderValue::from_str(etag) {
         headers.insert(header::ETAG, v);
     }
@@ -2054,11 +2061,37 @@ pub(crate) fn cc_too_many(host: &str, path: &str, retry_after: u64, banned: bool
     default_page::rate_limited_page(host, path, retry_after, banned)
 }
 
-fn not_modified_response(etag: &str) -> Response {
+fn not_modified_response(etag: &str, entry: &CacheEntry) -> Response {
     let mut headers = HeaderMap::new();
+    for name in [
+        "cache-control",
+        "vary",
+        "expires",
+        "content-location",
+        "last-modified",
+    ] {
+        if let Some(value) = entry.header(name) {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+    }
     if let Ok(v) = HeaderValue::from_str(etag) {
         headers.insert(header::ETAG, v);
     }
+    headers.insert(
+        header::DATE,
+        HeaderValue::from_str(&httpdate::fmt_http_date(std::time::SystemTime::now()))
+            .unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
+    );
+    headers.insert(
+        HeaderName::from_static("age"),
+        HeaderValue::from_str(&entry.age_secs().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
     cache_status_headers(&mut headers, CacheStatus::Revalidated.as_str());
     apply_security_headers(&mut headers);
     let mut resp = Response::new(Body::empty());
@@ -2173,6 +2206,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get("set-cookie").is_none());
         assert_eq!(resp.headers().get("age").unwrap(), "0");
+        assert!(resp.headers().get(header::DATE).is_some());
         assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
     }
 }

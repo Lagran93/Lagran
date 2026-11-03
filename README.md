@@ -9,9 +9,9 @@
 
 ## Demo
 
-- 在线演示：https://demo.lagrancdn.com
-- 管理员用户名：`admin@lagrancdn.com`
-- 管理员密码：`admin123`
+- 在线演示：https://console.lagrancdn.com
+- 管理员用户名/密码：`暂不提供`
+- 普通用户名/密码：`demo@lagrancdn.com` / `demo123456`
 
 
 ## 快速导航
@@ -285,9 +285,9 @@ sudo tar czf /backup/lagran-config-$(date +%F).tgz /etc/lagran
 - 带普通 Cookie 的请求默认绕过缓存；缓存响应不保存 `Set-Cookie`
 - Partial Range 只支持单段；多段 Range 直接透传源站
 - 大对象完整 GET 需要对象 `complete=true`；partial 对象只响应已覆盖的 Range
-- 浏览器 `no-cache` 当前不作为共享缓存 bypass；严格 RFC revalidate 需单独配置/开发
+- 浏览器 `no-cache`/`max-age=0`/`Pragma: no-cache` 请求统一回源；响应 `no-cache` 不写入共享缓存
 - CC 是 L7 防护；SYN/UDP/连接耗尽等 L4 攻击仍需云清洗或上游联动
-- 普通域名限流为单进程内存态；CC 配置 Redis 后可跨 Edge 共享
+- 普通域名限流配置 `REDIS_URL` 后跨 Edge 共享；Redis 故障时回退单进程 bucket
 - 行为评分是启发式，默认关闭，需验证误报
 - gRPC/proto 仍是占位，当前 Edge-Control 使用 HTTP + JSON
 

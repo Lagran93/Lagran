@@ -402,7 +402,7 @@ const presets = [
 const actionHint = computed(() => {
   if (form.value.action === 'bypass') return '请求不读也不写缓存，直接回源（适合登录态、动态接口）。'
   if (form.value.action === 'no_store') return '照常回源，但响应不写入缓存。'
-  return '按 TTL 缓存响应；源站 no-store / private 仍会阻止缓存。'
+  return '按 TTL 缓存响应；源站 no-store / private / no-cache / max-age=0 仍会阻止写入。'
 })
 
 const filtered = computed(() => {

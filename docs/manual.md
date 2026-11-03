@@ -340,7 +340,7 @@ no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 域名高级设置包括：
 
 - 回源超时
-- 全局限流 RPS / 突发
+- 全局限流 RPS / 突发（配置 Edge `REDIS_URL` 后跨节点共享 token bucket）
 - 忽略 Query
 - CORS 允许来源
 - 防盗链 Referer
@@ -553,8 +553,9 @@ Control 的 CONTROL_PUBLIC_URL
 | `AGENT_URL` | 控制面回调 Edge 的地址，必须是管理端口 |
 | `PUBLIC_IP` | GeoDNS 使用 |
 | `CC_SYNC_INTERVAL` | 共享封禁同步间隔 |
-| `REDIS_URL` | CC 滑动窗口共享 |
-| `CC_REDIS_PREFIX` | Redis key 前缀 |
+| `REDIS_URL` | CC 滑动窗口与普通域名限流共享 |
+| `CC_REDIS_PREFIX` | CC Redis key 前缀 |
+| `RATE_LIMIT_REDIS_PREFIX` | 普通限流 Redis key 前缀 |
 | `CACHE_TTL` | 默认缓存 TTL |
 | `CACHE_BACKEND` | `memory` / `disk` / `hybrid` |
 | `DISK_CACHE_DIR` | 普通磁盘缓存目录 |
@@ -638,6 +639,8 @@ SWR：
 规则 swr_seconds > 源站 stale-while-revalidate > 0
 ```
 
+但源站返回 `s-maxage`、`must-revalidate` 或 `proxy-revalidate` 时，共享缓存不会在过期后继续返回旧内容，SWR 被抑制。
+
 ### 5.3 哪些响应可缓存
 
 必须满足：
@@ -648,11 +651,14 @@ SWR：
 - 无 `Set-Cookie`
 - 无 `no-store`
 - 无 `private`
-- `no-cache` 且没有规则 TTL 时通常不写入
+- 无 `no-cache`（即使存在规则 TTL 也不写入；本实现不保存“只能校验后使用”的条目）
+- 无 `max-age=0` / `s-maxage=0`
 - `Vary` 字段受支持，或没有 `Vary`
 - 请求无 `Authorization`
 - 请求无普通 Cookie（规则 `ignore_cookie` 例外）
-- 请求无 `no-store`
+- 请求无 `no-store`、`no-cache`、`max-age=0`、`Pragma: no-cache`
+
+多个 `Cache-Control` 响应头会按逗号合并后解析；多个 `Vary` 头同理。
 
 ### 5.4 支持的 Vary
 
@@ -670,33 +676,36 @@ SWR：
 
 CORS `Vary` 会被哈希进 cache key，避免不同 Origin 串缓存。
 
-### 5.5 浏览器 no-cache 的真实行为
+### 5.5 请求 no-cache 的真实行为
 
-当前实现：
-
-```text
-完整可缓存 GET/HEAD：
-  Cache-Control: no-cache / Pragma: no-cache
-  → Edge 删除请求头
-  → 完整缓存命中时直接 HIT
-```
-
-因此：
-
-- 小文件完整对象：no-cache 仍可能 HIT
-- 大文件完整对象：no-cache 仍可能 HIT
-- 大文件只有 partial Range 段：完整 GET 仍 MISS
-- 请求相同且已覆盖的 Range：可能 HIT
-
-`no-store` 是例外，会 bypass：
+请求带有以下任一项时，Edge 不读取共享缓存，直接回源：
 
 ```text
-Cache-Control: no-store → 不读不写
+Cache-Control: no-cache
+Cache-Control: max-age=0
+Pragma: no-cache
 ```
 
-> 如果业务要求严格遵循 RFC 的 `no-cache = 每次回源校验`，需要统一修改普通缓存和 Range 缓存策略，而不是按文件大小分支。
+这意味着：
 
-### 5.6 普通缓存与大对象缓存
+- 小文件、大文件、完整 GET、Range 行为一致
+- 不再出现“小文件 no-cache 仍 HIT、大文件不命中”的差异
+- 响应仍可写回缓存，但本次请求从源站获取
+- `Cache-Control: no-store` 仍然是不读不写
+
+这是本实现选择的保守 RFC 语义：不保存需要每次 revalidate 的共享对象，也不把请求的 `no-cache` 删除后继续 HIT。
+
+### 5.6 响应头语义
+
+缓存命中时：
+
+- `Age` 按对象年龄生成
+- 缺少 `Date` 时生成当前 `Date`
+- 304 响应保留 `Cache-Control`、`Vary`、`Expires`、`Content-Location`、`Last-Modified`、`ETag`、`Age`
+- `Set-Cookie` 不会从缓存回放
+- `no-store`/`private` 的对象不会进入共享缓存
+
+### 5.7 普通缓存与大对象缓存
 
 | 项目 | 普通缓存 | 大对象缓存 |
 |---|---|---|
@@ -726,7 +735,7 @@ LARGE_CACHE_MAX_BYTES=21474836480
 - 请求没有触发 Cookie/Authorization/no-store bypass
 - 磁盘目录可写、容量足够
 
-### 5.7 Partial Range
+### 5.8 Partial Range
 
 流程：
 
@@ -835,7 +844,7 @@ Age > TTL       → X-Cache: STALE
 
 对 700MB 级视频，TTL=10 通常过短，会在播放过程中不断失效。
 
-### 5.8 缓存预热
+### 5.9 缓存预热
 
 预热接口：
 
@@ -863,7 +872,7 @@ POST /api/v1/prefetch
 - 大缓存关闭或超过最大对象限制
 - 控制面回调 Edge 超时/`agent_url` 错误
 
-### 5.9 缓存诊断
+### 5.10 缓存诊断
 
 控制台「缓存诊断」会：
 
@@ -909,10 +918,12 @@ CC_DOWNLOAD_MULTIPLIER=2
 
 ### 6.3 滑动窗口与 Redis
 
-- 未配置 `REDIS_URL`：进程内固定窗口。
-- 配置 Redis：跨 Edge 共享排序集合滑动窗口。
-- Redis key 前缀：`CC_REDIS_PREFIX`，默认 `lagran:cc`。
+- 未配置 `REDIS_URL`：CC 使用进程内固定窗口，普通域名限流使用进程内 token bucket。
+- 配置 Redis：CC 跨 Edge 共享排序集合滑动窗口，普通域名限流跨 Edge 共享 token bucket。
+- CC Redis key 前缀：`CC_REDIS_PREFIX`，默认 `lagran:cc`。
+- 普通限流 Redis key 前缀：`RATE_LIMIT_REDIS_PREFIX`，默认 `lagran:rate`。
 - Redis 超时会回退本地。
+- 多 Edge 必须使用相同 `REDIS_URL` 和相同前缀，才能共享同一预算。
 
 ### 6.4 全局阈值与攻击模式
 
@@ -1072,8 +1083,11 @@ ACCESS_LOG_REPORT=true
 | `stale` | SWR 窗口返回旧内容 |
 | `cookie` | Cookie 绕过 |
 | `authorization` | Authorization 绕过 |
-| `no-store` | 请求 no-store |
-| `no-cache` | 响应 no-cache 且无规则 TTL |
+| `no-store` | 请求/响应 no-store |
+| `no-cache` | 响应 no-cache，未写入共享缓存 |
+| `request-no-cache` | 请求 no-cache 回源 |
+| `request-max-age-0` | 请求 max-age=0 回源 |
+| `request-pragma-no-cache` | 请求 Pragma: no-cache 回源 |
 | `vary` | Vary 不受支持 |
 | `vary:user-agent` | Vary User-Agent |
 | `vary:cookie` | Vary Cookie 且未 ignore |
@@ -1314,21 +1328,20 @@ Accept-Ranges: bytes
 - 两次 Range 不同
 - 第一次 fill 尚未 commit
 
-### 9.7 no-cache 小文件命中、大文件不命中
+### 9.7 no-cache 行为
 
-确认：
+请求带 `Cache-Control: no-cache`、`max-age=0` 或 `Pragma: no-cache`：
 
-```bash
-find /var/lib/lagran/large-cache -name '*.meta.json' \
-  -exec jq -c '{key,complete,segments}' {} \; | grep file
-```
+- 普通文件、大文件、完整 GET、Range 一致回源
+- 不会因为文件大小不同而出现部分 HIT
+- 回源响应仍可写入缓存，但本次请求不使用旧对象
 
-- 小文件通常是完整对象，`complete=true`。
-- 大文件如果只有 partial Range，`complete=false`，完整 GET 必然 MISS。
-- 相同且已覆盖的 Range 应 HIT。
-- `no-cache` 不是 bypass 条件；只有 `no-store` 等会 bypass。
+响应带 `Cache-Control: no-cache`：
 
-如果要求严格 RFC 语义，应统一修改策略，不要只让大文件绕过。
+- 不写入共享缓存，即使命中路径规则也不覆盖
+- 日志中的 `X-Lagran-Cache-Reason` 为 `no-cache`
+
+如果要求“保存后每次条件请求 304 复用”，需要额外实现独立的 validator-only 缓存层；当前实现选择不保存，避免把 no-cache 对象当作 fresh 命中。
 
 ### 9.8 预热失败
 
@@ -1632,9 +1645,10 @@ cd apps/frontend && npm run generate
 - 普通缓存以完整对象为单位；大对象支持 partial Range segment，但仅覆盖已请求区间。
 - 大对象完整 GET 需要 `complete=true`；partial 不能拼接为完整响应。
 - 单段 Range 才支持 partial 填充；多段 Range 透传。
-- `no-cache` 当前对完整可缓存 GET 被忽略；不是严格 RFC 的每次 revalidate。
+- `no-cache` 响应不进入共享缓存；请求 no-cache 统一回源，不保存 validator-only 条目。
+- `only-if-cached`、`min-fresh`、`max-stale`、`stale-if-error` 尚未完整实现；请求 no-cache 选择直接回源。
 - 修改缓存规则/配置不会自动删除旧缓存。
-- 普通域名限流为单进程；CC 配置 Redis 后才跨 Edge 共享。
+- 普通域名限流在配置 `REDIS_URL` 后由 Redis token bucket 跨 Edge 共享；未配置或 Redis 故障时回退进程内 bucket。
 - L4/SYN/UDP/连接耗尽防护需要云清洗或 nftables/运营商联动。
 - 行为评分是启发式，不是完整设备指纹，默认关闭。
 - 泛域名 ACME DNS-01 未实现。

@@ -99,7 +99,11 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
     if std::env::var("MOCK_SHIELD").is_ok() {
         if let Ok(log) = std::env::var("MOCK_SHIELD_LOG") {
             use std::io::Write;
-            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+            {
                 let _ = writeln!(fh, "{host}");
             }
         }
@@ -324,14 +328,14 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ("Cache-Control", "public, max-age=3600".into()),
                 ],
             ),
-            // Realistic static asset: origin asks revalidation and varies on
-            // Cookie. An ignore_cookie cache rule must be able to override both.
+            // Static asset that varies on Cookie. An ignore_cookie cache rule
+            // must be able to store it; no-cache is covered by /nocache.
             "/assets/vary.js" => (
                 200,
                 b"console.log('vary');".to_vec(),
                 vec![
                     ("Content-Type", "application/javascript".into()),
-                    ("Cache-Control", "no-cache".into()),
+                    ("Cache-Control", "public, max-age=60".into()),
                     ("Vary", "Cookie".into()),
                 ],
             ),

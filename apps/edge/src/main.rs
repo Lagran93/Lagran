@@ -81,7 +81,9 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
-    );
+    )
+    .with_redis_url(&config.redis_url)
+    .await;
     let origin_health_map = origin_health::OriginHealthMap::new();
     let domains = DomainRegistry::new();
     let control = agent::ControlClient::new(&config);

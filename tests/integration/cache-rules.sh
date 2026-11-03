@@ -144,12 +144,12 @@ CSS_ETAG="$(hdr etag)"
 get "/assets/app.css" -H 'Cookie: __cf_bm=test; sid=1' >/dev/null
 check "ignore_cookie rule caches browser cookie request" "$(hdr x-cache)" "HIT"
 CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0' -H "If-None-Match: $CSS_ETAG")
-check "Chrome reload revalidates from edge cache" "$CODE" "304"
-check "Chrome reload is not BYPASS" "$(hdr x-cache)" "REVALIDATED"
+check "Chrome reload returns origin response" "$CODE" "200"
+check "Chrome reload bypasses fresh edge hit" "$(hdr x-cache)" "BYPASS"
 CODE=$(get "/assets/app.css" -H 'Cookie: lagran_clearance=test' \
   -H 'Cache-Control: no-cache' -H "If-None-Match: $CSS_ETAG")
-check "no-cache + cookie still revalidates cache" "$CODE" "304"
-check "no-cache + cookie is not BYPASS" "$(hdr x-cache)" "REVALIDATED"
+check "no-cache + cookie returns origin response" "$CODE" "200"
+check "no-cache + cookie bypasses fresh edge hit" "$(hdr x-cache)" "BYPASS"
 get "/assets/app.js" >/dev/null
 check "js regex rule miss" "$(hdr x-cache)" "MISS"
 get "/assets/app.js" >/dev/null
