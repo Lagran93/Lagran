@@ -144,6 +144,9 @@ struct ReqCtx {
     start: Instant,
     cache_label: &'static str,
     cache_reason: Option<&'static str>,
+    /// Age reported by pingora-cache for a hit; used to override a stale
+    /// origin `Age: 0` with the actual shared-cache age.
+    cache_age_secs: Option<u64>,
     status: u16,
     attempt: u8,
     origin_order: Vec<String>,
@@ -171,6 +174,7 @@ impl Default for ReqCtx {
             start: Instant::now(),
             cache_label: "MISS",
             cache_reason: None,
+            cache_age_secs: None,
             status: 0,
             attempt: 0,
             origin_order: Vec::new(),
@@ -448,6 +452,7 @@ impl ProxyHttp for DataPlaneProxy {
         _is_fresh: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedFreshness>> {
+        ctx.cache_age_secs = Some(meta.age().as_secs());
         let Some(plan) = ctx.plan.as_ref() else {
             return Ok(None);
         };
@@ -725,6 +730,14 @@ impl ProxyHttp for DataPlaneProxy {
         }
         ctx.cache_label = label;
         ctx.status = response.status.as_u16();
+        // Shared-cache hits must expose the object's age, not the origin's
+        // stored Age header (commonly `Age: 0` on every cached response).
+        if matches!(label, "HIT" | "STALE" | "REVALIDATED") {
+            response.remove_header("age");
+            if let Some(age) = ctx.cache_age_secs {
+                response.insert_header("age", age.to_string())?;
+            }
+        }
         response.remove_header(META_HEADER);
         response.remove_header("x-lagran-cache-reason");
         response.insert_header("x-cache", label)?;
