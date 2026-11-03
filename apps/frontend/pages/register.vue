@@ -106,6 +106,14 @@ async function submit() {
     error.value = '请输入邮箱和密码'
     return
   }
+  if (password.value.length < 8) {
+    error.value = '密码至少需要 8 个字符'
+    return
+  }
+  if (!/[A-Za-z]/.test(password.value) || !/\d/.test(password.value)) {
+    error.value = '密码必须同时包含字母和数字'
+    return
+  }
   if (password.value !== confirm.value) {
     error.value = '两次输入的密码不一致'
     return

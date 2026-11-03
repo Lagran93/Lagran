@@ -375,6 +375,16 @@ block    命中后拦截或挑战
 monitor  只记录，不拦截
 ```
 
+WAF 检查会先做最多两次百分号解码，`%2527`、`%253Cscript%253E` 等双层编码不能绕过。
+同时检测：
+
+- `Transfer-Encoding` 与 `Content-Length` 同时出现
+- `X-Original-URL` / `X-Rewrite-URL` 路径覆盖头
+- 空字节、超长 path/query
+- 扫描器 UA、敏感路径、SQLi/XSS/路径穿越/RCE/SSRF/XXE/Log4Shell/SSTI/NoSQL/LDAP/Java 反序列化/WebShell 等托管规则
+
+WAF 目前不读取请求体（在代理读取 body 前执行），GET/HEAD 的 path/query/header 是主要检查面。
+
 ### 3.6 缓存刷新与预热
 
 #### 缓存刷新
@@ -990,7 +1000,24 @@ CC_BEHAVIOR_ENABLED=true
 CC_BEHAVIOR_SCORE=4
 ```
 
-只对 HTML 动态/登录页面生效，根据 UA、Accept-Language、Sec-CH-UA、Sec-Fetch-Mode、Cookie 等评分；达到阈值先挑战。默认关闭。
+只对 HTML 动态/登录页面生效，根据 UA、Accept/Accept-Language/Accept-Encoding、Sec-CH-UA、Sec-Fetch-Mode/Dest、Cookie、Header 数量等评分；达到阈值先挑战。默认关闭。
+
+新增信号：
+
+- `HeadlessChrome`、Playwright、Puppeteer、Selenium、PhantomJS
+- curl/wget/python/go/httpclient 等自动化 UA
+- Chrome 类 UA 缺少 Sec-CH-UA
+- `Sec-Fetch-Mode` 非法值
+- `navigate` 但 `Sec-Fetch-Dest` 不是 document
+- UA 同时包含 Chrome 与 Firefox
+- 缺少 Accept/Accept-Language/Accept-Encoding/Cookie 或 Header 过少
+
+命中后 WAF 事件的 `rule_name` 会带上原因，例如：
+
+```text
+behavior-score:headless-ua,navigate-dest-mismatch
+```
+
 
 ### 6.8 CC 统计
 

@@ -7,6 +7,9 @@
 const EXACT: Record<string, string> = {
   'domain already exists': '该域名已经接入，请勿重复添加',
   'node name already exists': '节点名称已存在，请更换名称',
+  'password must contain letters and digits': '密码必须同时包含字母和数字',
+  'password must be at least 8 characters': '密码至少需要 8 个字符',
+  'invalid email': '邮箱格式不正确',
   'email already registered': '该邮箱已经注册，请直接登录或更换邮箱',
   'invalid email or password': '邮箱或密码错误',
   'account is disabled': '账号已被禁用，请联系管理员',

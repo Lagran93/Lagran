@@ -652,12 +652,12 @@ pub(crate) fn validate_email(email: &str) -> Result<(), &'static str> {
 
 pub(crate) fn validate_password(password: &str) -> Result<(), &'static str> {
     if password.len() < 8 {
-        return Err("password must be at least 8 characters");
+        return Err("密码至少需要 8 个字符");
     }
     let has_letter = password.chars().any(|c| c.is_ascii_alphabetic());
     let has_digit = password.chars().any(|c| c.is_ascii_digit());
     if !has_letter || !has_digit {
-        return Err("password must contain letters and digits");
+        return Err("密码必须同时包含字母和数字");
     }
     Ok(())
 }

@@ -293,7 +293,6 @@ pub struct WafRequest<'a> {
     pub user_agent: &'a str,
     pub referer: &'a str,
     pub ip: Option<IpAddr>,
-    #[allow(dead_code)]
     pub headers: &'a HeaderMap,
 }
 
@@ -306,6 +305,9 @@ const SQLI: &[&str] = &[
     "or 1=1--",
     "and 1=1--",
     "or true--",
+    "or 1=1#",
+    "or 1=1/*",
+    "union select null",
     "information_schema",
     "sleep(",
     "pg_sleep(",
@@ -352,9 +354,27 @@ const TRAVERSAL: &[&str] = &[
 ];
 
 const SCANNER_UA: &[&str] = &[
-    "sqlmap", "nikto", "nmap", "masscan", "acunetix", "nessus", "dirbuster", "zgrab", "wpscan",
-    "nuclei", "ffuf", "gobuster", "feroxbuster", "whatweb", "w3af", "commix", "xsstrike",
-    "arachni", "openvas", "zaproxy", "zap/",
+    "sqlmap",
+    "nikto",
+    "nmap",
+    "masscan",
+    "acunetix",
+    "nessus",
+    "dirbuster",
+    "zgrab",
+    "wpscan",
+    "nuclei",
+    "ffuf",
+    "gobuster",
+    "feroxbuster",
+    "whatweb",
+    "w3af",
+    "commix",
+    "xsstrike",
+    "arachni",
+    "openvas",
+    "zaproxy",
+    "zap/",
 ];
 
 const SCANNER_PATH: &[&str] = &[
@@ -404,6 +424,9 @@ const RCE: &[&str] = &[
     "perl -e",
     "python -c",
     "ruby -e",
+    "${ifs}",
+    "$ifs",
+    "bash -c",
 ];
 
 const SSRF: &[&str] = &[
@@ -412,6 +435,7 @@ const SSRF: &[&str] = &[
     "metadata.google.internal",
     "metadata.tencentyun.com",
     "metadata.azure.com",
+    "metadata.aliyun.com",
     "100.100.100.200",
     "kubernetes.default.svc",
     "file://",
@@ -421,6 +445,7 @@ const SSRF: &[&str] = &[
     "ldap://",
     "ldaps://",
     "rmi://",
+    "http://169.254.169.254",
     "127.0.0.1",
     "localhost",
     "[::1]",
@@ -489,13 +514,7 @@ const NOSQL: &[&str] = &[
     "' || '1'=='1",
 ];
 
-const LDAP: &[&str] = &[
-    "*)(uid=*",
-    "*)(cn=*",
-    ")(|(",
-    ")(&(",
-    "objectclass=*",
-];
+const LDAP: &[&str] = &["*)(uid=*", "*)(cn=*", ")(|(", ")(&(", "objectclass=*"];
 
 const JAVA: &[&str] = &[
     "java.lang.runtime",
@@ -610,6 +629,10 @@ fn level_verdict(
 
 /// Percent-decode then lower-case (ASCII). Invalid escapes are kept verbatim.
 pub fn decode_lower(input: &str) -> String {
+    decode_lower_once(input)
+}
+
+fn decode_lower_once(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -627,6 +650,18 @@ pub fn decode_lower(input: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).to_ascii_lowercase()
+}
+
+/// Decode twice so `%2527`/`%253Cscript%253E` cannot hide behind one layer of
+/// encoding. Only decode a second time when the first pass still contains `%`,
+/// keeping normal requests cheap.
+fn decode_lower_twice(input: &str) -> String {
+    let once = decode_lower_once(input);
+    if once.contains('%') {
+        decode_lower_once(&once)
+    } else {
+        once
+    }
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -653,10 +688,10 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
         }
     }
 
-    let path = decode_lower(req.path);
-    let query = decode_lower(req.query);
-    let ua = decode_lower(req.user_agent);
-    let referer = decode_lower(req.referer);
+    let path = decode_lower_twice(req.path);
+    let query = decode_lower_twice(req.query);
+    let ua = decode_lower_twice(req.user_agent);
+    let referer = decode_lower_twice(req.referer);
     let haystack = format!("{path}?{query} {ua} {referer}");
 
     if cfg.managed.sqli && contains_any(&haystack, SQLI) {
@@ -712,15 +747,22 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     if cfg.managed.webshell && contains_any(&haystack, WEBSHELL) {
         return Some(verdict("WebShell / PHP 注入", "webshell"));
     }
-    if cfg.managed.protocol
-        && (path.contains('\0')
+    if cfg.managed.protocol {
+        let has_te = req.headers.contains_key("transfer-encoding");
+        let has_cl = req.headers.contains_key("content-length");
+        let override_headers =
+            req.headers.contains_key("x-original-url") || req.headers.contains_key("x-rewrite-url");
+        if (has_te && has_cl)
+            || override_headers
+            || path.contains('\0')
             || query.contains('\0')
             || path.contains("%00")
             || query.contains("%00")
             || path.len() > 2048
-            || query.len() > 8192)
-    {
-        return Some(verdict("协议异常 / 超长请求", "protocol"));
+            || query.len() > 8192
+        {
+            return Some(verdict("协议异常 / 请求走私", "protocol"));
+        }
     }
 
     // Custom rules: highest priority first, first match wins.
@@ -1085,5 +1127,33 @@ mod tests {
         assert_eq!(decode_lower("%3Cscript%3E"), "<script>");
         assert_eq!(decode_lower("A%20B"), "a b");
         assert_eq!(decode_lower("100%"), "100%");
+    }
+
+    #[test]
+    fn rejects_double_encoded_payloads() {
+        let c = cfg();
+        let h = HeaderMap::new();
+        let verdict = evaluate(
+            &c,
+            &req(
+                &h,
+                "/search",
+                "q=%2527%2520or%2520%25271%2527%253D%25271",
+                "Mozilla/5.0",
+            ),
+        )
+        .expect("double-encoded SQLi must be detected");
+        assert_eq!(verdict.category, "sqli");
+    }
+
+    #[test]
+    fn rejects_request_smuggling_headers() {
+        let c = cfg();
+        let mut h = HeaderMap::new();
+        h.insert("transfer-encoding", "chunked".parse().unwrap());
+        h.insert("content-length", "10".parse().unwrap());
+        let verdict =
+            evaluate(&c, &req(&h, "/api", "", "Mozilla/5.0")).expect("TE+CL must be rejected");
+        assert_eq!(verdict.category, "protocol");
     }
 }

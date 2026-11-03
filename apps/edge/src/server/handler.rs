@@ -1490,8 +1490,13 @@ pub(crate) async fn preflight_cacheable(
             crate::server::cc::CcPathClass::Dynamic | crate::server::cc::CcPathClass::Auth
         )
     {
-        let score = bot_guard::score(headers);
-        if score >= bot_guard::threshold() {
+        let behavior = bot_guard::analyze(headers);
+        if behavior.score >= bot_guard::threshold() {
+            let rule_name = if behavior.reasons.is_empty() {
+                "behavior-score".to_string()
+            } else {
+                format!("behavior-score:{}", behavior.reasons.join(","))
+            };
             state
                 .waf_log
                 .push(
@@ -1501,7 +1506,7 @@ pub(crate) async fn preflight_cacheable(
                     path_and_query,
                     "challenge",
                     "bot",
-                    "behavior-score",
+                    &rule_name,
                     "block",
                 )
                 .await;
