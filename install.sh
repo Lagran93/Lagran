@@ -347,6 +347,52 @@ EOF
   fi
 }
 
+install_edge_update_helper() {
+  if [[ ! -f "$STAGE/edge-update.sh" ]]; then
+    warn "release has no edge-update.sh; console edge upgrade will be unavailable"
+    return 0
+  fi
+  install -m 0755 "$STAGE/edge-update.sh" "$BIN_DIR/lagran-edge-update"
+  cat > "$CONF_DIR/edge-update.env" <<EOF
+LAGRAN_PREFIX=${PREFIX}
+LAGRAN_DATA_DIR=${DATA_DIR}
+LAGRAN_UPDATE_REPO=${REPO}
+EDGE_UPDATE_REQUEST_PATH=${DATA_DIR}/edge-update.request
+EDGE_UPDATE_STATUS_PATH=${DATA_DIR}/edge-update.status
+EOF
+  chmod 0644 "$CONF_DIR/edge-update.env"
+  cat > /etc/systemd/system/lagran-edge-update.service <<EOF
+[Unit]
+Description=Lagran CDN edge privileged updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_DIR}/lagran-edge-update
+TimeoutStartSec=600
+EOF
+  cat > /etc/systemd/system/lagran-edge-update.path <<EOF
+[Unit]
+Description=Watch for Lagran CDN edge update requests
+
+[Path]
+PathExists=${DATA_DIR}/edge-update.request
+Unit=lagran-edge-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    if [[ "$START_SERVICE" == "1" ]]; then
+      systemctl enable --now lagran-edge-update.path
+    else
+      systemctl enable lagran-edge-update.path
+    fi
+  fi
+}
+
 write_edge_env() {
   local env_file="$CONF_DIR/edge.env"
   if [[ -f "$env_file" ]]; then
@@ -385,6 +431,8 @@ LARGE_CACHE_MIN_OBJECT_BYTES=${LARGE_CACHE_MIN_OBJECT_BYTES:-8388608}
 LARGE_CACHE_MAX_OBJECT_BYTES=${LARGE_CACHE_MAX_OBJECT_BYTES:-1073741824}
 LARGE_CACHE_MAX_BYTES=${LARGE_CACHE_MAX_BYTES:-21474836480}
 CHALLENGE_SECRET=${CHALLENGE_SECRET:-}
+EDGE_UPDATE_HELPER=${BIN_DIR}/lagran-edge-update
+EDGE_UPDATE_REQUEST_PATH=${DATA_DIR}/edge-update.request
 EOF
   chown root:lagran "$env_file"
   chmod 0640 "$env_file"
@@ -549,6 +597,7 @@ main_edge() {
   install_env_example edge.env.example
   write_edge_env
   write_edge_unit
+  install_edge_update_helper
   enable_service lagran-edge
   cat <<EOF
 

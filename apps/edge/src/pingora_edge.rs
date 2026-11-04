@@ -1370,6 +1370,68 @@ impl DataPlaneProxy {
                     Err(e) => write_json(session, 400, &serde_json::json!({"error": e})).await,
                 }
             }
+            ("POST", "/__lagran/update") => {
+                let body = read_body(session, 64 * 1024).await?;
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+                    write_json(
+                        session,
+                        400,
+                        &serde_json::json!({ "error": "invalid json" }),
+                    )
+                    .await;
+                    return Ok(true);
+                };
+                let Some(version) = value.get("version").and_then(|v| v.as_str()) else {
+                    write_json(
+                        session,
+                        400,
+                        &serde_json::json!({ "error": "version is required" }),
+                    )
+                    .await;
+                    return Ok(true);
+                };
+                if !valid_release_tag(version) {
+                    write_json(
+                        session,
+                        400,
+                        &serde_json::json!({ "error": "invalid release version" }),
+                    )
+                    .await;
+                    return Ok(true);
+                }
+                if !edge_update_helper_installed() {
+                    write_json(
+                        session,
+                        503,
+                        &serde_json::json!({
+                            "error": "edge updater is not installed; re-run install.sh edge"
+                        }),
+                    )
+                    .await;
+                    return Ok(true);
+                }
+                if let Err(e) = queue_edge_update(version) {
+                    tracing::error!(error = %e, "queue edge update failed");
+                    write_json(
+                        session,
+                        500,
+                        &serde_json::json!({ "error": format!("cannot queue update: {e}") }),
+                    )
+                    .await;
+                    return Ok(true);
+                }
+                tracing::info!(version, "edge update queued");
+                write_json(
+                    session,
+                    202,
+                    &serde_json::json!({
+                        "queued": true,
+                        "version": version,
+                        "message": "edge updater will download, verify and restart the service"
+                    }),
+                )
+                .await;
+            }
             ("POST", "/__lagran/config/reload") => {
                 crate::agent::config_sync::request_config_reload();
                 write_json(
@@ -1688,6 +1750,62 @@ impl DataPlaneProxy {
         write_axum_response(session, resp, is_head).await;
         Ok(true)
     }
+}
+
+pub(crate) fn edge_update_helper_installed() -> bool {
+    if let Ok(helper) = std::env::var("EDGE_UPDATE_HELPER") {
+        if !helper.trim().is_empty() {
+            return std::path::Path::new(helper.trim()).is_file();
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("lagran-edge-update")))
+        .is_some_and(|path| path.is_file())
+}
+
+pub(crate) fn valid_release_tag(raw: &str) -> bool {
+    let tag = raw.trim();
+    let Some(rest) = tag.strip_prefix('v') else {
+        return false;
+    };
+    if rest.is_empty() || rest.len() > 64 {
+        return false;
+    }
+    if !rest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
+    {
+        return false;
+    }
+    let core = match rest.split(['+', '-']).next() {
+        Some(core) => core,
+        None => return false,
+    };
+    let mut parts = core.split('.');
+    let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    parts.next().is_none()
+        && [major, minor, patch]
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+pub(crate) fn queue_edge_update(version: &str) -> std::io::Result<()> {
+    let path = match std::env::var("EDGE_UPDATE_REQUEST_PATH") {
+        Ok(value) if !value.trim().is_empty() => std::path::PathBuf::from(value.trim()),
+        _ => std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("edge-update.request"),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, format!("{version}\n"))?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 async fn read_body(session: &mut Session, limit: usize) -> Result<Bytes> {
@@ -2096,7 +2214,17 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 
 #[cfg(test)]
 mod tests {
-    use super::{head_content_length_for_protocol, parse_single_range};
+    use super::{head_content_length_for_protocol, parse_single_range, valid_release_tag};
+
+    #[test]
+    fn release_tag_validation() {
+        assert!(valid_release_tag("v1.2.3"));
+        assert!(valid_release_tag("v1.2.3-rc.1"));
+        assert!(!valid_release_tag("1.2.3"));
+        assert!(!valid_release_tag("v1.2"));
+        assert!(!valid_release_tag("v1.2.3; reboot"));
+        assert!(!valid_release_tag("latest"));
+    }
 
     #[test]
     fn head_length_is_http2_only() {

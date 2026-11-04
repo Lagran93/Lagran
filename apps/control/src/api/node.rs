@@ -4,6 +4,7 @@
 use crate::middleware::agent_auth::AgentAuth;
 use crate::middleware::authz::Actor;
 use crate::repository;
+use crate::service::agent_http;
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
@@ -100,6 +101,100 @@ pub struct CreateNodeRequest {
     pub city: Option<String>,
     pub weight: Option<i32>,
     pub max_bandwidth_mbps: Option<i32>,
+}
+
+#[derive(Deserialize)]
+pub struct UpgradeNodeRequest {
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct UpgradeNodeResponse {
+    pub queued: bool,
+    pub version: String,
+    pub node: String,
+    pub message: String,
+}
+
+pub async fn upgrade(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+    Json(req): Json<UpgradeNodeRequest>,
+) -> Result<Json<UpgradeNodeResponse>, (StatusCode, Json<ErrorBody>)> {
+    admin(&actor)?;
+    let node_id = parse_uuid(&id)?;
+    let node = repository::get_node(&state.pool, node_id)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: "node not found".into(),
+                }),
+            )
+        })?;
+    if node.agent_url.trim().is_empty() || node.auth_token.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "node has no agent URL or agent token".into(),
+            }),
+        ));
+    }
+    let version = match req.version.as_deref() {
+        Some(raw) => crate::api::system::validate_tag(raw).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "invalid release version".into(),
+                }),
+            )
+        })?,
+        None => crate::api::system::latest_release_tag()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorBody {
+                        error: format!("cannot resolve latest release: {e}"),
+                    }),
+                )
+            })?,
+    };
+
+    let url = format!("{}/__lagran/update", node.agent_url.trim_end_matches('/'));
+    agent_http::post_json_ok(
+        &url,
+        &serde_json::json!({ "version": version }),
+        &node.auth_token,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorBody {
+                error: format!("edge rejected upgrade request: {e}"),
+            }),
+        )
+    })?;
+
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "node.upgrade",
+        &node.name,
+        &format!("version={version}"),
+    )
+    .await;
+    Ok(Json(UpgradeNodeResponse {
+        queued: true,
+        version: version.clone(),
+        node: node.name,
+        message: format!("node will download {version} and restart after verification"),
+    }))
 }
 
 #[derive(Deserialize)]

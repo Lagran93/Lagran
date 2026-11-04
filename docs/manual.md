@@ -467,6 +467,11 @@ PUBLIC_IP=<公网IP>
 
 3. 启动后观察心跳、版本、CPU/内存。
 4. 确保控制面能访问 `AGENT_URL`，否则 purge/config/cert/challenge 会失败。
+5. 在节点列表点击「升级」：控制面解析 GitHub Release，调用节点 `/__lagran/update`；Edge 写入更新请求，由 root 的 `lagran-edge-update.path/service` 下载、校验 SHA256、替换二进制并重启。
+   - 需要 `install.sh edge` 安装 `lagran-edge-update` helper 与 systemd path 单元。
+   - 首次启用该功能时，旧版 Edge 没有 `/__lagran/update` 端点，需要在节点上重新执行一次新版 `install.sh edge`；之后即可在控制台点击升级。
+   - Docker 部署没有宿主机 root helper，升级按钮会返回 503。
+   - 升级期间节点短暂停止代理；失败时旧二进制仍保留在 `edge-update-backup/`。
 
 ### 3.9 配置发布
 

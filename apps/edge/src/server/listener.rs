@@ -2,8 +2,7 @@
 
 use crate::server::agent_auth::RequireAgentToken;
 use crate::server::handler::AppState;
-use crate::server::purge::{self, EdgePurgeRequest};
-use axum::{
+use crate::server::purge::{self, EdgePurgeRequest};use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
@@ -23,6 +22,7 @@ fn management_routes() -> Router<Arc<AppState>> {
         .route("/__lagran/certs/load", post(load_cert_authed))
         .route("/__lagran/access-logs", get(list_access_logs))
         .route("/__lagran/config/reload", post(config_reload_authed))
+        .route("/__lagran/update", post(update_authed))
         .route("/__lagran/metrics", get(prometheus_metrics))
 }
 
@@ -121,6 +121,51 @@ async fn config_reload_authed(_auth: RequireAgentToken) -> impl IntoResponse {
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "reloading": true })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct EdgeUpdateBody {
+    version: String,
+}
+
+async fn update_authed(
+    _auth: RequireAgentToken,
+    Json(body): Json<EdgeUpdateBody>,
+) -> impl IntoResponse {
+    if !crate::pingora_edge::valid_release_tag(&body.version) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid release version" })),
+        )
+            .into_response();
+    }
+    if !crate::pingora_edge::edge_update_helper_installed() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "edge updater is not installed; re-run install.sh edge"
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = crate::pingora_edge::queue_edge_update(&body.version) {
+        tracing::error!(error = %error, "queue edge update failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("cannot queue update: {error}") })),
+        )
+            .into_response();
+    }
+    tracing::info!(version = %body.version, "edge update queued");
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "queued": true,
+            "version": body.version,
+            "message": "edge updater will download, verify and restart the service"
+        })),
     )
         .into_response()
 }

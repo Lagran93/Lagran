@@ -217,7 +217,7 @@ pub struct ApplyUpdateResponse {
     pub message: String,
 }
 
-fn validate_tag(raw: &str) -> Option<String> {
+pub(crate) fn validate_tag(raw: &str) -> Option<String> {
     let tag = if raw.trim_start().starts_with('v') {
         raw.trim().to_string()
     } else {
@@ -249,6 +249,13 @@ fn validate_tag(raw: &str) -> Option<String> {
         return None;
     }
     Some(tag)
+}
+
+/// Resolve the latest GitHub release tag, normalized to `vX.Y.Z`.
+pub(crate) async fn latest_release_tag() -> Result<String, String> {
+    let release = fetch_latest(&update_repo()).await?;
+    validate_tag(&release.tag_name)
+        .ok_or_else(|| format!("invalid release tag from GitHub: {}", release.tag_name))
 }
 
 pub async fn apply_update(

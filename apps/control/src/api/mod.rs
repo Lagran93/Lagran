@@ -143,6 +143,7 @@ pub fn create_router(state: AppState) -> Router {
                     get(node::detail).put(node::update).delete(node::delete),
                 )
                 .route("/nodes/:id/status", post(node::set_status))
+                .route("/nodes/:id/upgrade", post(node::upgrade))
                 .route("/nodes/heartbeat", post(node::heartbeat))
                 .route("/nodes/:id/heartbeat", post(node::heartbeat_by_path))
                 .route("/metrics/report", post(metrics::report))

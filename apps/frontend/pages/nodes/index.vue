@@ -127,6 +127,14 @@
                   <button class="btn btn-text btn-sm" type="button" @click="openDetail(n)">
                     详情
                   </button>
+                  <button
+                    class="btn btn-text btn-sm"
+                    type="button"
+                    :disabled="upgradingId === n.id"
+                    @click="upgrade(n)"
+                  >
+                    {{ upgradingId === n.id ? '升级中…' : '升级' }}
+                  </button>
                   <button class="btn btn-text btn-sm" type="button" @click="openEdit(n)">
                     编辑
                   </button>
@@ -609,6 +617,7 @@ interface CreatedNode {
 const nodes = ref<any[]>([])
 const loading = ref(false)
 const saving = ref(false)
+const upgradingId = ref('')
 const autoRefresh = ref(true)
 const lastUpdated = ref('')
 
@@ -864,6 +873,38 @@ async function openDetail(node: any) {
   } catch (e: any) {
     detailOpen.value = false
     toast.error(e?.data?.error || '读取节点详情失败')
+  }
+}
+
+async function upgrade(node: any) {
+  if (!node.agent_url || !node.has_token) {
+    toast.error('该节点缺少 Agent 地址或令牌，无法远程升级')
+    return
+  }
+  const ok = await ask({
+    title: '升级边缘节点',
+    message: `将让 ${node.name} 从控制面获取最新 Release，下载校验后自动替换二进制并重启。升级期间该节点流量会短暂中断。确认继续？`,
+    confirmText: '开始升级',
+  })
+  if (!ok) return
+  upgradingId.value = node.id
+  let queued = false
+  try {
+    const result = await api.post<any>(`/api/v1/nodes/${node.id}/upgrade`, {})
+    queued = true
+    toast.success(`升级任务已下发：${result.version}，节点将在下载校验后自动重启`)
+    window.setTimeout(load, 5000)
+    window.setTimeout(load, 15000)
+  } catch (e: any) {
+    toast.error(friendlyErrorMessage(e?.data?.error, '升级任务下发失败'))
+  } finally {
+    if (!queued) {
+      upgradingId.value = ''
+    } else {
+      window.setTimeout(() => {
+        if (upgradingId.value === node.id) upgradingId.value = ''
+      }, 20000)
+    }
   }
 }
 
