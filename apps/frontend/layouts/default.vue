@@ -46,6 +46,7 @@ const MENU: MenuGroup[] = [
     items: [
       { label: '项目管理', to: '/projects', icon: 'project' },
       { label: '用户管理', to: '/users', icon: 'users', admin: true },
+      { label: '用户组', to: '/groups', icon: 'users', admin: true },
       { label: '系统设置', to: '/settings', icon: 'settings' },
     ],
   },
@@ -75,6 +76,7 @@ const NAV_KEYS: Record<string, string> = {
   '/audit': 'nav.audit',
   '/projects': 'nav.projects',
   '/users': 'nav.users',
+  '/groups': 'nav.groups',
   '/settings': 'nav.settings',
 }
 const GROUP_KEYS: Record<string, string> = {
@@ -87,12 +89,35 @@ const GROUP_KEYS: Record<string, string> = {
 const sidebarOpen = ref(false)
 const userMenuOpen = ref(false)
 
+const NAV_PERMISSIONS: Record<string, string> = {
+  '/domains': 'domain:read',
+  '/domains/onboard': 'domain:write',
+  '/rules': 'cache:read',
+  '/cache-debug': 'cache:read',
+  '/waf': 'waf:read',
+  '/certs': 'cert:read',
+  '/purge': 'cache:write',
+  '/prefetch': 'prefetch:read',
+  '/config-releases': 'config:read',
+  '/nodes': 'node:read',
+  '/stats': 'analytics:read',
+  '/monitor': 'analytics:read',
+  '/alerts': 'alert:read',
+  '/access-logs': 'analytics:read',
+  '/audit': 'audit:read',
+  '/projects': 'project:read',
+  '/users': 'user:read',
+  '/groups': 'user:read',
+  '/settings': 'settings:read',
+}
+
 const groups = computed<MenuGroup[]>(() =>
   MENU.map((group) => ({
     ...group,
     title: i18n.t(GROUP_KEYS[group.title] || group.title),
     items: group.items
       .filter((item) => !item.admin || auth.isAdmin)
+      .filter((item) => !NAV_PERMISSIONS[item.to] || auth.can(NAV_PERMISSIONS[item.to]))
       .map((item) => ({ ...item, label: i18n.t(NAV_KEYS[item.to] || item.label) })),
   })).filter((group) => group.items.length > 0),
 )

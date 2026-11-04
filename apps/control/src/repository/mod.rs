@@ -3058,3 +3058,180 @@ pub async fn purge_old_telemetry(pool: &PgPool, days: i64) -> sqlx::Result<(u64,
     .await;
     Ok((a, m))
 }
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UserGroupRow {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub permissions: Vec<String>,
+    #[sqlx(default)]
+    pub member_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn list_user_groups(pool: &PgPool) -> sqlx::Result<Vec<UserGroupRow>> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        SELECT g.id, g.name, g.description, g.permissions,
+               (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count,
+               g.created_at, g.updated_at
+        FROM user_groups g
+        ORDER BY g.name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_user_group(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<UserGroupRow>> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        SELECT g.id, g.name, g.description, g.permissions,
+               (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count,
+               g.created_at, g.updated_at
+        FROM user_groups g WHERE g.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn create_user_group(
+    pool: &PgPool,
+    name: &str,
+    description: &str,
+    permissions: &[String],
+) -> sqlx::Result<UserGroupRow> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        INSERT INTO user_groups (name, description, permissions)
+        VALUES ($1, $2, $3)
+        RETURNING id, name, description, permissions, 0::bigint AS member_count, created_at, updated_at
+        "#,
+    )
+    .bind(name)
+    .bind(description)
+    .bind(permissions)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_user_group(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+    description: &str,
+    permissions: &[String],
+) -> sqlx::Result<Option<UserGroupRow>> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        UPDATE user_groups
+        SET name = $2, description = $3, permissions = $4, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, description, permissions,
+                  (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = user_groups.id) AS member_count,
+                  created_at, updated_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(description)
+    .bind(permissions)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_user_group(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM user_groups WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn set_user_groups(
+    pool: &PgPool,
+    user_id: Uuid,
+    group_ids: &[Uuid],
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_group_members WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    for group_id in group_ids {
+        sqlx::query(
+            "INSERT INTO user_group_members (group_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(group_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+pub async fn groups_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<UserGroupRow>> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        SELECT g.id, g.name, g.description, g.permissions,
+               (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count,
+               g.created_at, g.updated_at
+        FROM user_groups g
+        JOIN user_group_members m ON m.group_id = g.id
+        WHERE m.user_id = $1
+        ORDER BY g.name
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn permissions_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<String>> {
+    let permissions: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(array_agg(DISTINCT p), '{}')
+        FROM user_group_members m
+        JOIN user_groups g ON g.id = m.group_id
+        CROSS JOIN LATERAL unnest(g.permissions) AS p
+        WHERE m.user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(permissions)
+}
+
+pub async fn group_member_ids(pool: &PgPool, group_id: Uuid) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar("SELECT user_id FROM user_group_members WHERE group_id = $1 ORDER BY user_id")
+        .bind(group_id)
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn set_group_members(
+    pool: &PgPool,
+    group_id: Uuid,
+    user_ids: &[Uuid],
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_group_members WHERE group_id = $1")
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await?;
+    for user_id in user_ids {
+        sqlx::query(
+            "INSERT INTO user_group_members (group_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(group_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}

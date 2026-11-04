@@ -36,6 +36,7 @@ pub struct UserInfo {
     pub name: String,
     pub role: String,
     pub is_active: bool,
+    pub permissions: Vec<String>,
     pub created_at: String,
     pub last_login_at: Option<String>,
 }
@@ -88,9 +89,22 @@ pub(crate) fn to_user_info(user: repository::UserRow) -> UserInfo {
         name: user.name,
         role: user.role,
         is_active: user.is_active,
+        permissions: Vec::new(),
         created_at: user.created_at.to_rfc3339(),
         last_login_at: user.last_login_at.map(|t| t.to_rfc3339()),
     }
+}
+
+async fn user_info_with_permissions(
+    state: &AppState,
+    user: repository::UserRow,
+) -> UserInfo {
+    let permissions = repository::permissions_for_user(&state.pool, user.id)
+        .await
+        .unwrap_or_default();
+    let mut info = to_user_info(user);
+    info.permissions = permissions;
+    info
 }
 
 pub async fn public_config(State(state): State<AppState>) -> Json<PublicAuthConfig> {
@@ -235,7 +249,7 @@ pub async fn login(
 
     Ok(Json(LoginResponse {
         token,
-        user: to_user_info(user),
+        user: user_info_with_permissions(&state, user).await,
     }))
 }
 
@@ -375,7 +389,7 @@ pub async fn register(
         StatusCode::CREATED,
         Json(LoginResponse {
             token,
-            user: to_user_info(user),
+            user: user_info_with_permissions(&state, user).await,
         }),
     ))
 }
@@ -428,7 +442,7 @@ pub async fn me(
             }),
         ));
     }
-    Ok(Json(to_user_info(user)))
+    Ok(Json(user_info_with_permissions(&state, user).await))
 }
 
 pub async fn update_me(
@@ -516,7 +530,7 @@ pub async fn update_me(
     if let Some(redis) = state.redis.as_deref() {
         redis.invalidate_session(id).await;
     }
-    Ok(Json(to_user_info(user)))
+    Ok(Json(user_info_with_permissions(&state, user).await))
 }
 
 pub async fn change_password(

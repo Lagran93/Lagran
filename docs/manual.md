@@ -216,6 +216,24 @@ systemctl status lagran-dns --no-pager
 - 普通用户只能看到自己所属项目的域名、规则、统计和日志。
 - 普通用户新建域名未指定项目时，自动使用个人 `Default` 项目。
 
+用户组（`系统 → 用户组`）：
+
+- 一个用户可加入多个组，权限取并集
+- 权限按模块读写划分：`domain:read/write`、`cache:read/write`、`waf:read/write`、`cert:read/write`、`prefetch:read/write`、`project:read/write`、`node:read/write`、`analytics:read`、`config:read/write`、`alert:read/write`、`audit:read`、`settings:read/write`、`user:read/write`
+- 模块权限只决定“能否进入该功能”，项目和域名范围仍由项目成员关系决定
+- 未加入任何用户组的用户沿用原有项目角色权限
+- 全局 `admin` 不受用户组限制
+- 用户组变更最多约 30 秒生效（会话缓存 TTL）
+
+示例：
+
+```text
+只读运维组：domain:read, cache:read, waf:read, analytics:read
+WAF 值班组：domain:read, waf:read, waf:write
+缓存管理员：domain:read, cache:read, cache:write, prefetch:read, prefetch:write
+```
+
+
 ### 3.2 接入域名
 
 1. 在「域名管理 → 新增域名」填写：

@@ -28,6 +28,8 @@ struct CachedSession {
     role: String,
     is_active: bool,
     token_version: i64,
+    #[serde(default)]
+    permissions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,7 @@ pub struct Actor {
     pub email: String,
     pub name: String,
     pub is_admin: bool,
+    pub permissions: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -79,20 +82,28 @@ impl FromRequestParts<AppState> for Actor {
             .map_err(|_| ActorError::unauthorized("unauthorized"))?;
         let id = Uuid::parse_str(&user.0.sub)
             .map_err(|_| ActorError::unauthorized("invalid token subject"))?;
-        let session_key = format!("lagran:session:{id}");
+        let session_key = format!("lagran:session:v2:{id}");
         let redis = state.redis.as_deref();
         let cached = if let Some(redis) = redis {
             redis.get_json::<CachedSession>(&session_key).await
         } else {
             None
         };
-        let (role, is_active, token_version) = if let Some(cached) = cached {
-            (cached.role, cached.is_active, cached.token_version)
+        let (role, is_active, token_version, permissions) = if let Some(cached) = cached {
+            (
+                cached.role,
+                cached.is_active,
+                cached.token_version,
+                cached.permissions,
+            )
         } else {
             let fresh = repository::get_user_session(&state.pool, id)
                 .await
                 .map_err(|_| ActorError::internal())?
                 .ok_or_else(|| ActorError::unauthorized("user no longer exists"))?;
+            let permissions = repository::permissions_for_user(&state.pool, id)
+                .await
+                .unwrap_or_default();
             if let Some(redis) = redis {
                 let _ = redis
                     .set_json(
@@ -101,12 +112,13 @@ impl FromRequestParts<AppState> for Actor {
                             role: fresh.0.clone(),
                             is_active: fresh.1,
                             token_version: fresh.2,
+                            permissions: permissions.clone(),
                         },
                         state.config.redis_session_ttl_secs,
                     )
                     .await;
             }
-            fresh
+            (fresh.0, fresh.1, fresh.2, permissions)
         };
         if !is_active {
             if let Some(redis) = redis {
@@ -125,6 +137,7 @@ impl FromRequestParts<AppState> for Actor {
             email: user.0.email.clone(),
             name: user.0.name.clone(),
             is_admin: role == "admin",
+            permissions,
         })
     }
 }
@@ -132,6 +145,21 @@ impl FromRequestParts<AppState> for Actor {
 impl Actor {
     pub fn admin(&self) -> bool {
         self.is_admin
+    }
+
+    /// Module permission from user groups. Users without any group keep the
+    /// legacy project-role behaviour (empty set = unrestricted modules).
+    pub fn allows(&self, permission: &str) -> bool {
+        if self.is_admin || self.permissions.is_empty() {
+            return true;
+        }
+        self.permissions.iter().any(|granted| {
+            granted == permission
+                || granted == "*"
+                || granted
+                    .strip_suffix(":*")
+                    .is_some_and(|module| permission.starts_with(&format!("{module}:")))
+        })
     }
 
     /// True when the actor may read the project's resources.

@@ -23,6 +23,7 @@ const DICT: Record<string, { zh: string; en: string }> = {
   'nav.audit': { zh: '操作审计', en: 'Audit Log' },
   'nav.projects': { zh: '项目管理', en: 'Projects' },
   'nav.users': { zh: '用户管理', en: 'Users' },
+  'nav.groups': { zh: '用户组', en: 'Groups' },
   'nav.settings': { zh: '系统设置', en: 'Settings' },
   'nav.config': { zh: '配置发布', en: 'Config Releases' },
   'common.refresh': { zh: '刷新', en: 'Refresh' },

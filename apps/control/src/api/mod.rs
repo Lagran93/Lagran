@@ -14,6 +14,7 @@ pub mod dns_test;
 pub mod domain;
 pub mod domain_diag;
 pub mod edge_endpoints;
+pub mod group;
 pub mod health;
 pub mod health_origin;
 pub mod metrics;
@@ -73,6 +74,15 @@ pub fn create_router(state: AppState) -> Router {
                     get(user::get).put(user::update).delete(user::delete),
                 )
                 .route("/users/:id/password", put(user::reset_password))
+                .route("/groups", get(group::list).post(group::create))
+                .route(
+                    "/groups/:id",
+                    get(group::get).put(group::update).delete(group::delete),
+                )
+                .route(
+                    "/groups/:id/members",
+                    get(group::members).put(group::set_members),
+                )
                 .route("/projects", get(project::list).post(project::create))
                 .route("/projects/:id", get(project::get).delete(project::delete))
                 .route("/projects/:id/domains", get(project::list_domains))
@@ -222,6 +232,10 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/cc/bans/:domain/:ip", delete(cc::remove)),
         )
         .fallback(not_found)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::middleware::permission::require_permission,
+        ))
         .layer(axum::middleware::from_fn(trace_http_request))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)

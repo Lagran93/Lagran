@@ -5,6 +5,7 @@ export interface AuthUser {
   email: string
   name: string
   role?: 'admin' | 'user' | string
+  permissions?: string[]
   is_active?: boolean
   created_at?: string
   last_login_at?: string | null
@@ -22,6 +23,15 @@ export const useAuthStore = defineStore('auth', {
   getters: {
     isAuthenticated: (s) => !!s.token,
     isAdmin: (s) => s.user?.role === 'admin',
+    can: (s) => (permission: string) => {
+      if (s.user?.role === 'admin') return true
+      const permissions = s.user?.permissions || []
+      // No groups keeps the legacy project-role behaviour.
+      if (!permissions.length) return true
+      return permissions.some(
+        (p) => p === '*' || p === permission || (p.endsWith(':*') && permission.startsWith(p.slice(0, -1))),
+      )
+    },
   },
   actions: {
     hydrate() {

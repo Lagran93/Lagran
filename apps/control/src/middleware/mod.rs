@@ -3,6 +3,7 @@
 pub mod agent_auth;
 pub mod login_limit;
 pub mod authz;
+pub mod permission;
 
 use crate::state::AppState;
 use crate::utils::{decode_token, Claims};
