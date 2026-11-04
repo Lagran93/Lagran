@@ -43,7 +43,7 @@ use axum::{
 use http_body_util::{BodyExt, Limited};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Largest request body we are willing to buffer for pass-through traffic.
 const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;
@@ -436,6 +436,48 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         }
     }
 
+    let cache_lookup_path = if eff.ignore_query {
+        path_only.clone()
+    } else {
+        path_and_query.clone()
+    };
+    let key_method = if method == Method::HEAD {
+        Method::GET
+    } else {
+        method.clone()
+    };
+    let key = cache_key_for_request(&key_method, &host, &cache_lookup_path, &headers);
+
+    // Strict client revalidation (`no-cache` / `max-age=0` / Pragma) must not
+    // reuse a fresh body blindly. If we already have a validator, make one
+    // conditional origin request and either refresh the entry on 304 or replace
+    // it on 200. Without a validator, fall through to the normal full fetch.
+    if matches!(
+        request_reason,
+        Some("request-max-age-0" | "request-no-cache" | "request-pragma-no-cache")
+    ) {
+        if let Some(response) = revalidate_cached_entry(
+            &state,
+            &key,
+            &eff,
+            &headers,
+            &method,
+            &host,
+            &path_and_query,
+            &path_only,
+            &client_ip,
+            &user_agent,
+            &referer,
+            &request_id,
+            if_none_match.as_deref(),
+            start,
+        )
+        .await
+        {
+            return response;
+        }
+    }
+
     if !request_cacheable {
         let mut response = bypass_to_origin(
             &state,
@@ -456,18 +498,6 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         set_cache_reason(&mut response, request_reason);
         return response;
     }
-
-    let cache_lookup_path = if eff.ignore_query {
-        path_only.clone()
-    } else {
-        path_and_query.clone()
-    };
-    let key_method = if method == Method::HEAD {
-        Method::GET
-    } else {
-        method.clone()
-    };
-    let key = cache_key_for_request(&key_method, &host, &cache_lookup_path, &headers);
 
     if let Some((spec, raw_range)) = range_spec {
         let lookup = state.cache.get_result(&key).await;
@@ -1023,6 +1053,243 @@ async fn fetch_origin(
         tracing::warn!(origin = %target.url, "origin failed, trying next origin");
     }
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn revalidate_cached_entry(
+    state: &Arc<AppState>,
+    key: &str,
+    eff: &Effective,
+    headers: &HeaderMap,
+    method: &Method,
+    host: &str,
+    path_and_query: &str,
+    path_only: &str,
+    client_ip: &str,
+    user_agent: &str,
+    referer: &str,
+    request_id: &str,
+    client_if_none_match: Option<&str>,
+    start: Instant,
+) -> Option<Response> {
+    if headers.contains_key(header::RANGE) {
+        return None;
+    }
+    let entry = match state.cache.get_result(key).await {
+        CacheGetResult::Hit(entry) | CacheGetResult::Stale(entry) => entry,
+        CacheGetResult::Expired | CacheGetResult::Miss => return None,
+    };
+    if entry_response_bypass(eff, &entry) {
+        state.cache.delete(key).await;
+        return None;
+    }
+
+    let etag = entry.header("etag").map(str::to_string);
+    let last_modified = entry.header("last-modified").map(str::to_string);
+    if etag.is_none() && last_modified.is_none() {
+        return None;
+    }
+
+    let mut conditional = headers.clone();
+    conditional.remove(header::CACHE_CONTROL);
+    conditional.remove(header::PRAGMA);
+    conditional.remove(header::IF_NONE_MATCH);
+    conditional.remove(header::IF_MODIFIED_SINCE);
+    if let Some(ref etag) = etag {
+        if let Ok(value) = HeaderValue::from_str(etag) {
+            conditional.insert(header::IF_NONE_MATCH, value);
+        }
+    } else if let Some(ref last_modified) = last_modified {
+        if let Ok(value) = HeaderValue::from_str(last_modified) {
+            conditional.insert(header::IF_MODIFIED_SINCE, value);
+        }
+    }
+
+    match fetch_origin(
+        state,
+        eff,
+        host,
+        path_and_query,
+        &conditional,
+        &Method::GET,
+    )
+    .await
+    {
+        Ok(resp) if resp.status == StatusCode::NOT_MODIFIED => {
+            let mut refreshed = entry;
+            merge_revalidation_headers(&mut refreshed, &resp.headers);
+            // Let entry_to_response generate a fresh Date for the revalidated
+            // representation instead of retaining the pre-304 Date.
+            refreshed
+                .headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("date"));
+            refreshed.stored_at_epoch_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let content_type = refreshed.header("content-type").unwrap_or("");
+            let response_policy = resolve_rule_policy_for_response(
+                &eff.rules,
+                &eff.path,
+                method.as_str(),
+                path_and_query.split_once('?').map(|(_, q)| q).unwrap_or(""),
+                content_type,
+            );
+            if response_policy.action == RuleAction::Cache {
+                match decide_storage_reason(
+                    refreshed.status,
+                    &refreshed.headers,
+                    response_policy,
+                    state.default_ttl_secs,
+                ) {
+                    Ok(decision) => {
+                        if refreshed.body.len() <= state.max_cacheable_body {
+                            state
+                                .cache
+                                .set_with_swr(
+                                    key,
+                                    refreshed.clone(),
+                                    decision.ttl_secs,
+                                    decision.swr_secs,
+                                )
+                                .await;
+                        }
+                    }
+                    Err(_) => {
+                        state.cache.delete(key).await;
+                    }
+                }
+            } else {
+                state.cache.delete(key).await;
+            }
+
+            let mut response = serve_cached(
+                state,
+                refreshed,
+                CacheStatus::Revalidated,
+                method,
+                host,
+                path_only,
+                client_ip,
+                user_agent,
+                referer,
+                request_id,
+                client_if_none_match,
+                eff,
+                start,
+            )
+            .await;
+            set_cache_reason(&mut response, Some("origin-304"));
+            Some(response)
+        }
+        Ok(resp) => {
+            let status = resp.status;
+            let body_len = resp.body.len() as u64;
+            let etag = entry_etag(&resp);
+            let content_type = resp
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let response_policy = resolve_rule_policy_for_response(
+                &eff.rules,
+                &eff.path,
+                method.as_str(),
+                path_and_query.split_once('?').map(|(_, q)| q).unwrap_or(""),
+                content_type,
+            );
+            if response_policy.action == RuleAction::Cache
+                && (200..300).contains(&status.as_u16())
+            {
+                if let Ok(decision) = decide_storage_reason(
+                    status.as_u16(),
+                    &headers_vec(&resp.headers),
+                    response_policy,
+                    state.default_ttl_secs,
+                ) {
+                    if resp.body.len() <= state.max_cacheable_body {
+                        let entry = clone_as_entry(&resp);
+                        state
+                            .cache
+                            .set_with_swr(key, entry, decision.ttl_secs, decision.swr_secs)
+                            .await;
+                    } else {
+                        store_large_response(state, key, &resp, decision).await;
+                    }
+                }
+            }
+            state.metrics.record_miss(host, body_len).await;
+            log_access(
+                &state.access_log,
+                method,
+                host,
+                path_only,
+                status.as_u16(),
+                start,
+                client_ip,
+                user_agent,
+                referer,
+                body_len,
+                CacheStatus::Revalidated.as_str(),
+                request_id,
+            )
+            .await;
+            let mut response = origin_response(
+                resp,
+                CacheStatus::Revalidated.as_str(),
+                &etag,
+                &eff.cors,
+                &eff.custom_headers,
+                policy_browser_ttl(&response_policy),
+            );
+            set_cache_reason(&mut response, Some("origin-200"));
+            Some(response)
+        }
+        Err(error) => {
+            let failure = error.failure();
+            tracing::warn!(error = %error, origin = %eff.origin_url, "conditional revalidation failed");
+            log_access(
+                &state.access_log,
+                method,
+                host,
+                path_only,
+                failure.status().as_u16(),
+                start,
+                client_ip,
+                user_agent,
+                referer,
+                0,
+                failure.log_label(),
+                request_id,
+            )
+            .await;
+            Some(default_page::origin_error_page(host, path_only, failure))
+        }
+    }
+}
+
+fn merge_revalidation_headers(entry: &mut CacheEntry, headers: &HeaderMap) {
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        if name_str.eq_ignore_ascii_case("connection")
+            || name_str.eq_ignore_ascii_case("keep-alive")
+            || name_str.eq_ignore_ascii_case("transfer-encoding")
+            || name_str.eq_ignore_ascii_case("content-length")
+            || name_str.eq_ignore_ascii_case("set-cookie")
+            || name_str.eq_ignore_ascii_case("set-cookie2")
+            || name_str.eq_ignore_ascii_case("age")
+        {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        entry
+            .headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name_str));
+        entry.headers.push((name_str.to_string(), value.to_string()));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1897,7 +2164,6 @@ pub(crate) async fn log_access(
 }
 
 fn uuid_like_request_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())

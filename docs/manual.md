@@ -698,7 +698,7 @@ SWR：
 - `Vary` 字段受支持，或没有 `Vary`
 - 请求无 `Authorization`
 - 请求无普通 Cookie（规则 `ignore_cookie` 例外）
-- 请求无 `no-store`、`no-cache`、`max-age=0`、`Pragma: no-cache`
+- 请求带 `no-cache`/`max-age=0`/`Pragma: no-cache` 时走条件回源，不直接使用旧缓存
 
 多个 `Cache-Control` 响应头会按逗号合并后解析；多个 `Vary` 头同理。
 
@@ -720,7 +720,7 @@ CORS `Vary` 会被哈希进 cache key，避免不同 Origin 串缓存。
 
 ### 5.5 请求 no-cache 的真实行为
 
-请求带有以下任一项时，Edge 不读取共享缓存，直接回源：
+请求带有以下任一项时，Edge 不直接使用旧缓存，而是走条件回源：
 
 ```text
 Cache-Control: no-cache
@@ -728,14 +728,24 @@ Cache-Control: max-age=0
 Pragma: no-cache
 ```
 
-这意味着：
+如果缓存对象有 `ETag` 或 `Last-Modified`：
 
-- 小文件、大文件、完整 GET、Range 行为一致
-- 不再出现“小文件 no-cache 仍 HIT、大文件不命中”的差异
-- 响应仍可写回缓存，但本次请求从源站获取
+- Edge 向源站发送 `If-None-Match` / `If-Modified-Since`
+- 源站 `304 Not Modified`：复用缓存 body，刷新缓存头/存活时间
+- 源站 `200`：用新响应替换缓存
+- 响应头 `X-Lagran-Cache: REVALIDATED`
+- 响应头 `X-Lagran-Cache-Reason: origin-304`（或 `origin-200`）
+
+如果缓存对象没有 validator，或缓存不存在：
+
+- 按普通回源处理
+
+注意：
+
+- 该过程仍会向源站发起一次条件请求，节省的是响应 body 和缓存重建，不是完全的本地 HIT
 - `Cache-Control: no-store` 仍然是不读不写
 
-这是本实现选择的保守 RFC 语义：不保存需要每次 revalidate 的共享对象，也不把请求的 `no-cache` 删除后继续 HIT。
+这是本实现选择的保守 RFC 语义：不把请求的 `no-cache` 删除后直接 HIT。
 
 ### 5.6 响应头语义
 
@@ -1144,9 +1154,11 @@ ACCESS_LOG_REPORT=true
 | `authorization` | Authorization 绕过 |
 | `no-store` | 请求/响应 no-store |
 | `no-cache` | 响应 no-cache，未写入共享缓存 |
-| `request-no-cache` | 请求 no-cache 回源 |
-| `request-max-age-0` | 请求 max-age=0 回源 |
-| `request-pragma-no-cache` | 请求 Pragma: no-cache 回源 |
+| `request-no-cache` | 请求 no-cache 条件回源 |
+| `request-max-age-0` | 请求 max-age=0 条件回源 |
+| `request-pragma-no-cache` | 请求 Pragma: no-cache 条件回源 |
+| `origin-304` | 条件回源命中 304，复用缓存 |
+| `origin-200` | 条件回源返回 200，更新缓存 |
 | `vary` | Vary 不受支持 |
 | `vary:user-agent` | Vary User-Agent |
 | `vary:cookie` | Vary Cookie 且未 ignore |
@@ -1391,16 +1403,17 @@ Accept-Ranges: bytes
 
 请求带 `Cache-Control: no-cache`、`max-age=0` 或 `Pragma: no-cache`：
 
-- 普通文件、大文件、完整 GET、Range 一致回源
-- 不会因为文件大小不同而出现部分 HIT
-- 回源响应仍可写入缓存，但本次请求不使用旧对象
+- 有 `ETag`/`Last-Modified` 时向源站发条件请求
+- 源站 `304`：复用缓存 body，`X-Lagran-Cache: REVALIDATED`，`X-Lagran-Cache-Reason: origin-304`
+- 源站 `200`：新响应覆盖缓存
+- 没有 validator 时退回普通全量回源
 
 响应带 `Cache-Control: no-cache`：
 
 - 不写入共享缓存，即使命中路径规则也不覆盖
 - 日志中的 `X-Lagran-Cache-Reason` 为 `no-cache`
 
-如果要求“保存后每次条件请求 304 复用”，需要额外实现独立的 validator-only 缓存层；当前实现选择不保存，避免把 no-cache 对象当作 fresh 命中。
+如果要求“保存后每次条件请求 304 复用”，当前已由独立的条件校验路径处理；304 时不会重新下载 body。
 
 ### 9.8 预热失败
 
@@ -1704,7 +1717,7 @@ cd apps/frontend && npm run generate
 - 普通缓存以完整对象为单位；大对象支持 partial Range segment，但仅覆盖已请求区间。
 - 大对象完整 GET 需要 `complete=true`；partial 不能拼接为完整响应。
 - 单段 Range 才支持 partial 填充；多段 Range 透传。
-- `no-cache` 响应不进入共享缓存；请求 no-cache、`max-age=0` 统一回源，不保存 validator-only 条目。
+- `no-cache` 响应不进入共享缓存；请求 no-cache、`max-age=0` 有 validator 时走条件请求 304 复用，无 validator 时回源。
 - `only-if-cached`、`min-fresh`、`max-stale`、`stale-if-error` 尚未完整实现；请求 no-cache 选择直接回源。
 - 修改缓存规则/配置不会自动删除旧缓存。
 - 普通域名限流在配置 `REDIS_URL` 后由 Redis token bucket 跨 Edge 共享；未配置或 Redis 故障时回退进程内 bucket。

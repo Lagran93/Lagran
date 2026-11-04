@@ -54,7 +54,14 @@ pub struct OriginClient {
 
 /// Headers worth replaying to the origin for a cacheable GET/HEAD.
 fn cacheable_forward_headers(headers: &HeaderMap) -> Vec<(&'static str, HeaderValue)> {
-    const ALLOW: &[&str] = &["accept", "accept-language", "user-agent", "referer"];
+    const ALLOW: &[&str] = &[
+        "accept",
+        "accept-language",
+        "user-agent",
+        "referer",
+        "if-none-match",
+        "if-modified-since",
+    ];
     let mut out = Vec::with_capacity(ALLOW.len());
     for name in ALLOW {
         if let Some(v) = headers.get(*name) {

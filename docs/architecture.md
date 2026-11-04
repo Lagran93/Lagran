@@ -97,8 +97,9 @@ Internet
   unhealthy 时优先切换到 backup。
 - cache key 包含规范化的 `Accept-Language` 哈希，避免 `Vary: Accept-Language` 响应串语言；
   ETag 由响应 body 计算（源站未提供时），不使用 cache key 生成。
-- BYPASS/动态请求保留客户端的 `Cache-Control`/`Pragma`，只在可缓存 GET/HEAD 上做
-  `max-age=0` reload 归一化。
+- BYPASS/动态请求保留客户端的 `Cache-Control`/`Pragma`；可缓存对象上的
+  `max-age=0`/`no-cache`/`Pragma: no-cache` 走独立条件回源路径（有 validator 时
+  304 刷新缓存，无 validator 时全量回源）。
 - `pingora-cache` 启用 cache lock，并发 miss 会合并；`should_serve_stale` 允许
   `stale-while-revalidate` 窗口返回 STALE。
 - Control 的 config/cert 下发支持 ETag + `If-None-Match`/304；Edge 保存上次

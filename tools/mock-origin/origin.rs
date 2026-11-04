@@ -72,6 +72,7 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
     let mut cookie = String::new();
     let mut accept_language = String::new();
     let mut cache_control = String::new();
+    let mut if_none_match = String::new();
     let mut host = String::new();
     let mut range = String::new();
     for line in lines {
@@ -90,6 +91,8 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                 accept_language = value.to_string();
             } else if name.eq_ignore_ascii_case("cache-control") {
                 cache_control = value.to_string();
+            } else if name.eq_ignore_ascii_case("if-none-match") {
+                if_none_match = value.to_string();
             } else if name.eq_ignore_ascii_case("range") {
                 range = value.to_string();
             }
@@ -339,6 +342,32 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ("Vary", "Cookie".into()),
                 ],
             ),
+            "/assets/app.css" => {
+                let etag = "\"css-v1\"";
+                if if_none_match
+                    .split(',')
+                    .any(|candidate| candidate.trim() == etag)
+                {
+                    (
+                        304,
+                        Vec::new(),
+                        vec![
+                            ("ETag", etag.into()),
+                            ("Cache-Control", "public, max-age=600".into()),
+                        ],
+                    )
+                } else {
+                    (
+                        200,
+                        b"body{color:red}".to_vec(),
+                        vec![
+                            ("Content-Type", "text/css".into()),
+                            ("ETag", etag.into()),
+                            ("Cache-Control", "public, max-age=600".into()),
+                        ],
+                    )
+                }
+            }
             _ => (
                 200,
                 b"hello from origin".to_vec(),

@@ -1046,6 +1046,15 @@ impl DataPlaneProxy {
                 }
             })
         };
+        // Strict client revalidation has a dedicated conditional-origin path in
+        // the in-process engine (304 refresh). Keep it off the native cache
+        // fast path so a stale body is never served on max-age=0/no-cache.
+        if matches!(
+            request_reason,
+            Some("request-max-age-0" | "request-no-cache" | "request-pragma-no-cache")
+        ) {
+            return None;
+        }
         let bypasses = request_reason.is_some();
         let is_head = req.method == Method::HEAD && policy.action == RuleAction::Cache && !bypasses;
         let is_websocket = is_websocket_upgrade(&req.headers);
@@ -1769,6 +1778,8 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
         }
     };
     let body_len = bytes.len();
+    let no_content = parts.status == StatusCode::NOT_MODIFIED
+        || parts.status == StatusCode::NO_CONTENT;
     let head_content_length = if is_head {
         // HTTP/2 frames HEAD with END_STREAM and can safely carry the real
         // representation length. Pingora's H1 encoder cannot reliably do so
@@ -1779,7 +1790,11 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
     };
     let bytes = if is_head { Bytes::new() } else { bytes };
     let end_of_stream = bytes.is_empty();
-    let initial_len = if is_head { None } else { Some(bytes.len()) };
+    let initial_len = if is_head || no_content {
+        None
+    } else {
+        Some(bytes.len())
+    };
     let Ok(mut response) = ResponseHeader::build(parts.status.as_u16(), initial_len) else {
         return;
     };
@@ -1791,13 +1806,18 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
             return;
         }
     }
-    if is_head || end_of_stream {
-        let value = if is_head {
-            head_content_length.as_str()
-        } else {
-            "0"
-        };
-        if response.insert_header("content-length", value).is_err() {
+    if is_head {
+        if response
+            .insert_header("content-length", head_content_length.as_str())
+            .is_err()
+        {
+            return;
+        }
+    } else if end_of_stream {
+        // A 304/204 has no payload. Sending `Content-Length: 0` is misleading
+        // (RFC 9110 allows Content-Length on 304 only when it equals the 200
+        // representation length), so omit it entirely.
+        if !no_content && response.insert_header("content-length", "0").is_err() {
             return;
         }
     } else if response
