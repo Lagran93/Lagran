@@ -195,17 +195,26 @@
     </BaseModal>
 
     <!-- 编辑源站 -->
-    <BaseModal v-model="editOpen" title="编辑源站配置" width="880px" confirm-text="保存修改" :loading="submitting"
+    <BaseModal v-model="editOpen" title="编辑源站配置" width="860px" confirm-text="保存修改" :loading="submitting"
       @confirm="saveOrigin">
       <div class="origin-editor">
+        <div v-if="editDomain" class="origin-context">
+          <span class="origin-context-label">当前域名</span>
+          <strong class="origin-context-name">{{ editDomain.name }}</strong>
+          <span class="origin-context-address">
+            {{ editDomain.origin_proto }}://{{ editDomain.origin_host }}:{{ editDomain.origin_port }}
+          </span>
+        </div>
+
         <div class="origin-editor-head">
-          <div>
-            <div class="origin-editor-title">源站池</div>
-            <div class="origin-editor-sub">
-              优先级数字越小越优先；同一优先级按权重分配，健康检查失败会自动跳过。
-            </div>
+          <div class="origin-title-line">
+            <span class="origin-editor-title">源站池</span>
+            <span class="origin-count" :class="{ empty: !enabledOriginCount }">
+              <span class="origin-count-dot" />
+              {{ enabledOriginCount }}/{{ editForm.origins.length }} 已启用
+            </span>
           </div>
-          <button class="btn btn-default btn-sm" type="button" @click="addOrigin">
+          <button class="btn btn-default btn-sm origin-add-btn" type="button" @click="addOrigin">
             <AppIcon name="plus" :size="14" />
             添加源站
           </button>
@@ -216,80 +225,93 @@
             :class="{ 'is-disabled': !origin.enabled }">
             <div class="origin-card-head">
               <div class="origin-identity">
-                <span class="origin-number">{{ index + 1 }}</span>
+                <span class="origin-number">{{ String(index + 1).padStart(2, '0') }}</span>
                 <div class="origin-name-wrap">
-                  <div class="origin-name">{{ origin.host || '未填写源站主机' }}</div>
+                  <div class="origin-name">{{ origin.host || '新源站' }}</div>
                   <div class="origin-meta">
                     <span>{{ origin.proto.toUpperCase() }}</span>
-                    <span>·</span>
-                    <span>{{ origin.port || '—' }}</span>
-                    <span v-if="origin.enabled" class="origin-live">启用</span>
-                    <span v-else class="origin-paused">停用</span>
+                    <span class="origin-meta-separator" />
+                    <span>权重 {{ origin.weight || 100 }}</span>
+                    <span>优先级 {{ origin.priority ?? 0 }}</span>
                   </div>
                 </div>
               </div>
               <div class="origin-card-actions">
-                <label class="origin-toggle">
+                <label class="origin-enable" :class="{ active: origin.enabled }">
                   <input v-model="origin.enabled" type="checkbox" />
-                  启用
+                  <span class="origin-switch" aria-hidden="true" />
+                  <span>{{ origin.enabled ? '已启用' : '已停用' }}</span>
                 </label>
-                <button class="btn btn-text btn-sm danger" type="button"
-                  :disabled="editForm.origins.length <= 1" @click="removeOrigin(index)">
-                  删除
+                <button class="origin-delete" type="button" aria-label="删除该源站" :disabled="editForm.origins.length <= 1"
+                  @click="removeOrigin(index)">
+                  <AppIcon name="trash" :size="14" />
+                  <span>删除</span>
                 </button>
               </div>
             </div>
 
-            <div class="origin-grid">
-              <label class="origin-field">
-                <span>协议</span>
-                <select v-model="origin.proto" class="select">
-                  <option value="https">HTTPS</option>
-                  <option value="http">HTTP</option>
-                </select>
-              </label>
-              <label class="origin-field span-2">
-                <span>源站主机 / IP</span>
-                <input v-model="origin.host" class="input" placeholder="origin.example.com 或 203.0.113.10" />
-              </label>
-              <label class="origin-field">
-                <span>端口</span>
-                <input v-model.number="origin.port" class="input" type="number" min="1" max="65535" />
-              </label>
-              <label class="origin-field">
-                <span>权重</span>
-                <input v-model.number="origin.weight" class="input" type="number" min="1" />
-              </label>
-              <label class="origin-field">
-                <span>优先级</span>
-                <input v-model.number="origin.priority" class="input" type="number" min="0" />
-              </label>
-              <label class="origin-field span-2">
-                <span>TLS SNI <em>可选</em></span>
-                <input v-model="origin.sni" class="input" placeholder="证书域名，例如 origin.example.com" />
-              </label>
-              <label class="origin-field span-4">
-                <span>回源 Host <em>可选</em></span>
-                <input v-model="origin.host_header" class="input" placeholder="留空则使用 SNI / 源站主机" />
-              </label>
+            <div class="origin-card-body">
+              <div class="origin-config">
+                <label class="origin-field origin-proto-field">
+                  <span>协议</span>
+                  <select v-model="origin.proto" class="select">
+                    <option value="https">HTTPS</option>
+                    <option value="http">HTTP</option>
+                  </select>
+                </label>
+                <label class="origin-field origin-host-field">
+                  <span>源站主机 / IP</span>
+                  <input v-model="origin.host" class="input" inputmode="url" autocapitalize="none" spellcheck="false"
+                    placeholder="origin.example.com 或 203.0.113.10" />
+                </label>
+                <label class="origin-field origin-port-field">
+                  <span>端口</span>
+                  <input v-model.number="origin.port" class="input" type="number" min="1" max="65535" />
+                </label>
+              </div>
+
+              <div class="origin-tuning">
+                <label class="origin-field">
+                  <span>权重</span>
+                  <input v-model.number="origin.weight" class="input" type="number" min="1" placeholder="100" />
+                </label>
+                <label class="origin-field">
+                  <span>优先级</span>
+                  <input v-model.number="origin.priority" class="input" type="number" min="0" placeholder="0" />
+                </label>
+                <label class="origin-field">
+                  <span>TLS SNI <em>可选</em></span>
+                  <input v-model="origin.sni" class="input" inputmode="url" autocapitalize="none" spellcheck="false"
+                    placeholder="证书域名" />
+                </label>
+                <label class="origin-field">
+                  <span>回源 Host <em>可选</em></span>
+                  <input v-model="origin.host_header" class="input" inputmode="url" autocapitalize="none"
+                    spellcheck="false" placeholder="留空用 SNI / 主机" />
+                </label>
+              </div>
             </div>
           </div>
         </div>
 
         <div class="origin-options">
-          <label class="origin-option">
-            <input v-model="editForm.ssl_enabled" type="checkbox" />
-            <span>
-              <b>启用 HTTPS</b>
-              <small>HTTP 请求会 301/308 跳转到 HTTPS，需要有效证书</small>
-            </span>
-          </label>
-          <div class="origin-option-note">
-            源站填 IP 且使用 HTTPS 域名证书时，填写 TLS SNI；多虚拟主机时填写回源 Host。
+          <span class="origin-option-icon">
+            <AppIcon name="shield" :size="16" />
+          </span>
+          <div class="origin-option-copy">
+            <label class="origin-enable origin-https-toggle" :class="{ active: editForm.ssl_enabled }">
+              <input v-model="editForm.ssl_enabled" type="checkbox" />
+              <span class="origin-switch" aria-hidden="true" />
+              <span>启用 HTTPS 跳转</span>
+            </label>
+            <small>HTTP 请求 301/308 跳转到 HTTPS；源站为 IP + 域名证书时请填写 TLS SNI / 回源 Host。</small>
           </div>
         </div>
 
-        <p v-if="editError" class="text-danger" style="font-size: 13px">{{ editError }}</p>
+        <div v-if="editError" class="alert alert-danger origin-error" role="alert">
+          <AppIcon name="alert" :size="16" class="icon" />
+          <span>{{ editError }}</span>
+        </div>
       </div>
     </BaseModal>
 
@@ -453,6 +475,9 @@ const editForm = ref({
   origins: [] as OriginForm[],
   ssl_enabled: true,
 })
+const enabledOriginCount = computed(
+  () => editForm.value.origins.filter((origin) => origin.enabled).length,
+)
 
 const settingsOpen = ref(false)
 const settingsDomain = ref<any>(null)
@@ -837,84 +862,193 @@ onMounted(load)
 .origin-editor {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
+  min-width: 0;
+}
+
+.origin-context {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 9px;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.origin-context-label {
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--brand-bg);
+  color: var(--brand);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.origin-context-name {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.origin-context-address {
+  min-width: 0;
+  margin-left: auto;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .origin-editor-head {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
+}
+
+.origin-intro {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.origin-intro-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  border-radius: 10px;
+  background: var(--brand-bg);
+  color: var(--brand);
+}
+
+.origin-intro-copy {
+  min-width: 0;
+}
+
+.origin-title-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 22px;
 }
 
 .origin-editor-title {
   font-size: 14px;
   font-weight: 600;
-  color: var(--text-1);
+  color: var(--text);
+}
+
+.origin-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid var(--success-border);
+  border-radius: 999px;
+  background: var(--success-bg);
+  color: var(--success);
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.origin-count-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.origin-count.empty {
+  border-color: var(--border);
+  background: var(--bg);
+  color: var(--text-3);
 }
 
 .origin-editor-sub {
   margin-top: 4px;
   color: var(--text-3);
   font-size: 12px;
-  line-height: 1.5;
+  line-height: 1.6;
+}
+
+.origin-add-btn {
+  flex: none;
 }
 
 .origin-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 9px;
 }
 
 .origin-card {
-  border: 1px solid var(--divider);
+  border: 1px solid var(--border);
   border-radius: 12px;
-  background: #fff;
+  background: var(--card);
   overflow: hidden;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.02);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
 }
 
 .origin-card:hover {
-  border-color: var(--border);
-  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+  border-color: color-mix(in srgb, var(--brand) 35%, var(--border));
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.05);
 }
 
 .origin-card.is-disabled {
-  background: #fafbfc;
+  background: color-mix(in srgb, var(--card) 86%, var(--bg));
 }
 
 .origin-card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 12px 14px;
+  gap: 10px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--divider);
-  background: #fcfcfd;
+  background: color-mix(in srgb, var(--brand) 2%, var(--card));
 }
 
 .origin-card.is-disabled .origin-card-head {
-  background: #f6f7f9;
+  background: var(--bg);
 }
 
 .origin-identity {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
 }
 
 .origin-number {
   width: 24px;
   height: 24px;
-  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--brand) 18%, transparent);
+  border-radius: 7px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex: none;
   background: var(--brand-bg);
   color: var(--brand);
-  font-size: 12px;
+  font-family: var(--mono);
+  font-size: 10px;
   font-weight: 600;
 }
 
@@ -923,9 +1057,9 @@ onMounted(load)
 }
 
 .origin-name {
-  color: var(--text-1);
+  color: var(--text);
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -934,67 +1068,208 @@ onMounted(load)
 .origin-meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 4px;
-  margin-top: 3px;
+  margin-top: 2px;
   color: var(--text-3);
-  font-size: 11px;
-}
-
-.origin-live,
-.origin-paused {
-  margin-left: 4px;
-  padding: 1px 6px;
-  border-radius: 999px;
   font-size: 10px;
 }
 
-.origin-live {
-  color: #15803d;
-  background: #ecfdf3;
-}
-
-.origin-paused {
-  color: var(--text-3);
-  background: #f1f3f5;
+.origin-meta-separator {
+  width: 1px;
+  height: 9px;
+  background: var(--border-strong);
 }
 
 .origin-card-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   flex: none;
 }
 
-.origin-toggle {
+.origin-enable {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 7px;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
   color: var(--text-2);
   font-size: 12px;
   cursor: pointer;
+  user-select: none;
   white-space: nowrap;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
 }
 
-.origin-grid {
+.origin-enable:hover {
+  border-color: var(--border-strong);
+}
+
+.origin-enable.active {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.origin-enable input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.origin-enable:focus-within {
+  outline: 2px solid rgba(22, 119, 255, 0.28);
+  outline-offset: 2px;
+}
+
+.origin-switch {
+  position: relative;
+  width: 28px;
+  height: 16px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--text-4);
+  transition: background 0.15s ease;
+}
+
+.origin-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.24);
+  transition: transform 0.15s ease;
+}
+
+.origin-enable.active .origin-switch {
+  background: var(--success);
+}
+
+.origin-enable.active .origin-switch::after {
+  transform: translateX(12px);
+}
+
+.origin-delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.origin-delete:hover:not(:disabled) {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.origin-delete:focus-visible {
+  outline: 2px solid rgba(22, 119, 255, 0.28);
+  outline-offset: 2px;
+}
+
+.origin-delete:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.origin-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+}
+
+.origin-config {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr) 86px;
+  gap: 8px;
+}
+
+.origin-tuning {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px 12px;
-  padding: 14px;
+  gap: 8px;
+}
+
+.origin-advanced {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.origin-subgroup {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--divider);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg) 72%, var(--card));
+}
+
+.origin-subgroup-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.origin-subgroup-head>span {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.origin-subgroup-head em {
+  color: var(--text-3);
+  font-style: normal;
+  font-weight: 400;
+}
+
+.origin-subgroup-head small {
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.4;
+  text-align: right;
+}
+
+.origin-subgroup-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .origin-field {
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 5px;
+  gap: 3px;
 }
 
-.origin-field > span {
+.origin-field>span {
   color: var(--text-2);
-  font-size: 12px;
+  font-size: 11px;
 }
 
-.origin-field > span em {
+.origin-field>span em {
   color: var(--text-3);
   font-style: normal;
   font-weight: 400;
@@ -1002,60 +1277,81 @@ onMounted(load)
 
 .origin-field .input,
 .origin-field .select {
-  height: 34px;
+  height: 32px;
   width: 100%;
   min-width: 0;
 }
 
-.origin-field.span-2 {
-  grid-column: span 2;
-}
-
-.origin-field.span-4 {
-  grid-column: span 4;
-}
-
 .origin-options {
-  border: 1px solid var(--divider);
-  border-radius: 10px;
-  padding: 12px 14px;
-  background: #fafbfc;
-}
-
-.origin-option {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  cursor: pointer;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--brand) 2%, var(--card));
 }
 
-.origin-option input {
-  margin-top: 2px;
+.origin-option-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 7px;
+  background: var(--brand-bg);
+  color: var(--brand);
 }
 
-.origin-option span {
+.origin-option-copy {
   display: flex;
+  min-width: 0;
   flex-direction: column;
   gap: 2px;
 }
 
-.origin-option b {
-  color: var(--text-1);
-  font-size: 13px;
+.origin-https-toggle {
+  align-self: flex-start;
+  min-height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
   font-weight: 500;
 }
 
-.origin-option small {
-  color: var(--text-3);
-  font-size: 12px;
+.origin-https-toggle:hover {
+  border-color: transparent;
 }
 
-.origin-option-note {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--divider);
+.origin-https-toggle.active {
+  background: transparent;
+}
+
+.origin-option-copy small {
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.origin-help {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
   color: var(--text-3);
   font-size: 12px;
+  line-height: 1.55;
+}
+
+.origin-help .app-icon {
+  margin-top: 2px;
+  color: var(--text-4);
+}
+
+.origin-error {
+  margin: 0;
 }
 
 .check-col {
@@ -1079,34 +1375,128 @@ onMounted(load)
 }
 
 @media (max-width: 720px) {
-  .origin-editor-head {
-    flex-direction: column;
+  .origin-editor {
+    gap: 12px;
   }
 
-  .origin-editor-head .btn {
+  .origin-context-address {
+    width: 100%;
+    margin-left: 0;
+    padding-left: 2px;
+  }
+
+  .origin-editor-head {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .origin-add-btn {
     width: 100%;
     justify-content: center;
   }
 
-  .origin-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .origin-field.span-2 {
-    grid-column: span 2;
-  }
-
-  .origin-field.span-4 {
-    grid-column: span 2;
+  .origin-card {
+    border-radius: 10px;
   }
 
   .origin-card-head {
     align-items: flex-start;
+    gap: 10px;
   }
 
   .origin-card-actions {
+    gap: 4px;
+  }
+
+  .origin-enable {
+    min-height: 34px;
+    padding: 0 8px;
+  }
+
+  .origin-delete {
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0 6px;
+  }
+
+  .origin-delete span {
+    display: none;
+  }
+
+  .origin-card-body {
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .origin-config {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .origin-host-field {
+    order: -1;
+    grid-column: 1 / -1;
+  }
+
+  .origin-tuning {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .origin-field .input,
+  .origin-field .select {
+    height: 36px;
+  }
+
+  .origin-options {
+    padding: 10px;
+  }
+}
+
+@media (max-width: 520px) {
+  .origin-intro-icon {
+    width: 32px;
+    height: 32px;
+  }
+
+  .origin-card-head {
+    flex-wrap: wrap;
+    padding: 12px;
+  }
+
+  .origin-card-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .origin-delete {
+    min-width: auto;
+    padding: 0 8px;
+  }
+
+  .origin-delete span {
+    display: inline;
+  }
+
+  .origin-subgroup-head {
+    align-items: flex-start;
     flex-direction: column;
-    align-items: flex-end;
+    gap: 2px;
+  }
+
+  .origin-subgroup-head small {
+    text-align: left;
+  }
+
+  .origin-tls-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .origin-options {
+    gap: 9px;
+  }
+
+  .origin-option-icon {
+    width: 28px;
+    height: 28px;
   }
 }
 </style>
