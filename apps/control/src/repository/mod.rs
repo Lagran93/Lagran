@@ -2170,37 +2170,31 @@ pub async fn insert_access_logs_batch(
 pub async fn list_access_logs(
     pool: &PgPool,
     host: Option<&str>,
+    visible_hosts: Option<Vec<String>>,
+    status_min: Option<i32>,
+    status_max: Option<i32>,
     limit: i64,
 ) -> sqlx::Result<Vec<AccessLogRow>> {
-    if let Some(h) = host.filter(|s| !s.is_empty()) {
-        sqlx::query_as::<_, AccessLogRow>(
-            r#"
-            SELECT id, ts, node_id, client_ip, method, host, path, status, bytes,
-                   latency_ms, cache_status, user_agent, referer
-            FROM access_logs
-            WHERE host = $1
-            ORDER BY ts DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(h)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-    } else {
-        sqlx::query_as::<_, AccessLogRow>(
-            r#"
-            SELECT id, ts, node_id, client_ip, method, host, path, status, bytes,
-                   latency_ms, cache_status, user_agent, referer
-            FROM access_logs
-            ORDER BY ts DESC
-            LIMIT $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-    }
+    sqlx::query_as::<_, AccessLogRow>(
+        r#"
+        SELECT id, ts, node_id, client_ip, method, host, path, status, bytes,
+               latency_ms, cache_status, user_agent, referer
+        FROM access_logs
+        WHERE ($1::text IS NULL OR host = $1)
+          AND ($2::text[] IS NULL OR host = ANY($2))
+          AND ($3::int IS NULL OR status >= $3)
+          AND ($4::int IS NULL OR status < $4)
+        ORDER BY ts DESC
+        LIMIT $5
+        "#,
+    )
+    .bind(host.filter(|s| !s.is_empty()))
+    .bind(visible_hosts)
+    .bind(status_min)
+    .bind(status_max)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 // ---------------------------------------------------------------------------

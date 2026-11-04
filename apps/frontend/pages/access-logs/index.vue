@@ -115,13 +115,7 @@ const loading = ref(false)
 const page = ref(1)
 const pageSize = 20
 
-const filtered = computed(() => {
-  return rows.value.filter((r) => {
-    if (!statusClass.value) return true
-    const bucket = `${Math.floor(Number(r.status) / 100)}xx`
-    return bucket === statusClass.value
-  })
-})
+const filtered = computed(() => rows.value)
 
 const paged = computed(() => {
   const start = (page.value - 1) * pageSize
@@ -145,6 +139,7 @@ function exportLogs() {
 
 watch([statusClass, limit], () => {
   page.value = 1
+  load()
 })
 
 function statusTone(status: number) {
@@ -158,10 +153,12 @@ async function load() {
   loading.value = true
   page.value = 1
   try {
-    const q = host.value.trim()
-      ? `?host=${encodeURIComponent(host.value.trim())}&limit=${limit.value}`
-      : `?limit=${limit.value}`
-    rows.value = (await api.get<any[]>(`/api/v1/access-logs${q}`)) || []
+    const q = new URLSearchParams()
+    const hostValue = host.value.trim()
+    if (hostValue) q.set('host', hostValue)
+    if (statusClass.value) q.set('status_class', statusClass.value)
+    q.set('limit', String(limit.value))
+    rows.value = (await api.get<any[]>(`/api/v1/access-logs?${q.toString()}`)) || []
   } catch {
     rows.value = []
   } finally {

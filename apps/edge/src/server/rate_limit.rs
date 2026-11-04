@@ -7,10 +7,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-const REDIS_TIMEOUT: Duration = Duration::from_millis(25);
+const REDIS_TIMEOUT: Duration = Duration::from_millis(10);
+const REDIS_FAILURE_COOLDOWN_MS: u64 = 5_000;
 
 #[derive(Clone, Default)]
 pub struct RateLimiter {
@@ -33,6 +35,9 @@ struct Bucket {
 pub struct RedisRateLimiter {
     conn: redis::aio::ConnectionManager,
     prefix: String,
+    /// After a timeout/error, skip Redis for a short cooldown so a degraded
+    /// Redis cannot add the timeout to every request.
+    fail_until_ms: Arc<AtomicU64>,
 }
 
 impl RedisRateLimiter {
@@ -47,7 +52,23 @@ impl RedisRateLimiter {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "lagran:rate".to_string());
-        Ok(Self { conn, prefix })
+        Ok(Self {
+            conn,
+            prefix,
+            fail_until_ms: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn mark_failed(&self) {
+        self.fail_until_ms
+            .store(Self::now_ms() + REDIS_FAILURE_COOLDOWN_MS, Ordering::Relaxed);
     }
 
     /// Returns `None` when Redis is unavailable or timed out, so the caller can
@@ -55,6 +76,9 @@ impl RedisRateLimiter {
     async fn check(&self, key: &str, rps: u32, burst: u32) -> Option<bool> {
         if rps == 0 {
             return Some(true);
+        }
+        if Self::now_ms() < self.fail_until_ms.load(Ordering::Relaxed) {
+            return None;
         }
         let burst = burst.max(1);
         // Keep state long enough for the bucket to refill, but never forever.
@@ -89,7 +113,7 @@ impl RedisRateLimiter {
             "#,
         );
         let redis_key = format!("{}:limit:{}", self.prefix, key);
-        let result: i64 = tokio::time::timeout(
+        let result: i64 = match tokio::time::timeout(
             REDIS_TIMEOUT,
             script
                 .key(redis_key)
@@ -99,8 +123,13 @@ impl RedisRateLimiter {
                 .invoke_async(&mut conn),
         )
         .await
-        .ok()?
-        .ok()?;
+        {
+            Ok(Ok(value)) => value,
+            _ => {
+                self.mark_failed();
+                return None;
+            }
+        };
         Some(result != 0)
     }
 }

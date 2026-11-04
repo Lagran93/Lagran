@@ -285,7 +285,7 @@ sudo tar czf /backup/lagran-config-$(date +%F).tgz /etc/lagran
 - 带普通 Cookie 的请求默认绕过缓存；缓存响应不保存 `Set-Cookie`
 - Partial Range 只支持单段；多段 Range 直接透传源站
 - 大对象完整 GET 需要对象 `complete=true`；partial 对象只响应已覆盖的 Range
-- 浏览器 `no-cache`/`max-age=0`/`Pragma: no-cache` 请求统一回源；响应 `no-cache` 不写入共享缓存
+- 浏览器 `no-cache`/`Pragma: no-cache` 请求回源；`max-age=0` 不再强制回源；响应 `no-cache` 不写入共享缓存
 - CC 是 L7 防护；SYN/UDP/连接耗尽等 L4 攻击仍需云清洗或上游联动
 - 普通域名限流配置 `REDIS_URL` 后跨 Edge 共享；Redis 故障时回退单进程 bucket
 - 行为评分是启发式，默认关闭，需验证误报

@@ -9,7 +9,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 #[derive(Deserialize)]
 pub struct AccessEntryIn {
@@ -41,6 +40,8 @@ pub struct ReportAck {
 pub struct ListQuery {
     pub host: Option<String>,
     pub limit: Option<i64>,
+    /// 2xx / 3xx / 4xx / 5xx
+    pub status_class: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -96,7 +97,7 @@ pub async fn list(
     Query(q): Query<ListQuery>,
 ) -> Json<Vec<AccessLogDto>> {
     // Non-admins only see hosts that belong to their projects.
-    let visible_hosts: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
+    let visible_hosts: Option<Vec<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
         Some(ids) => {
             let rows = repository::list_domains(&state.pool)
@@ -119,16 +120,26 @@ pub async fn list(
         }
     }
 
+    let (status_min, status_max) = match q.status_class.as_deref() {
+        Some("2xx") => (Some(200), Some(300)),
+        Some("3xx") => (Some(300), Some(400)),
+        Some("4xx") => (Some(400), Some(500)),
+        Some("5xx") => (Some(500), Some(600)),
+        _ => (None, None),
+    };
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let rows = repository::list_access_logs(&state.pool, q.host.as_deref(), limit)
-        .await
-        .unwrap_or_default();
+    let rows = repository::list_access_logs(
+        &state.pool,
+        q.host.as_deref(),
+        visible_hosts,
+        status_min,
+        status_max,
+        limit,
+    )
+    .await
+    .unwrap_or_default();
     Json(
         rows.into_iter()
-            .filter(|r| match &visible_hosts {
-                None => true,
-                Some(hosts) => hosts.contains(&r.host),
-            })
             .map(|r| AccessLogDto {
                 id: r.id,
                 ts: r.ts.to_rfc3339(),

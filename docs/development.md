@@ -655,6 +655,6 @@ CC_SYNC_INTERVAL=5   # 共享封禁拉取间隔（秒），最小 2
 | BYPASS / 动态 / WebSocket / 磁盘混合等 | 进程内 legacy `handler`（仍经 Pingora 入口） |
 | 管理接口 `/__lagran/*`、ACME | Pingora 直接响应 |
 
-Chrome 强制刷新会带 `Cache-Control: max-age=0`；对**可缓存 GET**，Pingora 路径会剥离该头以便 ETag/304 仍可用。若需严格尊重客户端 no-cache，请用规则 `action=bypass`。
+Chrome 强制刷新会带 `Cache-Control: max-age=0`；对**可缓存 GET**，Edge 保留该头但继续使用新鲜缓存，避免页面导航全部回源。`no-cache`/`Pragma: no-cache` 仍会回源；若需强制绕过，请用规则 `action=bypass`。
 
 可调：`MAX_CACHEABLE_BODY`、`CONFIG_SYNC_INTERVAL_SECS`、`ORIGIN_HEALTH_*`。

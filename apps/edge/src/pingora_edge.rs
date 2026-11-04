@@ -1800,6 +1800,11 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
         if response.insert_header("content-length", value).is_err() {
             return;
         }
+    } else if response
+        .insert_header("content-length", body_len.to_string())
+        .is_err()
+    {
+        return;
     }
     let _ = session
         .write_response_header(Box::new(response), end_of_stream)
