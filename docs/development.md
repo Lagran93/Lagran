@@ -445,7 +445,7 @@ bash tests/integration/failover-https.sh
 - **浏览器 TTL**：覆盖返回给客户端的 `Cache-Control: max-age`，不影响边缘存储时长；0 = 跟随源站
 - **Query 缓存键**：可继承域名设置、强制忽略（`?x=1` 与 `?x=2` 共用缓存）或强制区分
 - **Cookie**：默认带 Cookie 的请求绕过共享缓存；规则可勾选 `ignore_cookie`，仅建议用于 CSS/JS/图片等公共静态资源
-- **Chrome 重载**：`Cache-Control: max-age=0` 不再直接 BYPASS；边缘用缓存 ETag 校验并返回 `304 REVALIDATED`，不会回源
+- **Chrome 重载**：`Cache-Control: max-age=0` 视为必须 revalidate 的请求，直接回源，不读取新鲜缓存；如命中源站 304 由源站响应决定
 - **启用/停用**：停用后边缘立即忽略该规则（配置版本号包含此字段，约 15 秒同步）
 - **规则测试器**：输入域名 + 路径 + 方法 + 查询串，返回命中的规则和最终生效策略
 
@@ -655,6 +655,6 @@ CC_SYNC_INTERVAL=5   # 共享封禁拉取间隔（秒），最小 2
 | BYPASS / 动态 / WebSocket / 磁盘混合等 | 进程内 legacy `handler`（仍经 Pingora 入口） |
 | 管理接口 `/__lagran/*`、ACME | Pingora 直接响应 |
 
-Chrome 强制刷新会带 `Cache-Control: max-age=0`；对**可缓存 GET**，Edge 保留该头但继续使用新鲜缓存，避免页面导航全部回源。`no-cache`/`Pragma: no-cache` 仍会回源；若需强制绕过，请用规则 `action=bypass`。
+Chrome 强制刷新会带 `Cache-Control: max-age=0`；对**可缓存 GET**，Edge 按严格语义回源，不读取共享缓存。若需要强制绕过规则，可使用 `action=bypass`。
 
 可调：`MAX_CACHEABLE_BODY`、`CONFIG_SYNC_INTERVAL_SECS`、`ORIGIN_HEALTH_*`。

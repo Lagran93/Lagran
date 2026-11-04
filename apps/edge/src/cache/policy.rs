@@ -581,10 +581,9 @@ pub fn has_non_clearance_cookie(headers: &HeaderMap) -> bool {
 
 /// Requests whose responses must never be served from / stored in the shared
 /// cache: authenticated or personalised traffic, client `no-store`/`no-cache`
-/// (`Pragma: no-cache`), conditional-range probes. `max-age=0` stays
-/// cache-eligible: browsers attach it to ordinary navigations/reloads, and
-/// making every navigation miss would defeat the shared cache. A cached fresh
-/// entry may still be served; `no-cache` remains a hard revalidation bypass.
+/// (`max-age=0` and `Pragma: no-cache`), conditional-range probes. A request
+/// that demands revalidation bypasses the fresh-hit path; fetching from origin
+/// is standards-correct when this edge has no per-request revalidation loop.
 /// Why a request bypasses the shared cache. The returned value is exposed as
 /// `X-Lagran-Cache-Reason` for operator diagnostics.
 pub fn request_bypass_reason<B>(req: &Request<B>, ignore_cookie: bool) -> Option<&'static str> {
@@ -620,6 +619,13 @@ fn request_cache_control_reason(headers: &HeaderMap) -> Option<&'static str> {
             }
             if name.eq_ignore_ascii_case("no-cache") {
                 return Some("request-no-cache");
+            }
+            if let Some((name, value)) = part.split_once('=') {
+                if name.trim().eq_ignore_ascii_case("max-age")
+                    && value.trim().trim_matches('"').parse::<u64>().ok() == Some(0)
+                {
+                    return Some("request-max-age-0");
+                }
             }
         }
     }
@@ -1257,11 +1263,11 @@ mod tests {
             .header("cache-control", "max-age=0")
             .body(())
             .unwrap();
-        assert!(
-            !request_bypasses_cache(&reload, false),
-            "browser max-age=0 navigation must remain cache-eligible"
+        assert!(request_bypasses_cache(&reload, false));
+        assert_eq!(
+            request_bypass_reason(&reload, false),
+            Some("request-max-age-0")
         );
-        assert_eq!(request_bypass_reason(&reload, false), None);
 
         let revalidate = Request::builder()
             .uri("http://cdn.test/a.js")

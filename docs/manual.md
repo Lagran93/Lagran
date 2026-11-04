@@ -698,8 +698,7 @@ SWR：
 - `Vary` 字段受支持，或没有 `Vary`
 - 请求无 `Authorization`
 - 请求无普通 Cookie（规则 `ignore_cookie` 例外）
-- 请求无 `no-store`、`no-cache`、`Pragma: no-cache`
-- 请求 `max-age=0` 不影响缓存命中（浏览器普通导航会携带，避免误伤页面缓存）
+- 请求无 `no-store`、`no-cache`、`max-age=0`、`Pragma: no-cache`
 
 多个 `Cache-Control` 响应头会按逗号合并后解析；多个 `Vary` 头同理。
 
@@ -725,16 +724,15 @@ CORS `Vary` 会被哈希进 cache key，避免不同 Origin 串缓存。
 
 ```text
 Cache-Control: no-cache
+Cache-Control: max-age=0
 Pragma: no-cache
 ```
 
-`Cache-Control: max-age=0` 是浏览器普通导航/重载常见头，不再强制回源；命中新鲜缓存时仍直接返回，避免每次打开页面都穿透源站。
-
 这意味着：
 
-- `no-cache` 请求不读取旧缓存，仍可回源并更新缓存
-- `max-age=0` 请求可以命中新鲜缓存
-- 响应仍可写回缓存（除 `no-store`/`private`/响应 `no-cache` 等）
+- 小文件、大文件、完整 GET、Range 行为一致
+- 不再出现“小文件 no-cache 仍 HIT、大文件不命中”的差异
+- 响应仍可写回缓存，但本次请求从源站获取
 - `Cache-Control: no-store` 仍然是不读不写
 
 这是本实现选择的保守 RFC 语义：不保存需要每次 revalidate 的共享对象，也不把请求的 `no-cache` 删除后继续 HIT。
@@ -1147,6 +1145,7 @@ ACCESS_LOG_REPORT=true
 | `no-store` | 请求/响应 no-store |
 | `no-cache` | 响应 no-cache，未写入共享缓存 |
 | `request-no-cache` | 请求 no-cache 回源 |
+| `request-max-age-0` | 请求 max-age=0 回源 |
 | `request-pragma-no-cache` | 请求 Pragma: no-cache 回源 |
 | `vary` | Vary 不受支持 |
 | `vary:user-agent` | Vary User-Agent |
@@ -1390,16 +1389,11 @@ Accept-Ranges: bytes
 
 ### 9.7 no-cache 行为
 
-请求带 `Cache-Control: no-cache` 或 `Pragma: no-cache`：
+请求带 `Cache-Control: no-cache`、`max-age=0` 或 `Pragma: no-cache`：
 
-- 回源获取最新响应
+- 普通文件、大文件、完整 GET、Range 一致回源
 - 不会因为文件大小不同而出现部分 HIT
 - 回源响应仍可写入缓存，但本次请求不使用旧对象
-
-请求仅带 `Cache-Control: max-age=0`：
-
-- 属于浏览器普通导航/重载行为
-- 新鲜缓存仍可命中，避免页面加载被强制穿透源站
 
 响应带 `Cache-Control: no-cache`：
 
@@ -1710,7 +1704,7 @@ cd apps/frontend && npm run generate
 - 普通缓存以完整对象为单位；大对象支持 partial Range segment，但仅覆盖已请求区间。
 - 大对象完整 GET 需要 `complete=true`；partial 不能拼接为完整响应。
 - 单段 Range 才支持 partial 填充；多段 Range 透传。
-- `no-cache` 响应不进入共享缓存；请求 no-cache 回源，`max-age=0` 仍可命中新鲜缓存。
+- `no-cache` 响应不进入共享缓存；请求 no-cache、`max-age=0` 统一回源，不保存 validator-only 条目。
 - `only-if-cached`、`min-fresh`、`max-stale`、`stale-if-error` 尚未完整实现；请求 no-cache 选择直接回源。
 - 修改缓存规则/配置不会自动删除旧缓存。
 - 普通域名限流在配置 `REDIS_URL` 后由 Redis token bucket 跨 Edge 共享；未配置或 Redis 故障时回退进程内 bucket。
