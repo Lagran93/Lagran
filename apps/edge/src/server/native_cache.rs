@@ -219,11 +219,14 @@ impl HandleMiss for EntryMiss {
         }
         let mut headers = self.headers;
         headers.push((META_HEADER.to_string(), self.encoded_meta));
+        let now = now_epoch_secs();
         let mut entry = CacheEntry {
             status: self.status,
             headers,
             body: self.body.freeze(),
-            stored_at_epoch_secs: now_epoch_secs(),
+            stored_at_epoch_secs: now,
+            fresh_until_epoch_secs: now + self.fresh_secs.max(1),
+            stale_until_epoch_secs: now + self.fresh_secs.max(1) + self.swr_secs,
         };
         entry
             .headers

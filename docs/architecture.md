@@ -54,7 +54,8 @@
 12. Range：小段 Range 命中完整对象时切片；开放/大范围 Range 由 Pingora 流式透传，避免视频整包下载；
     多段 Range 透传源站
 
-响应统一带 `X-Cache` / `X-Cache-Status` / `X-Lagran-Cache-Reason`（仅未命中缓存时）/ `Age` / `ETag`
+响应统一带 `X-Cache` / `X-Cache-Status` / `X-Lagran-Cache-Reason`（仅未命中缓存时）/ `Age` /
+`X-Lagran-Cache-TTL`（剩余新鲜寿命，区别于已存活时间 `Age`）/ `ETag`
 （源站 ETag 优先，否则按内容计算）。
 
 ## 数据模型（PostgreSQL）

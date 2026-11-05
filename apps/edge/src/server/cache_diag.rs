@@ -131,6 +131,7 @@ pub async fn diag_handler(
         "x-cache",
         "x-cache-status",
         "x-lagran-cache-reason",
+        "x-lagran-cache-ttl",
         "age",
         "etag",
         "cache-control",

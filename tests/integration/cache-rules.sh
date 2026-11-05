@@ -179,6 +179,7 @@ CODE=$(get "/large" -H 'Cache-Control: max-age=0')
 check "large object conditional returns 200" "$CODE" "200"
 check "large object conditional revalidates" "$(hdr x-cache)" "REVALIDATED"
 check "large object conditional uses origin-304" "$(hdr x-lagran-cache-reason)" "origin-304"
+check "large object exposes remaining TTL" "$(hdr x-lagran-cache-ttl | grep -cE '^[0-9]+$' || true)" "1"
 check "large object body size" "$(wc -c < "$LOG_DIR/b" | tr -d ' ')" "2097152"
 get "/assets/no-validator.css" -H 'Cache-Control: max-age=0' >/dev/null
 check "computed validator cold is MISS" "$(hdr x-cache)" "MISS"

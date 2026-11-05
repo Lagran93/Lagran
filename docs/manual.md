@@ -1146,6 +1146,7 @@ ACCESS_LOG_REPORT=true
 | `X-Cache-Status` | 同 `X-Cache` |
 | `X-Lagran-Cache-Reason` | 未命中/绕过/填充原因 |
 | `Age` | 缓存对象年龄 |
+| `X-Lagran-Cache-TTL` | 缓存对象剩余新鲜寿命（秒）；`Age` 是已存活时间，两者互补 |
 | `ETag` | 源站或 Edge 生成 |
 | `X-Lagran-Error` | 源站错误类型 |
 

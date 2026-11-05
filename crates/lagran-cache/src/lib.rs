@@ -40,6 +40,10 @@ pub struct CacheEntry {
     pub body: Bytes,
     /// When this entry was stored (for Age header)
     pub stored_at_epoch_secs: u64,
+    /// Fresh-until epoch (for remaining TTL header); 0 when unknown.
+    pub fresh_until_epoch_secs: u64,
+    /// Hard-expiry epoch including stale-while-revalidate; 0 when unknown.
+    pub stale_until_epoch_secs: u64,
 }
 
 impl CacheEntry {
@@ -49,6 +53,8 @@ impl CacheEntry {
             headers,
             body,
             stored_at_epoch_secs: now_epoch_secs(),
+            fresh_until_epoch_secs: 0,
+            stale_until_epoch_secs: 0,
         }
     }
 
@@ -75,6 +81,12 @@ impl CacheEntry {
 
     pub fn age_secs(&self) -> u64 {
         now_epoch_secs().saturating_sub(self.stored_at_epoch_secs)
+    }
+
+    /// Remaining fresh lifetime in seconds, when the backend recorded it.
+    pub fn ttl_secs(&self) -> Option<u64> {
+        (self.fresh_until_epoch_secs > 0)
+            .then(|| self.fresh_until_epoch_secs.saturating_sub(now_epoch_secs()))
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -250,10 +262,15 @@ impl CacheBackend for MemoryCache {
         self.set_with_swr(key, entry, ttl_secs, 0).await;
     }
 
-    async fn set_with_swr(&self, key: &str, entry: CacheEntry, fresh_secs: u64, swr_secs: u64) {
+    async fn set_with_swr(&self, key: &str, mut entry: CacheEntry, fresh_secs: u64, swr_secs: u64) {
         let now = Instant::now();
         let fresh = Duration::from_secs(fresh_secs.max(1));
         let swr = Duration::from_secs(swr_secs);
+        let fresh_secs = fresh_secs.max(1);
+        let now_epoch = now_epoch_secs();
+        entry.fresh_until_epoch_secs = now_epoch + fresh_secs;
+        entry.stale_until_epoch_secs = now_epoch + fresh_secs + swr_secs;
+        entry.stored_at_epoch_secs = now_epoch;
         self.inner.insert(
             key.to_string(),
             TimedEntry {

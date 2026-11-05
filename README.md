@@ -181,6 +181,7 @@ curl -i http://127.0.0.1:8081/
 X-Powered-By: lagran-edge
 X-Cache: HIT | MISS | BYPASS | STALE
 X-Lagran-Cache-Reason: <缓存原因>
+X-Lagran-Cache-TTL: <剩余新鲜秒数>
 ```
 
 ---

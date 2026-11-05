@@ -2479,6 +2479,11 @@ fn entry_to_response(
         HeaderValue::from_str(&entry.age_secs().to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
+    if let Some(ttl) = entry.ttl_secs() {
+        if let Ok(v) = HeaderValue::from_str(&ttl.to_string()) {
+            headers.insert(HeaderName::from_static("x-lagran-cache-ttl"), v);
+        }
+    }
     headers.insert(
         HeaderName::from_static("x-powered-by"),
         HeaderValue::from_static("lagran-edge"),
@@ -2603,6 +2608,11 @@ fn not_modified_response(etag: &str, entry: &CacheEntry) -> Response {
         HeaderValue::from_str(&entry.age_secs().to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
+    if let Some(ttl) = entry.ttl_secs() {
+        if let Ok(v) = HeaderValue::from_str(&ttl.to_string()) {
+            headers.insert(HeaderName::from_static("x-lagran-cache-ttl"), v);
+        }
+    }
     cache_status_headers(&mut headers, CacheStatus::Revalidated.as_str());
     apply_security_headers(&mut headers);
     let mut resp = Response::new(Body::empty());

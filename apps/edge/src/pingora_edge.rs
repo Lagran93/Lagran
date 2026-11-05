@@ -148,6 +148,7 @@ struct ReqCtx {
     /// Age reported by pingora-cache for a hit; used to override a stale
     /// origin `Age: 0` with the actual shared-cache age.
     cache_age_secs: Option<u64>,
+    cache_ttl_secs: Option<u64>,
     status: u16,
     attempt: u8,
     origin_order: Vec<String>,
@@ -176,6 +177,7 @@ impl Default for ReqCtx {
             cache_label: "MISS",
             cache_reason: None,
             cache_age_secs: None,
+            cache_ttl_secs: None,
             status: 0,
             attempt: 0,
             origin_order: Vec::new(),
@@ -457,6 +459,7 @@ impl ProxyHttp for DataPlaneProxy {
         ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedFreshness>> {
         ctx.cache_age_secs = Some(meta.age().as_secs());
+        ctx.cache_ttl_secs = Some(meta.fresh_sec().saturating_sub(meta.age().as_secs()));
         let Some(plan) = ctx.plan.as_ref() else {
             return Ok(None);
         };
@@ -752,6 +755,11 @@ impl ProxyHttp for DataPlaneProxy {
         response.remove_header(META_HEADER);
         response.remove_header(VALIDATOR_SOURCE_HEADER);
         response.remove_header("x-lagran-cache-reason");
+        if matches!(label, "HIT" | "STALE" | "REVALIDATED") {
+            if let Some(ttl) = ctx.cache_ttl_secs {
+                response.insert_header("x-lagran-cache-ttl", ttl.to_string())?;
+            }
+        }
         response.insert_header("x-cache", label)?;
         response.insert_header("x-cache-status", label)?;
         response.insert_header("x-powered-by", "lagran-edge")?;
@@ -927,14 +935,20 @@ impl ProxyHttp for DataPlaneProxy {
                     self.state.default_ttl_secs,
                 ) {
                     if ctx.head_body.len() <= 8 * 1024 * 1024 {
+                        let now_epoch = SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
                         let mut entry = crate::cache::CacheEntry {
                             status: ctx.head_status,
                             headers: hdrs,
                             body: ctx.head_body.clone().freeze(),
-                            stored_at_epoch_secs: SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0),
+                            stored_at_epoch_secs: now_epoch,
+                            fresh_until_epoch_secs: now_epoch
+                                + decision.ttl_secs.max(1),
+                            stale_until_epoch_secs: now_epoch
+                                + decision.ttl_secs.max(1)
+                                + decision.swr_secs,
                         };
                         if entry.header("etag").is_none() {
                             let etag = compute_etag(&entry);
@@ -1195,6 +1209,11 @@ impl DataPlaneProxy {
         plan: &NativePlan,
     ) {
         let total = entry.content_length();
+        let now_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cache_ttl = entry.meta.fresh_until.saturating_sub(now_epoch);
         let etag = entry
             .meta
             .headers
@@ -1221,7 +1240,6 @@ impl DataPlaneProxy {
                 for (name, value) in &entry.meta.headers {
                     if name.eq_ignore_ascii_case("content-length")
                         || name.eq_ignore_ascii_case(META_HEADER)
-                || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
                         || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
                         || is_hop_by_hop(name)
                     {
@@ -1237,6 +1255,7 @@ impl DataPlaneProxy {
                 let _ = response.insert_header("x-cache", "REVALIDATED");
                 let _ = response.insert_header("x-cache-status", "REVALIDATED");
                 let _ = response.insert_header("x-lagran-cache-reason", "origin-304");
+                let _ = response.insert_header("x-lagran-cache-ttl", cache_ttl.to_string());
                 let _ = response.insert_header("x-powered-by", "lagran-edge");
                 let _ = session.write_response_header(Box::new(response), true).await;
                 return;
@@ -1270,6 +1289,7 @@ impl DataPlaneProxy {
         let _ = response.insert_header("x-lagran-cache-reason", "origin-304");
         let _ = response.insert_header("x-powered-by", "lagran-edge");
         let _ = response.insert_header("age", "0");
+        let _ = response.insert_header("x-lagran-cache-ttl", cache_ttl.to_string());
         let mut final_headers = response.headers.clone();
         apply_security_headers(&mut final_headers);
         apply_cors_and_custom(&mut final_headers, &plan.cors, &plan.custom);
@@ -1491,6 +1511,13 @@ impl DataPlaneProxy {
                 .map(|d| d.as_secs().saturating_sub(entry.meta.stored_at))
                 .unwrap_or(0);
             let _ = response.insert_header("age", age.to_string());
+            let ttl = entry.meta.fresh_until.saturating_sub(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+            let _ = response.insert_header("x-lagran-cache-ttl", ttl.to_string());
         }
         if session
             .write_response_header(Box::new(response), false)

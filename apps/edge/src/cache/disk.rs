@@ -102,6 +102,8 @@ impl DiskCache {
             } else {
                 meta.fresh_until.saturating_sub(60)
             },
+            fresh_until_epoch_secs: meta.fresh_until,
+            stale_until_epoch_secs: meta.stale_until,
         };
         let fresh_left = meta.fresh_until.saturating_sub(now);
         let stale_left = meta.stale_until.saturating_sub(now);
