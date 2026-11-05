@@ -477,12 +477,21 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         {
             return response;
         }
-        // A strict revalidation request with no cached representation still
-        // needs to populate the cache; otherwise a client that always sends
-        // max-age=0 would bypass forever after an Edge restart.
-        if !headers.contains_key(header::RANGE) && state.cache.get(&key).await.is_none() {
-            request_cacheable = true;
-            request_reason = None;
+        // A strict revalidation request with no usable cached representation
+        // still needs to populate the cache. An older entry without validator
+        // cannot answer a 304 and must be replaced by a full origin response.
+        if !headers.contains_key(header::RANGE) {
+            if let Some(entry) = state.cache.get(&key).await {
+                if entry.header("etag").is_none() && entry.header("last-modified").is_none() {
+                    tracing::debug!(key, "dropping cache entry without validator");
+                    state.cache.delete(&key).await;
+                }
+            }
+            if state.cache.get(&key).await.is_none() {
+                tracing::debug!(key, "cold revalidation bootstraps normal fetch");
+                request_cacheable = true;
+                request_reason = None;
+            }
         }
     }
 
@@ -501,6 +510,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             &referer,
             &request_id,
             start,
+            if strict_revalidation { Some(&key) } else { None },
         )
         .await;
         set_cache_reason(&mut response, request_reason);
@@ -573,6 +583,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
             &referer,
             &request_id,
             start,
+            None,
         )
         .await;
         set_cache_reason(&mut response, Some("range-bypass"));
@@ -784,6 +795,7 @@ async fn bypass_to_origin(
     referer: &str,
     request_id: &str,
     start: Instant,
+    cache_key: Option<&str>,
 ) -> Response {
     let label = if request_method_cacheable(method) {
         CacheStatus::Bypass
@@ -882,6 +894,44 @@ async fn bypass_to_origin(
         Ok(resp) => {
             let status = resp.status;
             let body_len = resp.body.len() as u64;
+            if let Some(key) = cache_key {
+                if request_method_cacheable(method) && (200..300).contains(&status.as_u16()) {
+                    let content_type = resp
+                        .headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let response_policy = resolve_rule_policy_for_response(
+                        &eff.rules,
+                        &eff.path,
+                        method.as_str(),
+                        path_and_query.split_once('?').map(|(_, q)| q).unwrap_or(""),
+                        content_type,
+                    );
+                    if response_policy.action == RuleAction::Cache {
+                        if let Ok(decision) = decide_storage_reason(
+                            status.as_u16(),
+                            &headers_vec(&resp.headers),
+                            response_policy,
+                            state.default_ttl_secs,
+                        ) {
+                            if resp.body.len() <= state.max_cacheable_body {
+                                state
+                                    .cache
+                                    .set_with_swr(
+                                        key,
+                                        clone_as_entry(&resp),
+                                        decision.ttl_secs,
+                                        decision.swr_secs,
+                                    )
+                                    .await;
+                            } else {
+                                store_large_response(state, key, &resp, decision).await;
+                            }
+                        }
+                    }
+                }
+            }
             let out = pass_through_response(resp, label.as_str(), &eff.cors, &eff.custom_headers);
             state.metrics.record_bypass(host, body_len).await;
             log_access(
@@ -979,12 +1029,22 @@ async fn fetch_with_single_flight(
                                     .cache
                                     .set_with_swr(key, entry, decision.ttl_secs, decision.swr_secs)
                                     .await;
+                                tracing::debug!(
+                                    key,
+                                    ttl = decision.ttl_secs,
+                                    swr = decision.swr_secs,
+                                    body_len = resp.body.len(),
+                                    "stored origin response"
+                                );
                             } else if !store_large_response(state, key, resp, decision).await {
                                 reason = Some("body-too-large");
                                 tracing::debug!(len = resp.body.len(), %host, "object too large to cache");
                             }
                         }
-                        Err(r) => reason = Some(r),
+                        Err(r) => {
+                            tracing::debug!(key, reason = r, "origin response not stored");
+                            reason = Some(r);
+                        }
                     }
                 }
                 resp.cache_reason = reason;
@@ -1094,7 +1154,14 @@ async fn revalidate_cached_entry(
 
     let etag = entry.header("etag").map(str::to_string);
     let last_modified = entry.header("last-modified").map(str::to_string);
+    tracing::debug!(
+        key,
+        has_etag = etag.is_some(),
+        has_last_modified = last_modified.is_some(),
+        "revalidation cache entry"
+    );
     if etag.is_none() && last_modified.is_none() {
+        tracing::debug!(key, "revalidation entry has no validator");
         return None;
     }
 

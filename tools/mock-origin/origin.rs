@@ -387,6 +387,19 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     )
                 }
             }
+            "/api/file/cover" => (
+                200,
+                vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10],
+                vec![
+                    ("Content-Type", "image/jpeg".into()),
+                    ("ETag", "\"a34e7b93b74a1cd3\"".into()),
+                    ("Cache-Control", "public, max-age=604800".into()),
+                    (
+                        "Vary",
+                        "origin, access-control-request-method, access-control-request-headers".into(),
+                    ),
+                ],
+            ),
             _ => (
                 200,
                 b"hello from origin".to_vec(),

@@ -161,8 +161,15 @@ CODE=$(get "/assets/app.css?bootstrap=1" -H 'Cache-Control: max-age=0')
 check "max-age=0 with empty cache bootstraps a MISS" "$CODE" "200"
 check "max-age=0 bootstrap stores the response" "$(hdr x-cache)" "MISS"
 CODE=$(get "/assets/app.css?bootstrap=1" -H 'Cache-Control: max-age=0')
-check "max-age=0 after bootstrap revalidates" "$CODE" "304"
+check "max-age=0 after bootstrap revalidates" "$CODE" "200"
+check "max-age=0 after bootstrap returns cached body" "$(wc -c < "$LOG_DIR/b" | tr -d ' ')" "15"
 check "max-age=0 after bootstrap uses REVALIDATED" "$(hdr x-cache)" "REVALIDATED"
+CODE=$(get "/api/file/cover?code=8D964bmw" -H 'Cache-Control: max-age=0')
+check "cover cold max-age=0 is MISS" "$CODE" "200"
+check "cover cold max-age=0 stores" "$(hdr x-cache)" "MISS"
+CODE=$(get "/api/file/cover?code=8D964bmw" -H 'Cache-Control: max-age=0')
+check "cover warm max-age=0 revalidates" "$CODE" "200"
+check "cover warm max-age=0 uses REVALIDATED" "$(hdr x-cache)" "REVALIDATED"
 CODE=$(get "/assets/app.css" -H 'Cookie: lagran_clearance=test' \
   -H 'Cache-Control: no-cache' -H "If-None-Match: $CSS_ETAG")
 check "no-cache + ignored cookie revalidates via origin 304" "$CODE" "304"
