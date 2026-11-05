@@ -102,6 +102,9 @@ AGENT_TOKEN="$NODE_TOKEN" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
 CACHE_TTL=60 \
 CACHE_BACKEND=memory \
+LARGE_CACHE_ENABLED=true \
+LARGE_CACHE_DIR="$LOG_DIR/large-cache" \
+LARGE_CACHE_MIN_OBJECT_BYTES=65536 \
 ./target/debug/lagran-edge >"$LOG_DIR/edge.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$EDGE_PORT/__lagran/health" >/dev/null && break; sleep 0.5; done
@@ -170,6 +173,13 @@ check "cover cold max-age=0 stores" "$(hdr x-cache)" "MISS"
 CODE=$(get "/api/file/cover?code=8D964bmw" -H 'Cache-Control: max-age=0')
 check "cover warm max-age=0 revalidates" "$CODE" "200"
 check "cover warm max-age=0 uses REVALIDATED" "$(hdr x-cache)" "REVALIDATED"
+get "/large" >/dev/null
+check "large object cold miss" "$(hdr x-cache)" "MISS"
+CODE=$(get "/large" -H 'Cache-Control: max-age=0')
+check "large object conditional returns 200" "$CODE" "200"
+check "large object conditional revalidates" "$(hdr x-cache)" "REVALIDATED"
+check "large object conditional uses origin-304" "$(hdr x-lagran-cache-reason)" "origin-304"
+check "large object body size" "$(wc -c < "$LOG_DIR/b" | tr -d ' ')" "2097152"
 CODE=$(get "/assets/app.css" -H 'Cookie: lagran_clearance=test' \
   -H 'Cache-Control: no-cache' -H "If-None-Match: $CSS_ETAG")
 check "no-cache + ignored cookie revalidates via origin 304" "$CODE" "304"

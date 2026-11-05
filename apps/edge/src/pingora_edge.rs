@@ -325,6 +325,9 @@ impl ProxyHttp for DataPlaneProxy {
             return self.handle_management(session, &path).await;
         }
 
+        if self.try_large_revalidation(session).await? {
+            return Ok(true);
+        }
         if let Some(plan) = self.native_plan(session).await {
             let path_and_query = session
                 .req_header()
@@ -999,6 +1002,294 @@ impl ProxyHttp for DataPlaneProxy {
 }
 
 impl DataPlaneProxy {
+    /// Large-object conditional revalidation. For strict requests, try a HEAD
+    /// conditional request first. A 304 is served from the existing large file
+    /// without touching its body; a 200 removes the stale object and lets the
+    /// normal native path stream and replace it.
+    async fn try_large_revalidation(&self, session: &mut Session) -> Result<bool> {
+        let Some(large) = self.state.large_cache.as_ref() else {
+            return Ok(false);
+        };
+        if session.req_header().method != Method::GET
+            || session.req_header().headers.contains_key("range")
+        {
+            return Ok(false);
+        }
+        let strict = session
+            .req_header()
+            .headers
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                v.split(',')
+                    .any(|p| p.trim().eq_ignore_ascii_case("no-cache"))
+                    || v.split(',')
+                        .any(|p| p.trim().eq_ignore_ascii_case("max-age=0"))
+            })
+            .unwrap_or(false)
+            || session
+                .req_header()
+                .headers
+                .get("pragma")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("no-cache"));
+        if !strict {
+            return Ok(false);
+        }
+
+        let cache_control = session.req_header().headers.get("cache-control").cloned();
+        let pragma = session.req_header().headers.get("pragma").cloned();
+        session.req_header_mut().remove_header("cache-control");
+        session.req_header_mut().remove_header("pragma");
+        let plan = self.native_plan(session).await;
+        let Some(plan) = plan else {
+            if let Some(v) = cache_control {
+                let _ = session.req_header_mut().insert_header("cache-control", v);
+            }
+            if let Some(v) = pragma {
+                let _ = session.req_header_mut().insert_header("pragma", v);
+            }
+            return Ok(false);
+        };
+        // A normal-object entry is handled by the in-process conditional layer.
+        if self.state.cache.get(&plan.key).await.is_some() {
+            if let Some(v) = cache_control {
+                let _ = session.req_header_mut().insert_header("cache-control", v);
+            }
+            if let Some(v) = pragma {
+                let _ = session.req_header_mut().insert_header("pragma", v);
+            }
+            return Ok(false);
+        }
+        let Some(entry) = large.get_any(&plan.key).await else {
+            // No large object: leave request cache headers removed so the
+            // native path streams and fills the large cache in one pass.
+            return Ok(false);
+        };
+        if !entry.meta.complete {
+            return Ok(false);
+        }
+        let etag = entry
+            .meta
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+            .map(|(_, v)| v.clone());
+        let last_modified = entry
+            .meta
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("last-modified"))
+            .map(|(_, v)| v.clone());
+        if etag.is_none() && last_modified.is_none() {
+            large.delete(&plan.key).await;
+            return Ok(false);
+        }
+
+        let target = match plan.origins.iter().find(|origin| origin.enabled) {
+            Some(target) => target.clone(),
+            None => return Ok(false),
+        };
+        let path_and_query = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let mut headers = session.req_header().headers.clone();
+        if let Some(host) = target.host_header.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(host) {
+                headers.insert(axum::http::header::HOST, value);
+            }
+        }
+        if let Some(etag) = etag {
+            if let Ok(value) = HeaderValue::from_str(&etag) {
+                headers.insert("if-none-match", value);
+            }
+        } else if let Some(last_modified) = last_modified {
+            if let Ok(value) = HeaderValue::from_str(&last_modified) {
+                headers.insert("if-modified-since", value);
+            }
+        }
+        let conditional = match self
+            .state
+            .origin
+            .request_with_sni(
+                &target.url,
+                &Method::HEAD,
+                &path_and_query,
+                &headers,
+                None,
+                false,
+                target.sni.as_deref(),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                large.delete(&plan.key).await;
+                return Ok(false);
+            }
+        };
+        if conditional.status != StatusCode::NOT_MODIFIED {
+            large.delete(&plan.key).await;
+            return Ok(false);
+        }
+        let conditional_headers = header_vec(&conditional.headers);
+        let mut merged_headers = entry.meta.headers.clone();
+        for (name, value) in &conditional_headers {
+            if name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+                || name.eq_ignore_ascii_case("connection")
+                || name.eq_ignore_ascii_case("age")
+            {
+                continue;
+            }
+            merged_headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            merged_headers.push((name.clone(), value.clone()));
+        }
+        let decision = match decide_storage_reason(
+            200,
+            &merged_headers,
+            plan.policy,
+            self.state.default_ttl_secs,
+        ) {
+            Ok(decision) => decision,
+            Err(_) => return Ok(false),
+        };
+        if !large
+            .refresh_meta(
+                &plan.key,
+                &conditional_headers,
+                decision.ttl_secs,
+                decision.swr_secs,
+            )
+            .await
+        {
+            return Ok(false);
+        }
+        let Some(entry) = large.get(&plan.key).await else {
+            return Ok(false);
+        };
+        self.serve_large_full(session, entry, &plan).await;
+        Ok(true)
+    }
+
+    async fn serve_large_full(
+        &self,
+        session: &mut Session,
+        entry: crate::cache::large::LargeEntry,
+        plan: &NativePlan,
+    ) {
+        let total = entry.content_length();
+        let etag = entry
+            .meta
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+            .map(|(_, v)| v.clone());
+        if let Some(etag) = etag.as_deref() {
+            let client_match = session
+                .req_header()
+                .headers
+                .get("if-none-match")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .any(|candidate| candidate == etag || candidate == "*")
+                });
+            if client_match {
+                let Ok(mut response) = ResponseHeader::build(StatusCode::NOT_MODIFIED.as_u16(), None)
+                else {
+                    return;
+                };
+                for (name, value) in &entry.meta.headers {
+                    if name.eq_ignore_ascii_case("content-length")
+                        || name.eq_ignore_ascii_case(META_HEADER)
+                        || is_hop_by_hop(name)
+                    {
+                        continue;
+                    }
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        let _ = response.insert_header(name, value);
+                    }
+                }
+                let _ = response.insert_header("x-cache", "REVALIDATED");
+                let _ = response.insert_header("x-cache-status", "REVALIDATED");
+                let _ = response.insert_header("x-lagran-cache-reason", "origin-304");
+                let _ = response.insert_header("x-powered-by", "lagran-edge");
+                let _ = session.write_response_header(Box::new(response), true).await;
+                return;
+            }
+        }
+
+        let Ok(mut response) =
+            ResponseHeader::build(StatusCode::OK.as_u16(), Some(total as usize))
+        else {
+            return;
+        };
+        for (name, value) in &entry.meta.headers {
+            if name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("content-range")
+                || name.eq_ignore_ascii_case(META_HEADER)
+                || is_hop_by_hop(name)
+            {
+                continue;
+            }
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                let _ = response.insert_header(name, value);
+            }
+        }
+        let _ = response.insert_header("content-length", total.to_string());
+        let _ = response.insert_header("x-cache", "REVALIDATED");
+        let _ = response.insert_header("x-cache-status", "REVALIDATED");
+        let _ = response.insert_header("x-lagran-cache-reason", "origin-304");
+        let _ = response.insert_header("x-powered-by", "lagran-edge");
+        let _ = response.insert_header("age", "0");
+        let mut final_headers = response.headers.clone();
+        apply_security_headers(&mut final_headers);
+        apply_cors_and_custom(&mut final_headers, &plan.cors, &plan.custom);
+        for (name, value) in final_headers.iter() {
+            let _ = response.insert_header(name.clone(), value.clone());
+        }
+        if session
+            .write_response_header(Box::new(response), false)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut entry = entry;
+        const CHUNK: u64 = 8 * 1024 * 1024;
+        let mut pos = 0;
+        while pos < total {
+            let want = (total - pos).min(CHUNK) as usize;
+            let Ok(Some(chunk)) = entry.read_at(pos, want).await else {
+                return;
+            };
+            pos += chunk.len() as u64;
+            let done = pos >= total;
+            if session
+                .write_response_body(Some(chunk), done)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if done {
+                break;
+            }
+        }
+    }
+
     async fn native_plan(&self, session: &Session) -> Option<NativePlan> {
         if !self.native_cache || self.storage.is_none() {
             return None;

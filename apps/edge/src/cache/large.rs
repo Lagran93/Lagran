@@ -365,6 +365,71 @@ impl LargeCache {
         Some(LargeEntry { meta, file })
     }
 
+    /// Refresh a complete large object after an origin 304. The data file is
+    /// not rewritten; only the sidecar metadata/TTL/validators are updated.
+    pub async fn refresh_meta(
+        &self,
+        key: &str,
+        headers: &[(String, String)],
+        fresh_secs: u64,
+        swr_secs: u64,
+    ) -> bool {
+        let (_data_path, meta_path) = self.paths_for_key(key);
+        let Ok(meta_bytes) = fs::read(&meta_path).await else {
+            return false;
+        };
+        let Ok(mut meta) = serde_json::from_slice::<LargeMeta>(&meta_bytes) else {
+            return false;
+        };
+        if meta.key != key || !meta.complete {
+            return false;
+        }
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+                || name.eq_ignore_ascii_case("connection")
+                || name.eq_ignore_ascii_case("age")
+            {
+                continue;
+            }
+            meta.headers
+                .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            meta.headers.push((name.clone(), value.clone()));
+        }
+        let now = now_unix();
+        meta.fresh_until = now + fresh_secs.max(1);
+        meta.stale_until = now + fresh_secs.max(1) + swr_secs;
+        meta.stored_at = now;
+        let Ok(meta_bytes) = serde_json::to_vec(&meta) else {
+            return false;
+        };
+        write_atomic(&meta_path, &meta_bytes).await.is_ok()
+    }
+
+    pub async fn delete(&self, key: &str) -> bool {
+        let (data_path, meta_path) = self.paths_for_key(key);
+        let data_len = fs::metadata(&data_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let meta_len = fs::metadata(&meta_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let data_removed = fs::remove_file(&data_path).await.is_ok();
+        let meta_removed = fs::remove_file(&meta_path).await.is_ok();
+        if data_removed || meta_removed {
+            self.release_bytes(data_len + meta_len);
+            self.entries
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .ok();
+            return true;
+        }
+        false
+    }
+
     pub async fn begin(
         self: &Arc<Self>,
         key: &str,

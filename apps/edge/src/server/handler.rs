@@ -1788,11 +1788,23 @@ async fn store_large_response(
     if !large.accepts(len as u64) {
         return false;
     }
+    let mut headers = headers_vec(&resp.headers);
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("etag"))
+    {
+        let etag = compute_etag(&CacheEntry::new(
+            resp.status.as_u16(),
+            headers.clone(),
+            resp.body.clone(),
+        ));
+        headers.push(("etag".to_string(), etag));
+    }
     let Some(mut writer) = large
         .begin(
             key,
             resp.status.as_u16(),
-            headers_vec(&resp.headers),
+            headers,
             len as u64,
             decision.ttl_secs,
             decision.swr_secs,

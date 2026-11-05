@@ -400,6 +400,33 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ),
                 ],
             ),
+            "/large" => {
+                if method == "HEAD"
+                    && if_none_match
+                        .split(',')
+                        .any(|candidate| candidate.trim() == "\"large-v1\"")
+                {
+                    (
+                        304,
+                        Vec::new(),
+                        vec![
+                            ("Content-Type", "application/octet-stream".into()),
+                            ("ETag", "\"large-v1\"".into()),
+                            ("Cache-Control", "public, max-age=3600".into()),
+                        ],
+                    )
+                } else {
+                    (
+                        200,
+                        vec![b'L'; 2 * 1024 * 1024],
+                        vec![
+                            ("Content-Type", "application/octet-stream".into()),
+                            ("ETag", "\"large-v1\"".into()),
+                            ("Cache-Control", "public, max-age=3600".into()),
+                        ],
+                    )
+                }
+            }
             _ => (
                 200,
                 b"hello from origin".to_vec(),
