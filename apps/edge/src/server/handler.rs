@@ -452,10 +452,11 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     // reuse a fresh body blindly. If we already have a validator, make one
     // conditional origin request and either refresh the entry on 304 or replace
     // it on 200. Without a validator, fall through to the normal full fetch.
-    if matches!(
+    let strict_revalidation = matches!(
         request_reason,
         Some("request-max-age-0" | "request-no-cache" | "request-pragma-no-cache")
-    ) {
+    );
+    if strict_revalidation {
         if let Some(response) = revalidate_cached_entry(
             &state,
             &key,
@@ -475,6 +476,13 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         .await
         {
             return response;
+        }
+        // A strict revalidation request with no cached representation still
+        // needs to populate the cache; otherwise a client that always sends
+        // max-age=0 would bypass forever after an Edge restart.
+        if !headers.contains_key(header::RANGE) && state.cache.get(&key).await.is_none() {
+            request_cacheable = true;
+            request_reason = None;
         }
     }
 

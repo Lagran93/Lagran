@@ -2,20 +2,53 @@
 //! forwarding and connection pooling.
 
 use anyhow::{anyhow, Context, Result};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
+use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use lagran_cache::CacheEntry;
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tower::Service;
 
-type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+type DefaultHttpsClient =
+    Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+/// Resolver for IP origins with a DNS certificate: connect to the configured
+/// IP while the HTTP/2 `:authority` remains the SNI hostname. This keeps
+/// virtual-host selection and TLS verification correct without forcing
+/// HTTP/1.1.
+#[derive(Clone)]
+struct FixedResolver {
+    addr: SocketAddr,
+}
+
+impl Service<Name> for FixedResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = std::io::Error;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _name: Name) -> Self::Future {
+        std::future::ready(Ok(vec![self.addr].into_iter()))
+    }
+}
+
+type SniHttpsClient = Client<
+    hyper_rustls::HttpsConnector<HttpConnector<FixedResolver>>,
+    Full<Bytes>,
+>;
 
 /// Upstream response as returned by the origin.
 pub struct OriginResponse {
@@ -44,10 +77,9 @@ impl OriginResponse {
 
 #[derive(Clone)]
 pub struct OriginClient {
-    client: Arc<HttpsClient>,
-    /// Clients with a fixed TLS SNI, keyed by SNI hostname. One client per
-    /// certificate hostname lets an IP origin verify against its DNS cert.
-    sni_clients: Arc<RwLock<HashMap<String, Arc<HttpsClient>>>>,
+    client: Arc<DefaultHttpsClient>,
+    /// SNI clients keyed by `sni|ip:port`.
+    sni_clients: Arc<RwLock<HashMap<String, Arc<SniHttpsClient>>>>,
     /// Fallback default origin (legacy single-origin)
     base_url: Arc<RwLock<String>>,
 }
@@ -91,29 +123,37 @@ fn is_hop_by_hop(name: &str) -> bool {
 }
 
 #[allow(deprecated)]
-fn build_client(server_name: Option<&str>) -> HttpsClient {
+fn build_client() -> DefaultHttpsClient {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_nodelay(true);
     http.set_connect_timeout(Some(Duration::from_secs(5)));
 
-    let base = hyper_rustls::HttpsConnectorBuilder::new()
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
-        .https_or_http();
-    let https = match server_name.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(name) => base
-            .with_server_name(name.to_string())
-            // IP origin + DNS certificate: HTTP/2 sends the URI IP as
-            // `:authority`, and some origins (notably Caddy virtual hosts)
-            // then ignore the explicit `Host` header and select the wrong
-            // site. HTTP/1.1 makes Host authoritative for virtual hosting.
-            .enable_http1()
-            .wrap_connector(http),
-        None => base
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(http),
-    };
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http);
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(64)
+        .build(https)
+}
+
+#[allow(deprecated)]
+fn build_sni_client(addr: SocketAddr) -> SniHttpsClient {
+    let mut http = HttpConnector::new_with_resolver(FixedResolver { addr });
+    http.enforce_http(false);
+    http.set_nodelay(true);
+    http.set_connect_timeout(Some(Duration::from_secs(5)));
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http);
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(64)
@@ -123,7 +163,7 @@ fn build_client(server_name: Option<&str>) -> HttpsClient {
 impl OriginClient {
     pub fn new(base_url: String) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = build_client(None);
+        let client = build_client();
         Self {
             client: Arc::new(client),
             sni_clients: Arc::new(RwLock::new(HashMap::new())),
@@ -131,19 +171,21 @@ impl OriginClient {
         }
     }
 
-    async fn client_for(&self, sni: Option<&str>) -> Arc<HttpsClient> {
-        let Some(sni) = sni.map(str::trim).filter(|s| !s.is_empty()) else {
-            return self.client.clone();
-        };
-        let key = sni.to_ascii_lowercase();
+    async fn client_for(&self, sni: Option<&str>, addr: Option<SocketAddr>) -> Arc<SniHttpsClient> {
+        let sni = sni
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let addr = addr.map(|a| a.to_string()).unwrap_or_default();
+        let key = format!("{sni}|{addr}");
         if let Some(client) = self.sni_clients.read().await.get(&key) {
             return client.clone();
         }
-        let client = Arc::new(build_client(Some(&key)));
-        self.sni_clients
-            .write()
-            .await
-            .insert(key, client.clone());
+        let client = Arc::new(build_sni_client(
+            addr.parse().expect("fixed resolver address"),
+        ));
+        self.sni_clients.write().await.insert(key, client.clone());
         client
     }
 
@@ -279,7 +321,21 @@ impl OriginClient {
         forward_sensitive: bool,
         sni: Option<&str>,
     ) -> Result<OriginResponse> {
-        let url = build_url(base_url, path_and_query)?;
+        let fixed = sni
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|name| split_ip_base(base_url).map(|addr| (name, addr)));
+        let (effective_base, sni_client) = match fixed {
+            Some((name, (ip, port))) => (
+                base_with_host(base_url, name),
+                Some(
+                    self.client_for(Some(name), Some(SocketAddr::new(ip, port)))
+                        .await,
+                ),
+            ),
+            None => (base_url.to_string(), None),
+        };
+        let url = build_url(&effective_base, path_and_query)?;
 
         let mut builder = Request::builder().method(method.clone()).uri(&url);
 
@@ -319,11 +375,17 @@ impl OriginClient {
             .body(Full::new(body.unwrap_or_default()))
             .with_context(|| format!("build origin request: {url}"))?;
 
-        let client = self.client_for(sni).await;
-        let resp = client
-            .request(req)
-            .await
-            .with_context(|| format!("origin request failed: {url}"))?;
+        let resp = match sni_client {
+            Some(client) => client
+                .request(req)
+                .await
+                .with_context(|| format!("origin request failed: {url}"))?,
+            None => self
+                .client
+                .request(req)
+                .await
+                .with_context(|| format!("origin request failed: {url}"))?,
+        };
 
         let status = StatusCode::from_u16(resp.status().as_u16())
             .map_err(|e| anyhow!("invalid status: {e}"))?;
@@ -357,6 +419,31 @@ impl OriginClient {
     }
 }
 
+fn split_ip_base(base_url: &str) -> Option<(IpAddr, u16)> {
+    let uri: Uri = base_url.parse().ok()?;
+    let host = uri.host()?;
+    let ip: IpAddr = host.parse().ok()?;
+    let port = uri.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str() == Some("http") {
+            80
+        } else {
+            443
+        }
+    });
+    Some((ip, port))
+}
+
+fn base_with_host(base_url: &str, host: &str) -> String {
+    let Ok(uri) = base_url.parse::<Uri>() else {
+        return base_url.to_string();
+    };
+    let scheme = uri.scheme_str().unwrap_or("https");
+    match uri.port_u16() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
 fn build_url(base_url: &str, path_and_query: &str) -> Result<String> {
     let base = base_url.trim_end_matches('/');
     if !(base.starts_with("http://") || base.starts_with("https://")) {
@@ -387,6 +474,23 @@ mod tests {
             "https://origin.test/a"
         );
         assert!(build_url("origin.test", "/a").is_err());
+    }
+
+    #[test]
+    fn ip_base_is_split_and_rewritten_to_sni_host() {
+        assert_eq!(
+            split_ip_base("https://45.63.84.225:443"),
+            Some(("45.63.84.225".parse().unwrap(), 443))
+        );
+        assert_eq!(
+            base_with_host("https://45.63.84.225", "test-origin.akgo.net"),
+            "https://test-origin.akgo.net"
+        );
+        assert_eq!(
+            base_with_host("https://45.63.84.225:8443", "test-origin.akgo.net"),
+            "https://test-origin.akgo.net:8443"
+        );
+        assert_eq!(split_ip_base("https://origin.test"), None);
     }
 
     #[test]
