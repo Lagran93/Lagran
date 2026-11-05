@@ -1756,11 +1756,17 @@ fn entry_response_bypass(eff: &Effective, entry: &CacheEntry) -> bool {
 }
 
 fn clone_as_entry(resp: &OriginResponse) -> CacheEntry {
-    CacheEntry::new(
+    let mut entry = CacheEntry::new(
         resp.status.as_u16(),
         headers_vec(&resp.headers),
         resp.body.clone(),
-    )
+    );
+    if entry.header("etag").is_none() {
+        entry
+            .headers
+            .push(("etag".to_string(), compute_etag(&entry)));
+    }
+    entry
 }
 
 /// Store an already-buffered origin response in the streaming large-object

@@ -10,6 +10,7 @@ use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use crate::cache::policy::compute_etag;
 use lagran_cache::CacheEntry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -71,7 +72,12 @@ impl OriginResponse {
                     .map(|s| (k.as_str().to_string(), s.to_string()))
             })
             .collect();
-        CacheEntry::new(self.status.as_u16(), headers, self.body)
+        let mut entry = CacheEntry::new(self.status.as_u16(), headers, self.body);
+        if entry.header("etag").is_none() {
+            let etag = compute_etag(&entry);
+            entry.headers.push(("etag".to_string(), etag));
+        }
+        entry
     }
 }
 
@@ -491,6 +497,18 @@ mod tests {
             "https://test-origin.akgo.net:8443"
         );
         assert_eq!(split_ip_base("https://origin.test"), None);
+    }
+
+    #[test]
+    fn origin_entry_gets_computed_etag_when_origin_omits_it() {
+        let entry = OriginResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"hello"),
+            cache_reason: None,
+        }
+        .into_entry();
+        assert!(entry.header("etag").is_some());
     }
 
     #[test]
