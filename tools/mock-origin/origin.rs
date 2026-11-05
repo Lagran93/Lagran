@@ -427,6 +427,14 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     )
                 }
             }
+            "/assets/no-validator.css" => (
+                200,
+                b"body{color:green}".to_vec(),
+                vec![
+                    ("Content-Type", "text/css".into()),
+                    ("Cache-Control", "public, max-age=60".into()),
+                ],
+            ),
             _ => (
                 200,
                 b"hello from origin".to_vec(),

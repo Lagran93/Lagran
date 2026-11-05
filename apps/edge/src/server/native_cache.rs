@@ -6,7 +6,7 @@
 //! header that is stripped before the response reaches the client; this keeps
 //! disk/hybrid persistence working without a separate metadata sidecar.
 
-use crate::cache::policy::compute_etag;
+use crate::cache::policy::{compute_etag, VALIDATOR_SOURCE_HEADER};
 use crate::cache::large::{LargeCache, LargeEntry, LargeWriter};
 use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
 use async_trait::async_trait;
@@ -225,9 +225,28 @@ impl HandleMiss for EntryMiss {
             body: self.body.freeze(),
             stored_at_epoch_secs: now_epoch_secs(),
         };
-        if entry.header("etag").is_none() {
+        entry
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER));
+        let has_etag = entry.header("etag").is_some();
+        let has_last_modified = entry.header("last-modified").is_some();
+        if has_etag {
+            entry.headers.push((
+                VALIDATOR_SOURCE_HEADER.to_string(),
+                "etag".to_string(),
+            ));
+        } else if has_last_modified {
+            entry.headers.push((
+                VALIDATOR_SOURCE_HEADER.to_string(),
+                "last-modified".to_string(),
+            ));
+        } else {
             let etag = compute_etag(&entry);
             entry.headers.push(("etag".to_string(), etag));
+            entry.headers.push((
+                VALIDATOR_SOURCE_HEADER.to_string(),
+                "computed".to_string(),
+            ));
         }
         self.cache
             .set_with_swr(&self.key, entry, self.fresh_secs, self.swr_secs)
@@ -434,6 +453,25 @@ impl Storage for NativeStorage {
                 if large.accepts(len) {
                     let mut stored_headers = headers.clone();
                     stored_headers.push((META_HEADER.to_string(), encoded_meta.clone()));
+                    stored_headers.retain(|(name, _)| {
+                        !name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                    });
+                    let has_etag = stored_headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("etag"));
+                    let has_last_modified = stored_headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("last-modified"));
+                    stored_headers.push((
+                        VALIDATOR_SOURCE_HEADER.to_string(),
+                        if has_etag {
+                            "etag".to_string()
+                        } else if has_last_modified {
+                            "last-modified".to_string()
+                        } else {
+                            "computed".to_string()
+                        },
+                    ));
                     if let Some(writer) = large
                         .begin(&key, status, stored_headers, len, fresh_secs, swr_secs)
                         .await

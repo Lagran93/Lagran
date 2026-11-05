@@ -10,6 +10,7 @@
 use crate::cache::policy::{
     cache_key_for_request, compute_etag, decide_storage_reason, request_bypass_reason_headers,
     resolve_rule_policy, resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
+    VALIDATOR_SOURCE_HEADER,
 };
 use crate::config::registry::{DomainEntry, OriginTarget};
 use crate::config::EdgeConfig;
@@ -749,6 +750,7 @@ impl ProxyHttp for DataPlaneProxy {
             }
         }
         response.remove_header(META_HEADER);
+        response.remove_header(VALIDATOR_SOURCE_HEADER);
         response.remove_header("x-lagran-cache-reason");
         response.insert_header("x-cache", label)?;
         response.insert_header("x-cache-status", label)?;
@@ -1081,6 +1083,17 @@ impl DataPlaneProxy {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("last-modified"))
             .map(|(_, v)| v.clone());
+        let validator_source = entry
+            .meta
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        if validator_source == "computed" {
+            large.delete(&plan.key).await;
+            return Ok(false);
+        }
         if etag.is_none() && last_modified.is_none() {
             large.delete(&plan.key).await;
             return Ok(false);
@@ -1208,6 +1221,8 @@ impl DataPlaneProxy {
                 for (name, value) in &entry.meta.headers {
                     if name.eq_ignore_ascii_case("content-length")
                         || name.eq_ignore_ascii_case(META_HEADER)
+                || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                        || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
                         || is_hop_by_hop(name)
                     {
                         continue;
@@ -1237,6 +1252,7 @@ impl DataPlaneProxy {
             if name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("content-range")
                 || name.eq_ignore_ascii_case(META_HEADER)
+                || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
                 || is_hop_by_hop(name)
             {
                 continue;
@@ -1426,6 +1442,7 @@ impl DataPlaneProxy {
         };
         for (name, value) in &entry.meta.headers {
             if name.eq_ignore_ascii_case(META_HEADER)
+                || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
                 || name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("content-range")
                 || is_hop_by_hop(name)
@@ -1820,6 +1837,7 @@ impl DataPlaneProxy {
         let mut headers = HeaderMap::new();
         for (name, value) in &entry.headers {
             if name.eq_ignore_ascii_case(META_HEADER)
+                || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
                 || name.eq_ignore_ascii_case("content-length")
                 || is_hop_by_hop(name)
             {

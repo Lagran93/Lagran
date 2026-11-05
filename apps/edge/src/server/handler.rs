@@ -15,7 +15,7 @@ use crate::cache::policy::{
     cache_key_for_request, compute_etag, decide_storage_reason, etag_matches,
     is_uncacheable_header, request_bypass_reason, request_method_cacheable, resolve_rule_policy,
     resolve_rule_policy_for_response, strip_response_headers, CacheDecision, CacheRule,
-    CacheStatus, ResolvedPolicy, RuleAction, RuleSet,
+    CacheStatus, ResolvedPolicy, RuleAction, RuleSet, VALIDATOR_SOURCE_HEADER,
 };
 use crate::cache::{CacheEntry, CacheGetResult, LargeCache, SharedCache};
 use crate::config::registry::{DomainEntry, DomainRegistry, OriginTarget};
@@ -482,8 +482,16 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         // cannot answer a 304 and must be replaced by a full origin response.
         if !headers.contains_key(header::RANGE) {
             if let Some(entry) = state.cache.get(&key).await {
-                if entry.header("etag").is_none() && entry.header("last-modified").is_none() {
-                    tracing::debug!(key, "dropping cache entry without validator");
+                let source = entry.header(VALIDATOR_SOURCE_HEADER).unwrap_or("");
+                let has_upstream_validator = match source {
+                    "etag" | "last-modified" => true,
+                    "computed" => false,
+                    _ => {
+                        entry.header("etag").is_some() || entry.header("last-modified").is_some()
+                    }
+                };
+                if !has_upstream_validator {
+                    tracing::debug!(key, "dropping cache entry without upstream validator");
                     state.cache.delete(&key).await;
                 }
             }
@@ -1154,14 +1162,30 @@ async fn revalidate_cached_entry(
 
     let etag = entry.header("etag").map(str::to_string);
     let last_modified = entry.header("last-modified").map(str::to_string);
+    let validator_source = entry.header(VALIDATOR_SOURCE_HEADER).unwrap_or("");
     tracing::debug!(
         key,
         has_etag = etag.is_some(),
         has_last_modified = last_modified.is_some(),
+        validator_source,
         "revalidation cache entry"
     );
-    if etag.is_none() && last_modified.is_none() {
-        tracing::debug!(key, "revalidation entry has no validator");
+    if validator_source == "computed" {
+        tracing::debug!(key, "revalidation entry validator is edge-computed");
+        return None;
+    }
+    let use_etag = match validator_source {
+        "etag" => etag.is_some(),
+        "last-modified" => false,
+        _ => etag.is_some(),
+    };
+    let use_last_modified = !use_etag
+        && match validator_source {
+            "last-modified" => last_modified.is_some(),
+            _ => last_modified.is_some(),
+        };
+    if !use_etag && !use_last_modified {
+        tracing::debug!(key, "revalidation entry has no upstream validator");
         return None;
     }
 
@@ -1170,12 +1194,14 @@ async fn revalidate_cached_entry(
     conditional.remove(header::PRAGMA);
     conditional.remove(header::IF_NONE_MATCH);
     conditional.remove(header::IF_MODIFIED_SINCE);
-    if let Some(ref etag) = etag {
-        if let Ok(value) = HeaderValue::from_str(etag) {
-            conditional.insert(header::IF_NONE_MATCH, value);
+    if use_etag {
+        if let Some(ref etag) = etag {
+            if let Ok(value) = HeaderValue::from_str(etag) {
+                conditional.insert(header::IF_NONE_MATCH, value);
+            }
         }
-    } else if let Some(ref last_modified) = last_modified {
-        if let Ok(value) = HeaderValue::from_str(last_modified) {
+    } else if let Some(ref modified) = last_modified {
+        if let Ok(value) = HeaderValue::from_str(modified) {
             conditional.insert(header::IF_MODIFIED_SINCE, value);
         }
     }
@@ -1761,10 +1787,30 @@ fn clone_as_entry(resp: &OriginResponse) -> CacheEntry {
         headers_vec(&resp.headers),
         resp.body.clone(),
     );
-    if entry.header("etag").is_none() {
-        entry
-            .headers
-            .push(("etag".to_string(), compute_etag(&entry)));
+    let has_etag = entry.header("etag").is_some();
+    let has_last_modified = entry.header("last-modified").is_some();
+    entry
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER));
+    if has_etag {
+        entry.headers.push((
+            VALIDATOR_SOURCE_HEADER.to_string(),
+            "etag".to_string(),
+        ));
+    } else if has_last_modified {
+        entry.headers.push((
+            VALIDATOR_SOURCE_HEADER.to_string(),
+            "last-modified".to_string(),
+        ));
+    } else {
+        entry.headers.push((
+            "etag".to_string(),
+            compute_etag(&entry),
+        ));
+        entry.headers.push((
+            VALIDATOR_SOURCE_HEADER.to_string(),
+            "computed".to_string(),
+        ));
     }
     entry
 }
@@ -1789,16 +1835,34 @@ async fn store_large_response(
         return false;
     }
     let mut headers = headers_vec(&resp.headers);
-    if !headers
+    let has_etag = headers
         .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("etag"))
-    {
+        .any(|(name, _)| name.eq_ignore_ascii_case("etag"));
+    let has_last_modified = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("last-modified"));
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER));
+    if has_etag {
+        headers.push((
+            VALIDATOR_SOURCE_HEADER.to_string(),
+            "etag".to_string(),
+        ));
+    } else if has_last_modified {
+        headers.push((
+            VALIDATOR_SOURCE_HEADER.to_string(),
+            "last-modified".to_string(),
+        ));
+    } else {
         let etag = compute_etag(&CacheEntry::new(
             resp.status.as_u16(),
             headers.clone(),
             resp.body.clone(),
         ));
         headers.push(("etag".to_string(), etag));
+        headers.push((
+            VALIDATOR_SOURCE_HEADER.to_string(),
+            "computed".to_string(),
+        ));
     }
     let Some(mut writer) = large
         .begin(

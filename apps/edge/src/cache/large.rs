@@ -79,6 +79,8 @@ pub struct LargeWriter {
     meta_path: PathBuf,
     written: u64,
     failed: bool,
+    fresh_secs: u64,
+    swr_secs: u64,
 }
 
 impl LargeWriter {
@@ -127,7 +129,12 @@ impl LargeWriter {
             return false;
         }
         self.meta.complete = true;
-        self.meta.stored_at = now_unix();
+        let committed_at = now_unix();
+        // TTL must start when the object is committed, not when the transfer
+        // began. A slow large download can otherwise finish already expired.
+        self.meta.fresh_until = committed_at + self.fresh_secs.max(1);
+        self.meta.stale_until = self.meta.fresh_until + self.swr_secs;
+        self.meta.stored_at = committed_at;
         let meta_bytes = match serde_json::to_vec(&self.meta) {
             Ok(v) => v,
             Err(_) => {
@@ -179,6 +186,8 @@ pub struct RangeWriter {
     written: u64,
     new_entry: bool,
     committed: bool,
+    fresh_secs: u64,
+    swr_secs: u64,
 }
 
 impl RangeWriter {
@@ -217,7 +226,10 @@ impl RangeWriter {
         self.meta.complete = self
             .meta
             .covers(0, self.meta.content_length.saturating_sub(1));
-        self.meta.stored_at = now_unix();
+        let committed_at = now_unix();
+        self.meta.fresh_until = committed_at + self.fresh_secs.max(1);
+        self.meta.stale_until = self.meta.fresh_until + self.swr_secs;
+        self.meta.stored_at = committed_at;
         let Ok(meta_bytes) = serde_json::to_vec(&self.meta) else {
             self.abort().await;
             return false;
@@ -277,6 +289,10 @@ impl LargeCache {
         let min_object_bytes = min_object_bytes.max(1024 * 1024);
         let max_object_bytes = max_object_bytes.max(min_object_bytes);
         let max_bytes = max_bytes.max(max_object_bytes);
+        let removed_parts = cleanup_stale_parts(&root, 6 * 60 * 60).await.unwrap_or(0);
+        if removed_parts > 0 {
+            tracing::warn!(path = %root.display(), removed_parts, "removed stale large-cache part files");
+        }
         let (used, count) = scan_usage(&root).await.unwrap_or((0, 0));
         tracing::info!(
             path = %root.display(),
@@ -484,6 +500,8 @@ impl LargeCache {
             meta_path,
             written: 0,
             failed: false,
+            fresh_secs: fresh,
+            swr_secs,
         })
     }
 
@@ -566,6 +584,8 @@ impl LargeCache {
             written: 0,
             new_entry,
             committed: false,
+            fresh_secs: fresh,
+            swr_secs,
         })
     }
 
@@ -729,8 +749,45 @@ async fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
-async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {
-    let mut total = 0u64;
+async fn cleanup_stale_parts(root: &Path, max_age_secs: u64) -> anyhow::Result<u64> {
+    let now = SystemTime::now();
+    let mut removed = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut rd) = fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            let Ok(ft) = ent.file_type().await else {
+                continue;
+            };
+            let path = ent.path();
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.contains(".part.") {
+                continue;
+            }
+            let Ok(meta) = ent.metadata().await else {
+                continue;
+            };
+            let age = meta
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if age >= max_age_secs && fs::remove_file(&path).await.is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {    let mut total = 0u64;
     let mut count = 0usize;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -756,6 +813,7 @@ async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn streams_complete_object_and_purges() {
@@ -798,6 +856,31 @@ mod tests {
 
         assert_eq!(cache.purge_patterns(&["large.test".into()]).await, 1);
         assert!(cache.get(key).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ttl_starts_at_commit_not_transfer_start() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-large-cache-ttl-test-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = LargeCache::open(&dir, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let key = "GET:large.test:/slow.bin";
+        let mut writer = cache
+            .begin(key, 200, Vec::new(), 1024 * 1024, 1, 0)
+            .await
+            .expect("writer");
+        // Simulate a slow transfer: the TTL would expire before commit if it
+        // were measured from `begin`.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        writer.write_all(&vec![1_u8; 1024 * 1024]).await;
+        assert!(writer.commit().await);
+        assert!(cache.get(key).await.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

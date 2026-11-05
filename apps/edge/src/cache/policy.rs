@@ -21,6 +21,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
+/// Internal cache metadata: which validator came from the origin.
+/// Values: `etag`, `last-modified`, `computed`.
+pub const VALIDATOR_SOURCE_HEADER: &str = "x-lagran-validator-source";
+
 /// Standard CDN-style cache status labels
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStatus {
@@ -817,6 +821,7 @@ pub fn is_uncacheable_header(name: &str) -> bool {
         || n == "date"
         || n == "etag"
         || n == "x-lagran-cache-reason"
+        || n == "x-lagran-validator-source"
         || is_hop_by_hop(&n)
 }
 
@@ -827,6 +832,7 @@ pub fn strip_response_headers(headers: &mut HeaderMap) {
         .filter(|k| {
             let n = k.as_str().to_ascii_lowercase();
             is_hop_by_hop(&n) || n == "content-length" || n == "x-lagran-cache-reason"
+                || n == "x-lagran-validator-source"
         })
         .map(|k| k.as_str().to_string())
         .collect();

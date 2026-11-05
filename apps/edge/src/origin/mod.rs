@@ -10,7 +10,7 @@ use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use crate::cache::policy::compute_etag;
+use crate::cache::policy::{compute_etag, VALIDATOR_SOURCE_HEADER};
 use lagran_cache::CacheEntry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -73,9 +73,29 @@ impl OriginResponse {
             })
             .collect();
         let mut entry = CacheEntry::new(self.status.as_u16(), headers, self.body);
-        if entry.header("etag").is_none() {
-            let etag = compute_etag(&entry);
-            entry.headers.push(("etag".to_string(), etag));
+        let has_etag = entry.header("etag").is_some();
+        let has_last_modified = entry.header("last-modified").is_some();
+        entry
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER));
+        if has_etag {
+            entry.headers.push((
+                VALIDATOR_SOURCE_HEADER.to_string(),
+                "etag".to_string(),
+            ));
+        } else if has_last_modified {
+            entry.headers.push((
+                VALIDATOR_SOURCE_HEADER.to_string(),
+                "last-modified".to_string(),
+            ));
+        } else {
+            entry
+                .headers
+                .push(("etag".to_string(), compute_etag(&entry)));
+            entry.headers.push((
+                VALIDATOR_SOURCE_HEADER.to_string(),
+                "computed".to_string(),
+            ));
         }
         entry
     }

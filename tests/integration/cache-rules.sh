@@ -180,6 +180,10 @@ check "large object conditional returns 200" "$CODE" "200"
 check "large object conditional revalidates" "$(hdr x-cache)" "REVALIDATED"
 check "large object conditional uses origin-304" "$(hdr x-lagran-cache-reason)" "origin-304"
 check "large object body size" "$(wc -c < "$LOG_DIR/b" | tr -d ' ')" "2097152"
+get "/assets/no-validator.css" -H 'Cache-Control: max-age=0' >/dev/null
+check "computed validator cold is MISS" "$(hdr x-cache)" "MISS"
+get "/assets/no-validator.css" -H 'Cache-Control: max-age=0' >/dev/null
+check "computed validator stays MISS without upstream validator" "$(hdr x-cache)" "MISS"
 CODE=$(get "/assets/app.css" -H 'Cookie: lagran_clearance=test' \
   -H 'Cache-Control: no-cache' -H "If-None-Match: $CSS_ETAG")
 check "no-cache + ignored cookie revalidates via origin 304" "$CODE" "304"
