@@ -151,6 +151,12 @@ CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0')
 check "Chrome max-age=0 without client validator returns body" "$CODE" "200"
 check "Chrome max-age=0 without client validator uses REVALIDATED" "$(hdr x-cache)" "REVALIDATED"
 check "Chrome max-age=0 without validator records origin-304" "$(hdr x-lagran-cache-reason)" "origin-304"
+get "/assets/reval-empty.css" >/dev/null
+check "empty-conditional fixture fills cache" "$(hdr x-cache)" "MISS"
+CODE=$(get "/assets/reval-empty.css" -H 'Cache-Control: no-cache')
+check "empty conditional 200 retries unconditional origin" "$CODE" "200"
+check "empty conditional retry returns body" "$(wc -c < "$LOG_DIR/b" | tr -d ' ')" "16"
+check "empty conditional retry uses revalidated status" "$(hdr x-cache)" "REVALIDATED"
 CODE=$(get "/assets/app.css" -H 'Cookie: lagran_clearance=test' \
   -H 'Cache-Control: no-cache' -H "If-None-Match: $CSS_ETAG")
 check "no-cache + ignored cookie revalidates via origin 304" "$CODE" "304"

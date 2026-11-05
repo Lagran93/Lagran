@@ -368,6 +368,25 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     )
                 }
             }
+            "/assets/reval-empty.css" => {
+                if if_none_match.is_empty() {
+                    (
+                        200,
+                        b"body{color:blue}".to_vec(),
+                        vec![
+                            ("Content-Type", "text/css".into()),
+                            ("ETag", "\"empty-v1\"".into()),
+                            ("Cache-Control", "public, max-age=600".into()),
+                        ],
+                    )
+                } else {
+                    (
+                        200,
+                        Vec::new(),
+                        vec![("Cache-Control", "public, max-age=600".into())],
+                    )
+                }
+            }
             _ => (
                 200,
                 b"hello from origin".to_vec(),

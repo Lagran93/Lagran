@@ -1164,6 +1164,7 @@ ACCESS_LOG_REPORT=true
 | `request-pragma-no-cache` | 请求 Pragma: no-cache 条件回源 |
 | `origin-304` | 条件回源命中 304，复用缓存 |
 | `origin-200` | 条件回源返回 200，更新缓存 |
+| `origin-empty-fallback` | 条件回源返回异常空 200，改为使用缓存 body |
 | `vary` | Vary 不受支持 |
 | `vary:user-agent` | Vary User-Agent |
 | `vary:cookie` | Vary Cookie 且未 ignore |

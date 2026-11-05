@@ -103,8 +103,11 @@ fn build_client(server_name: Option<&str>) -> HttpsClient {
     let https = match server_name.map(str::trim).filter(|s| !s.is_empty()) {
         Some(name) => base
             .with_server_name(name.to_string())
+            // IP origin + DNS certificate: HTTP/2 sends the URI IP as
+            // `:authority`, and some origins (notably Caddy virtual hosts)
+            // then ignore the explicit `Host` header and select the wrong
+            // site. HTTP/1.1 makes Host authoritative for virtual hosting.
             .enable_http1()
-            .enable_http2()
             .wrap_connector(http),
         None => base
             .enable_http1()

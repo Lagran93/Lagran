@@ -1105,7 +1105,7 @@ async fn revalidate_cached_entry(
         }
     }
 
-    match fetch_origin(
+    let origin_result = fetch_origin(
         state,
         eff,
         host,
@@ -1113,7 +1113,8 @@ async fn revalidate_cached_entry(
         &conditional,
         &Method::GET,
     )
-    .await
+    .await;
+    match origin_result
     {
         Ok(resp) if resp.status == StatusCode::NOT_MODIFIED => {
             let mut refreshed = entry;
@@ -1184,6 +1185,80 @@ async fn revalidate_cached_entry(
             Some(response)
         }
         Ok(resp) => {
+            let mut resp = resp;
+            // Some origins/shields answer a conditional GET with an empty 200
+            // even though the unconditional representation is non-empty. Do
+            // not replace a usable cache body with that response: retry once
+            // without validators, and if the retry also fails, serve the
+            // cached body rather than a blank page.
+            if resp.status.is_success() && resp.body.is_empty() && !entry.body.is_empty() {
+                let mut retry_headers = headers.clone();
+                retry_headers.remove(header::IF_NONE_MATCH);
+                retry_headers.remove(header::IF_MODIFIED_SINCE);
+                match fetch_origin(
+                    state,
+                    eff,
+                    host,
+                    path_and_query,
+                    &retry_headers,
+                    &Method::GET,
+                )
+                .await
+                {
+                    Ok(full) if !full.body.is_empty() => {
+                        resp = full;
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            host,
+                            "conditional revalidation returned empty 200 twice; serving cached body"
+                        );
+                        let mut response = serve_cached(
+                            state,
+                            entry,
+                            CacheStatus::Revalidated,
+                            method,
+                            host,
+                            path_only,
+                            client_ip,
+                            user_agent,
+                            referer,
+                            request_id,
+                            client_if_none_match,
+                            eff,
+                            start,
+                        )
+                        .await;
+                        set_cache_reason(&mut response, Some("origin-empty-fallback"));
+                        return Some(response);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            host,
+                            "conditional revalidation returned empty 200; serving cached body"
+                        );
+                        let mut response = serve_cached(
+                            state,
+                            entry,
+                            CacheStatus::Revalidated,
+                            method,
+                            host,
+                            path_only,
+                            client_ip,
+                            user_agent,
+                            referer,
+                            request_id,
+                            client_if_none_match,
+                            eff,
+                            start,
+                        )
+                        .await;
+                        set_cache_reason(&mut response, Some("origin-empty-fallback"));
+                        return Some(response);
+                    }
+                }
+            }
             let status = resp.status;
             let body_len = resp.body.len() as u64;
             let etag = entry_etag(&resp);
