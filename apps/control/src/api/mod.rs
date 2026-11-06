@@ -165,6 +165,7 @@ pub fn create_router(state: AppState) -> Router {
                     put(prefetch::update_schedule).delete(prefetch::delete_schedule),
                 )
                 .route("/stats/by-domain", get(stats::by_domain))
+                .route("/stats/by-node", get(stats::by_node))
                 .route("/stats/timeseries", get(stats::timeseries))
                 .route("/stats/realtime", get(stats::realtime))
                 .route("/stats/summary", get(stats::summary))

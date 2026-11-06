@@ -371,3 +371,60 @@ pub async fn by_domain(
             .collect(),
     )
 }
+
+
+#[derive(Deserialize)]
+pub struct NodeStatsQuery {
+    pub hours: Option<i32>,
+}
+
+#[derive(Serialize)]
+pub struct NodeMetricsDto {
+    pub node: String,
+    pub domain: String,
+    pub requests: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub bytes_sent: u64,
+    pub hit_ratio: f64,
+}
+
+/// Per-node cache hit ratios for the multi-node comparison dashboard.
+pub async fn by_node(
+    State(state): State<AppState>,
+    actor: Actor,
+    Query(query): Query<NodeStatsQuery>,
+) -> Json<Vec<NodeMetricsDto>> {
+    let hours = query.hours.unwrap_or(1).clamp(1, 168);
+    let hosts = if actor.admin() {
+        None
+    } else {
+        Some(visible_names(&state, &actor).await)
+    };
+    if hosts.as_ref().is_some_and(|h| h.is_empty()) {
+        return Json(Vec::new());
+    }
+    let rows = repository::metrics_by_node(&state.pool, hours, hosts.as_deref())
+        .await
+        .unwrap_or_default();
+    Json(
+        rows.into_iter()
+            .map(|(node, domain, requests, hits, misses, bytes)| {
+                let total = hits + misses;
+                NodeMetricsDto {
+                    node,
+                    domain,
+                    requests: requests as u64,
+                    cache_hits: hits as u64,
+                    cache_misses: misses as u64,
+                    bytes_sent: bytes as u64,
+                    hit_ratio: if total > 0 {
+                        hits as f64 / total as f64
+                    } else {
+                        0.0
+                    },
+                }
+            })
+            .collect(),
+    )
+}

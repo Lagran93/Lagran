@@ -78,7 +78,7 @@ pub async fn purge(
         "purge requested"
     );
 
-    let nodes = match repository::list_online_nodes_with_agent(&state.pool).await {
+    let nodes = match repository::list_nodes_with_agent(&state.pool).await {
         Ok(n) => n,
         Err(e) => {
             tracing::error!(error = %e, "list nodes for purge");
@@ -94,7 +94,7 @@ pub async fn purge(
     if nodes.is_empty() {
         return Ok(Json(PurgeResponse {
             success: true,
-            message: "no online edge agents with agent_url; nothing dispatched".into(),
+            message: "no edge agents with agent_url; nothing dispatched".into(),
             purged_count: 0,
             nodes: vec![],
         }));
@@ -107,17 +107,29 @@ pub async fn purge(
         tags: req.tags.clone().unwrap_or_default(),
         purge_all: req.purge_all.unwrap_or(false),
     };
+    let payload = match serde_json::to_value(&body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::error!(error = %e, "encode purge payload");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "encode purge payload".into(),
+                }),
+            ));
+        }
+    };
 
     let mut results = Vec::new();
     let mut total = 0u64;
     let mut any_fail = false;
 
-    for node in nodes {
-        let url = format!("{}/__lagran/purge", node.agent_url.trim_end_matches('/'));
-        let token = if node.auth_token.is_empty() {
+    for (name, agent_url, auth_token) in nodes {
+        let url = format!("{}/__lagran/purge", agent_url.trim_end_matches('/'));
+        let token = if auth_token.is_empty() {
             state.config.agent_token.clone()
         } else {
-            node.auth_token.clone()
+            auth_token.clone()
         };
         let result = dispatch_one(&url, &body, &token).await;
         match result {
@@ -125,10 +137,18 @@ pub async fn purge(
                 total += reply.purged_count;
                 if !reply.success {
                     any_fail = true;
+                    let _ = repository::enqueue_purge_retry(
+                        &state.pool,
+                        &name,
+                        &agent_url,
+                        &payload,
+                        &reply.message,
+                    )
+                    .await;
                 }
                 results.push(NodePurgeResult {
-                    node: node.name.clone(),
-                    agent_url: node.agent_url.clone(),
+                    node: name.clone(),
+                    agent_url: agent_url.clone(),
                     success: reply.success,
                     purged_count: reply.purged_count,
                     message: reply.message,
@@ -136,10 +156,18 @@ pub async fn purge(
             }
             Err(e) => {
                 any_fail = true;
-                tracing::warn!(node = %node.name, error = %e, "purge dispatch failed");
+                tracing::warn!(node = %name, error = %e, "purge dispatch failed; queued for retry");
+                let _ = repository::enqueue_purge_retry(
+                    &state.pool,
+                    &name,
+                    &agent_url,
+                    &payload,
+                    &e,
+                )
+                .await;
                 results.push(NodePurgeResult {
-                    node: node.name,
-                    agent_url: node.agent_url,
+                    node: name,
+                    agent_url,
                     success: false,
                     purged_count: 0,
                     message: e,

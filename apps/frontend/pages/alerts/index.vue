@@ -441,6 +441,7 @@ const metricOptions = computed(() =>
     { value: 'node_offline', label: '边缘节点离线' },
     { value: 'cache_hit_ratio', label: '缓存命中率过低' },
     { value: 'waf_spike', label: 'WAF 事件突增' },
+    { value: 'config_release_failed', label: '配置发布失败' },
   ].filter((m) => auth.isAdmin || m.value !== 'node_offline'),
 )
 
@@ -489,6 +490,8 @@ const thresholdLabel = computed(() => {
       return '命中率下限（%）'
     case 'waf_spike':
       return '事件数阈值'
+    case 'config_release_failed':
+      return '失败发布阈值'
     default:
       return '连续失败次数'
   }
@@ -504,6 +507,8 @@ const thresholdHint = computed(() => {
       return '命中率低于该百分比时告警'
     case 'waf_spike':
       return '窗口内 WAF 事件数达到该值时告警'
+    case 'config_release_failed':
+      return '24 小时内出现失败发布时告警'
     default:
       return '源站连续失败达到该次数时告警'
   }

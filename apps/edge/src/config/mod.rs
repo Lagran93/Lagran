@@ -25,6 +25,11 @@ pub struct EdgeConfig {
     pub cache_capacity: u64,
     /// Approximate memory-cache byte cap; 0 means unbounded.
     pub cache_max_bytes: u64,
+    /// Redis L2 cache endpoint (falls back to REDIS_URL when empty).
+    pub cache_redis_url: String,
+    pub cache_redis_prefix: String,
+    /// Maximum serialized body written to Redis L2.
+    pub cache_l2_max_body: usize,
     /// memory | disk | hybrid
     pub cache_backend: String,
     pub disk_cache_dir: String,
@@ -132,6 +137,17 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(512 * 1024 * 1024)
                 .clamp(16 * 1024 * 1024, 8 * 1024 * 1024 * 1024),
+            cache_redis_url: env_nonempty("CACHE_REDIS_URL").unwrap_or_default(),
+            cache_redis_prefix: std::env::var("CACHE_REDIS_PREFIX")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "lagran:cache".to_string()),
+            cache_l2_max_body: std::env::var("CACHE_L2_MAX_BODY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8 * 1024 * 1024)
+                .clamp(1024 * 1024, 64 * 1024 * 1024),
             cache_backend: std::env::var("CACHE_BACKEND")
                 .unwrap_or_else(|_| "memory".into())
                 .to_lowercase(),

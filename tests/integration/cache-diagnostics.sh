@@ -86,7 +86,8 @@ echo "== start edge =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 NODE_ID="diag-edge-$$" AGENT_TOKEN="$NODE_TOKEN" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" EDGE_ADMIN_LISTEN= \
-CACHE_TTL=60 CACHE_BACKEND=memory \
+CACHE_TTL=60 CACHE_BACKEND="${CACHE_BACKEND:-memory}" \
+CACHE_REDIS_URL="${CACHE_REDIS_URL:-}" CACHE_REDIS_PREFIX="${CACHE_REDIS_PREFIX:-lagran:test:$$}" \
 ./target/debug/lagran-edge >"$LOG_DIR/edge.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$EDGE_PORT/__lagran/health" >/dev/null && break; sleep 0.5; done
 SYNCED=0

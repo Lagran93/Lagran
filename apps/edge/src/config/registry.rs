@@ -109,6 +109,17 @@ impl DomainRegistry {
         self.inner.read().await.get(&host).cloned()
     }
 
+    /// Domain name -> per-domain config version, for cache invalidation when a
+    /// domain changes on the control plane.
+    pub async fn version_map(&self) -> HashMap<String, String> {
+        self.inner
+            .read()
+            .await
+            .iter()
+            .map(|(domain, entry)| (domain.clone(), entry.version.clone()))
+            .collect()
+    }
+
     pub async fn contains(&self, host: &str) -> bool {
         self.get(host).await.is_some()
     }

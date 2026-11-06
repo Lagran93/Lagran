@@ -604,10 +604,13 @@ Control 的 CONTROL_PUBLIC_URL
 | `CC_REDIS_PREFIX` | CC Redis key 前缀 |
 | `RATE_LIMIT_REDIS_PREFIX` | 普通限流 Redis key 前缀 |
 | `CACHE_TTL` | 默认缓存 TTL |
-| `CACHE_BACKEND` | `memory` / `disk` / `hybrid` |
+| `CACHE_BACKEND` | `memory` / `disk` / `hybrid` / `redis` / `l2` |
 | `DISK_CACHE_DIR` | 普通磁盘缓存目录 |
 | `MAX_CACHEABLE_BODY` | 普通缓存单对象上限，8 MiB 默认 |
 | `CACHE_MAX_BYTES` | 内存缓存近似字节上限，默认 512 MiB；超限按 LRU 淘汰 |
+| `CACHE_REDIS_URL` | 所有 Edge 共享的 Redis L2 地址；为空复用 `REDIS_URL`。不是节点本地 Redis |
+| `CACHE_REDIS_PREFIX` | Redis L2 key 前缀 |
+| `CACHE_L2_MAX_BODY` | 写入 Redis L2 的最大序列化 body |
 | `ORIGIN_READ_TIMEOUT_MS` | 回源读取空闲超时，默认 30000；流媒体不会因总时长被中断 |
 | `DOWNSTREAM_KEEPALIVE_SECS` | 下游 HTTP/1.1 keepalive 空闲超时，默认 60 |
 | `DOWNSTREAM_H2_IDLE_SECS` | 下游 HTTP/2 空闲超时，默认 120 |
@@ -626,6 +629,161 @@ Control 的 CONTROL_PUBLIC_URL
 | `TRUST_PROXY_HEADERS` | 是否信任前置代理 XFF |
 | `ACCESS_LOG_*` | 访问日志路径/JSON/缓冲/上报 |
 | `RUST_LOG` | 日志级别 |
+
+### 4.3.1 Redis 部署位置与 L2 架构
+
+`CACHE_REDIS_URL` 是每个 Edge 节点上的客户端连接地址，指向一个**所有目标 Edge 都能访问的共享 Redis**。它不是“必须和 Control 部署在同一台机器”，也不是“每台 Edge 各连自己的 Redis”。
+
+典型拓扑：
+
+```text
+edge-kr-01 ─┐
+edge-kr-02 ─┼──> redis-l2.internal:6379
+edge-kr-03 ─┘
+```
+
+#### 三种部署方式
+
+| 方式 | 适用场景 | 说明 |
+|---|---|---|
+| 独立 Redis / 云 Redis 主从 | 生产推荐 | 所有 Edge 共享，不占用节点资源，可独立扩容、备份、监控 |
+| Control 服务器上的 Redis | 小规模、同区域 | 可用，但 Control 故障会导致 L2 不可用，且与 Control 抢内存 |
+| 某一台 Edge 节点上的 Redis | 仅测试 | 单点故障；该节点故障会让全站 L2 丢失，并影响该节点代理性能 |
+
+生产环境推荐：
+
+```text
+独立 Redis 实例
+或 Redis Sentinel / 云 Redis 主从
+与 Edge 同私有网络
+低 RTT
+只允许内网访问
+```
+
+不要把 L2 Redis 放在某一台 Edge 节点上作为长期方案。
+
+#### 多区域部署
+
+如果 Edge 分布在多个区域，推荐每个区域一个 Redis：
+
+```text
+韩国 Edge → redis-kr.internal
+美国 Edge → redis-us.internal
+欧洲 Edge → redis-eu.internal
+```
+
+特点：
+
+```text
+区域内共享 L2
+跨区域不共享
+```
+
+优点：
+
+- 低延迟
+- 不受跨洲 RTT 影响
+- 单区域 Redis 故障只影响该区域
+
+缺点：
+
+- 跨区域节点之间不共享缓存
+- 缓存一致性依赖 Control 的 purge fan-out 与配置版本失效
+
+不建议全球所有 Edge 共用一个远端 Redis：
+
+```text
+全球 Edge → 一个跨洲 Redis
+```
+
+原因：
+
+- 跨洲延迟高
+- 可能超过 L2 访问超时
+- Redis 成为全球单点
+- 带宽成本高
+
+#### 与 REDIS_URL 的关系
+
+`REDIS_URL` 与 `CACHE_REDIS_URL` 用途不同：
+
+```text
+REDIS_URL
+  CC 滑动窗口
+  普通域名限流
+  配置缓存 / 告警锁
+
+CACHE_REDIS_URL
+  L2 共享缓存
+  跨节点 single-flight
+  purge L2 清理
+```
+
+两者可以指向同一个 Redis，但生产建议分开：
+
+- 缓存对象可能较大
+- 缓存内存压力会触发淘汰
+- 限流 key 被淘汰会导致限流失效
+- 缓存更适合独立实例或独立淘汰策略
+
+如果必须共用一个实例，至少使用不同前缀，并确认 `maxmemory-policy` 不会错误淘汰限流/锁 key。
+
+#### 不同逻辑库不能替代资源隔离
+
+可以使用不同 Redis 逻辑库：
+
+```env
+REDIS_URL=redis://10.0.0.20:6379/0
+CACHE_REDIS_URL=redis://10.0.0.20:6379/1
+```
+
+这只能隔离 key 命名空间，不能隔离：
+
+- `maxmemory`
+- `maxmemory-policy`
+- CPU
+- 网络带宽
+- 持久化 / AOF / RDB
+- 慢查询和阻塞
+
+Redis 的 `maxmemory` 和淘汰策略是**实例级**的，不是 DB 级。缓存把实例内存打满时，`allkeys-lru` 仍可能淘汰限流 key；`volatile-lru` 也可能淘汰任何带 TTL 的限流或锁 key。
+
+因此：
+
+- 小规模、非关键环境可以接受同实例不同 DB + 不同前缀；
+- 生产环境仍建议缓存与限流使用独立实例；
+- 如果只能共用一个实例，应设置足够内存、监控 eviction，并评估限流 key 被淘汰的影响；
+- Redis Cluster 通常只支持 DB 0，`/1` 在集群模式下不可用。
+
+#### 配置示例
+
+```env
+CACHE_BACKEND=redis
+CACHE_REDIS_URL=redis://10.0.0.20:6379/0
+CACHE_REDIS_PREFIX=lagran:cache
+CACHE_L2_MAX_BODY=8388608
+```
+
+TLS / 密码：
+
+```env
+CACHE_REDIS_URL=rediss://:password@redis-l2.internal:6379/0
+```
+
+#### 容量与安全建议
+
+```text
+仅内网访问
+启用 ACL / 密码 / TLS
+独立 Redis 实例或独立逻辑库
+设置 maxmemory
+设置合理的 maxmemory-policy
+监控内存、命中率、延迟、淘汰数
+```
+
+Redis L2 只保存普通缓存对象。大文件仍走 LargeCache 本地磁盘，不写入 Redis。
+
+当 Redis 不可用时，Edge 自动降级为本地缓存；跨节点 single-flight 也会跳过等待，避免 Redis 故障拖慢请求。
 
 ### 4.4 DNS 关键变量
 

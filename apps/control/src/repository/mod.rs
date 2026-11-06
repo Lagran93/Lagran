@@ -1994,6 +1994,33 @@ pub async fn metrics_by_domain(
     .await
 }
 
+/// Per-node/per-domain counters for the multi-node hit-ratio dashboard.
+pub async fn metrics_by_node(
+    pool: &PgPool,
+    hours: i32,
+    hosts: Option<&[String]>,
+) -> sqlx::Result<Vec<(String, String, i64, i64, i64, i64)>> {
+    sqlx::query_as(
+        r#"
+        SELECT node_name,
+               COALESCE(NULLIF(domain, ''), '(unknown)') AS domain,
+               COALESCE(SUM(requests), 0)::bigint,
+               COALESCE(SUM(cache_hits), 0)::bigint,
+               COALESCE(SUM(cache_misses), 0)::bigint,
+               COALESCE(SUM(bytes_sent), 0)::bigint
+        FROM edge_metrics
+        WHERE reported_at > NOW() - make_interval(hours => $1)
+          AND ($3::text[] IS NULL OR domain = ANY($3))
+        GROUP BY 1, 2
+        ORDER BY 3 DESC
+        "#,
+    )
+    .bind(hours)
+    .bind(hosts)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn get_backup_origin(
     pool: &PgPool,
     name: &str,
@@ -3228,4 +3255,102 @@ pub async fn set_group_members(
         .await?;
     }
     tx.commit().await
+}
+
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PurgeRetryRow {
+    pub id: uuid::Uuid,
+    pub node_id: String,
+    pub agent_url: String,
+    pub payload: sqlx::types::Json<serde_json::Value>,
+    pub attempts: i32,
+    pub auth_token: String,
+}
+
+pub async fn list_nodes_with_agent(pool: &PgPool) -> sqlx::Result<Vec<(String, String, String)>> {
+    sqlx::query_as(
+        r#"
+        SELECT name, COALESCE(agent_url, ''), COALESCE(auth_token, '')
+        FROM edge_nodes
+        WHERE COALESCE(agent_url, '') <> ''
+        ORDER BY name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn enqueue_purge_retry(
+    pool: &PgPool,
+    node_id: &str,
+    agent_url: &str,
+    payload: &serde_json::Value,
+    error: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO purge_retries (node_id, agent_url, payload, last_error)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(node_id)
+    .bind(agent_url)
+    .bind(sqlx::types::Json(payload))
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn due_purge_retries(
+    pool: &PgPool,
+    limit: i64,
+) -> sqlx::Result<Vec<PurgeRetryRow>> {
+    sqlx::query_as::<_, PurgeRetryRow>(
+        r#"
+        SELECT r.id, r.node_id, r.agent_url, r.payload, r.attempts,
+               COALESCE(n.auth_token, '') AS auth_token
+        FROM purge_retries r
+        LEFT JOIN edge_nodes n ON n.name = r.node_id
+        WHERE r.next_at <= NOW() AND r.attempts < 10
+        ORDER BY r.next_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn finish_purge_retry(pool: &PgPool, id: uuid::Uuid) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM purge_retries WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn defer_purge_retry(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    attempts: i32,
+    error: &str,
+) -> sqlx::Result<()> {
+    let delay_secs = (30_i64 * (1_i64 << attempts.clamp(0, 6))).min(3600);
+    sqlx::query(
+        r#"
+        UPDATE purge_retries
+        SET attempts = attempts + 1,
+            next_at = NOW() + make_interval(secs => $2),
+            last_error = $3
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(delay_secs as f64)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

@@ -189,8 +189,36 @@ async fn findings_for(pool: &PgPool, rule: &AlertRuleRow) -> Result<Vec<Finding>
         "node_offline" => node_findings(pool, rule.threshold).await,
         "cache_hit_ratio" => cache_findings(pool, rule).await,
         "waf_spike" => waf_findings(pool, rule).await,
+        "config_release_failed" => release_findings(pool).await,
         _ => Ok(Vec::new()),
     }
+}
+
+async fn release_findings(pool: &PgPool) -> Result<Vec<Finding>, sqlx::Error> {
+    let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+        r#"
+        SELECT id, status, error
+        FROM config_releases
+        WHERE status IN ('failed', 'rolled_back')
+          AND COALESCE(finished_at, published_at, created_at) > NOW() - INTERVAL '24 hours'
+        ORDER BY created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, status, error)| Finding {
+            fingerprint: format!("config-release|{id}"),
+            severity: "critical",
+            value: 1.0,
+            message: format!(
+                "配置发布失败。\n发布 ID：{id}\n状态：{status}\n错误：{}",
+                if error.is_empty() { "未知错误" } else { &error }
+            ),
+        })
+        .collect())
 }
 
 async fn origin_findings(

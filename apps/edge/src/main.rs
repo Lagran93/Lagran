@@ -110,6 +110,8 @@ async fn main() -> anyhow::Result<()> {
         origin.clone(),
         rules.clone(),
         domains.clone(),
+        cache.clone(),
+        large_cache.clone(),
     );
     metrics_report::spawn_metrics_report(config.clone(), control.clone(), metrics.clone());
     access_report::spawn_access_report(config.clone(), control.clone(), access_log.clone());
@@ -143,8 +145,34 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let flight = if matches!(config.cache_backend.as_str(), "redis" | "l2") {
+        let url = if config.cache_redis_url.trim().is_empty() {
+            config.redis_url.clone()
+        } else {
+            config.cache_redis_url.clone()
+        };
+        if url.trim().is_empty() {
+            None
+        } else {
+            match edge::cache::flight::RedisFlight::connect(
+                &url,
+                format!("{}:flight", config.cache_redis_prefix),
+            )
+            .await
+            {
+                Ok(flight) => Some(flight),
+                Err(e) => {
+                    tracing::warn!(error = %e, "cross-node cache flight unavailable");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
     let state = Arc::new(AppState {
         cache,
+        flight,
         large_cache,
         origin,
         default_ttl_secs: config.default_ttl_secs,

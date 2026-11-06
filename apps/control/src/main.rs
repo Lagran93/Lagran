@@ -147,6 +147,10 @@ async fn main() -> anyhow::Result<()> {
     );
     control::service::prefetch::spawn(state.clone(), 15);
     control::service::config_release::spawn(state.clone(), 10);
+    control::service::purge_retry::spawn(
+        state.pool.clone(),
+        state.config.agent_token.clone(),
+    );
     {
         let state = state.clone();
         tokio::spawn(async move {

@@ -163,6 +163,7 @@ struct ReqCtx {
     head_status: u16,
     range_fill: Option<RangeFill>,
     range_sink: Option<RangeSink>,
+    flight_guard: Option<crate::cache::flight::FlightGuard>,
 }
 
 impl Default for ReqCtx {
@@ -192,6 +193,7 @@ impl Default for ReqCtx {
             head_status: 0,
             range_fill: None,
             range_sink: None,
+            flight_guard: None,
         }
     }
 }
@@ -373,6 +375,16 @@ impl ProxyHttp for DataPlaneProxy {
             }
             let small_range =
                 headers.contains_key("range") && range_is_small_bounded(&headers);
+            if plan.cacheable {
+                if let Some(flight) = self.state.flight.as_ref() {
+                    if let Some(guard) =
+                        crate::cache::flight::acquire(flight, &plan.key, self.state.cache.as_ref())
+                            .await
+                    {
+                        ctx.flight_guard = Some(guard);
+                    }
+                }
+            }
             // Small bounded ranges can be answered directly from a complete
             // SharedCache object, keeping range slices on the Pingora path.
             if plan.cache_reason == Some("range-bypass")

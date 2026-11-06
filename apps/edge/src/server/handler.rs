@@ -19,6 +19,7 @@ use crate::cache::policy::{
     CacheStatus, ResolvedPolicy, RuleAction, RuleSet, VALIDATOR_SOURCE_HEADER,
 };
 use crate::cache::{CacheEntry, CacheGetResult, LargeCache, SharedCache};
+use crate::cache::flight::RedisFlight;
 use crate::config::registry::{DomainEntry, DomainRegistry, OriginTarget};
 use crate::metrics::EdgeMetrics;
 use crate::origin::{OriginClient, OriginResponse};
@@ -56,6 +57,8 @@ const FETCH_WAIT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct AppState {
     pub cache: SharedCache,
+    /// Cross-node cold-miss coalescing; None when Redis L2 is disabled.
+    pub flight: Option<Arc<RedisFlight>>,
     /// Separate streaming disk cache for large objects; disabled when None.
     pub large_cache: Option<Arc<LargeCache>>,
     pub origin: OriginClient,
@@ -1261,6 +1264,21 @@ async fn fetch_with_single_flight(
 ) -> Result<(Fetched, bool), FetchError> {
     match state.inflight.begin(key).await {
         Slot::Leader(leader) => {
+            let flight_guard = if let Some(flight) = state.flight.as_ref() {
+                crate::cache::flight::acquire(flight, key, state.cache.as_ref()).await
+            } else {
+                None
+            };
+            if flight_guard.is_none() && state.flight.is_some() {
+                // Follower woke up after the leader wrote shared L2.
+                if let CacheGetResult::Hit(entry) | CacheGetResult::Stale(entry) =
+                    state.cache.get_result(key).await
+                {
+                    leader.finish().await;
+                    return Ok((Fetched::FromCache(entry_into_origin(entry)), false));
+                }
+            }
+            let _flight_guard = flight_guard;
             // HEAD must fetch and cache the full GET representation; otherwise
             // the empty HEAD body is stored under the shared GET key and later
             // GETs are poisoned with an empty response.

@@ -185,6 +185,27 @@
         </div>
       </div>
     </div>
+
+    <div class="wall-card">
+      <div class="wall-card-head"><span>节点缓存命中率 · 近 1 小时</span></div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr><th>节点</th><th>请求</th><th>命中</th><th>未命中</th><th>命中率</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="n in nodeStats" :key="n.node">
+              <td>{{ n.node }}</td>
+              <td>{{ formatNumber(n.requests) }}</td>
+              <td>{{ formatNumber(n.hits) }}</td>
+              <td>{{ formatNumber(n.misses) }}</td>
+              <td>{{ percent(n.hit_ratio) }}</td>
+            </tr>
+            <tr v-if="!nodeStats.length"><td colspan="5" class="wall-empty">暂无节点指标</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -208,6 +229,7 @@ const realtime = ref<any>({
   domains: [],
 })
 const nodes = ref<any[]>([])
+const nodeStatsRaw = ref<any[]>([])
 const health = ref<any[]>([])
 const wafStats = ref<any>({ total: 0, by_action: [], by_category: [] })
 const wafEvents = ref<any[]>([])
@@ -249,6 +271,23 @@ const live = computed(() =>
 )
 const maxDomain = computed(() => Math.max(1, ...topDomains.value.map((d) => d.requests || 0)))
 
+const nodeStats = computed(() => {
+  const byNode = new Map<string, { node: string; requests: number; hits: number; misses: number }>()
+  for (const row of nodeStatsRaw.value) {
+    const item = byNode.get(row.node) || { node: row.node, requests: 0, hits: 0, misses: 0 }
+    item.requests += row.requests || 0
+    item.hits += row.cache_hits || 0
+    item.misses += row.cache_misses || 0
+    byNode.set(row.node, item)
+  }
+  return [...byNode.values()]
+    .map((n) => ({
+      ...n,
+      hit_ratio: n.hits + n.misses ? n.hits / (n.hits + n.misses) : 0,
+    }))
+    .sort((a, b) => b.requests - a.requests)
+})
+
 function domainHit(d: any) {
   if (typeof d.hit_ratio === 'number') return d.hit_ratio
   const total = (d.cache_hits || 0) + (d.cache_misses || 0)
@@ -270,10 +309,11 @@ function totals(points: any[]) {
 }
 
 async function load() {
-  const [rt, ts, bd, endpoints, hs, ws, we, als, ale] = await Promise.all([
+  const [rt, ts, bd, nodeRows, endpoints, hs, ws, we, als, ale] = await Promise.all([
     api.get<any>('/api/v1/stats/realtime?minutes=5').catch(() => null),
     api.get<any>('/api/v1/stats/timeseries?hours=1&bucket=60&compare=true').catch(() => null),
     api.get<any[]>('/api/v1/stats/by-domain?hours=1').catch(() => []),
+    api.get<any[]>('/api/v1/stats/by-node?hours=1').catch(() => []),
     api.get<any>('/api/v1/edge-endpoints').catch(() => null),
     api.get<any[]>('/api/v1/origin-health').catch(() => []),
     api.get<any>('/api/v1/waf/stats?days=1').catch(() => null),
@@ -285,6 +325,7 @@ async function load() {
   series.value = ts?.current || []
   previousSeries.value = ts?.previous || []
   byDomain.value = bd || []
+  nodeStatsRaw.value = nodeRows || []
   nodes.value = endpoints?.nodes || []
   health.value = hs || []
   if (ws) wafStats.value = ws

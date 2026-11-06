@@ -16,6 +16,8 @@ pub fn request_config_reload() {
 // Runs periodically, sends the agent token, and follows the control plane's
 // aggregate version so unchanged config is not re-applied.
 
+use crate::cache::large::LargeCache;
+use crate::cache::SharedCache;
 use crate::agent::ControlClient;
 use crate::cache::policy::{CacheRule, RuleSet};
 use crate::config::registry::{DomainEntry, DomainRegistry};
@@ -473,6 +475,8 @@ pub fn spawn_config_sync(
     origin: OriginClient,
     rules: RuleSet,
     registry: DomainRegistry,
+    cache: SharedCache,
+    large_cache: Option<std::sync::Arc<LargeCache>>,
 ) {
     tokio::spawn(async move {
         tracing::info!(url = %control.endpoint("/api/v1/config"), "domain registry sync started");
@@ -495,9 +499,50 @@ pub fn spawn_config_sync(
                             let entries: Vec<DomainEntry> =
                                 cfg.domains.into_iter().map(DomainCfg::into_entry).collect();
                             let n = entries.len();
+
+                            // Any domain whose per-domain version changed must
+                            // drop its cache on every edge. This prevents old
+                            // TTL/rule/header objects from surviving a config
+                            // release or rollback on a subset of nodes.
+                            let old_versions = registry.version_map().await;
+                            let mut new_versions = std::collections::HashMap::new();
+                            for entry in &entries {
+                                new_versions.insert(entry.domain.clone(), entry.version.clone());
+                            }
+                            let mut changed_domains: Vec<String> = new_versions
+                                .iter()
+                                .filter(|(domain, version)| {
+                                    old_versions.get(*domain) != Some(*version)
+                                })
+                                .map(|(domain, _)| domain.clone())
+                                .collect();
+                            for domain in old_versions.keys() {
+                                if !new_versions.contains_key(domain) {
+                                    changed_domains.push(domain.clone());
+                                }
+                            }
+                            changed_domains.sort();
+                            changed_domains.dedup();
+
                             registry
                                 .replace_all(entries.clone(), cfg.version.clone())
                                 .await;
+                            for domain in &changed_domains {
+                                let purged = cache.purge_matching(&[domain.clone()]).await;
+                                let large_purged = if let Some(large) = large_cache.as_ref() {
+                                    large.purge_patterns(&[domain.clone()]).await
+                                } else {
+                                    0
+                                };
+                                if purged > 0 || large_purged > 0 {
+                                    tracing::info!(
+                                        domain = %domain,
+                                        purged,
+                                        large_purged,
+                                        "domain config changed; cache invalidated"
+                                    );
+                                }
+                            }
                             // Global rule set is only a legacy single-domain fallback,
                             // so keep the union but never use it for onboarded hosts.
                             rules

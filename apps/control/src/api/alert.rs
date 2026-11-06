@@ -21,6 +21,7 @@ const METRICS: &[&str] = &[
     "node_offline",
     "cache_hit_ratio",
     "waf_spike",
+    "config_release_failed",
 ];
 
 #[derive(Serialize)]
