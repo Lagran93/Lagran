@@ -164,6 +164,8 @@ struct ReqCtx {
     range_fill: Option<RangeFill>,
     range_sink: Option<RangeSink>,
     flight_guard: Option<crate::cache::flight::FlightGuard>,
+    /// Set when the in-process handler already wrote its own access log.
+    skip_logging: bool,
 }
 
 impl Default for ReqCtx {
@@ -194,6 +196,7 @@ impl Default for ReqCtx {
             range_fill: None,
             range_sink: None,
             flight_guard: None,
+            skip_logging: false,
         }
     }
 }
@@ -320,6 +323,7 @@ impl ProxyHttp for DataPlaneProxy {
         }
 
         if path.starts_with("/__lagran/") {
+            ctx.skip_logging = true;
             if !self.management_on_data {
                 write_plain(
                     session,
@@ -336,6 +340,7 @@ impl ProxyHttp for DataPlaneProxy {
         // WebSocket is intentionally legacy-only: Pingora's HTTP proxy does
         // not tunnel upgraded connections on this path.
         if is_websocket_upgrade(&session.req_header().headers) {
+            ctx.skip_logging = true;
             return self.handle_in_process(session).await;
         }
 
@@ -485,6 +490,7 @@ impl ProxyHttp for DataPlaneProxy {
             return Ok(false);
         }
 
+        ctx.skip_logging = true;
         self.handle_in_process(session).await
     }
 
@@ -982,15 +988,16 @@ impl ProxyHttp for DataPlaneProxy {
         _e: Option<&pingora::Error>,
         ctx: &mut Self::CTX,
     ) {
-        let Some(plan) = ctx.plan.as_ref() else {
+        if ctx.skip_logging {
             return;
-        };
+        }
         let status = session
             .response_written()
             .map(|r| r.status.as_u16())
             .unwrap_or(ctx.status);
         let bytes = session.body_bytes_sent() as u64;
         let label = ctx.cache_label;
+        if let Some(plan) = ctx.plan.as_ref() {
         if plan.is_head && ctx.head_status == 200 && !ctx.head_body.is_empty() {
             if let Some(headers) = ctx.head_headers.as_ref() {
                 let mut hdrs = header_vec(&headers.headers);
@@ -1032,6 +1039,7 @@ impl ProxyHttp for DataPlaneProxy {
                     }
                 }
             }
+        }
         }
         log_access(
             &self.state.access_log,
