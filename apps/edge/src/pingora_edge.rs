@@ -272,6 +272,7 @@ impl ProxyHttp for DataPlaneProxy {
             .map(|v| v.eq_ignore_ascii_case("https"))
             .unwrap_or(false);
         if path == "/__lagran/health" {
+            ctx.skip_logging = true;
             write_plain(
                 session,
                 200,

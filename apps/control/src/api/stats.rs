@@ -404,9 +404,13 @@ pub async fn by_node(
     if hosts.as_ref().is_some_and(|h| h.is_empty()) {
         return Json(Vec::new());
     }
-    let rows = repository::metrics_by_node(&state.pool, hours, hosts.as_deref())
-        .await
-        .unwrap_or_default();
+    let rows = match repository::metrics_by_node(&state.pool, hours, hosts.as_deref()).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "stats by-node query failed");
+            return Json(Vec::new());
+        }
+    };
     Json(
         rows.into_iter()
             .map(|(node, domain, requests, hits, misses, bytes)| {

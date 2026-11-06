@@ -2010,7 +2010,7 @@ pub async fn metrics_by_node(
                COALESCE(SUM(bytes_sent), 0)::bigint
         FROM edge_metrics
         WHERE reported_at > NOW() - make_interval(hours => $1)
-          AND ($3::text[] IS NULL OR domain = ANY($3))
+          AND ($2::text[] IS NULL OR domain = ANY($2))
         GROUP BY 1, 2
         ORDER BY 3 DESC
         "#,

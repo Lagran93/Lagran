@@ -23,6 +23,11 @@ pub fn spawn(pool: PgPool, fallback_token: String) {
 async fn run_once(pool: &PgPool, fallback_token: &str) -> Result<(), sqlx::Error> {
     let rows = repository::due_purge_retries(pool, 50).await?;
     for row in rows {
+        if row.attempts >= 9 {
+            repository::finish_purge_retry(pool, row.id).await?;
+            tracing::error!(node = %row.node_id, attempts = row.attempts, "purge retry exhausted; dropping");
+            continue;
+        }
         let token = if row.auth_token.is_empty() {
             fallback_token.to_string()
         } else {

@@ -433,6 +433,36 @@ onUnmounted(() => {
   min-width: 0;
 }
 
+.wall-card .table-wrap {
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+}
+
+.wall-card .table {
+  width: 100%;
+  background: transparent;
+  color: #dbe6f5;
+  border-collapse: collapse;
+}
+
+.wall-card .table th {
+  background: rgba(255, 255, 255, 0.04);
+  color: #8fa3bd;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-weight: 500;
+}
+
+.wall-card .table td {
+  background: transparent;
+  color: #dbe6f5;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.wall-card .table tbody tr:hover td {
+  background: rgba(75, 155, 255, 0.06);
+}
+
 .wall-label {
   font-size: 12px;
   color: #7f92ad;

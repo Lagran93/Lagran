@@ -110,8 +110,10 @@ pub async fn acquire(
     key: &str,
     cache: &dyn lagran_cache::CacheBackend,
 ) -> Option<FlightGuard> {
-    if let Some(guard) = flight.acquire(key).await.ok().flatten() {
-        return Some(guard);
+    match flight.acquire(key).await {
+        Ok(Some(guard)) => return Some(guard),
+        Err(_) => return None,
+        Ok(None) => {}
     }
     // Follower: wait for the leader to populate shared L2.
     let deadline = tokio::time::Instant::now() + LOCK_WAIT;

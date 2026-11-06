@@ -75,6 +75,18 @@ impl RedisL2Cache {
         format!("{}:{}", self.prefix, key)
     }
 
+    /// Escape Redis glob metacharacters so a purge path containing `?`, `*`,
+    /// `[` or `]` cannot delete unrelated keys.
+    fn glob_escape(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for ch in value.chars() {
+            if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out
+    }
     fn unhealthy(&self) -> bool {
         Self::now_ms() < self.fail_until_ms.load(Ordering::Relaxed)
     }
@@ -152,8 +164,7 @@ impl RedisL2Cache {
         }
     }
 
-    async fn redis_scan_keys(&self, pattern: &str) -> Vec<String> {
-        if self.unhealthy() {
+    async fn redis_scan_keys(&self, pattern: &str) -> Vec<String> {        if self.unhealthy() {
             return Vec::new();
         }
         let mut conn = self.conn.clone();
@@ -269,7 +280,7 @@ impl CacheBackend for RedisL2Cache {
     async fn purge_matching(&self, patterns: &[String]) -> u64 {
         let mut removed = self.local.purge_matching(patterns).await;
         for pattern in patterns {
-            let keys = self.redis_scan_keys(&format!("*{}*", pattern)).await;
+            let keys = self.redis_scan_keys(&format!("*{}*", Self::glob_escape(pattern))).await;
             if keys.is_empty() {
                 continue;
             }
@@ -285,12 +296,14 @@ impl CacheBackend for RedisL2Cache {
         // Local cache can inspect tags cheaply. For L2, scan only this domain's
         // keys and decode candidates.
         let removed = self.local.purge_tags(tags, domain).await;
-        let keys = self.redis_scan_keys(&format!("*{}*", domain)).await;
+        let keys = self.redis_scan_keys(&format!("*{}*", Self::glob_escape(domain))).await;
         let wanted: Vec<String> = tags.iter().map(|t| t.to_ascii_lowercase()).collect();
         let mut victims = Vec::new();
         let mut conn = self.conn.clone();
         for key in keys {
-            let Ok(raw) = conn.get::<_, Option<String>>(&key).await else {
+            let Ok(Ok(raw)) =
+                tokio::time::timeout(REDIS_TIMEOUT, conn.get::<_, Option<String>>(&key)).await
+            else {
                 continue;
             };
             let Some(raw) = raw else { continue };
