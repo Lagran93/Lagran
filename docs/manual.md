@@ -607,6 +607,7 @@ Control 的 CONTROL_PUBLIC_URL
 | `CACHE_BACKEND` | `memory` / `disk` / `hybrid` |
 | `DISK_CACHE_DIR` | 普通磁盘缓存目录 |
 | `MAX_CACHEABLE_BODY` | 普通缓存单对象上限，8 MiB 默认 |
+| `ORIGIN_READ_TIMEOUT_MS` | 回源读取空闲超时，默认 30000；流媒体不会因总时长被中断 |
 | `LARGE_CACHE_ENABLED` | 大对象缓存开关 |
 | `LARGE_CACHE_DIR` | 大对象目录 |
 | `LARGE_CACHE_MIN_OBJECT_BYTES` | 大对象最小字节数 |
@@ -1113,6 +1114,16 @@ curl -fsS http://127.0.0.1:8082/__lagran/metrics
 curl -fsS -H 'Host: cdn.example.com' http://127.0.0.1:8081/__lagran/health
 ```
 
+`__lagran/metrics` 额外包含回源超时与流式转发指标：
+
+- `lagran_edge_origin_timeouts_total`：连接/首字节/读取超时
+- `lagran_edge_origin_errors_total`：其他回源错误
+- `lagran_edge_origin_stream_requests_total`：legacy 流式回源请求
+- `lagran_edge_origin_stream_bytes_total`：流式转发字节数
+- `lagran_edge_origin_stream_errors_total`：流式 body 读取错误/空闲超时
+- `lagran_edge_datapath_pingora_total`：由 Pingora 数据面处理的请求数
+- `lagran_edge_datapath_legacy_total`：由 legacy 处理的请求数（WebSocket/兜底）
+
 管理接口需要节点 token 的端点：
 
 ```http
@@ -1147,6 +1158,7 @@ ACCESS_LOG_REPORT=true
 | `X-Lagran-Cache-Reason` | 未命中/绕过/填充原因 |
 | `Age` | 缓存对象年龄 |
 | `X-Lagran-Cache-TTL` | 缓存对象剩余新鲜寿命（秒）；`Age` 是已存活时间，两者互补 |
+| `X-Lagran-Datapath` | `pingora` / `legacy`，标识本次请求实际走的数据面 |
 | `ETag` | 源站或 Edge 生成 |
 | `X-Lagran-Error` | 源站错误类型 |
 

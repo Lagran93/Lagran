@@ -61,6 +61,10 @@ pub struct EdgeConfig {
     /// Max response body size stored in cache (bytes). Larger responses are
     /// still proxied but not written to cache.
     pub max_cacheable_body: usize,
+    /// Idle timeout while waiting for origin response bytes. This is separate
+    /// from the per-domain connect/header timeout so media streams are not
+    /// aborted just because the whole object takes longer than 10s.
+    pub origin_read_timeout_ms: u64,
     /// Optional streaming disk cache for large objects (Phase 2).
     pub large_cache_enabled: bool,
     pub large_cache_dir: String,
@@ -171,6 +175,11 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8 * 1024 * 1024)
                 .clamp(64 * 1024, 64 * 1024 * 1024),
+            origin_read_timeout_ms: std::env::var("ORIGIN_READ_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30_000)
+                .clamp(1_000, 600_000),
             large_cache_enabled: bool_env("LARGE_CACHE_ENABLED", false),
             large_cache_dir: std::env::var("LARGE_CACHE_DIR")
                 .ok()

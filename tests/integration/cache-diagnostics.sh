@@ -102,6 +102,14 @@ get "/cached" >/dev/null
 check "miss is MISS" "$(hdr x-cache)" "MISS"
 get "/cached" >/dev/null
 check "second is HIT" "$(hdr x-cache)" "HIT"
+check "normal GET uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
+
+get "/assets/app.css" >/dev/null
+CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0')
+check "no-cache without large cache returns 200" "$CODE" "200"
+check "no-cache without large cache revalidates" "$(hdr x-cache)" "REVALIDATED"
+check "no-cache without large cache uses origin-304" "$(hdr x-lagran-cache-reason)" "origin-304"
+check "no-cache GET uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
 
 echo "== control cache diagnose =="
 NODE_ONLINE=0
@@ -176,6 +184,7 @@ CODE=$(get "/big" -H 'Range: bytes=0-3')
 check "range status 206" "$CODE" "206"
 contains "range content-range" "$(hdr content-range)" "bytes 0-3/"
 check "range served from cache" "$(hdr x-cache)" "HIT"
+check "range cache uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
 check "range body length" "$(wc -c < "$LOG_DIR/b")" "4"
 
 echo "== range miss streams from origin =="

@@ -16,6 +16,24 @@ struct Counters {
 #[derive(Default)]
 pub struct EdgeMetrics {
     by_domain: Mutex<HashMap<String, Arc<Counters>>>,
+    origin_timeouts: AtomicU64,
+    origin_errors: AtomicU64,
+    stream_requests: AtomicU64,
+    stream_bytes: AtomicU64,
+    stream_errors: AtomicU64,
+    datapath_pingora: AtomicU64,
+    datapath_legacy: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GlobalSnapshot {
+    pub origin_timeouts: u64,
+    pub origin_errors: u64,
+    pub stream_requests: u64,
+    pub stream_bytes: u64,
+    pub stream_errors: u64,
+    pub datapath_pingora: u64,
+    pub datapath_legacy: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +80,46 @@ impl EdgeMetrics {
         let c = self.bucket(domain).await;
         c.requests.fetch_add(1, Ordering::Relaxed);
         c.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_origin_timeout(&self) {
+        self.origin_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_origin_error(&self) {
+        self.origin_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_stream_start(&self) {
+        self.stream_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_stream_bytes(&self, bytes: u64) {
+        self.stream_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_stream_error(&self) {
+        self.stream_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_pingora_datapath(&self) {
+        self.datapath_pingora.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_legacy_datapath(&self) {
+        self.datapath_legacy.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn global_snapshot(&self) -> GlobalSnapshot {
+        GlobalSnapshot {
+            origin_timeouts: self.origin_timeouts.load(Ordering::Relaxed),
+            origin_errors: self.origin_errors.load(Ordering::Relaxed),
+            stream_requests: self.stream_requests.load(Ordering::Relaxed),
+            stream_bytes: self.stream_bytes.load(Ordering::Relaxed),
+            stream_errors: self.stream_errors.load(Ordering::Relaxed),
+            datapath_pingora: self.datapath_pingora.load(Ordering::Relaxed),
+            datapath_legacy: self.datapath_legacy.load(Ordering::Relaxed),
+        }
     }
 
     /// Snapshot and reset all domain counters for reporting

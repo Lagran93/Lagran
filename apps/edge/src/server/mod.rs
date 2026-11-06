@@ -12,6 +12,7 @@ pub mod host_util;
 pub mod inflight;
 pub mod listener;
 pub mod native_cache;
+pub mod pipeline;
 pub mod prefetch;
 pub mod purge;
 pub mod rate_limit;

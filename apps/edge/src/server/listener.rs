@@ -208,6 +208,37 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     out.push_str(&hits);
     out.push_str(&misses);
     out.push_str(&bytes);
+    let global = state.metrics.global_snapshot();
+    out.push_str(&format!(
+        "# HELP lagran_edge_origin_timeouts_total Origin connect/header timeouts\n\
+         # TYPE lagran_edge_origin_timeouts_total counter\n\
+         lagran_edge_origin_timeouts_total {}\n\
+         # HELP lagran_edge_origin_errors_total Origin failures\n\
+         # TYPE lagran_edge_origin_errors_total counter\n\
+         lagran_edge_origin_errors_total {}\n\
+         # HELP lagran_edge_origin_stream_requests_total Streaming origin responses\n\
+         # TYPE lagran_edge_origin_stream_requests_total counter\n\
+         lagran_edge_origin_stream_requests_total {}\n\
+         # HELP lagran_edge_origin_stream_bytes_total Streaming bytes proxied\n\
+         # TYPE lagran_edge_origin_stream_bytes_total counter\n\
+         lagran_edge_origin_stream_bytes_total {}\n\
+         # HELP lagran_edge_origin_stream_errors_total Streaming body errors\n\
+         # TYPE lagran_edge_origin_stream_errors_total counter\n\
+         lagran_edge_origin_stream_errors_total {}\n\
+         # HELP lagran_edge_datapath_pingora_total Requests handled by Pingora\n\
+         # TYPE lagran_edge_datapath_pingora_total counter\n\
+         lagran_edge_datapath_pingora_total {}\n\
+         # HELP lagran_edge_datapath_legacy_total Requests handled by legacy\n\
+         # TYPE lagran_edge_datapath_legacy_total counter\n\
+         lagran_edge_datapath_legacy_total {}\n",
+        global.origin_timeouts,
+        global.origin_errors,
+        global.stream_requests,
+        global.stream_bytes,
+        global.stream_errors,
+        global.datapath_pingora,
+        global.datapath_legacy
+    ));
     out.push_str(&format!("lagran_edge_domains {}\n", snaps.len()));
     (
         StatusCode::OK,

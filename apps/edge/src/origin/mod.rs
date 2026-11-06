@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -59,6 +60,15 @@ pub struct OriginResponse {
     /// Operator-facing cache diagnostic, set by the handler when a response is
     /// served but not stored.
     pub cache_reason: Option<&'static str>,
+}
+
+/// Streaming origin response: status/headers are available before the body is
+/// consumed. Used by legacy bypass/video paths so large media is never
+/// accumulated in memory.
+pub struct OriginStreamResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Incoming,
 }
 
 impl OriginResponse {
@@ -337,7 +347,7 @@ impl OriginClient {
         .await
     }
 
-    pub async fn request_with_sni(
+    async fn send_with_sni(
         &self,
         base_url: &str,
         method: &Method,
@@ -346,7 +356,7 @@ impl OriginClient {
         body: Option<Bytes>,
         forward_sensitive: bool,
         sni: Option<&str>,
-    ) -> Result<OriginResponse> {
+    ) -> Result<(StatusCode, HeaderMap, Incoming)> {
         let fixed = sni
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -418,7 +428,7 @@ impl OriginClient {
 
         let mut out_headers = HeaderMap::new();
         for (k, v) in resp.headers().iter() {
-            if is_hop_by_hop(k.as_str()) || k.as_str().eq_ignore_ascii_case("content-length") {
+            if is_hop_by_hop(k.as_str()) {
                 continue;
             }
             if let (Ok(name), Ok(val)) = (
@@ -429,18 +439,68 @@ impl OriginClient {
             }
         }
 
-        let body = resp
-            .into_body()
+        Ok((status, out_headers, resp.into_body()))
+    }
+
+    pub async fn request_with_sni(
+        &self,
+        base_url: &str,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        body: Option<Bytes>,
+        forward_sensitive: bool,
+        sni: Option<&str>,
+    ) -> Result<OriginResponse> {
+        let (status, headers, body) = self
+            .send_with_sni(
+                base_url,
+                method,
+                path_and_query,
+                headers,
+                body,
+                forward_sensitive,
+                sni,
+            )
+            .await?;
+        let body = body
             .collect()
             .await
             .context("read origin body")?
             .to_bytes();
-
         Ok(OriginResponse {
             status,
-            headers: out_headers,
+            headers,
             body,
             cache_reason: None,
+        })
+    }
+
+    pub async fn request_stream_with_sni(
+        &self,
+        base_url: &str,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        body: Option<Bytes>,
+        forward_sensitive: bool,
+        sni: Option<&str>,
+    ) -> Result<OriginStreamResponse> {
+        let (status, headers, body) = self
+            .send_with_sni(
+                base_url,
+                method,
+                path_and_query,
+                headers,
+                body,
+                forward_sensitive,
+                sni,
+            )
+            .await?;
+        Ok(OriginStreamResponse {
+            status,
+            headers,
+            body,
         })
     }
 }

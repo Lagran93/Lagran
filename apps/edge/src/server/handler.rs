@@ -9,11 +9,12 @@
 //! * storage TTL comes from the matched rule, then origin `Cache-Control` /
 //!   `Expires`, then the domain/default TTL.
 
+use bytes::Bytes;
 use crate::agent::origin_health::OriginHealthMap;
 use crate::agent::{ControlClient, NodeControl};
 use crate::cache::policy::{
-    cache_key_for_request, compute_etag, decide_storage_reason, etag_matches,
-    is_uncacheable_header, request_bypass_reason, request_method_cacheable, resolve_rule_policy,
+    compute_etag, decide_storage_reason, etag_matches,
+    is_uncacheable_header, request_method_cacheable, resolve_rule_policy,
     resolve_rule_policy_for_response, strip_response_headers, CacheDecision, CacheRule,
     CacheStatus, ResolvedPolicy, RuleAction, RuleSet, VALIDATOR_SOURCE_HEADER,
 };
@@ -30,6 +31,7 @@ use crate::server::challenge;
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::host_util;
 use crate::server::inflight::{self, Inflight, Slot};
+use crate::server::pipeline::{facts_from_request, RequestPipeline};
 use crate::server::rate_limit::RateLimiter;
 use crate::server::waf_log::WafLog;
 use crate::server::websocket;
@@ -82,6 +84,8 @@ pub struct AppState {
     pub https_redirect_port: Option<u16>,
     /// Responses larger than this are proxied but not stored in cache.
     pub max_cacheable_body: usize,
+    /// Idle origin read timeout; separate from per-domain connect timeout.
+    pub origin_read_timeout_ms: u64,
 }
 
 /// Per-request view of the effective domain configuration.
@@ -191,7 +195,35 @@ impl std::fmt::Display for FetchError {
     }
 }
 
+/// Legacy-only entry point.
+///
+/// Normal GET/HEAD, Range, no-cache and cache revalidation are handled by the
+/// Pingora data plane. This function is retained for WebSocket, management-
+/// adjacent fallbacks, and requests where a native plan cannot be built.
 pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    state.metrics.record_legacy_datapath();
+    let is_ws = websocket::is_websocket_upgrade(req.headers());
+    let is_cache_method = req.method() == Method::GET || req.method() == Method::HEAD;
+    if is_cache_method && !is_ws {
+        tracing::warn!(
+            host = %host_util::resolve_request_host(&req),
+            method = %req.method(),
+            path = %req.uri().path(),
+            "legacy GET/HEAD fallback reached"
+        );
+    }
+    let mut response = proxy_handler_inner(State(state), req).await;
+    response.headers_mut().insert(
+        HeaderName::from_static("x-lagran-datapath"),
+        HeaderValue::from_static("legacy"),
+    );
+    response
+}
+
+async fn proxy_handler_inner(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> Response {
     let start = Instant::now();
     let method = req.method().clone();
     let path_and_query = req
@@ -353,20 +385,17 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     // Single preflight implementation shared with the Pingora native path:
     // HTTPS redirect, CC, rate-limit, WAF and hotlink.
     if let Some(domain) = domain_entry.as_ref() {
-        if let Some(resp) = preflight_cacheable(
-            &state,
-            domain,
-            &method,
+        let pipeline = RequestPipeline::new(&state);
+        let facts = facts_from_request(
+            &req,
             &host,
             &path_only,
             &path_and_query,
-            &headers,
             &client_ip,
             is_https,
             start,
-        )
-        .await
-        {
+        );
+        if let Some(resp) = pipeline.preflight(domain, &facts).await {
             return resp;
         }
     }
@@ -404,17 +433,9 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         return resp;
     }
 
-    let mut request_reason = if !request_method_cacheable(&method) {
-        Some("method")
-    } else {
-        request_bypass_reason(&req, eff.policy.ignore_cookie).or_else(|| {
-            if eff.policy.action != RuleAction::Cache {
-                Some("rule-bypass")
-            } else {
-                None
-            }
-        })
-    };
+    let pipeline = RequestPipeline::new(&state);
+    let class = pipeline.classify_request(&method, &headers, &eff.policy);
+    let mut request_reason = class.reason();
     let mut request_cacheable = request_reason.is_none();
     let mut range_spec = None;
     if request_cacheable {
@@ -436,17 +457,14 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         }
     }
 
-    let cache_lookup_path = if eff.ignore_query {
-        path_only.clone()
-    } else {
-        path_and_query.clone()
-    };
-    let key_method = if method == Method::HEAD {
-        Method::GET
-    } else {
-        method.clone()
-    };
-    let key = cache_key_for_request(&key_method, &host, &cache_lookup_path, &headers);
+    let key = pipeline.cache_key_with_ignore_query(
+        &method,
+        &host,
+        &path_only,
+        &path_and_query,
+        &headers,
+        eff.ignore_query,
+    );
 
     // Strict client revalidation (`no-cache` / `max-age=0` / Pragma) must not
     // reuse a fresh body blindly. If we already have a validator, make one
@@ -810,6 +828,25 @@ async fn bypass_to_origin(
     } else {
         CacheStatus::Dynamic
     };
+    if cache_key.is_none() {
+        return bypass_to_origin_streaming(
+            state,
+            req,
+            eff,
+            method,
+            host,
+            path_and_query,
+            path_only,
+            headers,
+            client_ip,
+            user_agent,
+            referer,
+            request_id,
+            start,
+            label,
+        )
+        .await;
+    }
 
     let body = match Limited::new(req.into_body(), MAX_PROXY_BODY)
         .collect()
@@ -976,6 +1013,222 @@ async fn bypass_to_origin(
                 0,
                 failure.log_label(),
                 &request_id,
+            )
+            .await;
+            default_page::origin_error_page(host, path_only, failure)
+        }
+    }
+}
+
+/// Streaming bypass path for legacy traffic (Range, cookie/auth, rules).
+/// Status/headers are bounded by the domain origin timeout; the body uses an
+/// idle timeout per chunk so a long media response is never aborted just for
+/// exceeding the total timeout.
+#[allow(clippy::too_many_arguments)]
+async fn bypass_to_origin_streaming(
+    state: &AppState,
+    req: Request<Body>,
+    eff: &Effective,
+    method: &Method,
+    host: &str,
+    path_and_query: &str,
+    path_only: &str,
+    headers: &HeaderMap,
+    client_ip: &str,
+    user_agent: &str,
+    referer: &str,
+    request_id: &str,
+    start: Instant,
+    label: CacheStatus,
+) -> Response {
+    let body = match Limited::new(req.into_body(), MAX_PROXY_BODY)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            tracing::warn!(error = %e, "request body too large or unreadable");
+            log_access(
+                &state.access_log,
+                method,
+                host,
+                path_only,
+                413,
+                start,
+                client_ip,
+                user_agent,
+                referer,
+                0,
+                label.as_str(),
+                request_id,
+            )
+            .await;
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large").into_response();
+        }
+    };
+
+    let sequence = origin_sequence(state, host, eff).await;
+    if sequence.is_empty() {
+        log_access(
+            &state.access_log,
+            method,
+            host,
+            path_only,
+            503,
+            start,
+            client_ip,
+            user_agent,
+            referer,
+            0,
+            OriginFailure::Unhealthy.log_label(),
+            request_id,
+        )
+        .await;
+        return default_page::origin_error_page(host, path_only, OriginFailure::Unhealthy);
+    }
+
+    let header_timeout = Duration::from_millis(eff.timeout_ms);
+    let idle_timeout = Duration::from_millis(state.origin_read_timeout_ms.max(1_000));
+    let mut result = Err(FetchError::Unhealthy);
+    for target in sequence {
+        let mut target_headers = headers.clone();
+        if let Some(host) = target.host_header.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(host) {
+                target_headers.insert(header::HOST, value);
+            }
+        }
+        let attempt = tokio::time::timeout(
+            header_timeout,
+            state.origin.request_stream_with_sni(
+                &target.url,
+                method,
+                path_and_query,
+                &target_headers,
+                Some(body.clone()),
+                true,
+                target.sni.as_deref(),
+            ),
+        )
+        .await;
+        result = match attempt {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(FetchError::Failed(e.to_string())),
+            Err(_) => Err(FetchError::Timeout),
+        };
+        if result.is_ok() {
+            break;
+        }
+        tracing::warn!(origin = %target.url, "stream origin failed, trying next origin");
+    }
+
+    match result {
+        Ok(resp) => {
+            state.metrics.record_stream_start();
+            let status = resp.status;
+            let mut out_headers = resp.headers;
+            let content_length = out_headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            strip_response_headers(&mut out_headers);
+            out_headers.remove(HeaderName::from_static("x-lagran-pingora-meta"));
+            out_headers.remove(HeaderName::from_static(VALIDATOR_SOURCE_HEADER));
+            out_headers.remove(HeaderName::from_static("x-lagran-cache-reason"));
+            if content_length > 0 {
+                if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
+                    out_headers.insert(header::CONTENT_LENGTH, value);
+                }
+            }
+            cache_status_headers(&mut out_headers, label.as_str());
+            out_headers.insert(
+                HeaderName::from_static("x-powered-by"),
+                HeaderValue::from_static("lagran-edge"),
+            );
+            apply_security_headers(&mut out_headers);
+            apply_cors_and_custom(&mut out_headers, &eff.cors, &eff.custom_headers);
+
+            let mut body = resp.body;
+            let stream_metrics = state.metrics.clone();
+            let stream = async_stream::stream! {
+                loop {
+                    let frame = match tokio::time::timeout(idle_timeout, body.frame()).await {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            stream_metrics.record_stream_error();
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "origin body idle timeout",
+                            ));
+                            break;
+                        }
+                    };
+                    match frame {
+                        Some(Ok(frame)) => {
+                            if let Ok(data) = frame.into_data() {
+                                if !data.is_empty() {
+                                    stream_metrics.record_stream_bytes(data.len() as u64);
+                                    yield Ok::<Bytes, std::io::Error>(data);
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            stream_metrics.record_stream_error();
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("origin body error: {e}"),
+                            ));
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            };
+
+            state.metrics.record_bypass(host, content_length).await;
+            log_access(
+                &state.access_log,
+                method,
+                host,
+                path_only,
+                status.as_u16(),
+                start,
+                client_ip,
+                user_agent,
+                referer,
+                content_length,
+                label.as_str(),
+                request_id,
+            )
+            .await;
+
+            let mut response = Response::new(Body::from_stream(stream));
+            *response.status_mut() = status;
+            *response.headers_mut() = out_headers;
+            response
+        }
+        Err(e) => {
+            if matches!(&e, FetchError::Timeout) {
+                state.metrics.record_origin_timeout();
+            } else {
+                state.metrics.record_origin_error();
+            }
+            let failure = e.failure();
+            let code = failure.status().as_u16();
+            tracing::warn!(error = %e, origin = %eff.origin_url, "stream origin fetch failed");
+            log_access(
+                &state.access_log,
+                method,
+                host,
+                path_only,
+                code,
+                start,
+                client_ip,
+                user_agent,
+                referer,
+                0,
+                failure.log_label(),
+                request_id,
             )
             .await;
             default_page::origin_error_page(host, path_only, failure)
