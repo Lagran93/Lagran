@@ -86,6 +86,10 @@ pub struct AppState {
     pub max_cacheable_body: usize,
     /// Idle origin read timeout; separate from per-domain connect timeout.
     pub origin_read_timeout_ms: u64,
+    pub downstream_keepalive_secs: u64,
+    pub downstream_h2_idle_secs: u64,
+    pub downstream_keepalive_requests: u32,
+    pub websocket_idle_secs: u64,
 }
 
 /// Per-request view of the effective domain configuration.
@@ -411,9 +415,15 @@ async fn proxy_handler_inner(
             .first()
             .map(|o| o.url.clone())
             .unwrap_or_else(|| eff.origin_url.clone());
-        let resp =
-            websocket::handle_upgrade(req, &ws_origin, &path_and_query, &headers, eff.timeout_ms)
-                .await;
+        let resp = websocket::handle_upgrade(
+            req,
+            &ws_origin,
+            &path_and_query,
+            &headers,
+            eff.timeout_ms,
+            state.websocket_idle_secs,
+        )
+        .await;
         let code = resp.status().as_u16();
         log_access(
             &state.access_log,
@@ -885,10 +895,11 @@ async fn bypass_to_origin(
         }
         let path = path_and_query.to_string();
         let body = body.clone();
+        let max_body = state.max_cacheable_body;
         async move {
             match tokio::time::timeout(
                 Duration::from_millis(eff.timeout_ms),
-                origin.request_with_sni(
+                origin.request_with_sni_limit(
                     &target.url,
                     &method,
                     &path,
@@ -896,6 +907,7 @@ async fn bypass_to_origin(
                     Some(body),
                     true,
                     target.sni.as_deref(),
+                    max_body,
                 ),
             )
             .await
@@ -1351,10 +1363,11 @@ async fn fetch_origin(
             }
         }
         let path = path_and_query.to_string();
+        let max_body = state.max_cacheable_body;
         async move {
             match tokio::time::timeout(
                 timeout,
-                origin.request_with_sni(
+                origin.request_with_sni_limit(
                     &target.url,
                     &method,
                     &path,
@@ -1362,6 +1375,7 @@ async fn fetch_origin(
                     None,
                     false,
                     target.sni.as_deref(),
+                    max_body,
                 ),
             )
             .await

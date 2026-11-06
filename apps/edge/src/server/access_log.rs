@@ -31,7 +31,7 @@ pub struct AccessRecord {
 
 #[derive(Clone)]
 pub struct AccessLog {
-    tx: mpsc::UnboundedSender<AccessRecord>,
+    tx: mpsc::Sender<AccessRecord>,
     /// Recent entries for local query / batch report
     buffer: Arc<Mutex<VecDeque<AccessRecord>>>,
     buffer_cap: usize,
@@ -71,7 +71,9 @@ impl AccessLog {
 
         let buffer_cap = buffer_cap.clamp(100, 50_000);
         let buffer = Arc::new(Mutex::new(VecDeque::with_capacity(buffer_cap.min(10_000))));
-        let (tx, mut rx) = mpsc::unbounded_channel::<AccessRecord>();
+        let (tx, mut rx) = mpsc::channel::<AccessRecord>(
+            buffer_cap.clamp(1_000, 20_000),
+        );
 
         {
             let buffer = buffer.clone();
@@ -170,8 +172,14 @@ impl AccessLog {
             cache = %rec.cache_status,
             "{}", combined_line(&rec)
         );
-        if self.tx.send(rec).is_err() {
-            tracing::warn!("access log writer stopped; record dropped");
+        match self.tx.try_send(rec) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("access log queue full; record dropped");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("access log writer stopped; record dropped");
+            }
         }
     }
 

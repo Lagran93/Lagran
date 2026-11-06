@@ -608,6 +608,9 @@ Control 的 CONTROL_PUBLIC_URL
 | `DISK_CACHE_DIR` | 普通磁盘缓存目录 |
 | `MAX_CACHEABLE_BODY` | 普通缓存单对象上限，8 MiB 默认 |
 | `ORIGIN_READ_TIMEOUT_MS` | 回源读取空闲超时，默认 30000；流媒体不会因总时长被中断 |
+| `DOWNSTREAM_KEEPALIVE_SECS` | 下游 HTTP/1.1 keepalive 空闲超时，默认 60 |
+| `DOWNSTREAM_H2_IDLE_SECS` | 下游 HTTP/2 空闲超时，默认 120 |
+| `DOWNSTREAM_KEEPALIVE_REQUESTS` | 单连接最大请求数，默认 1000 |
 | `LARGE_CACHE_ENABLED` | 大对象缓存开关 |
 | `LARGE_CACHE_DIR` | 大对象目录 |
 | `LARGE_CACHE_MIN_OBJECT_BYTES` | 大对象最小字节数 |

@@ -169,6 +169,10 @@ async fn main() -> anyhow::Result<()> {
         https_redirect_port: config.https_redirect_port,
         max_cacheable_body: config.max_cacheable_body,
         origin_read_timeout_ms: config.origin_read_timeout_ms,
+        downstream_keepalive_secs: config.downstream_keepalive_secs,
+        downstream_h2_idle_secs: config.downstream_h2_idle_secs,
+        downstream_keepalive_requests: config.downstream_keepalive_requests,
+        websocket_idle_secs: config.websocket_idle_secs,
     });
 
     agent::cc_sync::spawn_cc_sync(config.clone(), control.clone(), state.cc.clone());

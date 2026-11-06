@@ -35,7 +35,8 @@ use pingora::http::ResponseHeader;
 use pingora::listeners::tls::TlsSettings;
 use pingora::listeners::{TlsAccept, TlsAcceptCallbacks};
 use pingora::protocols::tls::TlsRef;
-use pingora::proxy::{http_proxy_service, FailToProxy, ProxyHttp, Session};
+use pingora::apps::HttpServerOptions;
+use pingora::proxy::{FailToProxy, ProxyHttp, ProxyServiceBuilder, Session};
 use pingora::server::Server;
 use pingora::tls::{ext, pkey::PKey, ssl, x509::X509};
 use pingora::upstreams::peer::HttpPeer;
@@ -765,6 +766,9 @@ impl ProxyHttp for DataPlaneProxy {
         let Some(plan) = ctx.plan.as_ref() else {
             return Ok(());
         };
+        // Bound idle HTTP/1.1 downstream connections. Without this Pingora
+        // defaults to no keepalive request limit and no idle cap.
+        session.set_keepalive(Some(self.state.downstream_keepalive_secs));
         let content_type = response
             .headers
             .get("content-type")
@@ -2937,7 +2941,14 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
         Ok(probe) => drop(probe),
         Err(e) => anyhow::bail!("cannot bind EDGE_LISTEN {}: {e}", config.listen_addr),
     }
-    let mut service = http_proxy_service(&server.configuration, proxy);
+    let mut downstream_options = HttpServerOptions::default();
+    downstream_options.keepalive_request_limit =
+        Some(config.downstream_keepalive_requests);
+    downstream_options.h2_idle_timeout =
+        Some(Duration::from_secs(config.downstream_h2_idle_secs));
+    let mut service = ProxyServiceBuilder::new(&server.configuration, proxy)
+        .server_options(downstream_options)
+        .build();
     service.add_tcp(&config.listen_addr);
 
     if let Some(ref https) = config.https_listen_addr {

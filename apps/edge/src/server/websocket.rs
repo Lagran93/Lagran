@@ -241,6 +241,31 @@ async fn origin_handshake(
     Ok(HandshakeReply { headers, leftover })
 }
 
+async fn tunnel_copy<R, W>(mut reader: R, mut writer: W, idle: Duration) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0_u8; 8 * 1024];
+    loop {
+        let n = match tokio::time::timeout(idle, reader.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "websocket idle timeout",
+                ))
+            }
+        };
+        if n == 0 {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+        writer.write_all(&buf[..n]).await?;
+    }
+}
+
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -254,6 +279,7 @@ pub async fn handle_upgrade(
     path_and_query: &str,
     headers: &HeaderMap,
     timeout_ms: u64,
+    idle_timeout_secs: u64,
 ) -> Response {
     if req.version() != Version::HTTP_11 {
         return (StatusCode::BAD_REQUEST, "WebSocket requires HTTP/1.1").into_response();
@@ -325,6 +351,7 @@ pub async fn handle_upgrade(
     }
 
     let leftover = reply.leftover;
+    let idle_timeout = Duration::from_secs(idle_timeout_secs.max(10));
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -335,9 +362,21 @@ pub async fn handle_upgrade(
                         return;
                     }
                 }
-                match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
-                    Ok((c2o, o2c)) => tracing::debug!(c2o, o2c, "websocket tunnel closed"),
-                    Err(e) => tracing::debug!(error = %e, "websocket tunnel error"),
+                let (client_read, client_write) = tokio::io::split(client);
+                let (upstream_read, upstream_write) = tokio::io::split(upstream);
+                let c2o = tunnel_copy(client_read, upstream_write, idle_timeout);
+                let o2c = tunnel_copy(upstream_read, client_write, idle_timeout);
+                tokio::pin!(c2o);
+                tokio::pin!(o2c);
+                tokio::select! {
+                    result = c2o => match result {
+                        Ok(()) => tracing::debug!("websocket client->origin closed"),
+                        Err(e) => tracing::debug!(error = %e, "websocket client->origin error"),
+                    },
+                    result = o2c => match result {
+                        Ok(()) => tracing::debug!("websocket origin->client closed"),
+                        Err(e) => tracing::debug!(error = %e, "websocket origin->client error"),
+                    },
                 }
             }
             Err(e) => tracing::warn!(error = %e, "client websocket upgrade failed"),

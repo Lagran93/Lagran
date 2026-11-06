@@ -65,6 +65,14 @@ pub struct EdgeConfig {
     /// from the per-domain connect/header timeout so media streams are not
     /// aborted just because the whole object takes longer than 10s.
     pub origin_read_timeout_ms: u64,
+    /// Downstream HTTP/1.1 keepalive idle timeout.
+    pub downstream_keepalive_secs: u64,
+    /// Downstream HTTP/2 idle timeout after the last active stream.
+    pub downstream_h2_idle_secs: u64,
+    /// Maximum requests served on one downstream connection.
+    pub downstream_keepalive_requests: u32,
+    /// Idle timeout for established WebSocket tunnels.
+    pub websocket_idle_secs: u64,
     /// Optional streaming disk cache for large objects (Phase 2).
     pub large_cache_enabled: bool,
     pub large_cache_dir: String,
@@ -180,6 +188,26 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30_000)
                 .clamp(1_000, 600_000),
+            downstream_keepalive_secs: std::env::var("DOWNSTREAM_KEEPALIVE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60)
+                .clamp(5, 3600),
+            downstream_h2_idle_secs: std::env::var("DOWNSTREAM_H2_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120)
+                .clamp(5, 3600),
+            downstream_keepalive_requests: std::env::var("DOWNSTREAM_KEEPALIVE_REQUESTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000)
+                .clamp(1, 100_000),
+            websocket_idle_secs: std::env::var("WEBSOCKET_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300)
+                .clamp(10, 86_400),
             large_cache_enabled: bool_env("LARGE_CACHE_ENABLED", false),
             large_cache_dir: std::env::var("LARGE_CACHE_DIR")
                 .ok()

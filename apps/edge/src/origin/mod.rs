@@ -4,7 +4,7 @@
 use anyhow::{anyhow, Context, Result};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::client::legacy::connect::dns::Name;
@@ -452,6 +452,30 @@ impl OriginClient {
         forward_sensitive: bool,
         sni: Option<&str>,
     ) -> Result<OriginResponse> {
+        self.request_with_sni_limit(
+            base_url,
+            method,
+            path_and_query,
+            headers,
+            body,
+            forward_sensitive,
+            sni,
+            64 * 1024 * 1024,
+        )
+        .await
+    }
+
+    pub async fn request_with_sni_limit(
+        &self,
+        base_url: &str,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        body: Option<Bytes>,
+        forward_sensitive: bool,
+        sni: Option<&str>,
+        max_body: usize,
+    ) -> Result<OriginResponse> {
         let (status, headers, body) = self
             .send_with_sni(
                 base_url,
@@ -463,10 +487,10 @@ impl OriginClient {
                 sni,
             )
             .await?;
-        let body = body
+        let body = Limited::new(body, max_body)
             .collect()
             .await
-            .context("read origin body")?
+            .map_err(|e| anyhow!("read origin body: {e}"))?
             .to_bytes();
         Ok(OriginResponse {
             status,
