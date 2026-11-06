@@ -607,6 +607,7 @@ Control 的 CONTROL_PUBLIC_URL
 | `CACHE_BACKEND` | `memory` / `disk` / `hybrid` |
 | `DISK_CACHE_DIR` | 普通磁盘缓存目录 |
 | `MAX_CACHEABLE_BODY` | 普通缓存单对象上限，8 MiB 默认 |
+| `CACHE_MAX_BYTES` | 内存缓存近似字节上限，默认 512 MiB；超限按 LRU 淘汰 |
 | `ORIGIN_READ_TIMEOUT_MS` | 回源读取空闲超时，默认 30000；流媒体不会因总时长被中断 |
 | `DOWNSTREAM_KEEPALIVE_SECS` | 下游 HTTP/1.1 keepalive 空闲超时，默认 60 |
 | `DOWNSTREAM_H2_IDLE_SECS` | 下游 HTTP/2 空闲超时，默认 120 |

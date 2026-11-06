@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -89,6 +90,15 @@ impl CacheEntry {
             .then(|| self.fresh_until_epoch_secs.saturating_sub(now_epoch_secs()))
     }
 
+    /// Approximate heap footprint used by the memory backend's byte cap.
+    pub fn memory_size(&self) -> u64 {
+        let mut size = self.body.len() as u64 + 128;
+        for (name, value) in &self.headers {
+            size += (name.len() + value.len()) as u64 + 32;
+        }
+        size
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -166,6 +176,9 @@ pub struct MemoryCache {
     lru: Arc<Mutex<LruState>>,
     /// Maximum number of entries; 0 means unbounded.
     capacity: usize,
+    /// Maximum approximate bytes; 0 means unbounded.
+    max_bytes: u64,
+    used_bytes: Arc<AtomicU64>,
 }
 
 impl Default for MemoryCache {
@@ -176,15 +189,29 @@ impl Default for MemoryCache {
 
 impl MemoryCache {
     pub fn new(max_capacity: u64) -> Self {
+        Self::with_max_bytes(max_capacity, 0)
+    }
+
+    pub fn with_max_bytes(max_capacity: u64, max_bytes: u64) -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
             lru: Arc::new(Mutex::new(LruState::default())),
             capacity: usize::try_from(max_capacity).unwrap_or(usize::MAX),
+            max_bytes,
+            used_bytes: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.used_bytes.load(Ordering::Relaxed)
     }
 
     fn touch(&self, key: &str) {
@@ -194,18 +221,34 @@ impl MemoryCache {
     }
 
     /// Evict least-recently-used entries until the cache fits its capacity.
-    fn evict_overflow(&self) {
-        if self.capacity == 0 {
-            return;
+    fn remove_key(&self, key: &str) -> Option<TimedEntry> {
+        let removed = self.inner.remove(key).map(|(_, entry)| entry);
+        if let Some(entry) = &removed {
+            self.used_bytes
+                .fetch_sub(entry.entry.memory_size(), Ordering::Relaxed);
         }
-        while self.inner.len() > self.capacity {
+        if let Ok(mut lru) = self.lru.lock() {
+            lru.remove(key);
+        }
+        removed
+    }
+
+    fn over_limit(&self) -> bool {
+        (self.capacity > 0 && self.inner.len() > self.capacity)
+            || (self.max_bytes > 0
+                && self.used_bytes.load(Ordering::Relaxed) > self.max_bytes)
+    }
+
+    /// Evict least-recently-used entries until count and byte limits fit.
+    fn evict_overflow(&self) {
+        while self.over_limit() {
             let victim = match self.lru.lock() {
                 Ok(mut lru) => lru.pop_victim(),
                 Err(_) => None,
             };
             match victim {
                 Some(key) => {
-                    self.inner.remove(&key);
+                    self.remove_key(&key);
                 }
                 None => {
                     // LRU bookkeeping out of sync (entries inserted elsewhere):
@@ -213,7 +256,7 @@ impl MemoryCache {
                     let any = self.inner.iter().next().map(|e| e.key().clone());
                     match any {
                         Some(key) => {
-                            self.inner.remove(&key);
+                            self.remove_key(&key);
                         }
                         None => break,
                     }
@@ -251,10 +294,7 @@ impl CacheBackend for MemoryCache {
             return CacheGetResult::Stale(entry);
         }
         drop(item);
-        self.inner.remove(key);
-        if let Ok(mut lru) = self.lru.lock() {
-            lru.remove(key);
-        }
+        self.remove_key(key);
         CacheGetResult::Expired
     }
 
@@ -271,7 +311,8 @@ impl CacheBackend for MemoryCache {
         entry.fresh_until_epoch_secs = now_epoch + fresh_secs;
         entry.stale_until_epoch_secs = now_epoch + fresh_secs + swr_secs;
         entry.stored_at_epoch_secs = now_epoch;
-        self.inner.insert(
+        let size = entry.memory_size();
+        let old = self.inner.insert(
             key.to_string(),
             TimedEntry {
                 entry,
@@ -279,19 +320,22 @@ impl CacheBackend for MemoryCache {
                 stale_until: now + fresh + swr,
             },
         );
+        if let Some(old) = old {
+            self.used_bytes
+                .fetch_sub(old.entry.memory_size(), Ordering::Relaxed);
+        }
+        self.used_bytes.fetch_add(size, Ordering::Relaxed);
         self.touch(key);
         self.evict_overflow();
     }
 
     async fn delete(&self, key: &str) {
-        self.inner.remove(key);
-        if let Ok(mut lru) = self.lru.lock() {
-            lru.remove(key);
-        }
+        self.remove_key(key);
     }
 
     async fn clear(&self) {
         self.inner.clear();
+        self.used_bytes.store(0, Ordering::Relaxed);
         if let Ok(mut lru) = self.lru.lock() {
             lru.pos.clear();
             lru.order.clear();
@@ -316,11 +360,8 @@ impl CacheBackend for MemoryCache {
             .collect();
         let mut removed = 0u64;
         for k in keys {
-            if self.inner.remove(&k).is_some() {
+            if self.remove_key(&k).is_some() {
                 removed += 1;
-            }
-            if let Ok(mut lru) = self.lru.lock() {
-                lru.remove(&k);
             }
         }
         removed
@@ -347,11 +388,8 @@ impl CacheBackend for MemoryCache {
             .collect();
         let mut removed = 0u64;
         for k in keys {
-            if self.inner.remove(&k).is_some() {
+            if self.remove_key(&k).is_some() {
                 removed += 1;
-            }
-            if let Ok(mut lru) = self.lru.lock() {
-                lru.remove(&k);
             }
         }
         removed
@@ -407,6 +445,22 @@ mod tests {
         assert!(matches!(c.get_result("a").await, CacheGetResult::Hit(_)));
         assert!(matches!(c.get_result("b").await, CacheGetResult::Miss));
         assert!(matches!(c.get_result("c").await, CacheGetResult::Hit(_)));
+    }
+
+    #[tokio::test]
+    async fn byte_budget_evicts_entries() {
+        let c = MemoryCache::with_max_bytes(10, 650);
+        let big = CacheEntry::new(
+            200,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from(vec![7_u8; 128]),
+        );
+        c.set("a", big.clone(), 60).await;
+        c.set("b", big.clone(), 60).await;
+        assert!(c.used_bytes() <= 650);
+        c.set("c", big, 60).await;
+        assert!(c.used_bytes() <= 650);
+        assert!(c.len().await <= 2);
     }
 
     #[tokio::test]

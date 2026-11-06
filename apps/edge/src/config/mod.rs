@@ -23,6 +23,8 @@ pub struct EdgeConfig {
     pub origin_url: String,
     pub default_ttl_secs: u64,
     pub cache_capacity: u64,
+    /// Approximate memory-cache byte cap; 0 means unbounded.
+    pub cache_max_bytes: u64,
     /// memory | disk | hybrid
     pub cache_backend: String,
     pub disk_cache_dir: String,
@@ -125,6 +127,11 @@ impl Default for EdgeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
+            cache_max_bytes: std::env::var("CACHE_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512 * 1024 * 1024)
+                .clamp(16 * 1024 * 1024, 8 * 1024 * 1024 * 1024),
             cache_backend: std::env::var("CACHE_BACKEND")
                 .unwrap_or_else(|_| "memory".into())
                 .to_lowercase(),

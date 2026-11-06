@@ -19,12 +19,18 @@ pub async fn build_cache(config: &EdgeConfig) -> anyhow::Result<SharedCache> {
             Ok(Arc::new(disk) as SharedCache)
         }
         "hybrid" => {
-            let mem = Arc::new(MemoryCache::new(config.cache_capacity));
+            let mem = Arc::new(MemoryCache::with_max_bytes(
+                config.cache_capacity,
+                config.cache_max_bytes,
+            ));
             let disk = Arc::new(
                 DiskCache::new(&config.disk_cache_dir, config.disk_cache_max_bytes).await?,
             );
             Ok(Arc::new(HybridCache::new(mem, disk)) as SharedCache)
         }
-        _ => Ok(Arc::new(MemoryCache::new(config.cache_capacity)) as SharedCache),
+        _ => Ok(Arc::new(MemoryCache::with_max_bytes(
+            config.cache_capacity,
+            config.cache_max_bytes,
+        )) as SharedCache),
     }
 }
