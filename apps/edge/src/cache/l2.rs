@@ -11,6 +11,7 @@ use bytes::Bytes;
 use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult, SharedCache};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -86,6 +87,33 @@ impl RedisL2Cache {
             out.push(ch);
         }
         out
+    }
+
+    fn tag_index_key(&self, tag: &str) -> String {
+        format!("{}:tagidx:{}", self.prefix, tag.to_ascii_lowercase())
+    }
+
+    fn cache_tags(headers: &[(String, String)]) -> Vec<String> {
+        let mut tags = Vec::new();
+        for (name, value) in headers {
+            if !["surrogate-key", "cache-tag", "x-cache-tag"]
+                .iter()
+                .any(|n| name.eq_ignore_ascii_case(n))
+            {
+                continue;
+            }
+            for tag in value
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+            {
+                let tag = tag.to_ascii_lowercase();
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        }
+        tags
     }
     fn unhealthy(&self) -> bool {
         Self::now_ms() < self.fail_until_ms.load(Ordering::Relaxed)
@@ -203,6 +231,26 @@ impl RedisL2Cache {
     }
 }
 
+impl RedisL2Cache {
+    async fn index_tags(&self, key: &str, tags: &[String], ttl_secs: u64) {
+        if tags.is_empty() || self.unhealthy() {
+            return;
+        }
+        let mut pipe = redis::pipe();
+        for tag in tags {
+            let index = self.tag_index_key(tag);
+            pipe.sadd(&index, key).ignore();
+            pipe.expire(&index, ttl_secs.max(60) as i64).ignore();
+        }
+        let mut conn = self.conn.clone();
+        match tokio::time::timeout(REDIS_TIMEOUT, pipe.query_async::<()>(&mut conn)).await {
+            Ok(Ok(_)) => {}
+            _ => self.mark_failed(),
+        }
+    }
+
+
+}
 #[async_trait]
 impl CacheBackend for RedisL2Cache {
     async fn get_result(&self, key: &str) -> CacheGetResult {
@@ -246,6 +294,7 @@ impl CacheBackend for RedisL2Cache {
     }
 
     async fn set_with_swr(&self, key: &str, entry: CacheEntry, fresh_secs: u64, swr_secs: u64) {
+        let tags = Self::cache_tags(&entry.headers);
         self.local
             .set_with_swr(key, entry.clone(), fresh_secs, swr_secs)
             .await;
@@ -259,6 +308,7 @@ impl CacheBackend for RedisL2Cache {
             stale_until: now + fresh_secs.max(1) + swr_secs,
         };
         self.redis_set(key, l2).await;
+        self.index_tags(key, &tags, fresh_secs.max(1) + swr_secs + 300).await;
     }
 
     async fn delete(&self, key: &str) {
@@ -293,41 +343,74 @@ impl CacheBackend for RedisL2Cache {
     }
 
     async fn purge_tags(&self, tags: &[String], domain: &str) -> u64 {
-        // Local cache can inspect tags cheaply. For L2, scan only this domain's
-        // keys and decode candidates.
         let removed = self.local.purge_tags(tags, domain).await;
-        let keys = self.redis_scan_keys(&format!("*{}*", Self::glob_escape(domain))).await;
         let wanted: Vec<String> = tags.iter().map(|t| t.to_ascii_lowercase()).collect();
-        let mut victims = Vec::new();
+        if wanted.is_empty() {
+            return removed;
+        }
         let mut conn = self.conn.clone();
-        for key in keys {
-            let Ok(Ok(raw)) =
-                tokio::time::timeout(REDIS_TIMEOUT, conn.get::<_, Option<String>>(&key)).await
+        let mut candidates: HashSet<String> = HashSet::new();
+        for tag in &wanted {
+            let result: redis::RedisResult<Vec<String>> = tokio::time::timeout(
+                REDIS_TIMEOUT,
+                conn.smembers(self.tag_index_key(tag)),
+            )
+            .await
+            .unwrap_or(Ok(Vec::new()));
+            if let Ok(keys) = result {
+                candidates.extend(keys);
+            }
+        }
+        // Entries written before the tag index existed have no members yet.
+        // Fall back to a domain scan only in that case.
+        if candidates.is_empty() {
+            candidates.extend(
+                self.redis_scan_keys(&format!("*{}*", Self::glob_escape(domain)))
+                    .await,
+            );
+        }
+        let mut victims = Vec::new();
+        for key in candidates {
+            if !key.contains(domain) {
+                continue;
+            }
+            let Ok(Ok(Some(raw))) =
+                tokio::time::timeout(REDIS_TIMEOUT, conn.get::<_, Option<String>>(self.key(&key)))
+                    .await
             else {
                 continue;
             };
-            let Some(raw) = raw else { continue };
             let Ok(entry) = serde_json::from_str::<L2Entry>(&raw) else {
                 continue;
             };
-            let hit = entry.headers.iter().any(|(name, value)| {
-                ["surrogate-key", "cache-tag", "x-cache-tag"]
-                    .iter()
-                    .any(|n| name.eq_ignore_ascii_case(n))
-                    && value.split(|c: char| c == ',' || c.is_whitespace()).any(|tag| {
-                        wanted.iter().any(|w| w == &tag.to_ascii_lowercase())
-                    })
-            });
-            if hit {
+            if Self::cache_tags(&entry.headers)
+                .iter()
+                .any(|tag| wanted.iter().any(|w| w == tag))
+            {
                 victims.push(key);
             }
         }
-        if !victims.is_empty() {
-            if let Ok(Ok(n)) = tokio::time::timeout(REDIS_TIMEOUT, conn.del::<_, usize>(victims)).await {
-                return removed + n as u64;
+        if victims.is_empty() {
+            return removed;
+        }
+        let mut pipe = redis::pipe();
+        for tag in &wanted {
+            let index = self.tag_index_key(tag);
+            for key in &victims {
+                pipe.srem(&index, key).ignore();
             }
         }
-        removed
+        match tokio::time::timeout(REDIS_TIMEOUT, pipe.query_async::<()>(&mut conn)).await {
+            Ok(Ok(_)) => {}
+            _ => self.mark_failed(),
+        }
+        let redis_keys: Vec<String> = victims.iter().map(|key| self.key(key)).collect();
+        let n: usize = tokio::time::timeout(REDIS_TIMEOUT, conn.del::<_, usize>(redis_keys))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(0);
+        removed + n as u64
     }
 
     async fn len(&self) -> usize {
@@ -367,6 +450,42 @@ mod tests {
             CacheGetResult::Hit(e) => assert_eq!(e.body, Bytes::from_static(b"hello")),
             other => panic!("expected L2 hit, got {other:?}"),
         }
+        c1.clear().await;
+    }
+
+    #[tokio::test]
+    async fn l2_tag_index_purges_without_scan() {
+        let url = std::env::var("CACHE_REDIS_URL")
+            .or_else(|_| std::env::var("REDIS_URL"))
+            .unwrap_or_else(|_| "redis://127.0.0.1/".into());
+        let prefix = format!("lagran:test:l2tag:{}", std::process::id());
+        let c1 = match RedisL2Cache::connect(
+            Arc::new(MemoryCache::new(10)) as SharedCache,
+            &url,
+            prefix.clone(),
+            1024 * 1024,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let c2 = RedisL2Cache::connect(
+            Arc::new(MemoryCache::new(10)) as SharedCache,
+            &url,
+            prefix.clone(),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+        let entry = CacheEntry::new(
+            200,
+            vec![("surrogate-key".into(), "foo bar".into())],
+            Bytes::from_static(b"tagged"),
+        );
+        c1.set("GET:tag.test:/x", entry, 60).await;
+        assert!(c2.purge_tags(&["foo".into()], "tag.test").await >= 1);
+        assert!(matches!(c2.get_result("GET:tag.test:/x").await, CacheGetResult::Miss));
         c1.clear().await;
     }
 }

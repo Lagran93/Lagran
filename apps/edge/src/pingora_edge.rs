@@ -1148,6 +1148,21 @@ impl DataPlaneProxy {
         // served here; on a changed origin the entry is dropped and the native
         // path performs a single streaming fill. This keeps strict no-cache
         // GETs out of the legacy data plane.
+        let _revalidation_guard = if let Some(flight) = self.state.flight.as_ref() {
+            match flight.try_lock(&plan.key).await {
+                Ok(Some(guard)) => Some(guard),
+                Ok(None) => {
+                    // Another node is validating this key. Wait for its
+                    // conditional request to finish, then use the refreshed
+                    // shared entry instead of firing a duplicate origin check.
+                    flight.wait_unlocked(&plan.key).await;
+                    None
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         if let Some(entry) = self.state.cache.get(&plan.key).await {
             if self
                 .try_normal_revalidation(session, &plan, entry)

@@ -172,14 +172,11 @@ impl AccessLog {
             cache = %rec.cache_status,
             "{}", combined_line(&rec)
         );
-        match self.tx.try_send(rec) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!("access log queue full; record dropped");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!("access log writer stopped; record dropped");
-            }
+        // Backpressure instead of dropping: a bounded queue keeps memory safe,
+        // and the request waits for the writer when the disk falls behind. This
+        // gives zero-loss access logging while the process is alive.
+        if self.tx.send(rec).await.is_err() {
+            tracing::warn!("access log writer stopped; record dropped");
         }
     }
 

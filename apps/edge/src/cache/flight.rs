@@ -57,7 +57,7 @@ impl RedisFlight {
         format!("{}:flight:{}", self.prefix, key)
     }
 
-    async fn acquire(self: &Arc<Self>, key: &str) -> Result<Option<FlightGuard>, ()> {
+    pub(crate) async fn try_lock(self: &Arc<Self>, key: &str) -> Result<Option<FlightGuard>, ()> {
         let token = format!(
             "{}:{}",
             std::process::id(),
@@ -82,6 +82,33 @@ impl RedisFlight {
             key: key.to_string(),
             token,
         }))
+    }
+
+    /// Wait until the current lock owner releases (or the lock TTL expires).
+    /// Used by conditional revalidation, where an old cache entry may still
+    /// exist while the leader is validating it.
+    pub(crate) async fn wait_unlocked(&self, key: &str) {
+        let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+        let mut conn = self.conn.clone();
+        while tokio::time::Instant::now() < deadline {
+            let exists = match tokio::time::timeout(
+                Duration::from_millis(250),
+                redis::cmd("EXISTS")
+                    .arg(self.key(key))
+                    .query_async::<i64>(&mut conn),
+            )
+            .await
+            {
+                Ok(Ok(value)) => value,
+                // Redis is degraded: do not let a missing lock lookup add
+                // another five seconds to every conditional request.
+                _ => return,
+            };
+            if exists == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     async fn release(&self, key: &str, token: &str) {
@@ -110,7 +137,7 @@ pub async fn acquire(
     key: &str,
     cache: &dyn lagran_cache::CacheBackend,
 ) -> Option<FlightGuard> {
-    match flight.acquire(key).await {
+    match flight.try_lock(key).await {
         Ok(Some(guard)) => return Some(guard),
         Err(_) => return None,
         Ok(None) => {}
