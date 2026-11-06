@@ -22,6 +22,7 @@ pub struct AccessEntryIn {
     pub bytes: Option<u64>,
     pub latency_ms: Option<u64>,
     pub cache_status: Option<String>,
+    pub action: Option<String>,
     pub user_agent: Option<String>,
     pub referer: Option<String>,
 }
@@ -57,6 +58,7 @@ pub struct AccessLogDto {
     pub bytes: i64,
     pub latency_ms: i32,
     pub cache_status: String,
+    pub action: String,
     pub user_agent: String,
     pub referer: String,
 }
@@ -79,6 +81,7 @@ pub async fn report(
             e.bytes.unwrap_or(0) as i64,
             e.latency_ms.unwrap_or(0) as i32,
             e.cache_status.unwrap_or_default(),
+            e.action.unwrap_or_default(),
             e.user_agent.unwrap_or_default(),
             e.referer.unwrap_or_default(),
         ));
@@ -152,6 +155,7 @@ pub async fn list(
                 bytes: r.bytes,
                 latency_ms: r.latency_ms,
                 cache_status: r.cache_status,
+                action: r.action,
                 user_agent: r.user_agent,
                 referer: r.referer,
             })

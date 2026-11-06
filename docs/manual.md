@@ -1312,6 +1312,43 @@ ACCESS_LOG_REPORT=true
 
 访问日志使用有界队列 + 反压：队列满时请求会等待写入完成，不再直接丢弃记录。磁盘长期阻塞会相应增加请求延迟；若需要“磁盘故障也不丢”，应再配置独立 spool。
 
+访问日志中的 `cache_status` 只表示 Edge 缓存结果：
+
+```text
+HIT / MISS / EXPIRED / STALE / BYPASS / REVALIDATED / DYNAMIC / NONE
+```
+
+安全或特殊处理动作放在独立的 `action` 字段：
+
+```text
+WAF
+CHALLENGE
+CC
+CC-BAN
+CC-CHALLENGE
+BOT-CHALLENGE
+WS
+HTTPS_REDIRECT
+NODE_DISABLED
+```
+
+因此：
+
+```text
+status=304 + cache_status=BYPASS
+```
+
+表示客户端带了条件请求，但 Edge 没有可复用的缓存对象，直接把条件请求转发给源站；源站返回 304。
+这并不表示 Edge 缓存命中。
+
+如果是：
+
+```text
+status=304 + cache_status=REVALIDATED
+```
+
+才表示 Edge 有缓存对象，并向源站完成了条件校验。
+
 ### 7.4 关键响应头
 
 | 头 | 含义 |

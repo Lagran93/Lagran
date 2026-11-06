@@ -345,7 +345,7 @@ impl ProxyHttp for DataPlaneProxy {
             return self.handle_in_process(session).await;
         }
 
-        if self.try_large_revalidation(session).await? {
+        if self.try_large_revalidation(session, ctx).await? {
             return Ok(true);
         }
         if let Some(plan) = self.native_plan(session).await {
@@ -1102,7 +1102,11 @@ impl DataPlaneProxy {
     /// conditional request first. A 304 is served from the existing large file
     /// without touching its body; a 200 removes the stale object and lets the
     /// normal native path stream and replace it.
-    async fn try_large_revalidation(&self, session: &mut Session) -> Result<bool> {
+    async fn try_large_revalidation(
+        &self,
+        session: &mut Session,
+        ctx: &mut ReqCtx,
+    ) -> Result<bool> {
         if session.req_header().method != Method::GET
             || session.req_header().headers.contains_key("range")
         {
@@ -1165,7 +1169,7 @@ impl DataPlaneProxy {
         };
         if let Some(entry) = self.state.cache.get(&plan.key).await {
             if self
-                .try_normal_revalidation(session, &plan, entry)
+                .try_normal_revalidation(session, ctx, &plan, entry)
                 .await?
             {
                 self.state.metrics.record_pingora_datapath();
@@ -1300,6 +1304,8 @@ impl DataPlaneProxy {
         let Some(entry) = large.get(&plan.key).await else {
             return Ok(false);
         };
+        ctx.cache_label = "REVALIDATED";
+        ctx.cache_reason = Some("origin-304");
         self.serve_large_full(session, entry, &plan).await;
         self.state.metrics.record_pingora_datapath();
         Ok(true)
@@ -1308,6 +1314,7 @@ impl DataPlaneProxy {
     async fn try_normal_revalidation(
         &self,
         session: &mut Session,
+        ctx: &mut ReqCtx,
         plan: &NativePlan,
         entry: crate::cache::CacheEntry,
     ) -> Result<bool> {
@@ -1392,6 +1399,8 @@ impl DataPlaneProxy {
                 && conditional.body.is_empty()
                 && !entry.body.is_empty()
             {
+                ctx.cache_label = "REVALIDATED";
+                ctx.cache_reason = Some("origin-empty-fallback");
                 self.serve_normal_entry(session, entry, plan, "origin-empty-fallback")
                     .await;
                 return Ok(true);
@@ -1416,6 +1425,8 @@ impl DataPlaneProxy {
                             .await;
                     }
                 }
+                ctx.cache_label = "REVALIDATED";
+                ctx.cache_reason = Some("origin-200");
                 self.serve_normal_entry(session, entry, plan, "origin-200")
                     .await;
                 return Ok(true);
@@ -1471,6 +1482,8 @@ impl DataPlaneProxy {
                 decision.swr_secs,
             )
             .await;
+        ctx.cache_label = "REVALIDATED";
+        ctx.cache_reason = Some("origin-304");
         self.serve_normal_entry(session, refreshed, plan, "origin-304")
             .await;
         Ok(true)

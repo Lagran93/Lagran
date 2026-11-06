@@ -24,6 +24,8 @@ pub struct AccessRecord {
     pub bytes: u64,
     pub latency_ms: u64,
     pub cache_status: String,
+    /// Security/edge action separated from the cache outcome (WAF, CC, WS...).
+    pub action: String,
     pub user_agent: String,
     pub referer: String,
     pub request_id: String,
@@ -126,6 +128,22 @@ impl AccessLog {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn split_status(label: &str) -> (&str, &str) {
+        match label {
+            "HIT" | "MISS" | "EXPIRED" | "DYNAMIC" | "BYPASS" | "REVALIDATED"
+            | "STALE" | "UPDATING" | "NONE" | "UNKNOWN" => (label, ""),
+            "WS" => ("NONE", "WS"),
+            "HTTPS_REDIRECT" => ("NONE", "HTTPS_REDIRECT"),
+            "NODE_DISABLED" => ("NONE", "NODE_DISABLED"),
+            "WAF" | "CHALLENGE" | "CC" | "CC-BAN" | "CC-CHALLENGE"
+            | "BOT-CHALLENGE" | "ERROR" | "TIMEOUT" | "UNHEALTHY" => {
+                ("BYPASS", label)
+            }
+            other => ("UNKNOWN", other),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         client_ip: &str,
@@ -141,6 +159,7 @@ impl AccessLog {
         request_id: &str,
     ) -> AccessRecord {
         let ts = chrono_like_now();
+        let (cache, action) = Self::split_status(cache_status);
         AccessRecord {
             ts,
             node_id: self.node_id.clone(),
@@ -151,7 +170,8 @@ impl AccessLog {
             status,
             bytes,
             latency_ms,
-            cache_status: cache_status.to_string(),
+            cache_status: cache.to_string(),
+            action: action.to_string(),
             user_agent: truncate(user_agent, 256),
             referer: truncate(referer, 256),
             request_id: truncate(request_id, 64),
@@ -222,7 +242,7 @@ impl AccessLog {
 
 fn combined_line(rec: &AccessRecord) -> String {
     format!(
-        "{ts} {ip} \"{method} {host}{path}\" status={status} bytes={bytes} cache={cache} {ms}ms ua=\"{ua}\" ref=\"{ref}\"",
+        "{ts} {ip} \"{method} {host}{path}\" status={status} bytes={bytes} cache={cache} action={action} {ms}ms ua=\"{ua}\" ref=\"{ref}\"",
         ts = rec.ts,
         ip = rec.client_ip,
         method = rec.method,
@@ -231,6 +251,7 @@ fn combined_line(rec: &AccessRecord) -> String {
         status = rec.status,
         bytes = rec.bytes,
         cache = rec.cache_status,
+        action = rec.action,
         ms = rec.latency_ms,
         ua = rec.user_agent.replace('"', "'"),
         ref = rec.referer.replace('"', "'"),
@@ -291,6 +312,16 @@ mod tests {
     fn timestamp_format_is_iso_utc() {
         // 2026-10-25T00:00:00Z
         assert_eq!(format_unix(1_792_886_400), "2026-10-25T00:00:00Z");
+    }
+
+    #[test]
+    fn security_labels_are_not_cache_statuses() {
+        assert_eq!(AccessLog::split_status("WAF"), ("BYPASS", "WAF"));
+        assert_eq!(AccessLog::split_status("WS"), ("NONE", "WS"));
+        assert_eq!(
+            AccessLog::split_status("REVALIDATED"),
+            ("REVALIDATED", "")
+        );
     }
 
     #[test]

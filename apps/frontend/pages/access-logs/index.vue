@@ -55,6 +55,7 @@
               <th style="min-width: 220px">路径</th>
               <th>状态</th>
               <th>缓存</th>
+              <th>动作</th>
               <th class="num">大小</th>
               <th class="num">耗时</th>
             </tr>
@@ -76,6 +77,10 @@
               </td>
               <td>
                 <StatusTag :status="r.cache_status">{{ r.cache_status }}</StatusTag>
+              </td>
+              <td>
+                <span v-if="r.action" class="text-2">{{ r.action }}</span>
+                <span v-else class="text-muted">-</span>
               </td>
               <td class="num text-2">{{ formatBytes(r.bytes) }}</td>
               <td class="num" :class="r.latency_ms > 1000 ? 'text-danger' : 'text-2'">
@@ -130,6 +135,7 @@ function exportLogs() {
     { key: 'path', label: '路径' },
     { key: 'status', label: '状态码' },
     { key: 'cache_status', label: '缓存状态' },
+    { key: 'action', label: '动作' },
     { key: 'bytes_sent', label: '响应字节' },
     { key: 'latency_ms', label: '耗时 ms' },
     { key: 'client_ip', label: '客户端 IP' },

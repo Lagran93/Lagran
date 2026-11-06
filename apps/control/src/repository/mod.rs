@@ -2112,6 +2112,7 @@ pub struct AccessLogRow {
     pub bytes: i64,
     pub latency_ms: i32,
     pub cache_status: String,
+    pub action: String,
     pub user_agent: String,
     pub referer: String,
 }
@@ -2130,6 +2131,7 @@ pub async fn insert_access_logs_batch(
         i64,    // bytes
         i32,    // latency_ms
         String, // cache
+        String, // action
         String, // ua
         String, // ref
     )],
@@ -2147,6 +2149,7 @@ pub async fn insert_access_logs_batch(
     let mut bytes = Vec::with_capacity(entries.len());
     let mut latencies = Vec::with_capacity(entries.len());
     let mut caches = Vec::with_capacity(entries.len());
+    let mut actions = Vec::with_capacity(entries.len());
     let mut agents = Vec::with_capacity(entries.len());
     let mut referers = Vec::with_capacity(entries.len());
     for e in entries {
@@ -2160,21 +2163,22 @@ pub async fn insert_access_logs_batch(
         bytes.push(e.7);
         latencies.push(e.8);
         caches.push(e.9.clone());
-        agents.push(e.10.clone());
-        referers.push(e.11.clone());
+        actions.push(e.10.clone());
+        agents.push(e.11.clone());
+        referers.push(e.12.clone());
     }
     let result = sqlx::query(
         r#"
         INSERT INTO access_logs
-          (ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, user_agent, referer)
+          (ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, action, user_agent, referer)
         SELECT
           COALESCE(NULLIF(t.ts, '')::timestamptz, NOW()),
           t.node_id, t.client_ip, t.method, t.host, t.path, t.status, t.bytes,
-          t.latency_ms, t.cache_status, t.user_agent, t.referer
+          t.latency_ms, t.cache_status, t.action, t.user_agent, t.referer
         FROM UNNEST(
           $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-          $7::int[], $8::bigint[], $9::int[], $10::text[], $11::text[], $12::text[]
-        ) AS t(ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, user_agent, referer)
+          $7::int[], $8::bigint[], $9::int[], $10::text[], $11::text[], $12::text[], $13::text[]
+        ) AS t(ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, action, user_agent, referer)
         "#,
     )
     .bind(ts)
@@ -2187,6 +2191,7 @@ pub async fn insert_access_logs_batch(
     .bind(bytes)
     .bind(latencies)
     .bind(caches)
+    .bind(actions)
     .bind(agents)
     .bind(referers)
     .execute(pool)
@@ -2205,7 +2210,7 @@ pub async fn list_access_logs(
     sqlx::query_as::<_, AccessLogRow>(
         r#"
         SELECT id, ts, node_id, client_ip, method, host, path, status, bytes,
-               latency_ms, cache_status, user_agent, referer
+               latency_ms, cache_status, action, user_agent, referer
         FROM access_logs
         WHERE ($1::text IS NULL OR host = $1)
           AND ($2::text[] IS NULL OR host = ANY($2))
