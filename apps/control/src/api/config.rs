@@ -84,10 +84,24 @@ pub struct WafRuleOut {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct RulepackOut {
+    pub version: String,
+    pub payload: String,
+    pub signature: String,
+    pub checksum: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct WafConfigOut {
     pub enabled: bool,
     pub mode: String,
     pub managed: WafManagedOut,
+    #[serde(default)]
+    pub managed_rulesets: Vec<String>,
+    #[serde(default)]
+    pub rulepack_version: String,
+    #[serde(default)]
+    pub rulepack: Option<RulepackOut>,
     pub rules: Vec<WafRuleOut>,
     pub ip_allow: Vec<String>,
     pub ip_deny: Vec<String>,
@@ -235,10 +249,52 @@ fn backup_config(row: &repository::DomainFullRow) -> Option<OriginConfig> {
 }
 
 fn waf_config_from(
+    domain: &str,
     settings: repository::WafSettingsRow,
     rules: Vec<repository::WafRuleRow>,
     ips: Vec<repository::WafIpRow>,
+    rulepacks: &[crate::waf_rulepack::RulepackRow],
 ) -> WafConfigOut {
+    let managed_rulesets = crate::waf_rulesets::parse_csv(&settings.managed_rulesets);
+    let active = rulepacks.iter().find(|p| p.slot == "active");
+    let previous = rulepacks.iter().find(|p| p.slot == "previous");
+    let pinned = if settings.waf_rulepack_version.trim().is_empty() {
+        None
+    } else {
+        rulepacks
+            .iter()
+            .find(|p| p.version == settings.waf_rulepack_version.trim())
+    };
+    let selected = pinned.or_else(|| {
+        if settings.waf_gray_percent > 0 {
+            match (active, previous) {
+                (Some(a), Some(p)) => {
+                    if crate::waf_rulepack::gray_bucket(domain, &a.version)
+                        < settings.waf_gray_percent as u32
+                    {
+                        Some(a)
+                    } else {
+                        Some(p)
+                    }
+                }
+                _ => active,
+            }
+        } else {
+            active
+        }
+    });
+    let ruleset_categories = selected
+        .map(|p| p.categories_for(&managed_rulesets))
+        .unwrap_or_else(|| {
+            crate::waf_rulesets::Categories::from_csv(&settings.managed_rulesets)
+        });
+    let rulepack_out = selected.map(|p| RulepackOut {
+        version: p.version.clone(),
+        payload: p.payload.clone(),
+        signature: p.signature.clone(),
+        checksum: p.checksum.clone(),
+    });
+    let rulepack_version = selected.map(|p| p.version.clone()).unwrap_or_default();
     let mut ip_allow = Vec::new();
     let mut ip_deny = Vec::new();
     for ip in ips {
@@ -252,22 +308,25 @@ fn waf_config_from(
         enabled: settings.enabled,
         mode: settings.mode,
         managed: WafManagedOut {
-            sqli: settings.sqli,
-            xss: settings.xss,
-            traversal: settings.traversal,
-            scanners: settings.scanners,
-            rce: settings.rce,
-            ssrf: settings.ssrf,
-            xxe: settings.xxe,
-            log4shell: settings.log4shell,
-            crlf: settings.crlf,
-            ssti: settings.ssti,
-            nosql: settings.nosql,
-            ldap: settings.ldap,
-            java: settings.java,
-            webshell: settings.webshell,
-            protocol: settings.protocol,
+            sqli: settings.sqli || ruleset_categories.sqli,
+            xss: settings.xss || ruleset_categories.xss,
+            traversal: settings.traversal || ruleset_categories.traversal,
+            scanners: settings.scanners || ruleset_categories.scanners,
+            rce: settings.rce || ruleset_categories.rce,
+            ssrf: settings.ssrf || ruleset_categories.ssrf,
+            xxe: settings.xxe || ruleset_categories.xxe,
+            log4shell: settings.log4shell || ruleset_categories.log4shell,
+            crlf: settings.crlf || ruleset_categories.crlf,
+            ssti: settings.ssti || ruleset_categories.ssti,
+            nosql: settings.nosql || ruleset_categories.nosql,
+            ldap: settings.ldap || ruleset_categories.ldap,
+            java: settings.java || ruleset_categories.java,
+            webshell: settings.webshell || ruleset_categories.webshell,
+            protocol: settings.protocol || ruleset_categories.protocol,
         },
+        managed_rulesets,
+        rulepack_version,
+        rulepack: rulepack_out,
         rules: rules
             .into_iter()
             .map(|r| WafRuleOut {
@@ -409,6 +468,12 @@ pub(crate) fn build(
             }
             w.challenge_difficulty.hash(&mut h);
             w.challenge_ttl_secs.hash(&mut h);
+            w.rulepack_version.hash(&mut h);
+            if let Some(pack) = &w.rulepack {
+                pack.version.hash(&mut h);
+                pack.signature.hash(&mut h);
+                pack.checksum.hash(&mut h);
+            }
         }
         None => "waf-none".hash(&mut h),
     }
@@ -468,6 +533,7 @@ pub async fn snapshot_domain(
     let rules = repository::list_rules_for_domain(pool, row.id)
         .await
         .unwrap_or_default();
+    let rulepacks = crate::waf_rulepack::list(pool).await.unwrap_or_default();
     let waf = match repository::get_waf_settings(pool, row.id)
         .await
         .ok()
@@ -480,7 +546,13 @@ pub async fn snapshot_domain(
             let waf_ips = repository::list_waf_ips(pool, row.id)
                 .await
                 .unwrap_or_default();
-            Some(waf_config_from(settings, waf_rules, waf_ips))
+            Some(waf_config_from(
+                &row.name,
+                settings,
+                waf_rules,
+                waf_ips,
+                &rulepacks,
+            ))
         }
         None => None,
     };
@@ -500,6 +572,9 @@ pub async fn get_domain_config(
     let rules = repository::list_rules_for_domain(&state.pool, row.id)
         .await
         .unwrap_or_default();
+    let rulepacks = crate::waf_rulepack::list(&state.pool)
+        .await
+        .unwrap_or_default();
     let waf = match repository::get_waf_settings(&state.pool, row.id)
         .await
         .ok()
@@ -512,7 +587,13 @@ pub async fn get_domain_config(
             let waf_ips = repository::list_waf_ips(&state.pool, row.id)
                 .await
                 .unwrap_or_default();
-            Some(waf_config_from(settings, waf_rules, waf_ips))
+            Some(waf_config_from(
+                &row.name,
+                settings,
+                waf_rules,
+                waf_ips,
+                &rulepacks,
+            ))
         }
         None => None,
     };
@@ -609,6 +690,9 @@ pub async fn list_all_configs(
             db_error()
         })?;
 
+    let rulepacks = crate::waf_rulepack::list(&state.pool)
+        .await
+        .unwrap_or_default();
     let mut waf_settings_by: HashMap<Uuid, repository::WafSettingsRow> =
         waf_settings.into_iter().map(|s| (s.domain_id, s)).collect();
     let mut waf_rules_by: HashMap<Uuid, Vec<repository::WafRuleRow>> = HashMap::new();
@@ -653,9 +737,11 @@ pub async fn list_all_configs(
         let rules = by_domain.remove(&row.id).unwrap_or_default();
         let waf = waf_settings_by.remove(&row.id).map(|settings| {
             waf_config_from(
+                &row.name,
                 settings,
                 waf_rules_by.remove(&row.id).unwrap_or_default(),
                 waf_ips_by.remove(&row.id).unwrap_or_default(),
+                &rulepacks,
             )
         });
         let mut cfg = build(&row, rule_configs(rules), waf);

@@ -79,6 +79,26 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("migrations applied");
 
+    {
+        if config.waf_rulepack_secret.trim().is_empty() {
+            tracing::warn!(
+                "WAF_RULEPACK_SECRET is not set; using the built-in development rulepack key"
+            );
+        }
+        let secret = control::waf_rulepack::signing_key(
+            &config.waf_rulepack_secret,
+            &config.agent_token,
+        );
+        match control::waf_rulepack::ensure_seed(&pool, &secret).await {
+            Ok(row) => tracing::info!(
+                version = %row.version,
+                slot = %row.slot,
+                "WAF rulepack ready"
+            ),
+            Err(e) => tracing::warn!(error = %e, "failed to seed WAF rulepack"),
+        }
+    }
+
     if config.seed_demo {
         repository::ensure_demo_user(&pool).await?;
         repository::ensure_demo_domain(&pool).await?;

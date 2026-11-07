@@ -113,6 +113,9 @@ pub struct WafSettingsDto {
     pub challenge_difficulty: u8,
     pub challenge_ttl_secs: u32,
     pub security_level: String,
+    pub managed_rulesets: Vec<String>,
+    pub waf_rulepack_version: String,
+    pub waf_gray_percent: u8,
 }
 
 impl Default for WafSettingsDto {
@@ -138,6 +141,9 @@ impl Default for WafSettingsDto {
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
             security_level: "off".into(),
+            managed_rulesets: Vec::new(),
+            waf_rulepack_version: String::new(),
+            waf_gray_percent: 0,
         }
     }
 }
@@ -165,6 +171,9 @@ impl From<repository::WafSettingsRow> for WafSettingsDto {
             challenge_difficulty: r.challenge_difficulty.clamp(1, 6) as u8,
             challenge_ttl_secs: r.challenge_ttl_secs.clamp(60, 86_400) as u32,
             security_level: r.security_level,
+            managed_rulesets: crate::waf_rulesets::parse_csv(&r.managed_rulesets),
+            waf_rulepack_version: r.waf_rulepack_version,
+            waf_gray_percent: r.waf_gray_percent.clamp(0, 100) as u8,
         }
     }
 }
@@ -182,6 +191,165 @@ pub async fn get_settings(
         .await
         .map_err(|_| db_error())?;
     Ok(Json(row.map(WafSettingsDto::from).unwrap_or_default()))
+}
+
+#[derive(Serialize)]
+pub struct ManagedRulesetDto {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub version: &'static str,
+    pub description: &'static str,
+    pub severity: &'static str,
+    pub recommended: bool,
+    pub categories: Vec<&'static str>,
+    pub category_labels: Vec<&'static str>,
+}
+
+/// Static catalog of managed rulesets. No database state is required.
+pub async fn list_rulesets() -> Json<Vec<ManagedRulesetDto>> {
+    Json(
+        crate::waf_rulesets::catalog()
+            .iter()
+            .map(|r| ManagedRulesetDto {
+                id: r.id,
+                name: r.name,
+                version: r.version,
+                description: r.description,
+                severity: r.severity,
+                recommended: r.recommended,
+                categories: r.categories.to_vec(),
+                category_labels: r.category_labels.to_vec(),
+            })
+            .collect(),
+    )
+}
+
+#[derive(Serialize)]
+pub struct RulepackDownload {
+    pub version: String,
+    pub payload: String,
+    pub signature: String,
+    pub checksum: String,
+}
+
+#[derive(Serialize)]
+pub struct RulepackVersionDto {
+    pub version: String,
+    pub slot: String,
+    pub signature: String,
+    pub checksum: String,
+    pub created_at: String,
+    pub created_by: String,
+}
+
+impl From<&crate::waf_rulepack::RulepackRow> for RulepackVersionDto {
+    fn from(row: &crate::waf_rulepack::RulepackRow) -> Self {
+        Self {
+            version: row.version.clone(),
+            slot: row.slot.clone(),
+            signature: row.signature.clone(),
+            checksum: row.checksum.clone(),
+            created_at: row.created_at.to_rfc3339(),
+            created_by: row.created_by.clone(),
+        }
+    }
+}
+
+pub async fn list_rulepacks(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<RulepackVersionDto>>, (StatusCode, Json<ErrorBody>)> {
+    let rows = crate::waf_rulepack::list(&state.pool)
+        .await
+        .map_err(|_| db_error())?;
+    Ok(Json(rows.iter().map(RulepackVersionDto::from).collect()))
+}
+
+#[derive(Deserialize)]
+pub struct PublishRulepackRequest {
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+pub async fn publish_rulepack(
+    State(state): State<AppState>,
+    actor: Actor,
+    Json(req): Json<PublishRulepackRequest>,
+) -> Result<Json<RulepackVersionDto>, (StatusCode, Json<ErrorBody>)> {
+    if !actor.is_admin {
+        return Err(forbidden());
+    }
+    let version = req
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            chrono::Utc::now().format("%Y.%m.%d-%H%M%S").to_string()
+        });
+    crate::waf_rulepack::validate_version(&version).map_err(bad_request)?;
+    let secret = crate::waf_rulepack::signing_key(
+        &state.config.waf_rulepack_secret,
+        &state.config.agent_token,
+    );
+    let row = crate::waf_rulepack::publish(&state.pool, &secret, &version, &actor.email)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "publish waf rulepack");
+            db_error()
+        })?;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "waf.rulepack.publish",
+        &version,
+        "发布托管 WAF 规则包",
+    )
+    .await;
+    Ok(Json(RulepackVersionDto::from(&row)))
+}
+
+pub async fn rollback_rulepack(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(version): Path<String>,
+) -> Result<Json<RulepackVersionDto>, (StatusCode, Json<ErrorBody>)> {
+    if !actor.is_admin {
+        return Err(forbidden());
+    }
+    let row = crate::waf_rulepack::rollback(&state.pool, &version)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found("rulepack version not found"))?;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "waf.rulepack.rollback",
+        &version,
+        "回滚托管 WAF 规则包",
+    )
+    .await;
+    Ok(Json(RulepackVersionDto::from(&row)))
+}
+
+pub async fn download_rulepack(
+    State(state): State<AppState>,
+    _agent: AgentAuth,
+    Path(version): Path<String>,
+) -> Result<Json<RulepackDownload>, (StatusCode, Json<ErrorBody>)> {
+    let row = if version == "active" {
+        crate::waf_rulepack::active(&state.pool).await
+    } else {
+        crate::waf_rulepack::get(&state.pool, &version).await
+    }
+    .map_err(|_| db_error())?
+    .ok_or_else(|| not_found("rulepack version not found"))?;
+    Ok(Json(RulepackDownload {
+        version: row.version,
+        payload: row.payload,
+        signature: row.signature,
+        checksum: row.checksum,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -206,6 +374,9 @@ pub struct SettingsRequest {
     pub challenge_difficulty: Option<u8>,
     pub challenge_ttl_secs: Option<u32>,
     pub security_level: Option<String>,
+    pub managed_rulesets: Option<Vec<String>>,
+    pub waf_rulepack_version: Option<String>,
+    pub waf_gray_percent: Option<u8>,
 }
 
 pub async fn put_settings(
@@ -247,6 +418,37 @@ pub async fn put_settings(
         ));
     }
 
+    let managed_rulesets = match req.managed_rulesets.as_deref() {
+        Some(ids) => crate::waf_rulesets::validate_ids(ids)
+            .map_err(|e| bad_request(e))?,
+        None => current.managed_rulesets.clone(),
+    };
+    let managed_csv = managed_rulesets.join(",");
+
+    let waf_rulepack_version = req
+        .waf_rulepack_version
+        .as_deref()
+        .unwrap_or(&current.waf_rulepack_version)
+        .trim()
+        .to_string();
+    if !waf_rulepack_version.is_empty() {
+        crate::waf_rulepack::validate_version(&waf_rulepack_version)
+            .map_err(|e| bad_request(e))?;
+        if crate::waf_rulepack::get(&state.pool, &waf_rulepack_version)
+            .await
+            .map_err(|_| db_error())?
+            .is_none()
+        {
+            return Err(bad_request(format!(
+                "unknown WAF rulepack version: {waf_rulepack_version}"
+            )));
+        }
+    }
+    let waf_gray_percent = req
+        .waf_gray_percent
+        .unwrap_or(current.waf_gray_percent)
+        .min(100) as i32;
+
     let row = repository::upsert_waf_settings(
         &state.pool,
         domain_id,
@@ -274,6 +476,9 @@ pub async fn put_settings(
             .unwrap_or(current.challenge_ttl_secs)
             .clamp(60, 86_400) as i32,
         &security_level,
+        &managed_csv,
+        &waf_rulepack_version,
+        waf_gray_percent,
     )
     .await
     .map_err(|e| {
@@ -289,7 +494,7 @@ pub async fn put_settings(
         &format!(
             "enabled={} mode={mode} level={} sqli={} xss={} traversal={} scanners={} \
              rce={} ssrf={} xxe={} log4shell={} crlf={} ssti={} nosql={} ldap={} \
-             java={} webshell={} protocol={} challenge={}/{}s",
+             java={} webshell={} protocol={} rulesets={} rulepack={} gray={}% challenge={}/{}s",
             row.enabled,
             row.security_level,
             row.sqli,
@@ -307,6 +512,9 @@ pub async fn put_settings(
             row.java,
             row.webshell,
             row.protocol,
+            managed_csv,
+            waf_rulepack_version,
+            waf_gray_percent,
             row.challenge_difficulty,
             row.challenge_ttl_secs
         ),

@@ -30,6 +30,8 @@ pub struct AppConfig {
     pub jwt_expire_hours: i64,
     /// Shared secret for edge agent APIs / DNS schedule (empty = weaker checks)
     pub agent_token: String,
+    /// HMAC secret for signed WAF rulepacks (empty = AGENT_TOKEN fallback).
+    pub waf_rulepack_secret: String,
     /// Public base URL of the control plane (used in node install commands).
     /// Empty = derive from the incoming request Host header.
     pub public_url: String,
@@ -108,6 +110,7 @@ impl Default for AppConfig {
             agent_token: env_nonempty("AGENT_TOKEN")
                 .or_else(|| env_nonempty("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
+            waf_rulepack_secret: env_nonempty("WAF_RULEPACK_SECRET").unwrap_or_default(),
             public_url: normalize_public_url(
                 &std::env::var("CONTROL_PUBLIC_URL").unwrap_or_default(),
             ),

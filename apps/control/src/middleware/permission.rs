@@ -29,6 +29,7 @@ fn is_agent_endpoint(method: &str, path: &str) -> bool {
         ("POST", "/api/v1/config/apply-report") => true,
         ("GET", "/api/v1/cc/bans") | ("POST", "/api/v1/cc/bans") => true,
         ("POST", "/api/v1/waf/events") => true,
+        ("GET", path) if path.starts_with("/api/v1/waf/rulepack/") => true,
         ("POST", "/api/v1/origin-health/report") => true,
         _ => {
             path.starts_with("/api/v1/certs/by-domain/")

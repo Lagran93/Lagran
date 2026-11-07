@@ -131,6 +131,14 @@ pub fn create_router(state: AppState) -> Router {
                     get(waf::list_ips).post(waf::create_ip),
                 )
                 .route("/waf/ips/:id", delete(waf::delete_ip))
+                .route("/waf/rulesets", get(waf::list_rulesets))
+                .route("/waf/rulepacks", get(waf::list_rulepacks))
+                .route("/waf/rulepacks/publish", post(waf::publish_rulepack))
+                .route(
+                    "/waf/rulepacks/:version/rollback",
+                    post(waf::rollback_rulepack),
+                )
+                .route("/waf/rulepack/:version", get(waf::download_rulepack))
                 .route(
                     "/waf/events",
                     get(waf::list_events).post(waf::report_events),

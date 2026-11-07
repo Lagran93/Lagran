@@ -394,6 +394,7 @@ no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 
 - 总开关、拦截/观察模式
 - 托管规则：SQLi、XSS、路径穿越、扫描器、RCE、SSRF、XXE、Log4Shell、CRLF、SSTI、NoSQL、LDAP 等
+- 托管规则集：OWASP 核心防护、注入扩展防护、SSRF/XXE 防护、扫描器与协议基线
 - 自定义规则：路径、Query、UA、Referer、Method、请求头、IP
 - IP 黑白名单：支持单 IP 与 CIDR
 - 安全级别：低/中/高/攻击中
@@ -416,6 +417,119 @@ WAF 检查会先做最多两次百分号解码，`%2527`、`%253Cscript%253E` �
 - 扫描器 UA、敏感路径、SQLi/XSS/路径穿越/RCE/SSRF/XXE/Log4Shell/SSTI/NoSQL/LDAP/Java 反序列化/WebShell 等托管规则
 
 WAF 目前不读取请求体（在代理读取 body 前执行），GET/HEAD 的 path/query/header 是主要检查面。
+
+托管规则集是**增量启用**：
+
+```text
+选中规则集 = 启用该规则集包含的全部签名类别
+不会关闭下方单独开启的规则
+规则集版本由控制面统一维护
+```
+
+可用接口：
+
+```http
+GET  /api/v1/waf/rulesets
+GET  /api/v1/domains/{id}/waf
+PUT  /api/v1/domains/{id}/waf
+```
+
+`PUT` 请求新增：
+
+```json
+{
+  "managed_rulesets": ["owasp-core", "injection-extended"]
+}
+```
+
+控制面保存选择后生成 Edge 有效配置：
+
+```text
+explicit category switches OR ruleset categories
+```
+
+因此规则集升级时，只要新增类别，域名会自动获得新增签名，不需要重新保存设置。
+因此规则集升级时，只要新增类别，域名会自动获得新增签名，不需要重新保存设置。
+
+### 签名规则包、缓存与灰度
+
+规则包是确定性的 JSON 文档，由 Control 使用 HMAC-SHA256 签名：
+
+```text
+WAF_RULEPACK_SECRET
+```
+
+未设置时使用内置开发默认值：
+
+```text
+lagran-dev-waf-rulepack-secret
+```
+
+生产必须显式设置 `WAF_RULEPACK_SECRET`，且 Control 与所有 Edge 完全一致；否则 Edge 会拒绝规则包并回退到配置中的有效布尔值。
+
+#### 发布与回滚
+
+```http
+GET  /api/v1/waf/rulepacks
+POST /api/v1/waf/rulepacks/publish
+POST /api/v1/waf/rulepacks/{version}/rollback
+GET  /api/v1/waf/rulepack/{version}
+```
+
+发布后：
+
+```text
+新版本 slot = active
+旧 active  = previous
+旧 previous = retired
+```
+
+回滚只切换 slot，不重新构建历史包。
+
+#### 按域名固定版本
+
+WAF 设置新增：
+
+```json
+{
+  "waf_rulepack_version": "2026.11",
+  "waf_gray_percent": 0
+}
+```
+
+- `waf_rulepack_version` 非空：该域名固定使用此版本。
+- 为空：跟随 Control 的 active 版本。
+- `waf_gray_percent`：1~99 时按 `hash(domain, active.version) % 100` 稳定切分到 active/previous。
+
+#### Edge 缓存
+
+Edge 从配置同步中获得：
+
+```text
+waf.rulepack.payload
+waf.rulepack.signature
+waf.rulepack.checksum
+```
+
+处理流程：
+
+```text
+校验 SHA-256 checksum
+校验 HMAC-SHA256 signature
+解析规则包版本
+写入本地缓存：
+  WAF_RULEPACK_CACHE_DIR/<version>.json
+  WAF_RULEPACK_CACHE_DIR/<version>.sig
+```
+
+默认目录：
+
+```text
+./data/waf-rulepacks
+```
+
+验签失败不会阻止域名继续使用 Control 已下发的有效托管布尔值，但不会写入缓存，并会记录告警日志。
+
 
 ### 3.6 缓存刷新与预热
 

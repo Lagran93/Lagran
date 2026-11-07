@@ -320,6 +320,7 @@ fn check_config(config: &EdgeConfig) -> anyhow::Result<()> {
     println!("cache_backend: {}", config.cache_backend);
     println!("redis: {}", if config.redis_url.trim().is_empty() { "disabled" } else { "configured" });
     println!("cert_dir: {}", config.cert_dir);
+    println!("waf_rulepack_cache_dir: {}", config.waf_rulepack_cache_dir);
     println!("access_log: {}", config.access_log_path.as_deref().unwrap_or("disabled"));
     println!("large_cache: {}", config.large_cache_enabled);
     Ok(())

@@ -208,7 +208,7 @@ struct DomainCfg {
 }
 
 impl DomainCfg {
-    fn into_entry(self) -> DomainEntry {
+    fn into_entry(self, config: &EdgeConfig) -> DomainEntry {
         let mut origins: Vec<crate::config::registry::OriginTarget> = if self.origins.is_empty() {
             let mut list = vec![origin_target(&self.origin)];
             if let Some(ref backup) = self.backup_origin {
@@ -270,7 +270,7 @@ impl DomainCfg {
             custom_headers: self.custom_headers,
             backup_origin_url,
             ssl_enabled: self.ssl_enabled,
-            waf: into_waf(self.waf),
+            waf: into_waf(self.waf, config),
             cc,
             signed_url_enabled: self.signed_url_enabled,
             signed_url_mode: self.signed_url_mode,
@@ -305,6 +305,10 @@ struct WafCfg {
     challenge_ttl_secs: u64,
     #[serde(default)]
     security_level: String,
+    #[serde(default)]
+    managed_rulesets: Vec<String>,
+    #[serde(default)]
+    rulepack: Option<crate::waf::rulepack::SignedRulepack>,
 }
 
 fn default_challenge_difficulty() -> u8 {
@@ -397,10 +401,66 @@ struct WafRuleCfg {
     enabled: bool,
 }
 
-fn into_waf(cfg: Option<WafCfg>) -> WafConfig {
+fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
     let Some(cfg) = cfg else {
         return WafConfig::default();
     };
+    let package = cfg.rulepack.as_ref().and_then(|pack| {
+        let secret = crate::waf::rulepack::signing_key(
+            &config.waf_rulepack_secret,
+            &config.agent_token,
+        );
+        pack.verify_and_cache(&secret, &config.waf_rulepack_cache_dir)
+    });
+    let mut managed = ManagedRules {
+        sqli: cfg.managed.sqli,
+        xss: cfg.managed.xss,
+        traversal: cfg.managed.traversal,
+        scanners: cfg.managed.scanners,
+        rce: cfg.managed.rce,
+        ssrf: cfg.managed.ssrf,
+        xxe: cfg.managed.xxe,
+        log4shell: cfg.managed.log4shell,
+        crlf: cfg.managed.crlf,
+        ssti: cfg.managed.ssti,
+        nosql: cfg.managed.nosql,
+        ldap: cfg.managed.ldap,
+        java: cfg.managed.java,
+        webshell: cfg.managed.webshell,
+        protocol: cfg.managed.protocol,
+    };
+    if let Some(package) = &package {
+        for id in &cfg.managed_rulesets {
+            let Some(entry) = package.rulesets.iter().find(|r| r.id == *id) else {
+                continue;
+            };
+            for category in &entry.categories {
+                match category.as_str() {
+                    "sqli" => managed.sqli = true,
+                    "xss" => managed.xss = true,
+                    "traversal" => managed.traversal = true,
+                    "scanners" => managed.scanners = true,
+                    "rce" => managed.rce = true,
+                    "ssrf" => managed.ssrf = true,
+                    "xxe" => managed.xxe = true,
+                    "log4shell" => managed.log4shell = true,
+                    "crlf" => managed.crlf = true,
+                    "ssti" => managed.ssti = true,
+                    "nosql" => managed.nosql = true,
+                    "ldap" => managed.ldap = true,
+                    "java" => managed.java = true,
+                    "webshell" => managed.webshell = true,
+                    "protocol" => managed.protocol = true,
+                    _ => {}
+                }
+            }
+        }
+        tracing::info!(
+            version = %package.version,
+            cache = %config.waf_rulepack_cache_dir,
+            "verified WAF rulepack"
+        );
+    }
     let rules = cfg
         .rules
         .into_iter()
@@ -436,23 +496,7 @@ fn into_waf(cfg: Option<WafCfg>) -> WafConfig {
         } else {
             WafMode::Block
         },
-        managed: ManagedRules {
-            sqli: cfg.managed.sqli,
-            xss: cfg.managed.xss,
-            traversal: cfg.managed.traversal,
-            scanners: cfg.managed.scanners,
-            rce: cfg.managed.rce,
-            ssrf: cfg.managed.ssrf,
-            xxe: cfg.managed.xxe,
-            log4shell: cfg.managed.log4shell,
-            crlf: cfg.managed.crlf,
-            ssti: cfg.managed.ssti,
-            nosql: cfg.managed.nosql,
-            ldap: cfg.managed.ldap,
-            java: cfg.managed.java,
-            webshell: cfg.managed.webshell,
-            protocol: cfg.managed.protocol,
-        },
+        managed,
         rules,
         ip_allow: parse_nets(cfg.ip_allow),
         ip_deny: parse_nets(cfg.ip_deny),
@@ -524,7 +568,7 @@ pub fn spawn_config_sync(
                         if cfg.version != last_version {
                             let release_id = cfg.release_id.clone();
                             let entries: Vec<DomainEntry> =
-                                cfg.domains.into_iter().map(DomainCfg::into_entry).collect();
+                                cfg.domains.into_iter().map(|d| d.into_entry(&config)).collect();
                             let n = entries.len();
 
                             // Any domain whose per-domain version changed must
@@ -637,7 +681,7 @@ pub fn spawn_config_sync(
                 let path = format!("/api/v1/config/{}", config.domain);
                 match control.get_json::<DomainCfg>(&path).await {
                     Ok(d) => {
-                        let entry = d.into_entry();
+                        let entry = d.into_entry(&config);
                         origin.set_base_url(entry.origin_url.clone()).await;
                         rules.replace(entry.rules.clone()).await;
                         registry.upsert(entry).await;

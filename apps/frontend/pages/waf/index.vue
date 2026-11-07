@@ -188,7 +188,94 @@
             {{ levelHint }}
           </p>
 
-          <div class="section-label">托管规则</div>
+          <div class="section-label">托管规则集</div>
+          <div class="ruleset-grid">
+            <label
+              v-for="rs in rulesets"
+              :key="rs.id"
+              class="ruleset-card"
+              :class="{ on: settings.managed_rulesets.includes(rs.id) }"
+            >
+              <input
+                type="checkbox"
+                :checked="settings.managed_rulesets.includes(rs.id)"
+                @change="toggleRuleset(rs.id)"
+              />
+              <span class="ruleset-body">
+                <span class="ruleset-head">
+                  <strong>{{ rs.name }}</strong>
+                  <span class="ruleset-version">{{ rs.version }}</span>
+                  <span v-if="rs.recommended" class="ruleset-badge">推荐</span>
+                </span>
+                <small>{{ rs.description }}</small>
+                <span class="ruleset-categories">
+                  <span v-for="(label, i) in rs.category_labels" :key="rs.categories[i]" class="ruleset-chip">
+                    {{ label }}
+                  </span>
+                </span>
+              </span>
+              <AppIcon :name="settings.managed_rulesets.includes(rs.id) ? 'check' : 'plus'" :size="15" />
+            </label>
+            <div v-if="!rulesets.length" class="text-muted" style="font-size: 13px">
+              正在加载托管规则集…
+            </div>
+          </div>
+          <p class="text-muted" style="font-size: 12px; margin-top: 8px">
+            规则集是增量启用：选中后会启用其覆盖的签名类别，不会关闭下方单独开启的规则。规则集版本由控制面统一维护。
+          </p>
+
+          <div class="section-label">规则包版本与灰度</div>
+          <div class="form-grid">
+            <div class="field">
+              <label class="field-label">规则包版本</label>
+              <select v-model="settings.waf_rulepack_version" class="select">
+                <option value="">跟随 active 版本</option>
+                <option v-for="p in rulepackVersions" :key="p.version" :value="p.version">
+                  {{ p.version }}（{{ p.slot }}）
+                </option>
+              </select>
+              <span class="field-hint">留空跟随控制面 active；固定版本可用于单域名验证/回滚。</span>
+            </div>
+            <div class="field">
+              <label class="field-label">灰度比例</label>
+              <input
+                v-model.number="settings.waf_gray_percent"
+                class="input"
+                type="number"
+                min="0"
+                max="100"
+              />
+              <span class="field-hint">0 = 全量 active；1~99 按域名稳定哈希切分到 active/previous。</span>
+            </div>
+          </div>
+
+          <div v-if="auth.isAdmin" class="rulepack-admin">
+            <div class="flex-between">
+              <span class="text-muted" style="font-size: 12px">
+                规则包由 Control 签名，Edge 验签后缓存到本地。回滚只切换 active/previous。
+              </span>
+              <button class="btn btn-default btn-sm" type="button" :disabled="rulepackBusy" @click="publishRulepack">
+                发布新版本
+              </button>
+            </div>
+            <div v-if="rulepackVersions.length" class="rulepack-versions">
+              <div v-for="p in rulepackVersions" :key="p.version" class="rulepack-version-row">
+                <span class="mono">{{ p.version }}</span>
+                <span class="text-muted">{{ p.slot }} · {{ p.created_at.slice(0, 10) }}</span>
+                <button
+                  v-if="p.slot !== 'active'"
+                  class="btn btn-text btn-sm"
+                  type="button"
+                  :disabled="rulepackBusy"
+                  @click="rollbackRulepack(p.version)"
+                >
+                  设为 active
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-label">单条托管规则</div>
           <div class="managed-grid">
             <label
               v-for="m in managedRules"
@@ -751,9 +838,15 @@ const settings = ref<any>({
   security_level: 'off',
   challenge_difficulty: 4,
   challenge_ttl_secs: 1800,
+  managed_rulesets: [] as string[],
+  waf_rulepack_version: '',
+  waf_gray_percent: 0,
 })
 
 const rules = ref<any[]>([])
+const rulesets = ref<any[]>([])
+const rulepackVersions = ref<any[]>([])
+const rulepackBusy = ref(false)
 const ips = ref<any[]>([])
 const rulePage = ref(1)
 const ipPage = ref(1)
@@ -996,6 +1089,9 @@ async function loadSettings() {
       security_level: s.security_level || 'off',
       challenge_difficulty: s.challenge_difficulty || 4,
       challenge_ttl_secs: s.challenge_ttl_secs || 1800,
+      managed_rulesets: Array.isArray(s.managed_rulesets) ? s.managed_rulesets : [],
+      waf_rulepack_version: s.waf_rulepack_version || '',
+      waf_gray_percent: s.waf_gray_percent ?? 0,
     }
   } catch {
     settings.value = {
@@ -1013,8 +1109,52 @@ async function loadSettings() {
       security_level: 'off',
       challenge_difficulty: 4,
       challenge_ttl_secs: 1800,
+      managed_rulesets: [],
+      waf_rulepack_version: '',
+      waf_gray_percent: 0,
     }
   }
+}
+
+async function loadRulesets() {
+  rulesets.value = (await api.get<any[]>('/api/v1/waf/rulesets').catch(() => [])) || []
+}
+
+async function loadRulepacks() {
+  rulepackVersions.value = (await api.get<any[]>('/api/v1/waf/rulepacks').catch(() => [])) || []
+}
+
+async function publishRulepack() {
+  rulepackBusy.value = true
+  try {
+    await api.post('/api/v1/waf/rulepacks/publish', {})
+    toast.success('新规则包已发布并签名')
+    await loadRulepacks()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '发布失败')
+  } finally {
+    rulepackBusy.value = false
+  }
+}
+
+async function rollbackRulepack(version: string) {
+  rulepackBusy.value = true
+  try {
+    await api.post(`/api/v1/waf/rulepacks/${version}/rollback`, {})
+    toast.success(`规则包已切换到 ${version}`)
+    await loadRulepacks()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '回滚失败')
+  } finally {
+    rulepackBusy.value = false
+  }
+}
+
+function toggleRuleset(id: string) {
+  const selected = settings.value.managed_rulesets || []
+  settings.value.managed_rulesets = selected.includes(id)
+    ? selected.filter((item: string) => item !== id)
+    : [...selected, id]
 }
 
 async function loadRules() {
@@ -1161,6 +1301,8 @@ async function reload() {
   loading.value = true
   try {
     await loadDomains()
+    await loadRulesets()
+    await loadRulepacks()
     await Promise.all([loadSettings(), loadRules(), loadIps(), loadBans()])
     if (tab.value === 'events') await loadEvents()
     if (tab.value === 'overview') await loadStats()
@@ -1205,6 +1347,9 @@ async function saveSettings() {
       security_level: s.security_level || 'off',
       challenge_difficulty: s.challenge_difficulty || 4,
       challenge_ttl_secs: s.challenge_ttl_secs || 1800,
+      managed_rulesets: Array.isArray(s.managed_rulesets) ? s.managed_rulesets : [],
+      waf_rulepack_version: s.waf_rulepack_version || '',
+      waf_gray_percent: s.waf_gray_percent ?? 0,
     }
     toast.success('WAF 设置已保存，边缘约 15 秒内同步')
   } catch (e: any) {
@@ -1607,8 +1752,138 @@ onMounted(reload)
   color: var(--brand);
 }
 
+/* managed rulesets */
+.ruleset-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.ruleset-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.ruleset-card:hover {
+  border-color: var(--border-strong);
+}
+
+.ruleset-card.on {
+  border-color: var(--brand-bg-strong);
+  background: var(--brand-bg);
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.06);
+}
+
+.ruleset-card input {
+  margin-top: 3px;
+  accent-color: var(--brand);
+}
+
+.ruleset-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.ruleset-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ruleset-head strong {
+  font-size: 13.5px;
+  color: var(--text);
+}
+
+.ruleset-version {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ruleset-badge {
+  font-size: 11px;
+  line-height: 18px;
+  padding: 0 7px;
+  border-radius: 9px;
+  color: var(--brand);
+  background: var(--brand-bg);
+}
+
+.ruleset-body small {
+  display: block;
+  margin-top: 5px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+.ruleset-categories {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 9px;
+}
+
+.ruleset-chip {
+  font-size: 11px;
+  line-height: 20px;
+  padding: 0 7px;
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text-2);
+}
+
+.ruleset-card .app-icon {
+  color: var(--text-4);
+}
+
+.ruleset-card.on .app-icon {
+  color: var(--brand);
+}
+
+/* rulepack version / rollout */
+.rulepack-admin {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.rulepack-versions {
+  margin-top: 10px;
+  border-top: 1px solid var(--divider);
+}
+
+.rulepack-version-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.rulepack-version-row:last-child {
+  border-bottom: 0;
+}
+
+.rulepack-version-row .btn {
+  margin-left: auto;
+}
+
 @media (max-width: 900px) {
-  .managed-grid {
+  .managed-grid,
+  .ruleset-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }

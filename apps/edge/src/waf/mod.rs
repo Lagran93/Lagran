@@ -10,6 +10,8 @@
 //! and CDN traffic is dominated by GET/HEAD. Managed checks cover the
 //! path/query/UA/referer, which is where most automated attacks show up.
 
+pub mod rulepack;
+
 use axum::http::HeaderMap;
 use std::net::IpAddr;
 

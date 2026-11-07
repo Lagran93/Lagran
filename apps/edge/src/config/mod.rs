@@ -49,12 +49,16 @@ pub struct EdgeConfig {
     pub domain: String,
     pub access_log_path: Option<String>,
     pub agent_token: String,
+    /// HMAC secret for signed WAF rulepacks (empty = AGENT_TOKEN fallback).
+    pub waf_rulepack_secret: String,
     pub access_log_json: bool,
     pub access_log_buffer: usize,
     pub access_log_report: bool,
     pub access_log_report_interval_secs: u64,
     /// Directory to persist TLS certs across restarts
     pub cert_dir: String,
+    /// Directory to cache verified signed WAF rulepacks.
+    pub waf_rulepack_cache_dir: String,
     /// Trust `X-Forwarded-For` for the client IP (only behind a trusted proxy).
     pub trust_proxy_headers: bool,
     /// Ship WAF events to the control plane.
@@ -178,6 +182,7 @@ impl Default for EdgeConfig {
             agent_token: env_nonempty("AGENT_TOKEN")
                 .or_else(|| env_nonempty("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
+            waf_rulepack_secret: env_nonempty("WAF_RULEPACK_SECRET").unwrap_or_default(),
             access_log_json: std::env::var("ACCESS_LOG_JSON")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -193,6 +198,8 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
             cert_dir: std::env::var("CERT_DIR").unwrap_or_else(|_| "./data/certs".into()),
+            waf_rulepack_cache_dir: std::env::var("WAF_RULEPACK_CACHE_DIR")
+                .unwrap_or_else(|_| "./data/waf-rulepacks".into()),
             trust_proxy_headers: bool_env("TRUST_PROXY_HEADERS", false),
             waf_report: bool_env("WAF_REPORT", true),
             waf_report_interval_secs: std::env::var("WAF_REPORT_INTERVAL")

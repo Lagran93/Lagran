@@ -2607,6 +2607,9 @@ pub struct WafSettingsRow {
     pub challenge_difficulty: i32,
     pub challenge_ttl_secs: i32,
     pub security_level: String,
+    pub managed_rulesets: String,
+    pub waf_rulepack_version: String,
+    pub waf_gray_percent: i32,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -2657,7 +2660,10 @@ pub async fn get_waf_settings(
         SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
                rce, ssrf, xxe, log4shell, crlf,
                ssti, nosql, ldap, java, webshell, protocol,
-               challenge_difficulty, challenge_ttl_secs, security_level
+               challenge_difficulty, challenge_ttl_secs, security_level,
+               COALESCE(managed_rulesets, '') AS managed_rulesets,
+               COALESCE(waf_rulepack_version, '') AS waf_rulepack_version,
+               COALESCE(waf_gray_percent, 0) AS waf_gray_percent
         FROM waf_settings WHERE domain_id = $1
         "#,
     )
@@ -2690,6 +2696,9 @@ pub async fn upsert_waf_settings(
     challenge_difficulty: i32,
     challenge_ttl_secs: i32,
     security_level: &str,
+    managed_rulesets: &str,
+    waf_rulepack_version: &str,
+    waf_gray_percent: i32,
 ) -> sqlx::Result<WafSettingsRow> {
     sqlx::query_as::<_, WafSettingsRow>(
         r#"
@@ -2697,9 +2706,10 @@ pub async fn upsert_waf_settings(
             (domain_id, enabled, mode, sqli, xss, traversal, scanners,
              rce, ssrf, xxe, log4shell, crlf,
              ssti, nosql, ldap, java, webshell, protocol,
-             challenge_difficulty, challenge_ttl_secs, security_level)
+             challenge_difficulty, challenge_ttl_secs, security_level,
+             managed_rulesets, waf_rulepack_version, waf_gray_percent)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
         ON CONFLICT (domain_id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
           mode = EXCLUDED.mode,
@@ -2721,11 +2731,15 @@ pub async fn upsert_waf_settings(
           challenge_difficulty = EXCLUDED.challenge_difficulty,
           challenge_ttl_secs = EXCLUDED.challenge_ttl_secs,
           security_level = EXCLUDED.security_level,
+          managed_rulesets = EXCLUDED.managed_rulesets,
+          waf_rulepack_version = EXCLUDED.waf_rulepack_version,
+          waf_gray_percent = EXCLUDED.waf_gray_percent,
           updated_at = NOW()
         RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners,
                   rce, ssrf, xxe, log4shell, crlf,
                   ssti, nosql, ldap, java, webshell, protocol,
-                  challenge_difficulty, challenge_ttl_secs, security_level
+                  challenge_difficulty, challenge_ttl_secs, security_level,
+                  managed_rulesets, waf_rulepack_version, waf_gray_percent
         "#,
     )
     .bind(domain_id)
@@ -2749,6 +2763,9 @@ pub async fn upsert_waf_settings(
     .bind(challenge_difficulty)
     .bind(challenge_ttl_secs)
     .bind(security_level)
+    .bind(managed_rulesets)
+    .bind(waf_rulepack_version)
+    .bind(waf_gray_percent)
     .fetch_one(pool)
     .await
 }
@@ -2759,7 +2776,10 @@ pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSetting
         SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
                rce, ssrf, xxe, log4shell, crlf,
                ssti, nosql, ldap, java, webshell, protocol,
-               challenge_difficulty, challenge_ttl_secs, security_level
+               challenge_difficulty, challenge_ttl_secs, security_level,
+               COALESCE(managed_rulesets, '') AS managed_rulesets,
+               COALESCE(waf_rulepack_version, '') AS waf_rulepack_version,
+               COALESCE(waf_gray_percent, 0) AS waf_gray_percent
         FROM waf_settings
         "#,
     )

@@ -11,4 +11,6 @@ pub mod service;
 pub mod state;
 pub mod utils;
 
+pub mod waf_rulepack;
+pub mod waf_rulesets;
 pub mod version;
