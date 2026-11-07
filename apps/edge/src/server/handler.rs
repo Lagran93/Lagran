@@ -276,6 +276,31 @@ async fn proxy_handler_inner(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
+    if let Err(violation) = crate::security::header_guard::validate(
+        &headers,
+        req.uri(),
+        &method,
+        req.version(),
+    ) {
+        log_access(
+            &state.access_log,
+            &method,
+            &host,
+            &path_only,
+            400,
+            start,
+            &client_ip,
+            &user_agent,
+            &referer,
+            0,
+            CacheStatus::Bypass.as_str(),
+            &request_id,
+        )
+        .await;
+        tracing::warn!(reason = violation.reason, "request header rejected");
+        return (StatusCode::BAD_REQUEST, "bad request headers").into_response();
+    }
+
     // A node disabled from the console stops serving traffic but keeps its
     // management endpoints (health, heartbeat, purge) reachable.
     if !state.node_control.is_serving() {

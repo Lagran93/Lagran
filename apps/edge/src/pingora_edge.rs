@@ -24,6 +24,7 @@ use crate::server::handler::{
 use crate::server::pipeline::{RequestFacts, RequestPipeline};
 use crate::server::native_cache::{leak_storage_with_large, NativeStorage, META_HEADER};
 use crate::server::purge;
+use crate::security::header_guard;
 use crate::security::signed_url;
 use async_trait::async_trait;
 use axum::body::Body;
@@ -263,6 +264,25 @@ impl ProxyHttp for DataPlaneProxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+
+        if let Err(violation) = header_guard::validate(
+            &req.headers,
+            &req.uri,
+            &ctx.method,
+            req.version,
+        ) {
+            ctx.cache_label = "BYPASS";
+            ctx.cache_reason = Some(violation.reason);
+            ctx.status = 400;
+            write_plain(
+                session,
+                400,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"bad request headers"),
+            )
+            .await;
+            return Ok(true);
+        }
 
         let path = ctx.path.clone();
         let is_https = session

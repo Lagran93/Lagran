@@ -895,6 +895,47 @@ curl -X POST https://console.example.com/api/v1/domains/<id>/signed-url/rotate \
 - 域名开启签名后，管理接口、健康检查和 ACME 不受影响。
 - Edge 必须与控制面配置版本同步后生效；密钥变更会触发该域名缓存失效。
 
+### 4.3.3 Header 规范化与请求走私防护
+
+Edge 在进入 WAF、缓存和源站之前会校验原始请求头，异常请求直接返回 `400`，不会回源。
+
+拒绝的条件：
+
+```text
+Content-Length 与 Transfer-Encoding 同时存在
+多个 Content-Length
+Content-Length 包含逗号、符号、空白或非数字
+多个 Transfer-Encoding
+Transfer-Encoding 不是唯一的 chunked
+多个 Host
+Host 为空、含空白/控制字符或非法字符
+绝对 URI 的 authority 与 Host 不一致
+Connection 头把 content-length / transfer-encoding 列为 hop-by-hop
+HTTP/2 出现 connection / proxy-connection / keep-alive / upgrade / transfer-encoding
+请求头数量超过 128
+请求头总字节超过 64 KiB
+Header 值包含 CR/LF、NUL 或其他非法控制字符
+```
+
+请求头名称由 `http::HeaderMap` 统一规范化；危险重复头直接拒绝，避免不同跳对 header 的合并/解释差异被利用。
+
+日志会记录：
+
+```text
+status=400
+cache_status=BYPASS
+reason=cl-...
+```
+
+具体 reason 不包含攻击者可控内容。
+
+适用于：
+
+```text
+Pingora 公共入口
+legacy 兜底入口
+```
+
 ### 4.4 DNS 关键变量
 
 | 变量 | 说明 |
