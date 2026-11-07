@@ -128,6 +128,9 @@ pub struct DomainConfigResponse {
     pub signed_url_secret: String,
     pub signed_url_previous_secret: String,
     pub signed_url_ttl_secs: u32,
+    pub origin_auth_header: String,
+    pub origin_auth_value: String,
+    pub hotlink_signature_enabled: bool,
     pub backup_origin: Option<OriginConfig>,
     pub origins: Vec<OriginConfig>,
     pub waf: Option<WafConfigOut>,
@@ -415,6 +418,9 @@ pub(crate) fn build(
     row.signed_url_secret.hash(&mut h);
     row.signed_url_previous_secret.hash(&mut h);
     row.signed_url_ttl_secs.hash(&mut h);
+    row.origin_auth_header.hash(&mut h);
+    row.origin_auth_value.hash(&mut h);
+    row.hotlink_signature_enabled.hash(&mut h);
 
     DomainConfigResponse {
         domain: row.name.clone(),
@@ -440,6 +446,9 @@ pub(crate) fn build(
         signed_url_secret: row.signed_url_secret.clone(),
         signed_url_previous_secret: row.signed_url_previous_secret.clone(),
         signed_url_ttl_secs: row.signed_url_ttl_secs.max(0) as u32,
+        origin_auth_header: row.origin_auth_header.clone(),
+        origin_auth_value: row.origin_auth_value.clone(),
+        hotlink_signature_enabled: row.hotlink_signature_enabled,
         backup_origin: backup,
         origins,
         waf,

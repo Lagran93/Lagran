@@ -804,6 +804,9 @@ pub struct SettingsRequest {
     pub signed_url_secret: Option<String>,
     pub signed_url_previous_secret: Option<String>,
     pub signed_url_ttl_secs: Option<u32>,
+    pub origin_auth_header: Option<String>,
+    pub origin_auth_value: Option<String>,
+    pub hotlink_signature_enabled: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -829,6 +832,9 @@ pub struct SettingsDto {
     pub signed_url_secret: String,
     pub signed_url_previous_secret: String,
     pub signed_url_ttl_secs: u32,
+    pub origin_auth_header: String,
+    pub origin_auth_value: String,
+    pub hotlink_signature_enabled: bool,
 }
 
 fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
@@ -862,6 +868,9 @@ fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
         signed_url_secret: s.signed_url_secret,
         signed_url_previous_secret: s.signed_url_previous_secret,
         signed_url_ttl_secs: s.signed_url_ttl_secs.max(0) as u32,
+        origin_auth_header: s.origin_auth_header,
+        origin_auth_value: s.origin_auth_value,
+        hotlink_signature_enabled: s.hotlink_signature_enabled,
     }
 }
 
@@ -1065,7 +1074,8 @@ pub async fn create_signed_url(
     } else {
         settings.signed_url_mode.as_str()
     };
-    if mode == "off" || !signed_path_protected(mode, &settings.signed_url_paths, &path) {
+    let hotlink_only = settings.hotlink_signature_enabled;
+    if !hotlink_only && (mode == "off" || !signed_path_protected(mode, &settings.signed_url_paths, &path)) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
@@ -1314,6 +1324,45 @@ pub async fn put_settings(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "update signed url settings");
+            db_error()
+        })?;
+    }
+
+    let security_requested = req.origin_auth_header.is_some()
+        || req.origin_auth_value.is_some()
+        || req.hotlink_signature_enabled.is_some();
+    if security_requested {
+        if req.hotlink_signature_enabled == Some(true) {
+            let settings = repository::get_domain_settings(&state.pool, &domain_name)
+                .await
+                .map_err(|_| db_error())?
+                .ok_or_else(|| not_found(&id))?;
+            if settings.signed_url_secret.is_empty() {
+                let secret = generate_secret();
+                repository::update_domain_signed_url(
+                    &state.pool,
+                    uid,
+                    None,
+                    None,
+                    None,
+                    Some(&secret),
+                    None,
+                    Some(settings.signed_url_ttl_secs),
+                )
+                .await
+                .map_err(|_| db_error())?;
+            }
+        }
+        repository::update_domain_security(
+            &state.pool,
+            uid,
+            req.origin_auth_header.as_deref().map(str::trim),
+            req.origin_auth_value.as_deref().map(str::trim),
+            req.hotlink_signature_enabled,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "update domain security");
             db_error()
         })?;
     }

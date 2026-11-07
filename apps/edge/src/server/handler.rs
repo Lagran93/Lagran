@@ -107,6 +107,8 @@ struct Effective {
     ignore_query: bool,
     cors: String,
     custom_headers: String,
+    origin_auth_header: String,
+    origin_auth_value: String,
     timeout_ms: u64,
 }
 
@@ -382,6 +384,8 @@ async fn proxy_handler_inner(
                 ignore_query: policy.ignore_query.unwrap_or(e.ignore_query_string),
                 cors: e.cors_origins.clone(),
                 custom_headers: e.custom_headers.clone(),
+                origin_auth_header: e.origin_auth_header.clone(),
+                origin_auth_value: e.origin_auth_value.clone(),
                 timeout_ms: u64::from(if e.origin_timeout_ms == 0 {
                     10_000
                 } else {
@@ -409,6 +413,8 @@ async fn proxy_handler_inner(
                 method: method.clone(),
                 cors: String::new(),
                 custom_headers: String::new(),
+                origin_auth_header: String::new(),
+                origin_auth_value: String::new(),
                 timeout_ms: 10_000,
             }
         }
@@ -430,6 +436,7 @@ async fn proxy_handler_inner(
         if let Some(resp) = pipeline.preflight(domain, &facts).await {
             return resp;
         }
+        headers.remove(crate::security::signed_url::HOTLINK_OK_HEADER);
     }
 
     // NOTE: origin health is checked where an origin fetch is actually needed
@@ -438,6 +445,11 @@ async fn proxy_handler_inner(
 
     // WebSocket upgrade → handshake with origin, then raw byte tunnel.
     if websocket::is_websocket_upgrade(&headers) {
+        crate::security::origin_auth::apply(
+            &mut headers,
+            &eff.origin_auth_header,
+            &eff.origin_auth_value,
+        );
         let ws_origin = origin_sequence(&state, &host, &eff)
             .await
             .first()
@@ -921,6 +933,11 @@ async fn bypass_to_origin(
                 headers.insert(header::HOST, value);
             }
         }
+        crate::security::origin_auth::apply(
+            &mut headers,
+            &eff.origin_auth_header,
+            &eff.origin_auth_value,
+        );
         let path = path_and_query.to_string();
         let body = body.clone();
         let max_body = state.max_cacheable_body;
@@ -1137,6 +1154,11 @@ async fn bypass_to_origin_streaming(
                 target_headers.insert(header::HOST, value);
             }
         }
+        crate::security::origin_auth::apply(
+            &mut target_headers,
+            &eff.origin_auth_header,
+            &eff.origin_auth_value,
+        );
         let attempt = tokio::time::timeout(
             header_timeout,
             state.origin.request_stream_with_sni(
@@ -1808,6 +1830,8 @@ fn spawn_revalidation(
             ignore_query: false,
             cors: String::new(),
             custom_headers: String::new(),
+            origin_auth_header: String::new(),
+            origin_auth_value: String::new(),
             timeout_ms,
         };
         match fetch_origin(&state, &eff, &host, &path_and_query, &headers, &Method::GET).await {
@@ -2608,7 +2632,11 @@ pub(crate) async fn preflight_cacheable(
         }
     }
 
-    if !domain.hotlink_allow_referers.is_empty()
+    let hotlink_signature_ok = headers
+        .get(crate::security::signed_url::HOTLINK_OK_HEADER)
+        .is_some_and(|v| v == "1");
+    if !hotlink_signature_ok
+        && (domain.hotlink_signature_enabled || !domain.hotlink_allow_referers.is_empty())
         && !hotlink_allowed(&domain.hotlink_allow_referers, &referer)
     {
         log_access(

@@ -195,6 +195,11 @@ pub fn spawn_origin_health(
                             headers.insert(header::HOST, value);
                         }
                     }
+                    crate::security::origin_auth::apply(
+                        &mut headers,
+                        &entry.origin_auth_header,
+                        &entry.origin_auth_value,
+                    );
                     let sni = target.and_then(|o| o.sni.as_deref());
                     let result = origin
                         .fetch_from_with_sni(&url, "/", &headers, sni)

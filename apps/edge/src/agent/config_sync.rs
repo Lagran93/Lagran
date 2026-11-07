@@ -191,6 +191,12 @@ struct DomainCfg {
     #[serde(default)]
     signed_url_ttl_secs: u32,
     #[serde(default)]
+    origin_auth_header: String,
+    #[serde(default)]
+    origin_auth_value: String,
+    #[serde(default)]
+    hotlink_signature_enabled: bool,
+    #[serde(default)]
     backup_origin: Option<OriginCfg>,
     #[serde(default)]
     origins: Vec<OriginCfg>,
@@ -272,6 +278,9 @@ impl DomainCfg {
             signed_url_secret: self.signed_url_secret,
             signed_url_previous_secret: self.signed_url_previous_secret,
             signed_url_ttl_secs: self.signed_url_ttl_secs,
+            origin_auth_header: self.origin_auth_header,
+            origin_auth_value: self.origin_auth_value,
+            hotlink_signature_enabled: self.hotlink_signature_enabled,
         }
     }
 }

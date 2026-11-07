@@ -18,13 +18,14 @@ use crate::server::cert_store::CertStore;
 use crate::server::challenge;
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::handler::{
-    apply_browser_ttl, apply_cors_and_custom, apply_security_headers, log_access,
-    policy_browser_ttl, proxy_handler, AppState,
+    apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed,
+    log_access, policy_browser_ttl, proxy_handler, AppState,
 };
 use crate::server::pipeline::{RequestFacts, RequestPipeline};
 use crate::server::native_cache::{leak_storage_with_large, NativeStorage, META_HEADER};
 use crate::server::purge;
 use crate::security::header_guard;
+use crate::security::origin_auth;
 use crate::security::signed_url;
 use async_trait::async_trait;
 use axum::body::Body;
@@ -359,38 +360,85 @@ impl ProxyHttp for DataPlaneProxy {
             return self.handle_management(session, &path).await;
         }
 
+        // The hotlink marker is internal; never trust a client-supplied value.
+        session
+            .req_header_mut()
+            .remove_header(signed_url::HOTLINK_OK_HEADER);
+
         // WebSocket is intentionally legacy-only: Pingora's HTTP proxy does
         // not tunnel upgraded connections on this path.
         if let Some(domain) = self.state.domains.get(&ctx.host).await {
-            if domain.signed_url_enabled {
+            let mut signed_verified = false;
+            let mode = signed_url::effective_mode(&domain);
+            if mode != "off" {
                 let uri = session.req_header().uri.clone();
-                match signed_url::verify(
-                    &domain,
-                    ctx.method.as_str(),
-                    &ctx.host,
-                    &uri,
-                    signed_url::now_epoch_secs(),
-                ) {
-                    Ok(verified) => {
-                        // Signature parameters must not enter the cache key or
-                        // the origin request, otherwise every signed URL creates
-                        // a separate cache object.
-                        session.req_header_mut().set_uri(verified.uri);
-                    }
-                    Err(e) => {
-                        ctx.cache_label = "BYPASS";
-                        ctx.cache_reason = Some(e.reason());
-                        ctx.status = 403;
-                        write_plain(
-                            session,
-                            403,
-                            "text/plain; charset=utf-8",
-                            Bytes::from_static(b"invalid or expired signed url"),
-                        )
-                        .await;
-                        return Ok(true);
+                let protected = signed_url::normalize_path(uri.path())
+                    .map(|path| signed_url::path_protected(&domain, &path))
+                    .unwrap_or(true);
+                if protected {
+                    match signed_url::verify(
+                        &domain,
+                        ctx.method.as_str(),
+                        &ctx.host,
+                        &uri,
+                        signed_url::now_epoch_secs(),
+                    ) {
+                        Ok(verified) => {
+                            // Signature parameters must not enter the cache key
+                            // or the origin request, otherwise every signed URL
+                            // creates a separate cache object.
+                            session.req_header_mut().set_uri(verified.uri);
+                            signed_verified = true;
+                        }
+                        Err(e) => {
+                            ctx.cache_label = "BYPASS";
+                            ctx.cache_reason = Some(e.reason());
+                            ctx.status = 403;
+                            write_plain(
+                                session,
+                                403,
+                                "text/plain; charset=utf-8",
+                                Bytes::from_static(b"invalid or expired signed url"),
+                            )
+                            .await;
+                            return Ok(true);
+                        }
                     }
                 }
+            }
+
+            if domain.hotlink_signature_enabled && !signed_verified {
+                let referer = session
+                    .req_header()
+                    .headers
+                    .get("referer")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if !hotlink_allowed(&domain.hotlink_allow_referers, referer) {
+                    let mut auth = (*domain).clone();
+                    auth.signed_url_enabled = true;
+                    auth.signed_url_mode = "all".to_string();
+                    auth.signed_url_paths.clear();
+                    let uri = session.req_header().uri.clone();
+                    if let Ok(verified) = signed_url::verify(
+                        &auth,
+                        ctx.method.as_str(),
+                        &ctx.host,
+                        &uri,
+                        signed_url::now_epoch_secs(),
+                    ) {
+                        session.req_header_mut().set_uri(verified.uri);
+                        let _ = session
+                            .req_header_mut()
+                            .insert_header(signed_url::HOTLINK_OK_HEADER, "1");
+                    }
+                }
+            }
+
+            if signed_verified {
+                let _ = session
+                    .req_header_mut()
+                    .insert_header(signed_url::HOTLINK_OK_HEADER, "1");
             }
         }
 
@@ -719,6 +767,7 @@ impl ProxyHttp for DataPlaneProxy {
         upstream_request: &mut pingora::http::RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        upstream_request.remove_header(signed_url::HOTLINK_OK_HEADER);
         if let Some(plan) = ctx.plan.as_ref() {
             // Keep HTTP Host aligned with the peer actually selected.
             let host = if !ctx.current_host_header.is_empty() {
@@ -731,6 +780,16 @@ impl ProxyHttp for DataPlaneProxy {
                 plan.origin_host.clone()
             };
             upstream_request.insert_header("host", host.as_str())?;
+            if !plan.domain.origin_auth_header.trim().is_empty()
+                && !plan.domain.origin_auth_value.trim().is_empty()
+            {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(plan.domain.origin_auth_header.trim().as_bytes()),
+                    HeaderValue::from_str(plan.domain.origin_auth_value.trim()),
+                ) {
+                    upstream_request.insert_header(name, value)?;
+                }
+            }
             if plan.cacheable || plan.is_head {
                 for name in [
                     "authorization",
@@ -1314,6 +1373,11 @@ impl DataPlaneProxy {
                 headers.insert(axum::http::header::HOST, value);
             }
         }
+        origin_auth::apply(
+            &mut headers,
+            &plan.domain.origin_auth_header,
+            &plan.domain.origin_auth_value,
+        );
         if let Some(etag) = etag {
             if let Ok(value) = HeaderValue::from_str(&etag) {
                 headers.insert("if-none-match", value);
@@ -1437,6 +1501,11 @@ impl DataPlaneProxy {
                 headers.insert(axum::http::header::HOST, value);
             }
         }
+        origin_auth::apply(
+            &mut headers,
+            &plan.domain.origin_auth_header,
+            &plan.domain.origin_auth_value,
+        );
         if use_etag {
             if let Some(etag) = etag.as_deref() {
                 if let Ok(value) = HeaderValue::from_str(etag) {

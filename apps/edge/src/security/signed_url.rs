@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const EXPIRES_PARAM: &str = "expires";
 pub const SIGNATURE_PARAM: &str = "signature";
 pub const SIG_PARAM: &str = "sig";
+pub const HOTLINK_OK_HEADER: &str = "x-lagran-hotlink-ok";
 const CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_TTL_SECS: u64 = 3600;
 

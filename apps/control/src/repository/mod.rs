@@ -1837,6 +1837,12 @@ pub struct DomainSettingsRow {
     pub signed_url_previous_secret: String,
     #[sqlx(default)]
     pub signed_url_ttl_secs: i32,
+    #[sqlx(default)]
+    pub origin_auth_header: String,
+    #[sqlx(default)]
+    pub origin_auth_value: String,
+    #[sqlx(default)]
+    pub hotlink_signature_enabled: bool,
 }
 
 pub async fn get_domain_settings(
@@ -1854,7 +1860,10 @@ pub async fn get_domain_settings(
                COALESCE(signed_url_paths, '') AS signed_url_paths,
                COALESCE(signed_url_secret, '') AS signed_url_secret,
                COALESCE(signed_url_previous_secret, '') AS signed_url_previous_secret,
-               COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs
+               COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs,
+               COALESCE(origin_auth_header, '') AS origin_auth_header,
+               COALESCE(origin_auth_value, '') AS origin_auth_value,
+               COALESCE(hotlink_signature_enabled, FALSE) AS hotlink_signature_enabled
         FROM domains WHERE name = $1
         "#,
     )
@@ -1988,6 +1997,32 @@ pub async fn update_domain_signed_url(
     .bind(secret)
     .bind(previous_secret)
     .bind(ttl_secs.map(|v| v.clamp(0, 86_400)))
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn update_domain_security(
+    pool: &PgPool,
+    id: Uuid,
+    origin_auth_header: Option<&str>,
+    origin_auth_value: Option<&str>,
+    hotlink_signature_enabled: Option<bool>,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE domains SET
+          origin_auth_header = COALESCE($2, origin_auth_header),
+          origin_auth_value = COALESCE($3, origin_auth_value),
+          hotlink_signature_enabled = COALESCE($4, hotlink_signature_enabled),
+          updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(origin_auth_header)
+    .bind(origin_auth_value)
+    .bind(hotlink_signature_enabled)
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
@@ -2466,6 +2501,12 @@ pub struct DomainFullRow {
     #[sqlx(default)]
     pub signed_url_ttl_secs: i32,
     #[sqlx(default)]
+    pub origin_auth_header: String,
+    #[sqlx(default)]
+    pub origin_auth_value: String,
+    #[sqlx(default)]
+    pub hotlink_signature_enabled: bool,
+    #[sqlx(default)]
     pub published_version_id: Option<Uuid>,
 }
 
@@ -2484,6 +2525,9 @@ pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>
                COALESCE(signed_url_secret, '') AS signed_url_secret,
                COALESCE(signed_url_previous_secret, '') AS signed_url_previous_secret,
                COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs,
+               COALESCE(origin_auth_header, '') AS origin_auth_header,
+               COALESCE(origin_auth_value, '') AS origin_auth_value,
+               COALESCE(hotlink_signature_enabled, FALSE) AS hotlink_signature_enabled,
                published_version_id
         FROM domains
         ORDER BY name
@@ -2511,6 +2555,9 @@ pub async fn get_domain_full_by_name(
                COALESCE(signed_url_secret, '') AS signed_url_secret,
                COALESCE(signed_url_previous_secret, '') AS signed_url_previous_secret,
                COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs,
+               COALESCE(origin_auth_header, '') AS origin_auth_header,
+               COALESCE(origin_auth_value, '') AS origin_auth_value,
+               COALESCE(hotlink_signature_enabled, FALSE) AS hotlink_signature_enabled,
                published_version_id
         FROM domains WHERE name = $1
         "#,

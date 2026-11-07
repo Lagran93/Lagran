@@ -346,6 +346,26 @@
             placeholder="example.com,*.example.com（留空关闭）" />
         </div>
 
+        <div class="form-grid">
+          <div class="field">
+            <label class="field-label">回源鉴权 Header</label>
+            <input v-model="settings.origin_auth_header" class="input" placeholder="例如 x-origin-token" />
+          </div>
+          <div class="field">
+            <label class="field-label">回源鉴权值</label>
+            <input v-model="settings.origin_auth_value" class="input" type="password" placeholder="仅 Edge 与源站知道" />
+          </div>
+        </div>
+        <div class="field">
+          <label class="field-label">防盗链签名</label>
+          <label class="switch" :class="{ on: settings.hotlink_signature_enabled }">
+            <span class="switch-track" />
+            <input v-model="settings.hotlink_signature_enabled" type="checkbox" style="display: none" />
+            使用签名 URL 密钥绕过 Referer 防盗链
+          </label>
+          <span class="field-hint">开启后，Referer 不在白名单时必须携带同一套 expires+sig；公开资源不受影响。</span>
+        </div>
+
         <div class="field">
           <label class="field-label">签名 URL 防护</label>
           <select v-model="settings.signed_url_mode" class="select">
@@ -542,6 +562,9 @@ const settings = ref({
   signed_url_secret: '',
   signed_url_previous_secret: '',
   signed_url_ttl_secs: 3600,
+  origin_auth_header: '',
+  origin_auth_value: '',
+  hotlink_signature_enabled: false,
 })
 
 const filtered = computed(() => {
@@ -819,6 +842,9 @@ async function openSettings(d: any) {
       signed_url_secret: s.signed_url_secret || '',
       signed_url_previous_secret: s.signed_url_previous_secret || '',
       signed_url_ttl_secs: s.signed_url_ttl_secs ?? 3600,
+      origin_auth_header: s.origin_auth_header || '',
+      origin_auth_value: s.origin_auth_value || '',
+      hotlink_signature_enabled: !!s.hotlink_signature_enabled,
     }
   } catch {
     toast.error('读取高级设置失败，已使用默认值')

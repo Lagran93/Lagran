@@ -936,6 +936,83 @@ Pingora 公共入口
 legacy 兜底入口
 ```
 
+### 4.3.4 Origin 鉴权与防盗链签名
+
+域名高级设置支持：
+
+```text
+origin_auth_header
+origin_auth_value
+hotlink_signature_enabled
+```
+
+## Origin 鉴权
+
+配置：
+
+```text
+origin_auth_header = x-origin-token
+origin_auth_value  = 仅 Edge 与源站知道的密钥
+```
+
+Edge 在回源请求中自动注入该 Header：
+
+```text
+x-origin-token: <value>
+```
+
+该 Header：
+
+```text
+不返回给客户端
+不进入缓存 key
+适用于 Pingora 原生回源、legacy 回源、条件回源、大对象回源和源站健康探测
+```
+
+源站需要校验该 Header 后才返回内容，避免绕过 CDN 直连源站。
+
+## 防盗链签名
+
+开启：
+
+```text
+hotlink_signature_enabled = true
+```
+
+复用签名 URL 的：
+
+```text
+signed_url_secret
+expires
+sig / signature
+```
+
+判定顺序：
+
+```text
+Referer 命中 hotlink_allow_referers
+→ 直接放行
+
+Referer 未命中或为空
+→ 要求 expires + sig 有效
+
+签名有效
+→ 放行
+
+签名缺失或无效
+→ 403
+```
+
+生成方式与控制面签名 URL 相同：
+
+```http
+POST /api/v1/domains/{id}/signed-url
+```
+
+即使 `signed_url_mode=off`，开启防盗链签名后仍可生成签名 URL。
+
+签名参数在验签后移除，不进入缓存 key 或源站请求。
+
 ### 4.4 DNS 关键变量
 
 | 变量 | 说明 |

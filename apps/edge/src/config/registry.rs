@@ -82,6 +82,11 @@ pub struct DomainEntry {
     pub signed_url_previous_secret: String,
     /// Maximum allowed link lifetime; 0 means the default (1 hour).
     pub signed_url_ttl_secs: u32,
+    /// Static header injected into origin requests (empty = disabled).
+    pub origin_auth_header: String,
+    pub origin_auth_value: String,
+    /// Accept the same HMAC-signed URL as a hotlink bypass.
+    pub hotlink_signature_enabled: bool,
 }
 
 #[derive(Clone, Default)]
@@ -218,6 +223,9 @@ mod tests {
             signed_url_secret: String::new(),
             signed_url_previous_secret: String::new(),
             signed_url_ttl_secs: 3600,
+            origin_auth_header: String::new(),
+            origin_auth_value: String::new(),
+            hotlink_signature_enabled: false,
         }
     }
 
