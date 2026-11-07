@@ -37,6 +37,11 @@ pub trait CacheBackend: Send + Sync {
     async fn get_result_with_source(&self, key: &str) -> (CacheGetResult, CacheSource) {
         (self.get_result(key).await, CacheSource::L1)
     }
+    /// Cheap local-only presence probe. Used to avoid taking a Redis
+    /// single-flight lock when L1 already has the object.
+    async fn has_local(&self, _key: &str) -> bool {
+        false
+    }
     async fn get(&self, key: &str) -> Option<CacheEntry> {
         match self.get_result(key).await {
             CacheGetResult::Hit(e) | CacheGetResult::Stale(e) => Some(e),

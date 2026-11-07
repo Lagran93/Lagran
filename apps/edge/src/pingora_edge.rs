@@ -381,7 +381,10 @@ impl ProxyHttp for DataPlaneProxy {
             }
             let small_range =
                 headers.contains_key("range") && range_is_small_bounded(&headers);
-            if plan.cacheable {
+            if plan.cacheable && !self.state.cache.has_local(&plan.key).await {
+                // Only take the cross-node lock when L1 does not already have
+                // the object. A plain L1 hit must not issue Redis SET/EVAL
+                // commands on every request.
                 if let Some(flight) = self.state.flight.as_ref() {
                     if let Some(guard) =
                         crate::cache::flight::acquire(flight, &plan.key, self.state.cache.as_ref())

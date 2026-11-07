@@ -334,6 +334,13 @@ impl CacheBackend for RedisL2Cache {
         }
     }
 
+    async fn has_local(&self, key: &str) -> bool {
+        matches!(
+            self.local.get_result(key).await,
+            CacheGetResult::Hit(_) | CacheGetResult::Stale(_)
+        )
+    }
+
     async fn set(&self, key: &str, entry: CacheEntry, ttl_secs: u64) {
         self.set_with_swr(key, entry, ttl_secs, 0).await;
     }
