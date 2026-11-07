@@ -52,6 +52,10 @@ pub async fn prefetch_handler(
             .header("host", &domain)
             .header("x-forwarded-proto", scheme)
             .header("user-agent", "lagran-prefetch/1.0")
+            // Trusted internal request: keep prefetch from being rejected by
+            // hotlink rules; origin auth is still injected by the normal
+            // proxy_handler -> fetch_origin path.
+            .header("x-lagran-hotlink-ok", "1")
             .body(Body::empty())
         {
             Ok(request) => request,

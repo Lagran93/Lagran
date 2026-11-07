@@ -39,13 +39,7 @@
     <div class="stat-grid">
       <StatCard label="节点总数" :value="nodes.length" icon="node" />
       <StatCard label="在线节点" :value="counts.online" icon="activity" tone="green" />
-      <StatCard
-        label="待接入 / 离线"
-        :value="counts.pending + counts.offline"
-        hint="安装后等待首次心跳"
-        icon="clock"
-        tone="orange"
-      />
+      <StatCard label="待接入 / 离线" :value="counts.pending + counts.offline" hint="安装后等待首次心跳" icon="clock" tone="orange" />
       <StatCard label="已停用" :value="counts.disabled" icon="alert" tone="red" />
     </div>
 
@@ -97,20 +91,16 @@
                 <div class="resource">
                   <span class="res-label">CPU</span>
                   <div class="progress res-bar">
-                    <div
-                      class="progress-bar"
-                      :style="{ width: `${n.cpu_usage ?? 0}%`, background: usageColor(n.cpu_usage) }"
-                    />
+                    <div class="progress-bar"
+                      :style="{ width: `${n.cpu_usage ?? 0}%`, background: usageColor(n.cpu_usage) }" />
                   </div>
                   <span class="res-val">{{ n.cpu_usage != null ? `${n.cpu_usage.toFixed(0)}%` : '—' }}</span>
                 </div>
                 <div class="resource">
                   <span class="res-label">MEM</span>
                   <div class="progress res-bar">
-                    <div
-                      class="progress-bar"
-                      :style="{ width: `${n.memory_usage ?? 0}%`, background: usageColor(n.memory_usage) }"
-                    />
+                    <div class="progress-bar"
+                      :style="{ width: `${n.memory_usage ?? 0}%`, background: usageColor(n.memory_usage) }" />
                   </div>
                   <span class="res-val">{{ n.memory_usage != null ? `${n.memory_usage.toFixed(0)}%` : '—' }}</span>
                 </div>
@@ -127,12 +117,8 @@
                   <button class="btn btn-text btn-sm" type="button" @click="openDetail(n)">
                     详情
                   </button>
-                  <button
-                    class="btn btn-text btn-sm"
-                    type="button"
-                    :disabled="upgradingId === n.id"
-                    @click="upgrade(n)"
-                  >
+                  <button class="btn btn-text btn-sm" type="button" :disabled="upgradingId === n.id"
+                    @click="upgrade(n)">
                     {{ upgradingId === n.id ? '升级中…' : '升级' }}
                   </button>
                   <button class="btn btn-text btn-sm" type="button" @click="openEdit(n)">
@@ -159,12 +145,8 @@
         <div class="skeleton" style="height: 34px; width: 100%" />
       </div>
 
-      <EmptyState
-        v-else-if="!nodes.length"
-        icon="node"
-        title="还没有边缘节点"
-        text="点击「添加节点」预注册一个节点，控制台会生成带一次性令牌的安装命令；在服务器上运行后约 15 秒出现在列表里。"
-      >
+      <EmptyState v-else-if="!nodes.length" icon="node" title="还没有边缘节点"
+        text="点击「添加节点」预注册一个节点，控制台会生成带一次性令牌的安装命令；在服务器上运行后约 15 秒出现在列表里。">
         <button class="btn btn-primary btn-sm" type="button" @click="openCreate">
           添加第一个节点
         </button>
@@ -172,13 +154,8 @@
     </div>
 
     <!-- 新增 / 编辑 -->
-    <BaseModal
-      v-model="formOpen"
-      :title="editing ? '编辑节点' : '添加边缘节点'"
-      :confirm-text="editing ? '保存修改' : '生成安装命令'"
-      :loading="saving"
-      @confirm="submitForm"
-    >
+    <BaseModal v-model="formOpen" :title="editing ? '编辑节点' : '添加边缘节点'" :confirm-text="editing ? '保存修改' : '生成安装命令'"
+      :loading="saving" @confirm="submitForm">
       <div class="form-col">
         <div v-if="!editing" class="alert alert-info">
           <AppIcon name="info" :size="16" class="icon" />
@@ -189,12 +166,7 @@
         <div class="form-grid">
           <div class="field span-2">
             <label class="field-label">节点名称 <span class="req">*</span></label>
-            <input
-              v-model="form.name"
-              class="input"
-              placeholder="例如 edge-hk-01"
-              :disabled="editing"
-            />
+            <input v-model="form.name" class="input" placeholder="例如 edge-hk-01" :disabled="editing" />
             <span class="field-hint">
               {{ editing ? '名称用于心跳标识，修改后需同步调整节点环境变量 NODE_ID。' : '全局唯一，对应边缘端的 NODE_ID。' }}
             </span>
@@ -205,13 +177,7 @@
           </div>
           <div class="field">
             <label class="field-label">国家/地区代码</label>
-            <input
-              v-model="form.country"
-              class="input"
-              list="node-country-codes"
-              maxlength="2"
-              placeholder="CN"
-            />
+            <input v-model="form.country" class="input" list="node-country-codes" maxlength="2" placeholder="CN" />
             <datalist id="node-country-codes">
               <option value="CN">中国大陆</option>
               <option value="HK">中国香港</option>
@@ -254,11 +220,7 @@
           </div>
           <div class="field span-2">
             <label class="field-label">Agent 地址</label>
-            <input
-              v-model="form.agent_url"
-              class="input"
-              placeholder="http://1.2.3.4:8081"
-            />
+            <input v-model="form.agent_url" class="input" placeholder="http://1.2.3.4:8081" />
             <span class="field-hint">
               控制面回调该节点的管理面地址（EDGE_ADMIN_LISTEN，如 8081），用于下发刷新、证书、ACME；
               不要填 CDN 数据端口 80/443。留空可稍后再填。
@@ -270,12 +232,7 @@
     </BaseModal>
 
     <!-- 安装命令 -->
-    <BaseModal
-      v-model="installOpen"
-      title="节点安装命令"
-      width="720px"
-      hide-footer
-    >
+    <BaseModal v-model="installOpen" title="节点安装命令" width="720px" hide-footer>
       <div v-if="created" class="form-col">
         <div class="alert alert-warning">
           <AppIcon name="alert" :size="16" class="icon" />
@@ -341,13 +298,8 @@
     <BaseDrawer v-model="detailOpen" :title="`节点 · ${detail?.node?.name || ''}`">
       <template #footer>
         <button class="btn btn-default" type="button" @click="detailOpen = false">关闭</button>
-        <button
-          v-if="detail"
-          class="btn"
-          :class="detail.node.status === 'disabled' ? 'btn-primary' : 'btn-default'"
-          type="button"
-          @click="toggle(detail.node)"
-        >
+        <button v-if="detail" class="btn" :class="detail.node.status === 'disabled' ? 'btn-primary' : 'btn-default'"
+          type="button" @click="toggle(detail.node)">
           {{ detail.node.status === 'disabled' ? '启用节点' : '停用节点' }}
         </button>
       </template>
@@ -547,7 +499,7 @@
         <div class="form-grid">
           <div class="field span-2">
             <label class="field-label">查询名称</label>
-            <input v-model="dnsForm.name" class="input" placeholder="cdn.edge.lagran.net" />
+            <input v-model="dnsForm.name" class="input" placeholder="cname.lagranedge.com" />
           </div>
           <div class="field span-2">
             <label class="field-label">客户端 IP / 子网（可选，作为 ECS）</label>
@@ -646,7 +598,7 @@ const schedForm = ref({ domain: '', ip: '', province: '', isp: '', city: '' })
 const dnsOpen = ref(false)
 const dnsLoading = ref(false)
 const dnsResult = ref<any>(null)
-const dnsForm = ref({ name: 'cdn.edge.lagran.net', ip: '' })
+const dnsForm = ref({ name: 'cname.lagranedge.com', ip: '' })
 
 const installOpen = ref(false)
 const installTab = ref<'binary' | 'docker'>('binary')
