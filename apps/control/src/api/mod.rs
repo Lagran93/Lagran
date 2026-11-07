@@ -138,6 +138,11 @@ pub fn create_router(state: AppState) -> Router {
                     "/waf/rulepacks/:version/rollback",
                     post(waf::rollback_rulepack),
                 )
+                .route(
+                    "/waf/rulepacks/:version/retire",
+                    post(waf::retire_rulepack),
+                )
+                .route("/waf/rulepacks/:version", delete(waf::delete_rulepack))
                 .route("/waf/rulepack/:version", get(waf::download_rulepack))
                 .route(
                     "/waf/events",

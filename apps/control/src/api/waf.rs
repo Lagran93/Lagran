@@ -268,6 +268,12 @@ pub async fn list_rulepacks(
 pub struct PublishRulepackRequest {
     #[serde(default)]
     pub version: Option<String>,
+    /// Optional catalog override. When omitted, the compiled catalog is used.
+    #[serde(default)]
+    pub rulesets: Option<Vec<crate::waf_rulepack::RulesetEntry>>,
+    /// Allow publishing an identical catalog under a new version label.
+    #[serde(default)]
+    pub force: bool,
 }
 
 pub async fn publish_rulepack(
@@ -288,12 +294,50 @@ pub async fn publish_rulepack(
             chrono::Utc::now().format("%Y.%m.%d-%H%M%S").to_string()
         });
     crate::waf_rulepack::validate_version(&version).map_err(bad_request)?;
+    if let Some(rulesets) = req.rulesets.as_deref() {
+        crate::waf_rulepack::validate_rulesets(rulesets).map_err(bad_request)?;
+    }
+    let candidate = req
+        .rulesets
+        .clone()
+        .unwrap_or_else(crate::waf_rulepack::catalog_entries);
+    let candidate_fingerprint = crate::waf_rulepack::catalog_fingerprint(&candidate);
+    if !req.force {
+        if let Some(active) = crate::waf_rulepack::active(&state.pool)
+            .await
+            .map_err(|_| db_error())?
+        {
+            let active_fingerprint = active
+                .parse_package()
+                .map(|p| crate::waf_rulepack::catalog_fingerprint(&p.rulesets))
+                .unwrap_or_default();
+            if !active_fingerprint.is_empty()
+                && active_fingerprint == candidate_fingerprint
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ErrorBody {
+                        error: format!(
+                            "catalog unchanged (active {}); deploy a new catalog or pass force=true",
+                            active.version
+                        ),
+                    }),
+                ));
+            }
+        }
+    }
     let secret = crate::waf_rulepack::signing_key(
         &state.config.waf_rulepack_secret,
         &state.config.agent_token,
     );
-    let row = crate::waf_rulepack::publish(&state.pool, &secret, &version, &actor.email)
-        .await
+    let row = crate::waf_rulepack::publish_with_rulesets(
+        &state.pool,
+        &secret,
+        &version,
+        req.rulesets,
+        &actor.email,
+    )
+    .await
         .map_err(|e| {
             tracing::error!(error = %e, "publish waf rulepack");
             db_error()
@@ -330,6 +374,98 @@ pub async fn rollback_rulepack(
     )
     .await;
     Ok(Json(RulepackVersionDto::from(&row)))
+}
+
+pub async fn retire_rulepack(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(version): Path<String>,
+) -> Result<Json<RulepackVersionDto>, (StatusCode, Json<ErrorBody>)> {
+    if !actor.is_admin {
+        return Err(forbidden());
+    }
+    let Some(row) = crate::waf_rulepack::get(&state.pool, &version)
+        .await
+        .map_err(|_| db_error())?
+    else {
+        return Err(not_found("rulepack version not found"));
+    };
+    if row.slot == "active" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "cannot retire the active rulepack; activate another version first".into(),
+            }),
+        ));
+    }
+    let row = crate::waf_rulepack::retire(&state.pool, &version)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found("rulepack version not found"))?;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "waf.rulepack.retire",
+        &version,
+        "将规则包版本标记为 retired",
+    )
+    .await;
+    Ok(Json(RulepackVersionDto::from(&row)))
+}
+
+pub async fn delete_rulepack(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(version): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    if !actor.is_admin {
+        return Err(forbidden());
+    }
+    let Some(row) = crate::waf_rulepack::get(&state.pool, &version)
+        .await
+        .map_err(|_| db_error())?
+    else {
+        return Err(not_found("rulepack version not found"));
+    };
+    if row.slot == "active" || row.slot == "previous" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: format!(
+                    "cannot delete {} rulepack; retire it first",
+                    row.slot
+                ),
+            }),
+        ));
+    }
+    let pinned = crate::waf_rulepack::pinned_count(&state.pool, &version)
+        .await
+        .map_err(|_| db_error())?;
+    if pinned > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: format!(
+                    "{pinned} domain(s) still pin rulepack {version}; clear their waf_rulepack_version first"
+                ),
+            }),
+        ));
+    }
+    let affected = crate::waf_rulepack::delete(&state.pool, &version)
+        .await
+        .map_err(|_| db_error())?;
+    if affected == 0 {
+        return Err(not_found("rulepack version not found"));
+    }
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "waf.rulepack.delete",
+        &version,
+        "删除规则包版本",
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "deleted": version })))
 }
 
 pub async fn download_rulepack(

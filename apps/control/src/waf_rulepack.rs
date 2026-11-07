@@ -51,7 +51,7 @@ impl RulepackRow {
                 continue;
             };
             for category in &entry.categories {
-                categories = categories.with(category);
+                categories = categories.enable(category);
             }
         }
         categories
@@ -85,6 +85,103 @@ pub fn build(version: &str) -> Rulepack {
             })
             .collect(),
     }
+}
+
+pub fn catalog_entries() -> Vec<RulesetEntry> {
+    waf_rulesets::catalog()
+        .iter()
+        .map(|r| RulesetEntry {
+            id: r.id.into(),
+            name: r.name.into(),
+            version: r.version.into(),
+            categories: r.categories.iter().map(|c| (*c).into()).collect(),
+        })
+        .collect()
+}
+
+pub fn build_with_rulesets(
+    version: &str,
+    rulesets: Vec<RulesetEntry>,
+) -> Rulepack {
+    Rulepack {
+        id: "lagran-waf-core".into(),
+        version: version.to_string(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        rulesets,
+    }
+}
+
+pub fn validate_rulesets(rulesets: &[RulesetEntry]) -> Result<(), String> {
+    if rulesets.is_empty() {
+        return Err("rulesets must not be empty".into());
+    }
+    let allowed = [
+        "sqli",
+        "xss",
+        "traversal",
+        "scanners",
+        "rce",
+        "ssrf",
+        "xxe",
+        "log4shell",
+        "crlf",
+        "ssti",
+        "nosql",
+        "ldap",
+        "java",
+        "webshell",
+        "protocol",
+    ];
+    let mut ids = std::collections::HashSet::new();
+    for ruleset in rulesets {
+        let id = ruleset.id.trim();
+        if id.is_empty() || id.len() > 64 {
+            return Err("ruleset id must be 1..=64 characters".into());
+        }
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'))
+        {
+            return Err(format!("invalid ruleset id: {id}"));
+        }
+        if !ids.insert(id.to_string()) {
+            return Err(format!("duplicate ruleset id: {id}"));
+        }
+        if ruleset.name.trim().is_empty() || ruleset.name.len() > 128 {
+            return Err("ruleset name must be 1..=128 characters".into());
+        }
+        if ruleset.categories.is_empty() {
+            return Err(format!("ruleset {id} must contain at least one category"));
+        }
+        for category in &ruleset.categories {
+            if !allowed.contains(&category.as_str()) {
+                return Err(format!("unknown category {category:?} in {id}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Canonical fingerprint of the semantic catalog contents. Version labels,
+/// human names and generated_at are intentionally excluded.
+pub fn catalog_fingerprint(rulesets: &[RulesetEntry]) -> String {
+    let mut normalized: Vec<(String, Vec<String>)> = rulesets
+        .iter()
+        .map(|r| {
+            let mut categories: Vec<String> = r
+                .categories
+                .iter()
+                .map(|c| c.trim().to_ascii_lowercase())
+                .filter(|c| !c.is_empty())
+                .collect();
+            categories.sort();
+            categories.dedup();
+            (r.id.trim().to_string(), categories)
+        })
+        .collect();
+    normalized.sort_by(|a, b| a.0.cmp(&b.0));
+    let encoded = serde_json::to_string(&normalized).unwrap_or_default();
+    hex(ring::digest::digest(&ring::digest::SHA256, encoded.as_bytes()).as_ref())
 }
 
 pub fn sign(payload: &str, secret: &str) -> (String, String) {
@@ -122,8 +219,21 @@ pub async fn publish(
     version: &str,
     actor: &str,
 ) -> sqlx::Result<RulepackRow> {
+    publish_with_rulesets(pool, secret, version, None, actor).await
+}
+
+pub async fn publish_with_rulesets(
+    pool: &PgPool,
+    secret: &str,
+    version: &str,
+    rulesets: Option<Vec<RulesetEntry>>,
+    actor: &str,
+) -> sqlx::Result<RulepackRow> {
     let version = version.trim();
-    let package = build(version);
+    let package = match rulesets {
+        Some(rulesets) => build_with_rulesets(version, rulesets),
+        None => build(version),
+    };
     let payload = serde_json::to_string(&package).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
     let (signature, checksum) = sign(&payload, secret);
     let mut tx = pool.begin().await?;
@@ -222,6 +332,37 @@ pub async fn rollback(pool: &PgPool, version: &str) -> sqlx::Result<Option<Rulep
     get(pool, version).await
 }
 
+pub async fn pinned_count(pool: &PgPool, version: &str) -> sqlx::Result<i64> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM waf_settings WHERE waf_rulepack_version = $1",
+    )
+    .bind(version)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn retire(pool: &PgPool, version: &str) -> sqlx::Result<Option<RulepackRow>> {
+    let Some(row) = get(pool, version).await? else {
+        return Ok(None);
+    };
+    if row.slot == "active" {
+        return Ok(None);
+    }
+    sqlx::query("UPDATE waf_rulepack_versions SET slot = 'retired' WHERE version = $1")
+        .bind(version)
+        .execute(pool)
+        .await?;
+    get(pool, version).await
+}
+
+pub async fn delete(pool: &PgPool, version: &str) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM waf_rulepack_versions WHERE version = $1")
+        .bind(version)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RulesetSummary {
     pub id: String,
@@ -290,6 +431,24 @@ mod tests {
         assert_eq!(ca, cb);
         let (c, _) = sign("{\"id\":\"y\"}", "secret");
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn custom_catalog_validation() {
+        let rulesets = vec![RulesetEntry {
+            id: "owasp-core".into(),
+            name: "OWASP core".into(),
+            version: "test".into(),
+            categories: vec!["xss".into(), "traversal".into()],
+        }];
+        assert!(validate_rulesets(&rulesets).is_ok());
+        let bad = vec![RulesetEntry {
+            id: "owasp-core".into(),
+            name: "OWASP core".into(),
+            version: "test".into(),
+            categories: vec!["not-a-category".into()],
+        }];
+        assert!(validate_rulesets(&bad).is_err());
     }
 
     #[test]

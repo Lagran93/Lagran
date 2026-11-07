@@ -180,24 +180,30 @@ impl Categories {
             return self;
         };
         for category in ruleset.categories {
-            match *category {
-                "sqli" => self.sqli = true,
-                "xss" => self.xss = true,
-                "traversal" => self.traversal = true,
-                "scanners" => self.scanners = true,
-                "rce" => self.rce = true,
-                "ssrf" => self.ssrf = true,
-                "xxe" => self.xxe = true,
-                "log4shell" => self.log4shell = true,
-                "crlf" => self.crlf = true,
-                "ssti" => self.ssti = true,
-                "nosql" => self.nosql = true,
-                "ldap" => self.ldap = true,
-                "java" => self.java = true,
-                "webshell" => self.webshell = true,
-                "protocol" => self.protocol = true,
-                _ => {}
-            }
+            self = self.enable(category);
+        }
+        self
+    }
+
+    /// Enable one signature category by its canonical name.
+    pub fn enable(mut self, category: &str) -> Self {
+        match category {
+            "sqli" => self.sqli = true,
+            "xss" => self.xss = true,
+            "traversal" => self.traversal = true,
+            "scanners" => self.scanners = true,
+            "rce" => self.rce = true,
+            "ssrf" => self.ssrf = true,
+            "xxe" => self.xxe = true,
+            "log4shell" => self.log4shell = true,
+            "crlf" => self.crlf = true,
+            "ssti" => self.ssti = true,
+            "nosql" => self.nosql = true,
+            "ldap" => self.ldap = true,
+            "java" => self.java = true,
+            "webshell" => self.webshell = true,
+            "protocol" => self.protocol = true,
+            _ => {}
         }
         self
     }

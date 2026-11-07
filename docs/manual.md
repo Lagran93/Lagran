@@ -486,6 +486,115 @@ GET  /api/v1/waf/rulepack/{version}
 
 回滚只切换 slot，不重新构建历史包。
 
+#### 发布不同 catalog 的快照
+
+管理员可以在发布时直接提供规则集目录覆盖：
+
+```http
+POST /api/v1/waf/rulepacks/publish
+```
+
+```json
+{
+  "version": "2026.13-custom",
+  "rulesets": [
+    {
+      "id": "owasp-core",
+      "name": "OWASP core (custom)",
+      "version": "2026.13",
+      "categories": ["xss", "traversal", "scanners", "rce", "crlf", "protocol"]
+    },
+    {
+      "id": "injection-extended",
+      "name": "Injection extended",
+      "version": "2026.13",
+      "categories": ["ssti", "nosql", "ldap", "java", "webshell"]
+    }
+  ]
+}
+```
+
+不传 `rulesets` 时使用编译内置 catalog。
+
+Control 会先比较新规则包与 active 的语义指纹：
+
+```text
+id + 排序后的 categories
+```
+
+如果完全相同，默认返回：
+
+```http
+409 Conflict
+catalog unchanged (active 2026.12); deploy a new catalog or pass force=true
+```
+
+这是为了避免生成“只有版本号变化、规则内容完全相同”的无意义版本。
+
+确实需要保留同内容的版本标签时：
+
+```json
+{
+  "force": true,
+  "version": "2026.12-snapshot"
+}
+```
+
+覆盖目录的限制：
+
+```text
+只能使用已有的类别名：
+sqli xss traversal scanners rce ssrf xxe log4shell crlf
+ssti nosql ldap java webshell protocol
+只能覆盖已有规则集 id：
+owasp-core injection-extended ssrf-xxe scanner-guard
+不能上传任意正则
+```
+
+用途：
+
+```text
+灰度验证不同类别组合
+临时关闭某个高风险类别
+自定义规则集成员关系
+发布可签名、可回滚的 catalog 快照
+```
+
+Edge 仍然只接收合并后的类别布尔值；是否生效不依赖 Edge 理解 catalog 结构。
+
+#### 删除历史规则包
+
+```http
+POST   /api/v1/waf/rulepacks/{version}/retire
+DELETE /api/v1/waf/rulepacks/{version}
+```
+
+删除限制：
+
+```text
+active   不能删除，也不能直接 retire
+previous 不能删除，必须先 retire
+retired  可以删除
+仍有域名 pin 该版本时不能删除
+```
+
+推荐顺序：
+
+```text
+1. 先确认没有域名固定该版本
+2. previous -> retire
+3. delete retired
+```
+
+删除只移除 Control 数据库记录。Edge 本地缓存文件不会自动删除：
+
+```text
+WAF_RULEPACK_CACHE_DIR/<version>.json
+WAF_RULEPACK_CACHE_DIR/<version>.sig
+```
+
+如需彻底清理，可在确认没有配置引用后手动删除这些缓存文件。
+
 #### 按域名固定版本
 
 WAF 设置新增：

@@ -253,24 +253,68 @@
             <div class="flex-between">
               <span class="text-muted" style="font-size: 12px">
                 规则包由 Control 签名，Edge 验签后缓存到本地。回滚只切换 active/previous。
+                发布前应先在 Control 中更新内置 catalog；catalog 无变化时发布会返回 409。
               </span>
               <button class="btn btn-default btn-sm" type="button" :disabled="rulepackBusy" @click="publishRulepack">
                 发布新版本
               </button>
             </div>
             <div v-if="rulepackVersions.length" class="rulepack-versions">
-              <div v-for="p in rulepackVersions" :key="p.version" class="rulepack-version-row">
-                <span class="mono">{{ p.version }}</span>
-                <span class="text-muted">{{ p.slot }} · {{ p.created_at.slice(0, 10) }}</span>
-                <button
-                  v-if="p.slot !== 'active'"
-                  class="btn btn-text btn-sm"
-                  type="button"
-                  :disabled="rulepackBusy"
-                  @click="rollbackRulepack(p.version)"
-                >
-                  设为 active
-                </button>
+              <div
+                v-for="p in rulepackVersions"
+                :key="p.version"
+                class="rulepack-version-row"
+                :class="`slot-${p.slot}`"
+              >
+                <div class="version-main">
+                  <div class="version-title">
+                    <span class="mono version-name">{{ p.version }}</span>
+                    <span class="slot-badge" :class="`slot-badge-${p.slot}`">
+                      <span class="slot-dot" />
+                      {{ slotLabel(p.slot) }}
+                    </span>
+                  </div>
+                  <div class="version-meta">
+                    <span>创建 {{ formatRulepackTime(p.created_at) }}</span>
+                    <span class="meta-sep">·</span>
+                    <span class="mono" :title="p.signature">签名 {{ p.signature.slice(0, 10) }}</span>
+                  </div>
+                </div>
+
+                <div class="version-actions">
+                  <span v-if="p.slot === 'active'" class="current-label">
+                    <AppIcon name="check" :size="13" />
+                    当前生效
+                  </span>
+                  <template v-else>
+                    <button
+                      class="btn btn-default btn-sm version-action"
+                      type="button"
+                      :disabled="rulepackBusy"
+                      @click="rollbackRulepack(p.version)"
+                    >
+                      设为 active
+                    </button>
+                    <button
+                      v-if="p.slot === 'previous'"
+                      class="btn btn-text btn-sm version-action"
+                      type="button"
+                      :disabled="rulepackBusy"
+                      @click="retireRulepack(p.version)"
+                    >
+                      转为 retired
+                    </button>
+                    <button
+                      v-if="p.slot === 'retired'"
+                      class="btn btn-text btn-sm danger version-action"
+                      type="button"
+                      :disabled="rulepackBusy"
+                      @click="deleteRulepack(p.version)"
+                    >
+                      删除
+                    </button>
+                  </template>
+                </div>
               </div>
             </div>
           </div>
@@ -1120,6 +1164,15 @@ async function loadRulesets() {
   rulesets.value = (await api.get<any[]>('/api/v1/waf/rulesets').catch(() => [])) || []
 }
 
+function slotLabel(slot: string) {
+  return ({ active: '当前版本', previous: '上一版本', retired: '已退役' } as Record<string, string>)[slot] || slot
+}
+
+function formatRulepackTime(value: string) {
+  if (!value) return ''
+  return value.slice(0, 16).replace('T', ' ')
+}
+
 async function loadRulepacks() {
   rulepackVersions.value = (await api.get<any[]>('/api/v1/waf/rulepacks').catch(() => [])) || []
 }
@@ -1132,6 +1185,45 @@ async function publishRulepack() {
     await loadRulepacks()
   } catch (e: any) {
     toast.error(e?.data?.error || '发布失败')
+  } finally {
+    rulepackBusy.value = false
+  }
+}
+
+async function retireRulepack(version: string) {
+  const ok = await ask({
+    title: '转为 retired',
+    text: `将规则包 ${version} 转为 retired？转为 retired 后才能删除。`,
+    confirmText: '转为 retired',
+  })
+  if (!ok) return
+  rulepackBusy.value = true
+  try {
+    await api.post(`/api/v1/waf/rulepacks/${version}/retire`, {})
+    toast.success(`规则包 ${version} 已转为 retired`)
+    await loadRulepacks()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '操作失败')
+  } finally {
+    rulepackBusy.value = false
+  }
+}
+
+async function deleteRulepack(version: string) {
+  const ok = await ask({
+    title: '删除规则包',
+    text: `删除规则包 ${version}？此操作不可撤销；仍有域名固定该版本时会被拒绝。`,
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!ok) return
+  rulepackBusy.value = true
+  try {
+    await api.del(`/api/v1/waf/rulepacks/${version}`)
+    toast.success(`规则包 ${version} 已删除`)
+    await loadRulepacks()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '删除失败')
   } finally {
     rulepackBusy.value = false
   }
@@ -1860,31 +1952,134 @@ onMounted(reload)
 }
 
 .rulepack-versions {
-  margin-top: 10px;
-  border-top: 1px solid var(--divider);
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .rulepack-version-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 0;
-  font-size: 12.5px;
-  border-bottom: 1px solid var(--divider);
+  gap: 14px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
-.rulepack-version-row:last-child {
-  border-bottom: 0;
+.rulepack-version-row:hover {
+  border-color: var(--border-strong);
+  background: var(--bg);
 }
 
-.rulepack-version-row .btn {
-  margin-left: auto;
+.rulepack-version-row.slot-active {
+  border-color: var(--brand-bg-strong);
+  background: var(--brand-bg);
+}
+
+.version-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.version-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.version-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.slot-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  line-height: 20px;
+}
+
+.slot-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.slot-badge-active {
+  color: var(--success);
+  background: var(--success-bg);
+}
+
+.slot-badge-previous {
+  color: var(--warning);
+  background: var(--warning-bg);
+}
+
+.slot-badge-retired {
+  color: var(--text-3);
+  background: var(--bg);
+}
+
+.version-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.meta-sep {
+  color: var(--text-4);
+}
+
+.version-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: none;
+}
+
+.version-action {
+  min-width: 82px;
+}
+
+.current-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--success);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 @media (max-width: 900px) {
   .managed-grid,
   .ruleset-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .rulepack-version-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .version-actions {
+    width: 100%;
+    justify-content: flex-start;
   }
 }
 </style>
