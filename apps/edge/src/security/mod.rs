@@ -1,1 +1,3 @@
-//! WAF / rate limit (placeholder)
+//! Security helpers
+
+pub mod signed_url;

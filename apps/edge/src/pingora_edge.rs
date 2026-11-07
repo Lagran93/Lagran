@@ -24,6 +24,7 @@ use crate::server::handler::{
 use crate::server::pipeline::{RequestFacts, RequestPipeline};
 use crate::server::native_cache::{leak_storage_with_large, NativeStorage, META_HEADER};
 use crate::server::purge;
+use crate::security::signed_url;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -340,6 +341,39 @@ impl ProxyHttp for DataPlaneProxy {
 
         // WebSocket is intentionally legacy-only: Pingora's HTTP proxy does
         // not tunnel upgraded connections on this path.
+        if let Some(domain) = self.state.domains.get(&ctx.host).await {
+            if domain.signed_url_enabled {
+                let uri = session.req_header().uri.clone();
+                match signed_url::verify(
+                    &domain,
+                    ctx.method.as_str(),
+                    &ctx.host,
+                    &uri,
+                    signed_url::now_epoch_secs(),
+                ) {
+                    Ok(verified) => {
+                        // Signature parameters must not enter the cache key or
+                        // the origin request, otherwise every signed URL creates
+                        // a separate cache object.
+                        session.req_header_mut().set_uri(verified.uri);
+                    }
+                    Err(e) => {
+                        ctx.cache_label = "BYPASS";
+                        ctx.cache_reason = Some(e.reason());
+                        ctx.status = 403;
+                        write_plain(
+                            session,
+                            403,
+                            "text/plain; charset=utf-8",
+                            Bytes::from_static(b"invalid or expired signed url"),
+                        )
+                        .await;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
         if is_websocket_upgrade(&session.req_header().headers) {
             ctx.skip_logging = true;
             return self.handle_in_process(session).await;

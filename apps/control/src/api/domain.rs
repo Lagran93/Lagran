@@ -541,7 +541,8 @@ pub async fn update(
     Path(id): Path<String>,
     Json(req): Json<UpdateDomainRequest>,
 ) -> Result<Json<DomainDto>, (StatusCode, Json<ErrorBody>)> {
-    let uid = parse_uuid(&id)?;
+    let domain = resolve_domain(&state, &id).await?;
+    let uid = domain.id;
     if !actor.can_write_domain(&state, uid).await {
         return Err(forbidden());
     }
@@ -797,6 +798,12 @@ pub struct SettingsRequest {
     pub cc_mode: Option<String>,
     pub cc_allow_ips: Option<String>,
     pub shield_url: Option<String>,
+    pub signed_url_enabled: Option<bool>,
+    pub signed_url_mode: Option<String>,
+    pub signed_url_paths: Option<String>,
+    pub signed_url_secret: Option<String>,
+    pub signed_url_previous_secret: Option<String>,
+    pub signed_url_ttl_secs: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -816,6 +823,12 @@ pub struct SettingsDto {
     pub cc_mode: String,
     pub cc_allow_ips: String,
     pub shield_url: String,
+    pub signed_url_enabled: bool,
+    pub signed_url_mode: String,
+    pub signed_url_paths: String,
+    pub signed_url_secret: String,
+    pub signed_url_previous_secret: String,
+    pub signed_url_ttl_secs: u32,
 }
 
 fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
@@ -839,7 +852,285 @@ fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
         },
         cc_allow_ips: s.cc_allow_ips,
         shield_url: s.shield_url,
+        signed_url_enabled: s.signed_url_enabled,
+        signed_url_mode: if s.signed_url_mode.is_empty() {
+            if s.signed_url_enabled { "all".into() } else { "off".into() }
+        } else {
+            s.signed_url_mode
+        },
+        signed_url_paths: s.signed_url_paths,
+        signed_url_secret: s.signed_url_secret,
+        signed_url_previous_secret: s.signed_url_previous_secret,
+        signed_url_ttl_secs: s.signed_url_ttl_secs.max(0) as u32,
     }
+}
+
+fn normalize_signed_path(path: &str) -> Result<String, ()> {
+    if !path.starts_with('/') {
+        return Err(());
+    }
+    let lower = path.to_ascii_lowercase();
+    if path.contains('\\')
+        || lower.contains("%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || lower.contains("%25")
+        || path.chars().any(|c| c.is_control())
+    {
+        return Err(());
+    }
+    let mut out = String::new();
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return Err(());
+        }
+        out.push('/');
+        out.push_str(segment);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    if path.ends_with('/') && out != "/" {
+        out.push('/');
+    }
+    Ok(out)
+}
+
+fn signed_path_protected(mode: &str, patterns: &str, path: &str) -> bool {
+    match mode {
+        "all" => true,
+        "paths" => patterns.lines().map(str::trim).filter(|p| !p.is_empty()).any(|p| {
+            if let Some(prefix) = p.strip_suffix('*') {
+                path.starts_with(prefix)
+            } else {
+                path == p
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn validate_signed_paths(value: &str) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+    let mut out = Vec::new();
+    for line in value.lines().flat_map(|line| line.split(',')) {
+        let pattern = line.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        let invalid = !pattern.starts_with('/')
+            || pattern.contains("..")
+            || pattern.contains('\\')
+            || pattern.to_ascii_lowercase().contains("%2e")
+            || pattern.to_ascii_lowercase().contains("%2f")
+            || pattern.matches('*').count() > 1
+            || (pattern.contains('*') && !pattern.ends_with("/*"));
+        if invalid {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "signed_url_paths must be exact paths or prefix/* patterns".into(),
+                }),
+            ));
+        }
+        out.push(pattern.to_string());
+    }
+    Ok(out.join("\n"))
+}
+
+fn generate_secret() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0u8; 32];
+    if SystemRandom::new().fill(&mut bytes).is_err() {
+        return uuid::Uuid::new_v4().simple().to_string();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Deserialize)]
+pub struct SignedUrlRequest {
+    pub path: Option<String>,
+    pub expires_in: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct SignedUrlResponse {
+    pub path_and_query: String,
+    pub expires: i64,
+}
+
+#[derive(Serialize)]
+pub struct SignedUrlRotateResponse {
+    pub signed_url_secret: String,
+    pub signed_url_previous_secret: String,
+}
+
+fn signed_canonical(
+    method: &str,
+    host: &str,
+    path: &str,
+    query: &str,
+    expires: &str,
+) -> String {
+    let mut pairs: Vec<String> = query
+        .split('&')
+        .filter(|part| {
+            let key = part.split('=').next().unwrap_or("");
+            !part.is_empty()
+                && !key.eq_ignore_ascii_case("expires")
+                && !key.eq_ignore_ascii_case("signature")
+                && !key.eq_ignore_ascii_case("sig")
+        })
+        .map(str::to_string)
+        .collect();
+    pairs.sort();
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        method.to_ascii_uppercase(),
+        host.to_ascii_lowercase(),
+        path,
+        pairs.join("&"),
+        expires
+    )
+}
+
+fn sign_path(
+    secret: &str,
+    method: &str,
+    host: &str,
+    path_and_query: &str,
+    expires: i64,
+) -> Result<String, String> {
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (path_and_query, ""),
+    };
+    let expires = expires.to_string();
+    let canonical = signed_canonical(method, host, path, query, &expires);
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let tag = ring::hmac::sign(&key, canonical.as_bytes());
+    let signature: String = tag.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let sep = if query.is_empty() { "?" } else { "&" };
+    Ok(format!("{path_and_query}{sep}expires={expires}&sig={signature}"))
+}
+
+/// POST /api/v1/domains/{id}/signed-url
+pub async fn create_signed_url(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+    Json(req): Json<SignedUrlRequest>,
+) -> Result<Json<SignedUrlResponse>, (StatusCode, Json<ErrorBody>)> {
+    let domain = resolve_domain(&state, &id).await?;
+    if !actor.can_write_domain(&state, domain.id).await {
+        return Err(forbidden());
+    }
+    let settings = repository::get_domain_settings(&state.pool, &domain.name)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found(&id))?;
+    if !settings.signed_url_enabled || settings.signed_url_secret.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "signed url is not enabled for this domain".into(),
+            }),
+        ));
+    }
+    let ttl = if settings.signed_url_ttl_secs <= 0 {
+        3600
+    } else {
+        settings.signed_url_ttl_secs as u64
+    };
+    let now = chrono::Utc::now().timestamp();
+    let expires = now + req.expires_in.unwrap_or(ttl).clamp(1, ttl) as i64;
+    let raw_path = req.path.as_deref().unwrap_or("/").trim();
+    let raw_path = if raw_path.starts_with('/') {
+        raw_path.to_string()
+    } else {
+        format!("/{raw_path}")
+    };
+    let path = normalize_signed_path(&raw_path).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "invalid signed url path".into(),
+            }),
+        )
+    })?;
+    let mode = if settings.signed_url_mode.is_empty() {
+        if settings.signed_url_enabled { "all" } else { "off" }
+    } else {
+        settings.signed_url_mode.as_str()
+    };
+    if mode == "off" || !signed_path_protected(mode, &settings.signed_url_paths, &path) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "path is not protected by signed url policy".into(),
+            }),
+        ));
+    }
+    let signed = sign_path(
+        &settings.signed_url_secret,
+        "GET",
+        &domain.name,
+        &path,
+        expires,
+    )
+    .map_err(|_| db_error())?;
+    Ok(Json(SignedUrlResponse {
+        path_and_query: signed,
+        expires,
+    }))
+}
+
+/// POST /api/v1/domains/{id}/signed-url/rotate
+pub async fn rotate_signed_url(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> Result<Json<SignedUrlRotateResponse>, (StatusCode, Json<ErrorBody>)> {
+    let domain = resolve_domain(&state, &id).await?;
+    if !actor.can_write_domain(&state, domain.id).await {
+        return Err(forbidden());
+    }
+    let settings = repository::get_domain_settings(&state.pool, &domain.name)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found(&id))?;
+    let current = if settings.signed_url_secret.is_empty() {
+        generate_secret()
+    } else {
+        settings.signed_url_secret
+    };
+    let next = generate_secret();
+    let mode = if settings.signed_url_mode.is_empty() {
+        "all".to_string()
+    } else {
+        settings.signed_url_mode.clone()
+    };
+    repository::update_domain_signed_url(
+        &state.pool,
+        domain.id,
+        Some(true),
+        Some(&mode),
+        Some(&settings.signed_url_paths),
+        Some(&next),
+        Some(&current),
+        Some(settings.signed_url_ttl_secs),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "rotate signed url secret");
+        db_error()
+    })?;
+    Ok(Json(SignedUrlRotateResponse {
+        signed_url_secret: next,
+        signed_url_previous_secret: current,
+    }))
 }
 
 async fn resolve_domain(
@@ -878,7 +1169,9 @@ pub async fn put_settings(
     Path(id): Path<String>,
     Json(req): Json<SettingsRequest>,
 ) -> Result<Json<SettingsDto>, (StatusCode, Json<ErrorBody>)> {
-    let uid = parse_uuid(&id)?;
+    let domain = resolve_domain(&state, &id).await?;
+    let uid = domain.id;
+    let domain_name = domain.name.clone();
     if !actor.can_write_domain(&state, uid).await {
         return Err(forbidden());
     }
@@ -937,6 +1230,94 @@ pub async fn put_settings(
         tracing::error!(error = %e, "update domain settings");
         db_error()
     })?;
+    let signed_requested = req.signed_url_enabled.is_some()
+        || req.signed_url_mode.is_some()
+        || req.signed_url_paths.is_some()
+        || req.signed_url_secret.is_some()
+        || req.signed_url_previous_secret.is_some()
+        || req.signed_url_ttl_secs.is_some();
+    let requested_mode = match req
+        .signed_url_mode
+        .as_deref()
+        .map(|m| m.trim().to_ascii_lowercase())
+    {
+        Some(mode) if mode == "off" || mode == "all" || mode == "paths" => Some(mode),
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "signed_url_mode must be off, all or paths".into(),
+                }),
+            ))
+        }
+        None => req
+            .signed_url_enabled
+            .map(|enabled| if enabled { "all" } else { "off" }.to_string())
+            .or_else(|| {
+                req.signed_url_paths
+                    .as_ref()
+                    .map(|paths| if paths.trim().is_empty() { "off" } else { "paths" }.to_string())
+            }),
+    };
+    let enabled_arg = requested_mode
+        .as_ref()
+        .map(|mode| mode != "off")
+        .or(req.signed_url_enabled);
+    let requested_paths = match req.signed_url_paths.as_deref() {
+        Some(value) => Some(validate_signed_paths(value)?),
+        None => None,
+    };
+    if requested_mode.as_deref() == Some("paths")
+        && requested_paths
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "signed_url_paths is required when mode is paths".into(),
+            }),
+        ));
+    }
+    if signed_requested {
+        let mut secret = req
+            .signed_url_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        let wanted_on = enabled_arg.unwrap_or(false);
+        if wanted_on && secret.is_none() {
+            let existing = repository::get_domain_settings(&state.pool, &domain_name)
+                .await
+                .ok()
+                .flatten();
+            if existing.map(|s| s.signed_url_secret.is_empty()).unwrap_or(true) {
+                secret = Some(generate_secret());
+            }
+        }
+        repository::update_domain_signed_url(
+            &state.pool,
+            uid,
+            enabled_arg,
+            requested_mode.as_deref(),
+            requested_paths.as_deref(),
+            secret.as_deref(),
+            req.signed_url_previous_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty()),
+            req.signed_url_ttl_secs.map(|v| v as i32),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "update signed url settings");
+            db_error()
+        })?;
+    }
+
     if n == 0 {
         return Err(not_found(&id));
     }

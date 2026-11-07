@@ -346,6 +346,45 @@
             placeholder="example.com,*.example.com（留空关闭）" />
         </div>
 
+        <div class="field">
+          <label class="field-label">签名 URL 防护</label>
+          <select v-model="settings.signed_url_mode" class="select">
+            <option value="off">关闭</option>
+            <option value="all">整个域名都要求签名</option>
+            <option value="paths">仅指定路径要求签名</option>
+          </select>
+          <span class="field-hint">
+            选择「仅指定路径」后，只需保护 /private/*、/downloads/* 等私有目录，公开页面和静态资源不受影响。
+          </span>
+        </div>
+
+        <div v-if="settings.signed_url_mode === 'paths'" class="field">
+          <label class="field-label">需要签名的路径</label>
+          <textarea v-model="settings.signed_url_paths" class="textarea" rows="4"
+            placeholder="/private/*&#10;/downloads/*&#10;/vip/exact-file.mp4" />
+          <span class="field-hint">每行一个规则，支持精确路径或 /prefix/*；不支持 .. 和正则。</span>
+        </div>
+
+        <div class="form-grid">
+          <div class="field">
+            <label class="field-label">签名有效期上限（秒）</label>
+            <input v-model.number="settings.signed_url_ttl_secs" class="input" type="number" min="1" />
+          </div>
+          <div class="field">
+            <label class="field-label">当前签名密钥</label>
+            <input v-model="settings.signed_url_secret" class="input" type="text"
+              placeholder="开启后自动生成；可手动填写" />
+          </div>
+        </div>
+        <div class="field">
+          <label class="field-label">上一个签名密钥（轮换兼容）</label>
+          <input v-model="settings.signed_url_previous_secret" class="input" type="text"
+            placeholder="轮换后旧密钥保留一段时间，留空则立即失效" />
+          <span class="field-hint">
+            修改密钥后旧链接会立即失效；建议使用接口 /signed-url/rotate 自动轮换。
+          </span>
+        </div>
+
         <div class="form-grid">
           <div class="field">
             <label class="field-label">回源超时（毫秒）</label>
@@ -497,6 +536,12 @@ const settings = ref({
   cc_ban_seconds: 300,
   cc_mode: 'block',
   cc_allow_ips: '',
+  signed_url_enabled: false,
+  signed_url_mode: 'off',
+  signed_url_paths: '',
+  signed_url_secret: '',
+  signed_url_previous_secret: '',
+  signed_url_ttl_secs: 3600,
 })
 
 const filtered = computed(() => {
@@ -768,6 +813,12 @@ async function openSettings(d: any) {
       cc_ban_seconds: s.cc_ban_seconds ?? 300,
       cc_mode: s.cc_mode || 'block',
       cc_allow_ips: s.cc_allow_ips || '',
+      signed_url_enabled: !!s.signed_url_enabled,
+      signed_url_mode: s.signed_url_mode || (s.signed_url_enabled ? 'all' : 'off'),
+      signed_url_paths: s.signed_url_paths || '',
+      signed_url_secret: s.signed_url_secret || '',
+      signed_url_previous_secret: s.signed_url_previous_secret || '',
+      signed_url_ttl_secs: s.signed_url_ttl_secs ?? 3600,
     }
   } catch {
     toast.error('读取高级设置失败，已使用默认值')

@@ -1825,6 +1825,18 @@ pub struct DomainSettingsRow {
     pub cc_allow_ips: String,
     #[sqlx(default)]
     pub shield_url: String,
+    #[sqlx(default)]
+    pub signed_url_enabled: bool,
+    #[sqlx(default)]
+    pub signed_url_mode: String,
+    #[sqlx(default)]
+    pub signed_url_paths: String,
+    #[sqlx(default)]
+    pub signed_url_secret: String,
+    #[sqlx(default)]
+    pub signed_url_previous_secret: String,
+    #[sqlx(default)]
+    pub signed_url_ttl_secs: i32,
 }
 
 pub async fn get_domain_settings(
@@ -1836,7 +1848,13 @@ pub async fn get_domain_settings(
         SELECT ignore_query_string, cors_origins, hotlink_allow_referers,
                origin_timeout_ms, custom_headers, rate_limit_rps, rate_limit_burst,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
-               COALESCE(shield_url, '') AS shield_url
+               COALESCE(shield_url, '') AS shield_url,
+               signed_url_enabled,
+               COALESCE(signed_url_mode, 'off') AS signed_url_mode,
+               COALESCE(signed_url_paths, '') AS signed_url_paths,
+               COALESCE(signed_url_secret, '') AS signed_url_secret,
+               COALESCE(signed_url_previous_secret, '') AS signed_url_previous_secret,
+               COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs
         FROM domains WHERE name = $1
         "#,
     )
@@ -1935,6 +1953,41 @@ pub async fn update_domain_settings(
     .bind(cc_mode.unwrap_or(&e.12))
     .bind(cc_allow_ips.unwrap_or(&e.13))
     .bind(shield_url.unwrap_or(&e.14))
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn update_domain_signed_url(
+    pool: &PgPool,
+    id: Uuid,
+    enabled: Option<bool>,
+    signed_url_mode: Option<&str>,
+    signed_url_paths: Option<&str>,
+    secret: Option<&str>,
+    previous_secret: Option<&str>,
+    ttl_secs: Option<i32>,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE domains SET
+          signed_url_enabled = COALESCE($2, signed_url_enabled),
+          signed_url_mode = COALESCE($3, signed_url_mode),
+          signed_url_paths = COALESCE($4, signed_url_paths),
+          signed_url_secret = COALESCE($5, signed_url_secret),
+          signed_url_previous_secret = COALESCE($6, signed_url_previous_secret),
+          signed_url_ttl_secs = COALESCE($7, signed_url_ttl_secs),
+          updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(enabled)
+    .bind(signed_url_mode)
+    .bind(signed_url_paths)
+    .bind(secret)
+    .bind(previous_secret)
+    .bind(ttl_secs.map(|v| v.clamp(0, 86_400)))
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
@@ -2401,6 +2454,18 @@ pub struct DomainFullRow {
     #[sqlx(default)]
     pub shield_url: String,
     #[sqlx(default)]
+    pub signed_url_enabled: bool,
+    #[sqlx(default)]
+    pub signed_url_mode: String,
+    #[sqlx(default)]
+    pub signed_url_paths: String,
+    #[sqlx(default)]
+    pub signed_url_secret: String,
+    #[sqlx(default)]
+    pub signed_url_previous_secret: String,
+    #[sqlx(default)]
+    pub signed_url_ttl_secs: i32,
+    #[sqlx(default)]
     pub published_version_id: Option<Uuid>,
 }
 
@@ -2412,7 +2477,14 @@ pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
                COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
-               COALESCE(shield_url, '') AS shield_url, published_version_id
+               COALESCE(shield_url, '') AS shield_url,
+               signed_url_enabled,
+               COALESCE(signed_url_mode, 'off') AS signed_url_mode,
+               COALESCE(signed_url_paths, '') AS signed_url_paths,
+               COALESCE(signed_url_secret, '') AS signed_url_secret,
+               COALESCE(signed_url_previous_secret, '') AS signed_url_previous_secret,
+               COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs,
+               published_version_id
         FROM domains
         ORDER BY name
         "#,
@@ -2432,7 +2504,14 @@ pub async fn get_domain_full_by_name(
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
                COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
-               COALESCE(shield_url, '') AS shield_url, published_version_id
+               COALESCE(shield_url, '') AS shield_url,
+               signed_url_enabled,
+               COALESCE(signed_url_mode, 'off') AS signed_url_mode,
+               COALESCE(signed_url_paths, '') AS signed_url_paths,
+               COALESCE(signed_url_secret, '') AS signed_url_secret,
+               COALESCE(signed_url_previous_secret, '') AS signed_url_previous_secret,
+               COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs,
+               published_version_id
         FROM domains WHERE name = $1
         "#,
     )

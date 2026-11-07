@@ -6,6 +6,7 @@ pub mod config;
 pub mod metrics;
 pub mod origin;
 pub mod pingora_edge;
+pub mod security;
 pub mod server;
 pub mod waf;
 

@@ -122,6 +122,12 @@ pub struct DomainConfigResponse {
     pub origin_timeout_ms: u32,
     pub custom_headers: String,
     pub shield_url: String,
+    pub signed_url_enabled: bool,
+    pub signed_url_mode: String,
+    pub signed_url_paths: String,
+    pub signed_url_secret: String,
+    pub signed_url_previous_secret: String,
+    pub signed_url_ttl_secs: u32,
     pub backup_origin: Option<OriginConfig>,
     pub origins: Vec<OriginConfig>,
     pub waf: Option<WafConfigOut>,
@@ -403,6 +409,12 @@ pub(crate) fn build(
         }
         None => "waf-none".hash(&mut h),
     }
+    row.signed_url_enabled.hash(&mut h);
+    row.signed_url_mode.hash(&mut h);
+    row.signed_url_paths.hash(&mut h);
+    row.signed_url_secret.hash(&mut h);
+    row.signed_url_previous_secret.hash(&mut h);
+    row.signed_url_ttl_secs.hash(&mut h);
 
     DomainConfigResponse {
         domain: row.name.clone(),
@@ -418,6 +430,16 @@ pub(crate) fn build(
         origin_timeout_ms: timeout,
         custom_headers: row.custom_headers.clone(),
         shield_url: row.shield_url.clone(),
+        signed_url_enabled: row.signed_url_enabled,
+        signed_url_mode: if row.signed_url_mode.is_empty() {
+            if row.signed_url_enabled { "all".into() } else { "off".into() }
+        } else {
+            row.signed_url_mode.clone()
+        },
+        signed_url_paths: row.signed_url_paths.clone(),
+        signed_url_secret: row.signed_url_secret.clone(),
+        signed_url_previous_secret: row.signed_url_previous_secret.clone(),
+        signed_url_ttl_secs: row.signed_url_ttl_secs.max(0) as u32,
         backup_origin: backup,
         origins,
         waf,

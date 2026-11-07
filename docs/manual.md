@@ -792,6 +792,109 @@ Redis L2 只保存普通缓存对象。大文件仍走 LargeCache 本地磁盘�
 
 当 Redis 不可用时，Edge 自动降级为本地缓存；跨节点 single-flight 也会跳过等待，避免 Redis 故障拖慢请求。
 
+### 4.3.2 签名 URL
+
+域名高级设置可开启：
+
+```text
+signed_url_mode
+signed_url_paths
+signed_url_enabled
+signed_url_secret
+signed_url_previous_secret
+signed_url_ttl_secs
+```
+
+`mode`：
+
+```text
+off     关闭
+all     整个域名要求签名
+paths   仅 signed_url_paths 匹配的路径要求签名
+```
+
+`paths` 每行一个规则：
+
+```text
+/private/*
+/downloads/*
+/vip/exact-file.mp4
+```
+
+仅支持精确路径或 `/prefix/*`；路径会先规范化并拒绝 `..`、`%2e`、`%2f`、反斜杠和控制字符。`/private/*` 不会匹配 `/private2/*`。
+
+启用后，受保护请求必须携带：
+
+```text
+expires=<unix 秒>
+sig=<hex HMAC-SHA256>
+```
+
+也接受 `signature=` 作为 `sig` 的别名。
+
+规范字符串：
+
+```text
+METHOD
+host
+path
+按字典序排序后的 query（剔除 expires/signature/sig）
+expires
+```
+
+各字段以换行符分隔。HMAC 密钥为当前 `signed_url_secret`；轮换期间也会尝试 `signed_url_previous_secret`。
+
+示例生成：
+
+```bash
+curl -X POST https://console.example.com/api/v1/domains/<id>/signed-url \
+  -H "Authorization: Bearer <token>" \
+  -H 'content-type: application/json' \
+  -d '{"path":"/private/file.mp4","expires_in":600}'
+```
+
+返回：
+
+```json
+{
+  "path_and_query": "/private/file.mp4?expires=...&sig=...",
+  "expires": 1794000000
+}
+```
+
+Edge 验签成功后会从 URI 中移除：
+
+```text
+expires
+signature
+sig
+```
+
+因此这些参数不会进入：
+
+```text
+缓存 key
+源站请求
+访问日志的 path 查询串
+```
+
+签名失败返回 `403`，不会回源。
+
+密钥轮换：
+
+```bash
+curl -X POST https://console.example.com/api/v1/domains/<id>/signed-url/rotate \
+  -H "Authorization: Bearer <token>"
+```
+
+旧密钥会移动到 `signed_url_previous_secret`，旧链接在配置同步后仍可通过校验；再次轮换会替换旧密钥。
+
+注意：
+
+- 签名 URL 的 query 参数顺序在签名时会被排序，但清理后保留原始顺序作为缓存 key；客户端应保持稳定参数顺序。
+- 域名开启签名后，管理接口、健康检查和 ACME 不受影响。
+- Edge 必须与控制面配置版本同步后生效；密钥变更会触发该域名缓存失效。
+
 ### 4.4 DNS 关键变量
 
 | 变量 | 说明 |

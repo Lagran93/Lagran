@@ -179,6 +179,18 @@ struct DomainCfg {
     #[serde(default)]
     ssl_enabled: bool,
     #[serde(default)]
+    signed_url_enabled: bool,
+    #[serde(default)]
+    signed_url_mode: String,
+    #[serde(default)]
+    signed_url_paths: String,
+    #[serde(default)]
+    signed_url_secret: String,
+    #[serde(default)]
+    signed_url_previous_secret: String,
+    #[serde(default)]
+    signed_url_ttl_secs: u32,
+    #[serde(default)]
     backup_origin: Option<OriginCfg>,
     #[serde(default)]
     origins: Vec<OriginCfg>,
@@ -254,6 +266,12 @@ impl DomainCfg {
             ssl_enabled: self.ssl_enabled,
             waf: into_waf(self.waf),
             cc,
+            signed_url_enabled: self.signed_url_enabled,
+            signed_url_mode: self.signed_url_mode,
+            signed_url_paths: self.signed_url_paths,
+            signed_url_secret: self.signed_url_secret,
+            signed_url_previous_secret: self.signed_url_previous_secret,
+            signed_url_ttl_secs: self.signed_url_ttl_secs,
         }
     }
 }

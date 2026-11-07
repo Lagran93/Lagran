@@ -47,7 +47,7 @@ impl OriginTarget {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DomainEntry {
     pub domain: String,
     pub origin_url: String,
@@ -71,6 +71,17 @@ pub struct DomainEntry {
     pub waf: WafConfig,
     /// CC/L7 flood policy (disabled by default).
     pub cc: CcConfig,
+    /// Require HMAC-signed URLs for this domain.
+    pub signed_url_enabled: bool,
+    /// off | all | paths. Empty means legacy signed_url_enabled behavior.
+    pub signed_url_mode: String,
+    /// Newline-separated path patterns; only used when mode is paths.
+    pub signed_url_paths: String,
+    /// Active signing key and previous key for zero-downtime rotation.
+    pub signed_url_secret: String,
+    pub signed_url_previous_secret: String,
+    /// Maximum allowed link lifetime; 0 means the default (1 hour).
+    pub signed_url_ttl_secs: u32,
 }
 
 #[derive(Clone, Default)]
@@ -201,6 +212,12 @@ mod tests {
             ssl_enabled: false,
             waf: WafConfig::default(),
             cc: CcConfig::default(),
+            signed_url_enabled: false,
+            signed_url_mode: String::new(),
+            signed_url_paths: String::new(),
+            signed_url_secret: String::new(),
+            signed_url_previous_secret: String::new(),
+            signed_url_ttl_secs: 3600,
         }
     }
 

@@ -106,6 +106,8 @@ pub fn create_router(state: AppState) -> Router {
                     get(domain::get_settings).put(domain::put_settings),
                 )
                 .route("/domains/:id/status", post(domain::set_status))
+                .route("/domains/:id/signed-url", post(domain::create_signed_url))
+                .route("/domains/:id/signed-url/rotate", post(domain::rotate_signed_url))
                 .route("/domains/:id/diagnose", post(domain_diag::diagnose))
                 .route("/edge-endpoints", get(edge_endpoints::list))
                 .route("/rules", get(rule::list).post(rule::create))
