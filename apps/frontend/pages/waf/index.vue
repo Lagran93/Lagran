@@ -1457,7 +1457,7 @@ onMounted(reload)
 .bar {
   width: 100%;
   max-width: 28px;
-  background: linear-gradient(180deg, #4096ff, #1677ff);
+  background: linear-gradient(180deg, #3b82f6, #2563eb);
   border-radius: 3px 3px 0 0;
   transition: height 0.2s ease;
 }

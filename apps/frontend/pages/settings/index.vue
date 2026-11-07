@@ -288,6 +288,8 @@
 </template>
 
 <script setup lang="ts">
+import { copyText } from '~/utils/clipboard'
+
 const api = useApi()
 const auth = useAuthStore()
 const toast = useToast()
@@ -467,10 +469,9 @@ async function savePassword() {
 const initial = computed(() => (auth.user?.name || auth.user?.email || 'L').slice(0, 1).toUpperCase())
 
 async function copy(text: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(text)
+  if (await copyText(text)) {
     toast.success(`${label}已复制`)
-  } catch {
+  } else {
     toast.error('复制失败，请手动选择文本')
   }
 }

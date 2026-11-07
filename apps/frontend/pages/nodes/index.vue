@@ -602,6 +602,7 @@
 </template>
 
 <script setup lang="ts">
+import { copyText } from '~/utils/clipboard'
 import { friendlyErrorMessage } from '~/utils/friendlyError'
 
 const api = useApi()
@@ -949,23 +950,10 @@ async function remove(node: any) {
 }
 
 async function copy(text: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(text)
+  if (await copyText(text)) {
     toast.success(`${label}已复制`)
-  } catch {
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    try {
-      document.execCommand('copy')
-      toast.success(`${label}已复制`)
-    } catch {
-      toast.error('复制失败，请手动选择文本')
-    }
-    document.body.removeChild(ta)
+  } else {
+    toast.error('复制失败，请手动选择文本')
   }
 }
 

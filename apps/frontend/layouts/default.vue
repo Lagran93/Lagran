@@ -87,7 +87,15 @@ const GROUP_KEYS: Record<string, string> = {
 }
 
 const sidebarOpen = ref(false)
+const sidebarCollapsed = ref(false)
 const userMenuOpen = ref(false)
+
+function toggleSidebarCollapsed() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+  if (import.meta.client) {
+    localStorage.setItem('lagran:sidebar-collapsed', sidebarCollapsed.value ? '1' : '0')
+  }
+}
 
 const NAV_PERMISSIONS: Record<string, string> = {
   '/domains': 'domain:read',
@@ -177,6 +185,9 @@ watch(
 let authRefreshTimer: ReturnType<typeof setInterval> | undefined
 
 onMounted(async () => {
+  if (import.meta.client) {
+    sidebarCollapsed.value = localStorage.getItem('lagran:sidebar-collapsed') === '1'
+  }
   auth.hydrate()
   await auth.refresh()
   // Detect revocations/expiry even when the user is idle on one page.
@@ -191,8 +202,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="app-shell">
-    <aside class="sidebar" :class="{ open: sidebarOpen }">
+  <div class="app-shell" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
+    <aside class="sidebar" :class="{ open: sidebarOpen, collapsed: sidebarCollapsed }">
       <div class="sidebar-brand">
         <div class="brand-mark">L</div>
         <div class="brand-text">
@@ -210,17 +221,18 @@ onUnmounted(() => {
             :to="item.to"
             class="menu-item"
             :class="{ active: isActive(item.to) }"
+            :title="sidebarCollapsed ? item.label : undefined"
             @click="closeSidebar"
           >
             <AppIcon :name="item.icon" :size="18" class="icon" />
-            <span>{{ item.label }}</span>
+            <span class="menu-label">{{ item.label }}</span>
           </NuxtLink>
         </div>
       </nav>
 
       <div class="sidebar-foot">
         <span class="dot" style="background: var(--success)" />
-        <span>{{ i18n.locale.value === 'zh' ? '控制面已连接' : 'Control plane connected' }}</span>
+        <span class="foot-text">{{ i18n.locale.value === 'zh' ? '控制面已连接' : 'Control plane connected' }}</span>
       </div>
     </aside>
 
@@ -236,6 +248,14 @@ onUnmounted(() => {
         >
           <AppIcon name="menu" :size="18" />
         </button>
+        <button
+          class="btn btn-icon btn-default sidebar-toggle-btn"
+          type="button"
+          :title="sidebarCollapsed ? '展开导航' : '收起导航'"
+          @click="toggleSidebarCollapsed"
+        >
+          <AppIcon name="menu" :size="18" />
+        </button>
 
         <div class="crumbs">
           <span>控制台</span>
@@ -246,6 +266,14 @@ onUnmounted(() => {
         </div>
 
         <div class="topbar-right">
+          <NuxtLink
+            v-if="auth.can('domain:write')"
+            to="/domains"
+            class="btn btn-primary btn-sm topbar-create"
+          >
+            <AppIcon name="plus" :size="14" />
+            接入域名
+          </NuxtLink>
           <button
             class="btn btn-icon btn-default"
             type="button"
@@ -296,6 +324,21 @@ onUnmounted(() => {
       <main class="content">
         <slot />
       </main>
+
+      <footer class="console-footer">
+        <span>© {{ new Date().getFullYear() }} Lagran CDN</span>
+        <span class="footer-sep">·</span>
+        <span>
+          开源协议
+          <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener noreferrer">
+            AGPL-3.0-only
+          </a>
+        </span>
+        <span class="footer-sep">·</span>
+        <a href="https://www.lagrancdn.com" target="_blank" rel="noopener noreferrer">
+          官网 lagrancdn.com
+        </a>
+      </footer>
     </div>
 
     <ToastHost />

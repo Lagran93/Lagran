@@ -255,7 +255,7 @@ onMounted(async () => {
 }
 
 .login-brand {
-  background: linear-gradient(150deg, #1677ff 0%, #2f7cf6 45%, #0e5fd8 100%);
+  background: linear-gradient(150deg, #2563eb 0%, #3b82f6 45%, #1d4ed8 100%);
   color: #fff;
   padding: 40px 40px 28px;
   display: flex;

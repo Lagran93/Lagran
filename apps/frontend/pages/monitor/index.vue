@@ -591,7 +591,7 @@ onUnmounted(() => {
 .top-bar i {
   display: block;
   height: 100%;
-  background: linear-gradient(90deg, #1677ff, #52c4ff);
+  background: linear-gradient(90deg, #2563eb, #22d3ee);
   border-radius: 3px;
 }
 
@@ -759,7 +759,7 @@ onUnmounted(() => {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #1677ff, #3ddc84);
+  background: linear-gradient(90deg, #2563eb, #3ddc84);
 }
 
 .cache-legend,
