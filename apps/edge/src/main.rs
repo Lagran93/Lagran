@@ -21,6 +21,11 @@ fn is_http_url(value: &str) -> bool {
 async fn main() -> anyhow::Result<()> {
     // Load .env BEFORE EnvFilter reads RUST_LOG
     let _ = dotenvy::dotenv();
+
+    if handle_cli()? {
+        return Ok(());
+    }
+
     init_tracing();
 
     let config = EdgeConfig::load();
@@ -260,6 +265,99 @@ fn random_secret() -> String {
                 .unwrap_or(0)
         )
     }
+}
+
+fn handle_cli() -> anyhow::Result<bool> {
+    let command = std::env::args().nth(1);
+    let Some(command) = command.as_deref() else {
+        return Ok(false);
+    };
+    // Let Pingora's own flags pass through.
+    if command.starts_with('-') {
+        return Ok(false);
+    }
+    match command {
+        "version" | "-V" | "--version" => {
+            println!("lagran-edge {} ({})", edge::version::VERSION, edge::version::GIT_HASH);
+            Ok(true)
+        }
+        "help" | "-h" | "--help" => {
+            print_help();
+            Ok(true)
+        }
+        "check-config" | "config-check" => {
+            let config = EdgeConfig::load();
+            check_config(&config)?;
+            Ok(true)
+        }
+        "health" => {
+            let config = EdgeConfig::load();
+            health(&config)?;
+            Ok(true)
+        }
+        "serve" => Ok(false),
+        other => {
+            anyhow::bail!("unknown command {other:?}\n\n{}", help_text());
+        }
+    }
+}
+
+fn check_config(config: &EdgeConfig) -> anyhow::Result<()> {
+    if !is_http_url(&config.control_url) {
+        anyhow::bail!(
+            "CONTROL_URL must start with http:// or https:// (got {:?})",
+            config.control_url
+        );
+    }
+    println!("config: ok");
+    println!("listen: {}", config.listen_addr);
+    println!("admin_listen: {}", config.admin_listen_addr.as_deref().unwrap_or("(same as listen)"));
+    println!("https_listen: {}", config.https_listen_addr.as_deref().unwrap_or("disabled"));
+    println!("control_url: {}", config.control_url);
+    println!("domain: {}", config.domain);
+    println!("node_id: {}", config.node_id);
+    println!("region: {}", config.region);
+    println!("cache_backend: {}", config.cache_backend);
+    println!("redis: {}", if config.redis_url.trim().is_empty() { "disabled" } else { "configured" });
+    println!("cert_dir: {}", config.cert_dir);
+    println!("access_log: {}", config.access_log_path.as_deref().unwrap_or("disabled"));
+    println!("large_cache: {}", config.large_cache_enabled);
+    Ok(())
+}
+
+fn health(config: &EdgeConfig) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    let addr = config
+        .admin_listen_addr
+        .as_deref()
+        .unwrap_or(&config.listen_addr);
+    let port = addr
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .ok_or_else(|| anyhow::anyhow!("invalid listen address {addr:?}"))?;
+    let target: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let mut stream = TcpStream::connect_timeout(&target, std::time::Duration::from_secs(3))
+        .map_err(|e| anyhow::anyhow!("edge health connect failed: {e}"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+    stream.write_all(b"GET /__lagran/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let status = response.lines().next().unwrap_or("");
+    println!("health: {status}");
+    if !status.contains(" 200 ") {
+        anyhow::bail!("edge health check failed: {status}");
+    }
+    Ok(())
+}
+
+fn help_text() -> &'static str {
+    "Lagran Edge\n\nUsage:\n  lagran-edge [serve]      start the data plane\n  lagran-edge check-config\n  lagran-edge health\n  lagran-edge version\n  lagran-edge help\n\nEnvironment:\n  CONTROL_URL, EDGE_LISTEN, EDGE_ADMIN_LISTEN\n  CACHE_BACKEND, DATABASE_URL, REDIS_URL\n"
+}
+
+fn print_help() {
+    println!("{}", help_text());
 }
 
 fn init_tracing() {

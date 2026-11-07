@@ -1039,6 +1039,68 @@ NUXT_PUBLIC_API_BASE=
 
 ---
 
+### 4.5 常用子命令
+
+三个服务都支持 `version`、`check-config`、`help`，默认无参数启动服务。
+
+## Control
+
+```bash
+lagran-control serve
+lagran-control check-config
+lagran-control migrate
+lagran-control health
+lagran-control version
+lagran-control help
+```
+
+`check-config` 只校验环境变量和关键安全项，不连接数据库。
+
+`migrate` 连接 PostgreSQL 并执行 `apps/control/migrations`。
+
+`health` 请求 `CONTROL_HEALTH_URL`，未设置时自动使用本机监听地址的 `/health`。
+
+## Edge
+
+```bash
+lagran-edge serve
+lagran-edge check-config
+lagran-edge health
+lagran-edge version
+lagran-edge help
+```
+
+`health` 请求管理监听地址：
+
+```text
+/__lagran/health
+```
+
+## DNS
+
+```bash
+lagran-dns serve
+lagran-dns check-config
+lagran-dns version
+lagran-dns help
+```
+
+`check-config` 校验：
+
+```text
+DNS_LISTEN 格式
+DNS_NS_NAME / DNS_NS_IP 数量
+DNS_ZONE
+CONTROL_URL
+```
+
+## 说明
+
+```text
+version 不连接数据库、不启动监听
+check-config 不改变运行状态
+health 只做只读探测
+```
 ## 5. 缓存机制与验证
 
 ### 5.1 缓存 key

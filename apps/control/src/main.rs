@@ -26,6 +26,10 @@ async fn main() -> anyhow::Result<()> {
     // Load .env BEFORE EnvFilter reads RUST_LOG
     let _ = dotenvy::dotenv();
 
+    if handle_cli().await? {
+        return Ok(());
+    }
+
     let config = AppConfig::load();
     if !config.public_url.is_empty() && !is_http_url(&config.public_url) {
         anyhow::bail!(
@@ -185,6 +189,119 @@ async fn main() -> anyhow::Result<()> {
         let _ = provider.shutdown();
     }
     Ok(())
+}
+
+/// Handle management subcommands before starting HTTP/TLS/DB background work.
+/// Returning `true` means the command completed and the process must exit.
+async fn handle_cli() -> anyhow::Result<bool> {
+    let command = std::env::args().nth(1);
+    let command = command.as_deref().unwrap_or("serve");
+    match command {
+        "version" | "-V" | "--version" => {
+            println!("lagran-control {} ({})", control::version::VERSION, control::version::GIT_HASH);
+            Ok(true)
+        }
+        "help" | "-h" | "--help" => {
+            print_help();
+            Ok(true)
+        }
+        "check-config" | "config-check" => {
+            let config = AppConfig::load();
+            check_config(&config)?;
+            Ok(true)
+        }
+        "migrate" | "db-migrate" => {
+            let config = AppConfig::load();
+            check_config(&config)?;
+            migrate(&config).await?;
+            Ok(true)
+        }
+        "health" => {
+            let config = AppConfig::load();
+            health(&config).await?;
+            Ok(true)
+        }
+        "serve" => Ok(false),
+        other => {
+            anyhow::bail!(
+                "unknown command {other:?}\n\n{}",
+                help_text()
+            );
+        }
+    }
+}
+
+fn check_config(config: &AppConfig) -> anyhow::Result<()> {
+    if !config.public_url.is_empty() && !is_http_url(&config.public_url) {
+        anyhow::bail!(
+            "CONTROL_PUBLIC_URL must start with http:// or https:// (got {:?})",
+            config.public_url
+        );
+    }
+    const DEFAULT_JWT: &str = "lagran-dev-secret-change-me";
+    if config.jwt_secret == DEFAULT_JWT || config.jwt_secret.len() < 16 {
+        if config.require_secure_secrets {
+            anyhow::bail!(
+                "JWT_SECRET is missing or uses the insecure default; set a strong secret or disable REQUIRE_SECURE_SECRETS"
+            );
+        }
+        eprintln!("warning: JWT_SECRET is the built-in default or too short");
+    }
+    if config.agent_token.is_empty() {
+        eprintln!("warning: AGENT_TOKEN is empty; agent endpoints are weaker");
+    }
+    println!("config: ok");
+    println!("bind: {}", config.bind_addr());
+    println!("public_url: {}", if config.public_url.is_empty() { "(derive from request)".to_string() } else { config.public_url.clone() });
+    println!("database: configured");
+    println!("database_pool: {}..{}", config.database_min_connections, config.database_max_connections);
+    println!("redis: {}", if config.redis_url.trim().is_empty() { "disabled" } else { "configured" });
+    println!("agent_token: {}", if config.agent_token.is_empty() { "empty" } else { "set" });
+    println!("jwt_secret: {}", if config.jwt_secret.len() >= 16 { "set" } else { "weak" });
+    println!("jwt_expire_hours: {}", config.jwt_expire_hours);
+    println!("allow_register: {}", config.allow_register);
+    println!("captcha_enabled: {}", config.captcha_enabled);
+    Ok(())
+}
+
+async fn migrate(config: &AppConfig) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database_max_connections.max(2))
+        .connect(&config.database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to database: {e}"))?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    println!("migrations: applied");
+    Ok(())
+}
+
+async fn health(config: &AppConfig) -> anyhow::Result<()> {
+    let url = std::env::var("CONTROL_HEALTH_URL").unwrap_or_else(|_| {
+        let bind = config.bind_addr();
+        let host_port = bind
+            .rsplit_once(':')
+            .map(|(_, port)| format!("127.0.0.1:{port}"))
+            .unwrap_or(bind);
+        format!("http://{host_port}/health")
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let response = client.get(&url).send().await?;
+    let status = response.status();
+    println!("health: {} {}", status.as_u16(), status.canonical_reason().unwrap_or(""));
+    if !status.is_success() {
+        anyhow::bail!("control health check failed: HTTP {}", status.as_u16());
+    }
+    Ok(())
+}
+
+fn help_text() -> &'static str {
+    "Lagran Control\n\nUsage:\n  lagran-control [serve]\n  lagran-control check-config\n  lagran-control migrate\n  lagran-control health\n  lagran-control version\n  lagran-control help\n\nEnvironment:\n  CONTROL_BIND, DATABASE_URL, JWT_SECRET, AGENT_TOKEN\n  CONTROL_HEALTH_URL  override health check URL\n"
+}
+
+fn print_help() {
+    println!("{}", help_text());
 }
 
 fn init_tracing(config: &AppConfig) -> Option<SdkTracerProvider> {

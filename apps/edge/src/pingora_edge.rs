@@ -3113,7 +3113,18 @@ fn prepare_proxy_headers(session: &mut Session, trust_proxy: bool) -> Result<()>
 
 /// Run the Pingora public listener. `upstream` is the loopback fallback router.
 pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> anyhow::Result<()> {
-    let opt = pingora::server::configuration::Opt::parse_args();
+    // `serve` is our subcommand; Pingora's own clap parser must not see it.
+    let opt = if std::env::args().nth(1).as_deref() == Some("serve") {
+        pingora::server::configuration::Opt {
+            upgrade: false,
+            daemon: false,
+            nocapture: false,
+            test: false,
+            conf: None,
+        }
+    } else {
+        pingora::server::configuration::Opt::parse_args()
+    };
     let mut server = Server::new(Some(opt))?;
     server.bootstrap();
 
