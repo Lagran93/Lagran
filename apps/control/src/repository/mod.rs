@@ -2623,6 +2623,7 @@ pub struct WafRuleRow {
     pub action: String,
     pub priority: i32,
     pub enabled: bool,
+    pub expr: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -2790,7 +2791,7 @@ pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSetting
 pub async fn list_waf_rules(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<WafRuleRow>> {
     sqlx::query_as::<_, WafRuleRow>(
         r#"
-        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
         FROM waf_rules WHERE domain_id = $1
         ORDER BY priority DESC, created_at
         "#,
@@ -2803,7 +2804,7 @@ pub async fn list_waf_rules(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<
 pub async fn list_waf_rules_all(pool: &PgPool) -> sqlx::Result<Vec<WafRuleRow>> {
     sqlx::query_as::<_, WafRuleRow>(
         r#"
-        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
         FROM waf_rules ORDER BY domain_id, priority DESC, created_at
         "#,
     )
@@ -2814,7 +2815,7 @@ pub async fn list_waf_rules_all(pool: &PgPool) -> sqlx::Result<Vec<WafRuleRow>> 
 pub async fn get_waf_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<WafRuleRow>> {
     sqlx::query_as::<_, WafRuleRow>(
         r#"
-        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
         FROM waf_rules WHERE id = $1
         "#,
     )
@@ -2834,12 +2835,13 @@ pub async fn create_waf_rule(
     action: &str,
     priority: i32,
     enabled: bool,
+    expr: &str,
 ) -> sqlx::Result<WafRuleRow> {
     sqlx::query_as::<_, WafRuleRow>(
         r#"
-        INSERT INTO waf_rules (domain_id, name, field, operator, value, action, priority, enabled)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        INSERT INTO waf_rules (domain_id, name, field, operator, value, action, priority, enabled, expr)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
         "#,
     )
     .bind(domain_id)
@@ -2850,6 +2852,7 @@ pub async fn create_waf_rule(
     .bind(action)
     .bind(priority)
     .bind(enabled)
+    .bind(expr)
     .fetch_one(pool)
     .await
 }
@@ -2865,14 +2868,15 @@ pub async fn update_waf_rule(
     action: &str,
     priority: i32,
     enabled: bool,
+    expr: &str,
 ) -> sqlx::Result<Option<WafRuleRow>> {
     sqlx::query_as::<_, WafRuleRow>(
         r#"
         UPDATE waf_rules SET
           name = $2, field = $3, operator = $4, value = $5,
-          action = $6, priority = $7, enabled = $8
+          action = $6, priority = $7, enabled = $8, expr = $9
         WHERE id = $1
-        RETURNING id, domain_id, name, field, operator, value, action, priority, enabled, created_at
+        RETURNING id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
         "#,
     )
     .bind(id)
@@ -2883,6 +2887,7 @@ pub async fn update_waf_rule(
     .bind(action)
     .bind(priority)
     .bind(enabled)
+    .bind(expr)
     .fetch_optional(pool)
     .await
 }

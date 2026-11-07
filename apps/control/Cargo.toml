@@ -24,6 +24,7 @@ http-body-util = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+lagran-waf-dsl = { path = "../../crates/lagran-waf-dsl" }
 sqlx = { workspace = true }
 jsonwebtoken = { workspace = true }
 bcrypt = { workspace = true }

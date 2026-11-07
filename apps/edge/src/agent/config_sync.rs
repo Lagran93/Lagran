@@ -399,6 +399,8 @@ struct WafRuleCfg {
     priority: i32,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default)]
+    expr: String,
 }
 
 fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
@@ -473,6 +475,21 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
                 "challenge" => WafAction::Challenge,
                 _ => WafAction::Block,
             };
+            let expr = if r.expr.trim().is_empty() {
+                None
+            } else {
+                match lagran_waf_dsl::parse(&r.expr) {
+                    Ok(expr) => Some(expr),
+                    Err(e) => {
+                        tracing::warn!(
+                            rule = %r.name,
+                            error = %e,
+                            "invalid WAF custom-rule DSL; rule disabled"
+                        );
+                        return None;
+                    }
+                }
+            };
             Some(WafRule {
                 name: if r.name.is_empty() {
                     "custom rule".into()
@@ -485,6 +502,7 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
                 action,
                 priority: r.priority,
                 enabled: r.enabled,
+                expr,
             })
         })
         .collect();

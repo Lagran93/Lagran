@@ -107,6 +107,8 @@ pub enum WafOp {
     Equals,
     Prefix,
     Suffix,
+    /// CIDR membership; only used by the DSL and only for the IP field.
+    In,
 }
 
 impl WafOp {
@@ -126,6 +128,7 @@ impl WafOp {
             WafOp::Equals => haystack == needle,
             WafOp::Prefix => haystack.starts_with(needle),
             WafOp::Suffix => haystack.ends_with(needle),
+            WafOp::In => false,
         }
     }
 }
@@ -140,6 +143,8 @@ pub struct WafRule {
     pub action: WafAction,
     pub priority: i32,
     pub enabled: bool,
+    /// Optional parsed boolean DSL; supersedes field/op/value.
+    pub expr: Option<lagran_waf_dsl::Expr>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -671,6 +676,61 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 /// Evaluate the WAF for one request. Returns the first matching verdict.
+fn eval_dsl(
+    expr: &lagran_waf_dsl::Expr,
+    req: &WafRequest,
+    path: &str,
+    query: &str,
+    ua: &str,
+    referer: &str,
+    method: &str,
+    ip_text: &str,
+) -> bool {
+    match expr {
+        lagran_waf_dsl::Expr::And(parts) => parts.iter().all(|part| {
+            eval_dsl(part, req, path, query, ua, referer, method, ip_text)
+        }),
+        lagran_waf_dsl::Expr::Or(parts) => parts.iter().any(|part| {
+            eval_dsl(part, req, path, query, ua, referer, method, ip_text)
+        }),
+        lagran_waf_dsl::Expr::Not(inner) => {
+            !eval_dsl(inner, req, path, query, ua, referer, method, ip_text)
+        }
+        lagran_waf_dsl::Expr::Condition { field, op, value } => {
+            let op = match op {
+                lagran_waf_dsl::Op::Contains => WafOp::Contains,
+                lagran_waf_dsl::Op::Equals => WafOp::Equals,
+                lagran_waf_dsl::Op::Prefix => WafOp::Prefix,
+                lagran_waf_dsl::Op::Suffix => WafOp::Suffix,
+                lagran_waf_dsl::Op::In => WafOp::In,
+            };
+            if op == WafOp::In {
+                let Ok(ip) = ip_text.parse::<IpAddr>() else {
+                    return false;
+                };
+                return value.split(',').any(|part| {
+                    IpNet::parse(part)
+                        .map(|net| net.contains(ip))
+                        .unwrap_or(false)
+                });
+            }
+            if let lagran_waf_dsl::Field::Header(name) = field {
+                return op.matches(&header_value(req.headers, name), value);
+            }
+            let haystack = match field {
+                lagran_waf_dsl::Field::Path => path,
+                lagran_waf_dsl::Field::Query => query,
+                lagran_waf_dsl::Field::UserAgent => ua,
+                lagran_waf_dsl::Field::Referer => referer,
+                lagran_waf_dsl::Field::Method => method,
+                lagran_waf_dsl::Field::Ip => ip_text,
+                lagran_waf_dsl::Field::Header(_) => unreachable!(),
+            };
+            op.matches(haystack, value)
+        }
+    }
+}
+
 pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     if !cfg.enabled {
         return None;
@@ -773,16 +833,21 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     let method = req.method.to_ascii_lowercase();
     let ip_text = req.ip.map(|i| i.to_string()).unwrap_or_default();
     for rule in rules {
-        let value: String = match &rule.field {
-            WafField::Path => path.clone(),
-            WafField::Query => query.clone(),
-            WafField::UserAgent => ua.clone(),
-            WafField::Referer => referer.clone(),
-            WafField::Method => method.clone(),
-            WafField::Ip => ip_text.clone(),
-            WafField::Header(name) => header_value(req.headers, name),
+        let matched = if let Some(expr) = &rule.expr {
+            eval_dsl(expr, req, &path, &query, &ua, &referer, &method, &ip_text)
+        } else {
+            let value: String = match &rule.field {
+                WafField::Path => path.clone(),
+                WafField::Query => query.clone(),
+                WafField::UserAgent => ua.clone(),
+                WafField::Referer => referer.clone(),
+                WafField::Method => method.clone(),
+                WafField::Ip => ip_text.clone(),
+                WafField::Header(name) => header_value(req.headers, name),
+            };
+            rule.op.matches(&value, &rule.value)
         };
-        if rule.op.matches(&value, &rule.value) {
+        if matched {
             return Some(WafVerdict {
                 action: rule.action,
                 rule_name: rule.name.clone(),
@@ -944,6 +1009,7 @@ mod tests {
                 action: WafAction::Allow,
                 priority: 100,
                 enabled: true,
+                expr: None,
             },
             WafRule {
                 name: "block admin".into(),
@@ -953,6 +1019,7 @@ mod tests {
                 action: WafAction::Block,
                 priority: 10,
                 enabled: true,
+                expr: None,
             },
         ];
 
@@ -986,6 +1053,7 @@ mod tests {
             action: WafAction::Log,
             priority: 0,
             enabled: true,
+            expr: None,
         }];
         let h = HeaderMap::new();
         let v = evaluate(&c, &req(&h, "/api/x", "", "curl")).unwrap();
@@ -1034,6 +1102,7 @@ mod tests {
             action: WafAction::Block,
             priority: 1,
             enabled: true,
+            expr: None,
         }];
         let mut h = HeaderMap::new();
         h.insert("x-api-key", "bad".parse().unwrap());
@@ -1146,6 +1215,61 @@ mod tests {
         )
         .expect("double-encoded SQLi must be detected");
         assert_eq!(verdict.category, "sqli");
+    }
+
+    #[test]
+    fn custom_rule_dsl_ip_cidr_in() {
+        let mut c = cfg();
+        c.rules = vec![WafRule {
+            name: "internal cidr".into(),
+            field: WafField::Ip,
+            op: WafOp::In,
+            value: "10.0.0.0/8,198.51.100.0/24".into(),
+            action: WafAction::Block,
+            priority: 10,
+            enabled: true,
+            expr: Some(
+                lagran_waf_dsl::parse(r#"ip in "10.0.0.0/8,198.51.100.0/24""#).unwrap(),
+            ),
+        }];
+        let h = HeaderMap::new();
+        assert_eq!(
+            evaluate(&c, &req(&h, "/", "", "curl")).unwrap().rule_name,
+            "internal cidr"
+        );
+        let mut req_bad = req(&h, "/", "", "curl");
+        req_bad.ip = Some("203.0.113.5".parse().unwrap());
+        assert!(evaluate(&c, &req_bad).is_none());
+    }
+
+    #[test]
+    fn custom_rule_dsl_boolean_logic() {
+        let mut c = cfg();
+        c.rules = vec![WafRule {
+            name: "admin without api key".into(),
+            field: WafField::Path,
+            op: WafOp::Prefix,
+            value: "/admin".into(),
+            action: WafAction::Block,
+            priority: 10,
+            enabled: true,
+            expr: Some(
+                lagran_waf_dsl::parse(
+                    r#"path prefix "/admin" AND NOT header:x-api-key equals "ok""#,
+                )
+                .unwrap(),
+            ),
+        }];
+        let mut h = HeaderMap::new();
+        assert_eq!(
+            evaluate(&c, &req(&h, "/admin/users", "", "curl"))
+                .unwrap()
+                .category,
+            "custom"
+        );
+        h.insert("x-api-key", "ok".parse().unwrap());
+        assert!(evaluate(&c, &req(&h, "/admin/users", "", "curl")).is_none());
+        assert!(evaluate(&c, &req(&h, "/public", "", "curl")).is_none());
     }
 
     #[test]

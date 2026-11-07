@@ -81,6 +81,8 @@ pub struct WafRuleOut {
     pub action: String,
     pub priority: i32,
     pub enabled: bool,
+    #[serde(default)]
+    pub expr: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -337,6 +339,7 @@ fn waf_config_from(
                 action: r.action,
                 priority: r.priority,
                 enabled: r.enabled,
+                expr: r.expr,
             })
             .collect(),
         ip_allow,
@@ -459,6 +462,7 @@ pub(crate) fn build(
                 r.action.hash(&mut h);
                 r.priority.hash(&mut h);
                 r.enabled.hash(&mut h);
+                r.expr.hash(&mut h);
             }
             for ip in &w.ip_allow {
                 ip.hash(&mut h);

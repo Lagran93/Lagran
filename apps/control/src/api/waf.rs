@@ -672,6 +672,7 @@ pub struct WafRuleDto {
     pub action: String,
     pub priority: i32,
     pub enabled: bool,
+    pub expr: String,
     pub created_at: String,
 }
 
@@ -687,6 +688,7 @@ impl From<repository::WafRuleRow> for WafRuleDto {
             action: r.action,
             priority: r.priority,
             enabled: r.enabled,
+            expr: r.expr,
             created_at: r.created_at.to_rfc3339(),
         }
     }
@@ -701,6 +703,8 @@ pub struct WafRuleRequest {
     pub action: Option<String>,
     pub priority: Option<i32>,
     pub enabled: Option<bool>,
+    /// Optional boolean DSL. When non-empty, it replaces the single condition.
+    pub expr: Option<String>,
 }
 
 struct ValidRule {
@@ -711,6 +715,7 @@ struct ValidRule {
     action: String,
     priority: i32,
     enabled: bool,
+    expr: String,
 }
 
 fn validate_rule(req: &WafRuleRequest) -> Result<ValidRule, (StatusCode, Json<ErrorBody>)> {
@@ -718,31 +723,52 @@ fn validate_rule(req: &WafRuleRequest) -> Result<ValidRule, (StatusCode, Json<Er
     if name.is_empty() {
         return Err(bad_request("name required".into()));
     }
-    let field = req.field.trim().to_ascii_lowercase();
-    let header_field = field.strip_prefix("header:").map(|name| {
-        let name = name.trim();
-        !name.is_empty()
-            && name.len() <= 64
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    });
-    if !FIELDS.contains(&field.as_str()) && header_field != Some(true) {
-        return Err(bad_request(format!(
-            "field must be one of {} or header:<name>",
-            FIELDS.join(", ")
-        )));
+    let expr = req.expr.as_deref().unwrap_or("").trim().to_string();
+    if !expr.is_empty() {
+        lagran_waf_dsl::validate(&expr).map_err(|e| {
+            bad_request(format!("invalid DSL at position {}: {}", e.position, e.message))
+        })?;
     }
-    let operator = req.operator.trim().to_ascii_lowercase();
-    if !OPERATORS.contains(&operator.as_str()) {
-        return Err(bad_request(format!(
-            "operator must be one of {}",
-            OPERATORS.join(", ")
-        )));
-    }
-    let value = req.value.trim();
-    if value.is_empty() {
-        return Err(bad_request("value required".into()));
+
+    let mut field = req.field.trim().to_ascii_lowercase();
+    let mut operator = req.operator.trim().to_ascii_lowercase();
+    let mut value = req.value.trim().to_string();
+    if expr.is_empty() {
+        let header_field = field.strip_prefix("header:").map(|name| {
+            let name = name.trim();
+            !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+        if !FIELDS.contains(&field.as_str()) && header_field != Some(true) {
+            return Err(bad_request(format!(
+                "field must be one of {} or header:<name>",
+                FIELDS.join(", ")
+            )));
+        }
+        if !OPERATORS.contains(&operator.as_str()) {
+            return Err(bad_request(format!(
+                "operator must be one of {}",
+                OPERATORS.join(", ")
+            )));
+        }
+        if value.is_empty() {
+            return Err(bad_request("value required".into()));
+        }
+    } else {
+        // The DSL supersedes the legacy condition. Keep harmless defaults for
+        // old Edge binaries and for the table's NOT NULL columns.
+        if field.is_empty() {
+            field = "path".into();
+        }
+        if operator.is_empty() {
+            operator = "contains".into();
+        }
+        if value.is_empty() {
+            value = expr.clone();
+        }
     }
     let action = req
         .action
@@ -764,6 +790,7 @@ fn validate_rule(req: &WafRuleRequest) -> Result<ValidRule, (StatusCode, Json<Er
         action,
         priority: req.priority.unwrap_or(0),
         enabled: req.enabled.unwrap_or(true),
+        expr,
     })
 }
 
@@ -803,6 +830,7 @@ pub async fn create_rule(
         &rule.action,
         rule.priority,
         rule.enabled,
+        &rule.expr,
     )
     .await
     .map_err(|e| {
@@ -815,8 +843,8 @@ pub async fn create_rule(
         "waf.rule.create",
         &domain_id.to_string(),
         &format!(
-            "{} {} {} {}",
-            rule.field, rule.operator, rule.value, rule.action
+            "{} {} {} {} expr={}",
+            rule.field, rule.operator, rule.value, rule.action, rule.expr
         ),
     )
     .await;
@@ -835,7 +863,7 @@ pub async fn update_rule(
     State(state): State<AppState>,
     actor: Actor,
     Path(id): Path<String>,
-    Json(req): Json<WafRuleRequest>,
+    Json(mut req): Json<WafRuleRequest>,
 ) -> Result<Json<WafRuleDto>, (StatusCode, Json<ErrorBody>)> {
     let rule_id = parse_uuid(&id)?;
     let existing = repository::get_waf_rule(&state.pool, rule_id)
@@ -844,6 +872,11 @@ pub async fn update_rule(
         .ok_or_else(|| not_found("rule not found"))?;
     if !actor.can_write_domain(&state, existing.domain_id).await {
         return Err(forbidden());
+    }
+    // Partial updates (for example the enable/disable toggle) must not
+    // silently clear an existing DSL expression.
+    if req.expr.is_none() {
+        req.expr = Some(existing.expr.clone());
     }
     let rule = validate_rule(&req)?;
     let row = repository::update_waf_rule(
@@ -856,6 +889,7 @@ pub async fn update_rule(
         &rule.action,
         rule.priority,
         rule.enabled,
+        &rule.expr,
     )
     .await
     .map_err(|_| db_error())?

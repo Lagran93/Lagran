@@ -5,6 +5,7 @@ members = [
     "apps/dns",
     "apps/edge",
     "crates/lagran-cache",
+    "crates/lagran-waf-dsl",
 ]
 
 [workspace.package]

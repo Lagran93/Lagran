@@ -640,6 +640,87 @@ waf.rulepack.checksum
 验签失败不会阻止域名继续使用 Control 已下发的有效托管布尔值，但不会写入缓存，并会记录告警日志。
 
 
+### 3.5.1 自定义 WAF 规则 DSL
+
+自定义规则支持可选布尔表达式：
+
+```json
+{
+  "name": "后台接口缺少内部密钥",
+  "field": "path",
+  "operator": "contains",
+  "value": "",
+  "action": "block",
+  "priority": 100,
+  "enabled": true,
+  "expr": "path prefix \"/admin\" AND NOT header:x-api-key equals \"ok\""
+}
+```
+
+`expr` 非空时，忽略 `field/operator/value` 单条件，使用表达式。
+
+## 语法
+
+```text
+expr    := or
+or      := and ("OR" and)*
+and     := unary ("AND" unary)*
+unary   := "NOT" unary | "(" expr ")" | condition
+condition := field operator "string"
+```
+
+字段：
+
+```text
+path
+query
+user_agent / ua
+referer
+method
+ip
+header:<name>
+```
+
+操作符：
+
+```text
+contains
+equals / eq
+prefix / starts_with
+suffix / ends_with
+in                 仅用于 ip，值为 CIDR 或 IP
+```
+
+示例：
+
+```text
+path prefix "/admin"
+method equals "POST" AND query contains "debug"
+path prefix "/api" AND NOT header:x-api-key equals "ok"
+(path prefix "/admin" OR path prefix "/internal") AND ip in "10.0.0.0/8"
+
+ip in "10.0.0.0/8,2001:db8::/32"
+ip in "203.0.113.7"
+NOT ip in "10.0.0.0/8"
+```
+
+关键字、字段名和值匹配不区分大小写。
+
+## 限制
+
+```text
+最大长度 2048
+最大嵌套深度 16
+最大 AST 节点数 64
+字符串最大 256
+不允许正则
+不允许代码执行
+```
+
+表达式由控制面校验，Edge 在配置同步时再次解析；无效表达式会导致该规则被跳过并记录日志。
+
+DSL 仍然只检查 path/query/UA/Referer/Method/Header/IP，不读取请求体。
+
 ### 3.6 缓存刷新与预热
 
 #### 缓存刷新

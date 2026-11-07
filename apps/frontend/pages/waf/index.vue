@@ -405,7 +405,10 @@
                 <tr v-for="r in pagedRules" :key="r.id">
                   <td class="cell-main">{{ r.name }}</td>
                   <td>
-                    <span class="mono">{{ fieldLabel(r.field) }} {{ opLabel(r.operator) }} {{ r.value }}</span>
+                    <span v-if="r.expr" class="mono dsl-cell" :title="r.expr">
+                      <span class="dsl-badge">DSL</span>{{ r.expr }}
+                    </span>
+                    <span v-else class="mono">{{ fieldLabel(r.field) }} {{ opLabel(r.operator) }} {{ r.value }}</span>
                   </td>
                   <td>
                     <StatusTag :tone="actionTone(r.action)">{{ actionLabel(r.action) }}</StatusTag>
@@ -699,7 +702,7 @@
         <div class="form-grid">
           <div class="field">
             <label class="field-label">匹配字段</label>
-            <select v-model="ruleForm.field" class="select">
+            <select v-model="ruleForm.field" class="select" :disabled="!!ruleForm.expr.trim()">
               <option value="path">路径 Path</option>
               <option value="query">查询串 Query</option>
               <option value="user_agent">User-Agent</option>
@@ -711,11 +714,11 @@
           </div>
           <div v-if="ruleForm.field === 'header'" class="field">
             <label class="field-label">请求头名称 <span class="req">*</span></label>
-            <input v-model="ruleForm.header_name" class="input" placeholder="例如 x-api-key" />
+            <input v-model="ruleForm.header_name" class="input" placeholder="例如 x-api-key" :disabled="!!ruleForm.expr.trim()" />
           </div>
           <div class="field">
             <label class="field-label">匹配方式</label>
-            <select v-model="ruleForm.operator" class="select">
+            <select v-model="ruleForm.operator" class="select" :disabled="!!ruleForm.expr.trim()">
               <option value="contains">包含</option>
               <option value="equals">等于</option>
               <option value="prefix">前缀</option>
@@ -723,8 +726,8 @@
             </select>
           </div>
           <div class="field span-2">
-            <label class="field-label">匹配内容 <span class="req">*</span></label>
-            <input v-model="ruleForm.value" class="input" placeholder="例如 /admin 或 sqlmap" />
+            <label class="field-label">匹配内容 <span v-if="!ruleForm.expr.trim()" class="req">*</span></label>
+            <input v-model="ruleForm.value" class="input" placeholder="例如 /admin 或 sqlmap" :disabled="!!ruleForm.expr.trim()" />
           </div>
           <div class="field">
             <label class="field-label">命中动作</label>
@@ -739,6 +742,41 @@
             <label class="field-label">优先级</label>
             <input v-model.number="ruleForm.priority" class="input" type="number" />
           </div>
+        </div>
+        <div class="field">
+          <label class="field-label">高级条件 DSL（可选）</label>
+          <div class="dsl-editor">
+            <textarea
+              ref="dslTextarea"
+              v-model="ruleForm.expr"
+              class="textarea mono"
+              rows="4"
+              placeholder='例如：path prefix "/admin" AND ip in "10.0.0.0/8"'
+              @input="updateDslSuggestions"
+              @focus="updateDslSuggestions"
+              @click="updateDslSuggestions"
+              @keydown="onDslKeydown"
+              @blur="closeDslSuggestionsSoon"
+            />
+            <div v-if="dslSuggestOpen && dslSuggestions.length" class="dsl-suggest">
+              <button
+                v-for="(item, i) in dslSuggestions"
+                :key="item.label"
+                type="button"
+                class="dsl-suggest-item"
+                :class="{ active: i === dslSuggestIndex }"
+                @mousedown.prevent="applyDslSuggestion(item)"
+              >
+                <span class="dsl-suggest-label mono">{{ item.label }}</span>
+                <span class="dsl-suggest-detail">{{ item.detail }}</span>
+              </button>
+              <div class="dsl-suggest-foot">↑↓ 选择 · Enter/Tab 补全 · Esc 关闭</div>
+            </div>
+          </div>
+          <span class="field-hint">
+            DSL 非空时忽略上面的单条件。支持 path/query/user_agent/referer/method/ip/header:名称、
+            contains/equals/prefix/suffix、ip in "CIDR"、AND/OR/NOT 和括号；不允许正则。
+          </span>
         </div>
         <label class="check">
           <input v-model="ruleForm.enabled" type="checkbox" />
@@ -946,6 +984,7 @@ const ruleForm = ref({
   action: 'block',
   priority: 0,
   enabled: true,
+  expr: '',
 })
 
 const ipModalOpen = ref(false)
@@ -1464,6 +1503,7 @@ function openRuleModal(rule?: any) {
         action: rule.action,
         priority: rule.priority,
         enabled: rule.enabled,
+        expr: rule.expr || '',
       }
     : {
         name: '',
@@ -1474,17 +1514,156 @@ function openRuleModal(rule?: any) {
         action: 'block',
         priority: 0,
         enabled: true,
+        expr: '',
       }
   ruleModalOpen.value = true
 }
 
-async function saveRule() {
-  ruleError.value = ''
-  if (!ruleForm.value.name.trim() || !ruleForm.value.value.trim()) {
-    ruleError.value = '请填写规则名称与匹配内容'
+const dslTextarea = ref<HTMLTextAreaElement | null>(null)
+const dslSuggestOpen = ref(false)
+const dslSuggestions = ref<{ label: string; insert: string; detail: string; back?: number }[]>([])
+const dslSuggestIndex = ref(0)
+const dslTokenStart = ref(0)
+
+const DSL_FIELDS = [
+  { label: 'path', insert: 'path ', detail: '请求路径' },
+  { label: 'query', insert: 'query ', detail: '查询串' },
+  { label: 'user_agent', insert: 'user_agent ', detail: 'User-Agent' },
+  { label: 'referer', insert: 'referer ', detail: 'Referer' },
+  { label: 'method', insert: 'method ', detail: '请求方法' },
+  { label: 'ip', insert: 'ip ', detail: '客户端 IP' },
+  { label: 'header:', insert: 'header:', detail: '请求头' },
+]
+const DSL_OPS = [
+  { label: 'contains', insert: 'contains ', detail: '包含' },
+  { label: 'equals', insert: 'equals ', detail: '等于' },
+  { label: 'prefix', insert: 'prefix ', detail: '前缀' },
+  { label: 'suffix', insert: 'suffix ', detail: '后缀' },
+]
+const DSL_KEYWORDS = [
+  { label: 'AND', insert: 'AND ', detail: '同时满足' },
+  { label: 'OR', insert: 'OR ', detail: '任一满足' },
+  { label: 'NOT', insert: 'NOT ', detail: '取反' },
+]
+
+function dslFieldKeys() {
+  return DSL_FIELDS.map((f) => f.label.replace(':', ''))
+}
+function dslOpKeys() {
+  return [...DSL_OPS.map((o) => o.label), 'in']
+}
+function insideDslString(before: string) {
+  let quote = ''
+  let escaped = false
+  for (const ch of before) {
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (ch === '\\') {
+      escaped = true
+      continue
+    }
+    if (quote) {
+      if (ch === quote) quote = ''
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    }
+  }
+  return !!quote
+}
+
+function updateDslSuggestions() {
+  const el = dslTextarea.value
+  if (!el) return
+  const value = ruleForm.value.expr || ''
+  const caret = el.selectionStart ?? value.length
+  const before = value.slice(0, caret)
+  if (insideDslString(before)) {
+    dslSuggestOpen.value = false
     return
   }
-  if (ruleForm.value.field === 'header' && !ruleForm.value.header_name.trim()) {
+  const tokenMatch = before.match(/[A-Za-z_][A-Za-z0-9_:-]*$/)
+  const token = tokenMatch?.[0] ?? ''
+  const start = tokenMatch ? caret - token.length : caret
+  dslTokenStart.value = start
+  const prior = before.slice(0, start).trimEnd()
+  const prev = (prior.match(/[A-Za-z_][A-Za-z0-9_:-]*$/) || [])[0]?.toLowerCase() || ''
+  const fields = dslFieldKeys()
+  const ops = dslOpKeys()
+  let candidates: { label: string; insert: string; detail: string; back?: number }[] = []
+
+  if (fields.includes(prev) || prev.startsWith('header:')) {
+    candidates = prev === 'ip'
+      ? [...DSL_OPS, { label: 'in', insert: 'in ', detail: 'CIDR 网段' }]
+      : DSL_OPS
+  } else if (ops.includes(prev)) {
+    candidates = prev === 'in'
+      ? [{ label: '"10.0.0.0/8"', insert: '"10.0.0.0/8"', detail: 'CIDR' }]
+      : [{ label: '""', insert: '""', detail: '字符串', back: 1 }]
+  } else if (prev === 'and' || prev === 'or' || prev === 'not' || prior === '' || prior.endsWith('(')) {
+    candidates = [...DSL_FIELDS, ...DSL_KEYWORDS]
+  } else if (prior.endsWith(')') || prior.endsWith('"') || prior.endsWith("'")) {
+    candidates = DSL_KEYWORDS
+  } else {
+    candidates = [...DSL_FIELDS, ...DSL_KEYWORDS]
+  }
+
+  const lower = token.toLowerCase()
+  dslSuggestions.value = candidates.filter((item) =>
+    item.label.toLowerCase().startsWith(lower)
+  )
+  dslSuggestIndex.value = 0
+  dslSuggestOpen.value = dslSuggestions.value.length > 0
+}
+
+function closeDslSuggestionsSoon() {
+  window.setTimeout(() => {
+    dslSuggestOpen.value = false
+  }, 120)
+}
+
+function applyDslSuggestion(item: { label: string; insert: string; back?: number }) {
+  const el = dslTextarea.value
+  if (!el) return
+  const value = ruleForm.value.expr || ''
+  const caret = el.selectionStart ?? value.length
+  const start = dslTokenStart.value
+  const next = value.slice(0, start) + item.insert + value.slice(caret)
+  ruleForm.value.expr = next
+  dslSuggestOpen.value = false
+  nextTick(() => {
+    const pos = start + item.insert.length - (item.back || 0)
+    el.focus()
+    el.setSelectionRange(pos, pos)
+  })
+}
+
+function onDslKeydown(event: KeyboardEvent) {
+  if (!dslSuggestOpen.value || !dslSuggestions.value.length) return
+  if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    dslSuggestIndex.value = (dslSuggestIndex.value + 1) % dslSuggestions.value.length
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault()
+    dslSuggestIndex.value =
+      (dslSuggestIndex.value - 1 + dslSuggestions.value.length) % dslSuggestions.value.length
+  } else if (event.key === 'Enter' || event.key === 'Tab') {
+    event.preventDefault()
+    applyDslSuggestion(dslSuggestions.value[dslSuggestIndex.value])
+  } else if (event.key === 'Escape') {
+    dslSuggestOpen.value = false
+  }
+}
+
+async function saveRule() {
+  ruleError.value = ''
+  const usingDsl = !!ruleForm.value.expr.trim()
+  if (!ruleForm.value.name.trim() || (!usingDsl && !ruleForm.value.value.trim())) {
+    ruleError.value = usingDsl ? '请填写规则名称' : '请填写规则名称与匹配内容'
+    return
+  }
+  if (!usingDsl && ruleForm.value.field === 'header' && !ruleForm.value.header_name.trim()) {
     ruleError.value = '请填写要匹配的请求头名称'
     return
   }
@@ -1521,6 +1700,7 @@ async function toggleRule(rule: any) {
       action: rule.action,
       priority: rule.priority,
       enabled: !rule.enabled,
+      expr: rule.expr || '',
     })
     await loadRules()
   } catch (e: any) {
@@ -2063,6 +2243,91 @@ onMounted(reload)
   color: var(--success);
   font-size: 12px;
   white-space: nowrap;
+}
+
+/* custom rule DSL */
+.dsl-editor {
+  position: relative;
+}
+
+.dsl-suggest {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 40;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+  padding: 4px;
+}
+
+.dsl-suggest-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.dsl-suggest-item:hover,
+.dsl-suggest-item.active {
+  background: var(--brand-bg);
+  color: var(--brand);
+}
+
+.dsl-suggest-label {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.dsl-suggest-item.active .dsl-suggest-label {
+  color: var(--brand);
+}
+
+.dsl-suggest-detail {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.dsl-suggest-foot {
+  padding: 6px 9px 3px;
+  font-size: 10.5px;
+  color: var(--text-3);
+  border-top: 1px solid var(--divider);
+  margin-top: 3px;
+}
+.dsl-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+
+.dsl-badge {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--brand-bg);
+  color: var(--brand);
+  font-family: var(--font);
+  font-size: 10px;
+  line-height: 18px;
 }
 
 @media (max-width: 900px) {
