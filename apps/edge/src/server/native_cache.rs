@@ -251,6 +251,13 @@ impl HandleMiss for EntryMiss {
                 "computed".to_string(),
             ));
         }
+        tracing::debug!(
+            key = %self.key,
+            body_len = len,
+            fresh_secs = self.fresh_secs,
+            swr_secs = self.swr_secs,
+            "native cache fill"
+        );
         self.cache
             .set_with_swr(&self.key, entry, self.fresh_secs, self.swr_secs)
             .await;

@@ -17,7 +17,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+/// Read timeout stays short so a degraded L2 cannot add latency to hits.
 const REDIS_TIMEOUT: Duration = Duration::from_millis(250);
+/// Writes can be much larger (base64 JSON) and may cross regions. A 250ms
+/// timeout caused every medium object to fail on remote Redis.
+const REDIS_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+const REDIS_ADMIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Serialize, Deserialize)]
 struct L2Entry {
@@ -34,6 +39,8 @@ pub struct RedisL2Cache {
     conn: redis::aio::ConnectionManager,
     prefix: String,
     max_body: usize,
+    read_timeout: Duration,
+    write_timeout: Duration,
     fail_until_ms: Arc<AtomicU64>,
 }
 
@@ -49,11 +56,34 @@ impl RedisL2Cache {
             .await
             .map_err(|_| "cache redis connection timeout".to_string())?
             .map_err(|e| format!("cache redis connection failed: {e}"))?;
+        // A successful connection is not enough: ACLs, read-only replicas or
+        // maxmemory=noeviction can make every cache write fail. Probe one
+        // short-lived key so startup fails over to local cache instead of
+        // claiming L2 is enabled while silently dropping writes.
+        let mut probe_conn = conn.clone();
+        let probe_key = format!("{}:__probe:{}", prefix, std::process::id());
+        let _: () = tokio::time::timeout(
+            Duration::from_millis(500),
+            probe_conn.set_ex(probe_key, "1", 5_u64),
+        )
+        .await
+        .map_err(|_| "cache redis write probe timeout".to_string())?
+        .map_err(|e| format!("cache redis write probe failed: {e}"))?;
         Ok(Self {
             local,
             conn,
             prefix,
             max_body: max_body.clamp(1024, 64 * 1024 * 1024),
+            read_timeout: std::env::var("CACHE_L2_READ_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|ms| Duration::from_millis(ms.clamp(50, 10_000)))
+                .unwrap_or(REDIS_TIMEOUT),
+            write_timeout: std::env::var("CACHE_L2_WRITE_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|ms| Duration::from_millis(ms.clamp(250, 30_000)))
+                .unwrap_or(REDIS_WRITE_TIMEOUT),
             fail_until_ms: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -130,13 +160,16 @@ impl RedisL2Cache {
         }
         let mut conn = self.conn.clone();
         let raw: Option<String> = match tokio::time::timeout(
-            REDIS_TIMEOUT,
+            self.read_timeout,
             conn.get(self.key(key)),
         )
         .await
         {
             Ok(Ok(value)) => value,
             _ => {
+                if !self.unhealthy() {
+                    tracing::warn!(key = %key, "Redis L2 read failed; using local cache");
+                }
                 self.mark_failed();
                 return None;
             }
@@ -157,11 +190,12 @@ impl RedisL2Cache {
             return;
         };
         if raw.len() > self.max_body {
+            tracing::warn!(key = %key, raw_len = raw.len(), max_body = self.max_body, "Redis L2 object exceeds CACHE_L2_MAX_BODY; local cache only");
             return;
         }
         let mut conn = self.conn.clone();
         let result: redis::RedisResult<()> = tokio::time::timeout(
-            REDIS_TIMEOUT,
+            self.write_timeout,
             conn.set_ex(self.key(key), raw, ttl),
         )
         .await
@@ -169,7 +203,10 @@ impl RedisL2Cache {
             std::io::ErrorKind::TimedOut,
             "cache redis set timeout",
         ))));
-        if result.is_err() {
+        if let Err(e) = &result {
+            if !self.unhealthy() {
+                tracing::warn!(error = %e, key = %key, "Redis L2 write failed; keeping local cache only");
+            }
             self.mark_failed();
         }
     }
@@ -180,7 +217,7 @@ impl RedisL2Cache {
         }
         let mut conn = self.conn.clone();
         let result: redis::RedisResult<usize> =
-            match tokio::time::timeout(REDIS_TIMEOUT, conn.del(self.key(key))).await {
+            match tokio::time::timeout(REDIS_ADMIN_TIMEOUT, conn.del(self.key(key))).await {
                 Ok(result) => result,
                 Err(_) => {
                     self.mark_failed();
@@ -200,7 +237,7 @@ impl RedisL2Cache {
         let mut keys = Vec::new();
         loop {
             let result: redis::RedisResult<(u64, Vec<String>)> = tokio::time::timeout(
-                REDIS_TIMEOUT,
+                REDIS_ADMIN_TIMEOUT,
                 redis::cmd("SCAN")
                     .arg(cursor)
                     .arg("MATCH")
@@ -243,7 +280,7 @@ impl RedisL2Cache {
             pipe.expire(&index, ttl_secs.max(60) as i64).ignore();
         }
         let mut conn = self.conn.clone();
-        match tokio::time::timeout(REDIS_TIMEOUT, pipe.query_async::<()>(&mut conn)).await {
+        match tokio::time::timeout(self.write_timeout, pipe.query_async::<()>(&mut conn)).await {
             Ok(Ok(_)) => {}
             _ => self.mark_failed(),
         }
@@ -295,6 +332,8 @@ impl CacheBackend for RedisL2Cache {
 
     async fn set_with_swr(&self, key: &str, entry: CacheEntry, fresh_secs: u64, swr_secs: u64) {
         let tags = Self::cache_tags(&entry.headers);
+        let body_len = entry.body.len();
+        tracing::debug!(key = %key, body_len, tags = tags.len(), "Redis L2 write");
         self.local
             .set_with_swr(key, entry.clone(), fresh_secs, swr_secs)
             .await;
@@ -324,7 +363,7 @@ impl CacheBackend for RedisL2Cache {
         }
         let mut conn = self.conn.clone();
         let _: redis::RedisResult<usize> =
-            tokio::time::timeout(REDIS_TIMEOUT, conn.del(keys)).await.unwrap_or(Ok(0));
+            tokio::time::timeout(REDIS_ADMIN_TIMEOUT, conn.del(keys)).await.unwrap_or(Ok(0));
     }
 
     async fn purge_matching(&self, patterns: &[String]) -> u64 {
@@ -335,7 +374,7 @@ impl CacheBackend for RedisL2Cache {
                 continue;
             }
             let mut conn = self.conn.clone();
-            if let Ok(Ok(n)) = tokio::time::timeout(REDIS_TIMEOUT, conn.del::<_, usize>(keys)).await {
+            if let Ok(Ok(n)) = tokio::time::timeout(REDIS_ADMIN_TIMEOUT, conn.del::<_, usize>(keys)).await {
                 removed += n as u64;
             }
         }
@@ -352,7 +391,7 @@ impl CacheBackend for RedisL2Cache {
         let mut candidates: HashSet<String> = HashSet::new();
         for tag in &wanted {
             let result: redis::RedisResult<Vec<String>> = tokio::time::timeout(
-                REDIS_TIMEOUT,
+                self.read_timeout,
                 conn.smembers(self.tag_index_key(tag)),
             )
             .await
@@ -375,7 +414,7 @@ impl CacheBackend for RedisL2Cache {
                 continue;
             }
             let Ok(Ok(Some(raw))) =
-                tokio::time::timeout(REDIS_TIMEOUT, conn.get::<_, Option<String>>(self.key(&key)))
+                tokio::time::timeout(REDIS_ADMIN_TIMEOUT, conn.get::<_, Option<String>>(self.key(&key)))
                     .await
             else {
                 continue;
@@ -400,12 +439,12 @@ impl CacheBackend for RedisL2Cache {
                 pipe.srem(&index, key).ignore();
             }
         }
-        match tokio::time::timeout(REDIS_TIMEOUT, pipe.query_async::<()>(&mut conn)).await {
+        match tokio::time::timeout(REDIS_ADMIN_TIMEOUT, pipe.query_async::<()>(&mut conn)).await {
             Ok(Ok(_)) => {}
             _ => self.mark_failed(),
         }
         let redis_keys: Vec<String> = victims.iter().map(|key| self.key(key)).collect();
-        let n: usize = tokio::time::timeout(REDIS_TIMEOUT, conn.del::<_, usize>(redis_keys))
+        let n: usize = tokio::time::timeout(REDIS_ADMIN_TIMEOUT, conn.del::<_, usize>(redis_keys))
             .await
             .ok()
             .and_then(Result::ok)

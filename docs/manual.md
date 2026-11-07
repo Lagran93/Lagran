@@ -604,13 +604,15 @@ Control 的 CONTROL_PUBLIC_URL
 | `CC_REDIS_PREFIX` | CC Redis key 前缀 |
 | `RATE_LIMIT_REDIS_PREFIX` | 普通限流 Redis key 前缀 |
 | `CACHE_TTL` | 默认缓存 TTL |
-| `CACHE_BACKEND` | `memory` / `disk` / `hybrid` / `redis` / `l2` |
+| `CACHE_BACKEND` | `memory` / `disk` / `hybrid` / `redis` / `l2`；`redis` 与 `l2` 当前等价，均启用本地 MemoryCache + Redis L2 |
 | `DISK_CACHE_DIR` | 普通磁盘缓存目录 |
 | `MAX_CACHEABLE_BODY` | 普通缓存单对象上限，8 MiB 默认 |
 | `CACHE_MAX_BYTES` | 内存缓存近似字节上限，默认 512 MiB；超限按 LRU 淘汰 |
 | `CACHE_REDIS_URL` | 所有 Edge 共享的 Redis L2 地址；为空复用 `REDIS_URL`。不是节点本地 Redis |
 | `CACHE_REDIS_PREFIX` | Redis L2 key 前缀 |
 | `CACHE_L2_MAX_BODY` | 写入 Redis L2 的最大序列化 body |
+| `CACHE_L2_WRITE_TIMEOUT_MS` | Redis L2 写超时，默认 3000ms；跨区域时适当增大 |
+| `CACHE_L2_READ_TIMEOUT_MS` | Redis L2 读超时，默认 250ms；跨区域时适当增大 |
 | `ORIGIN_READ_TIMEOUT_MS` | 回源读取空闲超时，默认 30000；流媒体不会因总时长被中断 |
 | `DOWNSTREAM_KEEPALIVE_SECS` | 下游 HTTP/1.1 keepalive 空闲超时，默认 60 |
 | `DOWNSTREAM_H2_IDLE_SECS` | 下游 HTTP/2 空闲超时，默认 120 |
@@ -762,7 +764,12 @@ CACHE_BACKEND=redis
 CACHE_REDIS_URL=redis://10.0.0.20:6379/0
 CACHE_REDIS_PREFIX=lagran:cache
 CACHE_L2_MAX_BODY=8388608
+# 跨区域或大对象写入时增大写超时；默认 3000ms
+CACHE_L2_WRITE_TIMEOUT_MS=3000
+CACHE_L2_READ_TIMEOUT_MS=250
 ```
+
+`CACHE_REDIS_URL` 末尾的 `/0` 是 Redis 逻辑数据库编号；排查 L2 key 时必须连接同一个数据库，`redis-cli SCAN 0` 默认只扫描 DB 0。
 
 TLS / 密码：
 

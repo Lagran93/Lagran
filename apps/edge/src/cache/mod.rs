@@ -26,6 +26,16 @@ pub async fn build_cache(config: &EdgeConfig) -> anyhow::Result<SharedCache> {
             } else {
                 config.cache_redis_url.clone()
             };
+            let source = if config.cache_redis_url.trim().is_empty() {
+                "REDIS_URL"
+            } else {
+                "CACHE_REDIS_URL"
+            };
+            let database = url
+                .rsplit('/')
+                .next()
+                .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or("0");
             if url.trim().is_empty() {
                 tracing::warn!("CACHE_BACKEND=redis but CACHE_REDIS_URL/REDIS_URL is empty; using local cache");
                 return Ok(local);
@@ -39,7 +49,12 @@ pub async fn build_cache(config: &EdgeConfig) -> anyhow::Result<SharedCache> {
             .await
             {
                 Ok(cache) => {
-                    tracing::info!(prefix = %config.cache_redis_prefix, "Redis L2 cache enabled");
+                    tracing::info!(
+                        prefix = %config.cache_redis_prefix,
+                        source,
+                        database,
+                        "Redis L2 cache enabled"
+                    );
                     Ok(Arc::new(cache) as SharedCache)
                 }
                 Err(e) => {

@@ -505,20 +505,31 @@ pub fn spawn_config_sync(
                             // TTL/rule/header objects from surviving a config
                             // release or rollback on a subset of nodes.
                             let old_versions = registry.version_map().await;
+                            // On first sync the registry is empty because the
+                            // process just started, not because every domain
+                            // changed. Purging here would wipe the shared L2
+                            // cache on every edge restart.
+                            let initial_sync = old_versions.is_empty();
                             let mut new_versions = std::collections::HashMap::new();
                             for entry in &entries {
                                 new_versions.insert(entry.domain.clone(), entry.version.clone());
                             }
-                            let mut changed_domains: Vec<String> = new_versions
-                                .iter()
-                                .filter(|(domain, version)| {
-                                    old_versions.get(*domain) != Some(*version)
-                                })
-                                .map(|(domain, _)| domain.clone())
-                                .collect();
-                            for domain in old_versions.keys() {
-                                if !new_versions.contains_key(domain) {
-                                    changed_domains.push(domain.clone());
+                            let mut changed_domains: Vec<String> = if initial_sync {
+                                Vec::new()
+                            } else {
+                                new_versions
+                                    .iter()
+                                    .filter(|(domain, version)| {
+                                        old_versions.get(*domain) != Some(*version)
+                                    })
+                                    .map(|(domain, _)| domain.clone())
+                                    .collect()
+                            };
+                            if !initial_sync {
+                                for domain in old_versions.keys() {
+                                    if !new_versions.contains_key(domain) {
+                                        changed_domains.push(domain.clone());
+                                    }
                                 }
                             }
                             changed_domains.sort();
