@@ -8,7 +8,7 @@ pub mod policy;
 
 pub use disk::{DiskCache, HybridCache};
 pub use large::LargeCache;
-pub use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult, MemoryCache, SharedCache};
+pub use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult, CacheSource, MemoryCache, SharedCache};
 
 use crate::config::EdgeConfig;
 use std::sync::Arc;

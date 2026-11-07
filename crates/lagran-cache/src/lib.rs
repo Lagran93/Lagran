@@ -8,9 +8,35 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheSource {
+    /// Local process memory cache.
+    L1,
+    /// Shared Redis L2 cache.
+    L2,
+    /// Local large-object/disk cache.
+    L3,
+    Unknown,
+}
+
+impl CacheSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheSource::L1 => "l1",
+            CacheSource::L2 => "l2",
+            CacheSource::L3 => "l3",
+            CacheSource::Unknown => "unknown",
+        }
+    }
+}
+
 #[async_trait]
 pub trait CacheBackend: Send + Sync {
     async fn get_result(&self, key: &str) -> CacheGetResult;
+    /// Same as `get_result`, additionally reporting which cache layer served it.
+    async fn get_result_with_source(&self, key: &str) -> (CacheGetResult, CacheSource) {
+        (self.get_result(key).await, CacheSource::L1)
+    }
     async fn get(&self, key: &str) -> Option<CacheEntry> {
         match self.get_result(key).await {
             CacheGetResult::Hit(e) | CacheGetResult::Stale(e) => Some(e),

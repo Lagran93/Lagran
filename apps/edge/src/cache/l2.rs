@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
-use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult, SharedCache};
+use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult, CacheSource, SharedCache};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -291,18 +291,26 @@ impl RedisL2Cache {
 #[async_trait]
 impl CacheBackend for RedisL2Cache {
     async fn get_result(&self, key: &str) -> CacheGetResult {
+        self.get_result_with_source(key).await.0
+    }
+
+    async fn get_result_with_source(&self, key: &str) -> (CacheGetResult, CacheSource) {
         match self.local.get_result(key).await {
-            CacheGetResult::Hit(entry) => return CacheGetResult::Hit(entry),
-            CacheGetResult::Stale(entry) => return CacheGetResult::Stale(entry),
+            CacheGetResult::Hit(entry) => {
+                return (CacheGetResult::Hit(entry), CacheSource::L1)
+            }
+            CacheGetResult::Stale(entry) => {
+                return (CacheGetResult::Stale(entry), CacheSource::L1)
+            }
             CacheGetResult::Expired | CacheGetResult::Miss => {}
         }
         let Some(entry) = self.redis_get(key).await else {
-            return CacheGetResult::Miss;
+            return (CacheGetResult::Miss, CacheSource::Unknown);
         };
         let now = Self::now_secs();
         if now > entry.stale_until {
             self.redis_del(key).await;
-            return CacheGetResult::Miss;
+            return (CacheGetResult::Miss, CacheSource::Unknown);
         }
         let body = B64.decode(entry.body.as_bytes()).unwrap_or_default();
         let local_entry = CacheEntry {
@@ -320,9 +328,9 @@ impl CacheBackend for RedisL2Cache {
             .set_with_swr(key, local_entry.clone(), ttl, swr)
             .await;
         if fresh {
-            CacheGetResult::Hit(local_entry)
+            (CacheGetResult::Hit(local_entry), CacheSource::L2)
         } else {
-            CacheGetResult::Stale(local_entry)
+            (CacheGetResult::Stale(local_entry), CacheSource::L2)
         }
     }
 
@@ -485,10 +493,14 @@ mod tests {
             Bytes::from_static(b"hello"),
         );
         c1.set("k", entry, 60).await;
-        match c2.get_result("k").await {
+        let (result, source) = c2.get_result_with_source("k").await;
+        match result {
             CacheGetResult::Hit(e) => assert_eq!(e.body, Bytes::from_static(b"hello")),
             other => panic!("expected L2 hit, got {other:?}"),
         }
+        assert_eq!(source, CacheSource::L2);
+        let (_, source) = c2.get_result_with_source("k").await;
+        assert_eq!(source, CacheSource::L1);
         c1.clear().await;
     }
 

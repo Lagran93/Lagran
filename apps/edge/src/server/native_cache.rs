@@ -8,7 +8,7 @@
 
 use crate::cache::policy::{compute_etag, VALIDATOR_SOURCE_HEADER};
 use crate::cache::large::{LargeCache, LargeEntry, LargeWriter};
-use crate::cache::{CacheEntry, CacheGetResult, SharedCache};
+use crate::cache::{CacheEntry, CacheGetResult, CacheSource, SharedCache};
 use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
 use base64::Engine;
@@ -21,6 +21,7 @@ use pingora_cache::storage::{
 use pingora_cache::trace::SpanHandle;
 use pingora_cache::CacheKey;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub const META_HEADER: &str = "x-lagran-pingora-meta";
 
@@ -352,6 +353,12 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn add_cache_headers(meta: &mut CacheMeta, source: CacheSource, lookup_ms: u128) {
+    let headers = meta.response_header_mut();
+    let _ = headers.insert_header("x-lagran-cache-source", source.as_str());
+    let _ = headers.insert_header("x-lagran-cache-lookup-ms", lookup_ms.to_string());
+}
+
 fn headers_vec(headers: &pingora::http::ResponseHeader) -> Vec<(String, String)> {
     headers
         .headers
@@ -371,6 +378,7 @@ impl Storage for NativeStorage {
         key: &CacheKey,
         _trace: &SpanHandle,
     ) -> pingora::Result<Option<(CacheMeta, HitHandler)>> {
+        let lookup_start = Instant::now();
         let Some(key) = Self::key_str(key) else {
             return Ok(None);
         };
@@ -400,6 +408,7 @@ impl Storage for NativeStorage {
                         meta.response_header_mut().insert_header("etag", etag)?;
                     }
                 }
+                add_cache_headers(&mut meta, CacheSource::L3, lookup_start.elapsed().as_millis());
                 return Ok(Some((
                     meta,
                     Box::new(LargeEntryHit {
@@ -410,7 +419,8 @@ impl Storage for NativeStorage {
                 )));
             }
         }
-        let entry = match self.cache.get_result(key).await {
+        let (cache_result, source) = self.cache.get_result_with_source(key).await;
+        let entry = match cache_result {
             CacheGetResult::Hit(entry) | CacheGetResult::Stale(entry) => entry,
             CacheGetResult::Expired | CacheGetResult::Miss => return Ok(None),
         };
@@ -435,6 +445,7 @@ impl Storage for NativeStorage {
                 meta.response_header_mut().insert_header("etag", etag)?;
             }
         }
+        add_cache_headers(&mut meta, source, lookup_start.elapsed().as_millis());
         Ok(Some((
             meta,
             Box::new(EntryHit {

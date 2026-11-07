@@ -1364,6 +1364,9 @@ status=304 + cache_status=REVALIDATED
 | `X-Cache` | `HIT` / `MISS` / `BYPASS` / `STALE` / `DYNAMIC` / `REVALIDATED` |
 | `X-Cache-Status` | 同 `X-Cache` |
 | `X-Lagran-Cache-Reason` | 未命中/绕过/填充原因 |
+| `X-Lagran-Cache-Source` | 缓存来源：`l1` 本地内存、`l2` Redis、`l3` 大对象磁盘、`origin` 回源 |
+| `X-Lagran-Cache-Lookup-MS` | 缓存查找耗时（毫秒）；回源 miss 记录为 0 |
+| `Server-Timing` | `cache;dur=<毫秒>`，与缓存查找耗时对应 |
 | `Age` | 缓存对象年龄 |
 | `X-Lagran-Cache-TTL` | 缓存对象剩余新鲜寿命（秒）；`Age` 是已存活时间，两者互补 |
 | `X-Lagran-Datapath` | `pingora` / `legacy`，标识本次请求实际走的数据面 |

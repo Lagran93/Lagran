@@ -844,6 +844,28 @@ impl ProxyHttp for DataPlaneProxy {
         if let Some(reason) = ctx.cache_reason {
             response.insert_header("x-lagran-cache-reason", reason)?;
         }
+        let cache_source = if matches!(label, "HIT" | "STALE" | "REVALIDATED") {
+            response
+                .headers
+                .get("x-lagran-cache-source")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("l1")
+                .to_string()
+        } else {
+            "origin".to_string()
+        };
+        let lookup_ms = response
+            .headers
+            .get("x-lagran-cache-lookup-ms")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("0")
+            .to_string();
+        response.insert_header("x-lagran-cache-source", cache_source)?;
+        response.insert_header("x-lagran-cache-lookup-ms", lookup_ms.clone())?;
+        response.insert_header(
+            "server-timing",
+            format!("cache;dur={lookup_ms}"),
+        )?;
 
         let mut headers = response.headers.clone();
         if plan.cacheable || plan.is_head {
