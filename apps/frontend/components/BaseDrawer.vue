@@ -5,8 +5,9 @@ const props = withDefaults(
     title?: string
     width?: string
     loading?: boolean
+    closeOnOverlay?: boolean
   }>(),
-  { title: '', width: '480px', loading: false },
+  { title: '', width: '480px', loading: false, closeOnOverlay: false },
 )
 
 const emit = defineEmits<{
@@ -23,7 +24,7 @@ function close() {
 <template>
   <Teleport to="body">
     <Transition name="drawer">
-      <div v-if="modelValue" class="drawer-mask" @click.self="close">
+      <div v-if="modelValue" class="drawer-mask" @click.self="closeOnOverlay && close()">
         <aside class="drawer-panel" :style="{ width }" role="dialog" aria-modal="true">
           <div class="drawer-head">
             <span class="drawer-title">{{ title }}</span>

@@ -9,6 +9,7 @@ const props = withDefaults(
     loading?: boolean
     danger?: boolean
     hideFooter?: boolean
+    closeOnOverlay?: boolean
   }>(),
   {
     title: '',
@@ -18,6 +19,7 @@ const props = withDefaults(
     loading: false,
     danger: false,
     hideFooter: false,
+    closeOnOverlay: false,
   },
 )
 
@@ -35,7 +37,7 @@ function close() {
 <template>
   <Teleport to="body">
     <Transition name="modal-fade">
-      <div v-if="modelValue" class="modal-mask" @click.self="close">
+      <div v-if="modelValue" class="modal-mask" @click.self="closeOnOverlay && close()">
         <div class="modal-panel" :style="{ width }" role="dialog" aria-modal="true">
           <div class="modal-head">
             <span class="modal-title">{{ title }}</span>

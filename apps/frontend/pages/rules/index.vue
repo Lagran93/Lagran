@@ -8,6 +8,10 @@
         </div>
       </div>
       <div class="page-actions">
+        <button class="btn btn-default" type="button" @click="openTester">
+          <AppIcon name="search" :size="15" />
+          规则测试
+        </button>
         <button class="btn btn-default" type="button" :disabled="loading" @click="load">
           <AppIcon name="refresh" :size="15" />
           刷新
@@ -16,77 +20,6 @@
           <AppIcon name="plus" :size="15" />
           新建规则
         </button>
-      </div>
-    </div>
-
-    <!-- 规则测试 -->
-    <div class="card tester">
-      <div class="card-head">
-        <div>
-          <div class="card-title">规则测试</div>
-          <div class="card-desc">输入一次请求，看看会命中哪条规则、最终生效的策略</div>
-        </div>
-      </div>
-      <div class="tester-form">
-        <select v-model="tester.domain_id" class="select" style="min-width: 190px">
-          <option value="">选择域名</option>
-          <option v-for="d in domains" :key="d.id" :value="d.id">{{ d.name }}</option>
-        </select>
-        <input v-model="tester.path" class="input" placeholder="/static/app.js" style="flex: 1; min-width: 180px" />
-        <select v-model="tester.method" class="select" style="width: 110px">
-          <option v-for="m in methodOptions" :key="m" :value="m">{{ m }}</option>
-        </select>
-        <input v-model="tester.query" class="input" placeholder="查询串（可选）" style="width: 180px" />
-        <input v-model="tester.content_type" class="input" placeholder="Content-Type（可选）" style="width: 190px" />
-        <button class="btn btn-primary" type="button" :disabled="testing" @click="runTest">
-          {{ testing ? '测试中…' : '测试' }}
-        </button>
-      </div>
-      <div class="text-muted" style="font-size: 12px; margin: 8px 18px; line-height: 1.6">
-        提示：Content-Type 条件只在源站响应返回后生效。若请求阶段命中了 `/api/*` 等 bypass
-        兜底规则，即使响应是 video/mp4，也不会读写缓存；需要额外添加一条不带 Content-Type 的路径 cache 规则。
-      </div>
-
-      <div v-if="testResult" class="test-result">
-        <div v-if="testResult.matched" class="test-hit">
-          <div class="test-head">
-            <StatusTag tone="success" dot>命中规则</StatusTag>
-            <span class="mono test-path">{{ testResult.matched.path_pattern }}</span>
-            <span class="text-muted" style="font-size: 12px">
-              优先级 {{ testResult.matched.priority }} · {{ testResult.note }}
-            </span>
-          </div>
-          <div class="effective-grid">
-            <div class="effective-item">
-              <span class="eff-label">动作</span>
-              <span class="eff-value">{{ actionLabel(testResult.effective.action) }}</span>
-            </div>
-            <div class="effective-item">
-              <span class="eff-label">边缘 TTL</span>
-              <span class="eff-value">{{ testResult.effective.action === 'cache' ? `${testResult.effective.ttl_seconds}
-                秒` : '—' }}</span>
-            </div>
-            <div class="effective-item">
-              <span class="eff-label">SWR</span>
-              <span class="eff-value">{{ testResult.effective.swr_seconds ? `${testResult.effective.swr_seconds} 秒` :
-                '—' }}</span>
-            </div>
-            <div class="effective-item">
-              <span class="eff-label">浏览器 TTL</span>
-              <span class="eff-value">{{ testResult.effective.browser_ttl_seconds ?
-                `${testResult.effective.browser_ttl_seconds} 秒` : '跟随源站' }}</span>
-            </div>
-            <div class="effective-item">
-              <span class="eff-label">Query</span>
-              <span class="eff-value">{{ queryModeLabel(testResult.effective.ignore_query) }}</span>
-            </div>
-          </div>
-        </div>
-        <div v-else class="test-miss">
-          <StatusTag tone="neutral" dot>未命中规则</StatusTag>
-          <span class="text-2" style="font-size: 13px">{{ testResult.note }}</span>
-          <span class="text-muted" style="font-size: 12px">默认 TTL 由域名设置决定，源站缓存头优先。</span>
-        </div>
       </div>
     </div>
 
@@ -338,6 +271,100 @@
         <p v-if="error" class="text-danger" style="font-size: 13px">{{ error }}</p>
       </div>
     </BaseModal>
+
+    <BaseModal v-model="testerOpen" title="规则测试" width="780px">
+      <div class="tester-modal">
+        <p class="tester-lead">
+          输入一次请求，查看会命中哪条规则、最终生效的缓存策略。
+        </p>
+
+        <div class="tester-grid">
+          <div class="field">
+            <label class="field-label">域名 <span class="req">*</span></label>
+            <select v-model="tester.domain_id" class="select">
+              <option value="">选择域名</option>
+              <option v-for="d in domains" :key="d.id" :value="d.id">{{ d.name }}</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label class="field-label">请求方法</label>
+            <select v-model="tester.method" class="select">
+              <option v-for="m in methodOptions" :key="m" :value="m">{{ m }}</option>
+            </select>
+          </div>
+
+          <div class="field span-2">
+            <label class="field-label">请求路径 <span class="req">*</span></label>
+            <input v-model="tester.path" class="input" placeholder="/static/app.js" />
+          </div>
+
+          <div class="field">
+            <label class="field-label">查询串（可选）</label>
+            <input v-model="tester.query" class="input" placeholder="例如 v=1" />
+          </div>
+
+          <div class="field">
+            <label class="field-label">Content-Type（可选）</label>
+            <input v-model="tester.content_type" class="input" placeholder="例如 video/mp4" />
+          </div>
+        </div>
+
+        <p class="tester-hint">
+          提示：Content-Type 条件只在源站响应返回后生效。若请求阶段命中了 `/api/*` 等 bypass
+          兜底规则，即使响应是 video/mp4，也不会读写缓存；需要额外添加一条不带 Content-Type 的路径 cache 规则。
+        </p>
+
+        <div v-if="testResult" class="test-result">
+          <div v-if="testResult.matched" class="test-hit">
+            <div class="test-head">
+              <StatusTag tone="success" dot>命中规则</StatusTag>
+              <span class="mono test-path">{{ testResult.matched.path_pattern }}</span>
+              <span class="text-muted" style="font-size: 12px">
+                优先级 {{ testResult.matched.priority }} · {{ testResult.note }}
+              </span>
+            </div>
+            <div class="effective-grid">
+              <div class="effective-item">
+                <span class="eff-label">动作</span>
+                <span class="eff-value">{{ actionLabel(testResult.effective.action) }}</span>
+              </div>
+              <div class="effective-item">
+                <span class="eff-label">边缘 TTL</span>
+                <span class="eff-value">{{ testResult.effective.action === 'cache' ? `${testResult.effective.ttl_seconds}
+                  秒` : '—' }}</span>
+              </div>
+              <div class="effective-item">
+                <span class="eff-label">SWR</span>
+                <span class="eff-value">{{ testResult.effective.swr_seconds ? `${testResult.effective.swr_seconds} 秒` :
+                  '—' }}</span>
+              </div>
+              <div class="effective-item">
+                <span class="eff-label">浏览器 TTL</span>
+                <span class="eff-value">{{ testResult.effective.browser_ttl_seconds ?
+                  `${testResult.effective.browser_ttl_seconds} 秒` : '跟随源站' }}</span>
+              </div>
+              <div class="effective-item">
+                <span class="eff-label">Query</span>
+                <span class="eff-value">{{ queryModeLabel(testResult.effective.ignore_query) }}</span>
+              </div>
+            </div>
+          </div>
+          <div v-else class="test-miss">
+            <StatusTag tone="neutral" dot>未命中规则</StatusTag>
+            <span class="text-2" style="font-size: 13px">{{ testResult.note }}</span>
+            <span class="text-muted" style="font-size: 12px">默认 TTL 由域名设置决定，源站缓存头优先。</span>
+          </div>
+        </div>
+      </div>
+
+      <template #footer>
+        <button class="btn btn-default" type="button" @click="testerOpen = false">关闭</button>
+        <button class="btn btn-primary" type="button" :disabled="testing" @click="runTest">
+          {{ testing ? '测试中…' : '开始测试' }}
+        </button>
+      </template>
+    </BaseModal>
   </div>
 </template>
 
@@ -361,6 +388,7 @@ const pageSize = 10
 const tester = ref({ domain_id: '', path: '/', method: 'GET', query: '', content_type: '' })
 const testing = ref(false)
 const testResult = ref<any>(null)
+const testerOpen = ref(false)
 
 const formOpen = ref(false)
 const editing = ref<any>(null)
@@ -599,12 +627,20 @@ async function remove(rule: any) {
   }
 }
 
+function openTester() {
+  if (!tester.value.domain_id && domains.value.length) {
+    tester.value.domain_id = domains.value[0].id
+  }
+  testerOpen.value = true
+}
+
 async function runTest() {
   if (!tester.value.domain_id) {
     toast.error('请先选择域名')
     return
   }
   testing.value = true
+  testResult.value = null
   try {
     testResult.value = await api.post('/api/v1/rules/test', {
       domain_id: tester.value.domain_id,
@@ -624,23 +660,46 @@ onMounted(load)
 </script>
 
 <style scoped>
-.tester {
-  margin-bottom: 16px;
+.tester-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
-.tester-form {
-  display: flex;
-  gap: 10px;
-  padding: 0 18px 16px;
-  flex-wrap: wrap;
+.tester-lead {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.tester-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 14px;
+}
+
+.tester-grid .span-2 {
+  grid-column: span 2;
+}
+
+.tester-hint {
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .test-result {
-  margin: 0 18px 18px;
+  margin: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 12px 14px;
-  background: #fafbfc;
+  background: var(--bg);
 }
 
 .test-head {
@@ -667,7 +726,7 @@ onMounted(load)
   flex-direction: column;
   gap: 2px;
   padding: 8px 10px;
-  background: #fff;
+  background: var(--card);
   border: 1px solid var(--divider);
   border-radius: var(--radius-sm);
 }
@@ -759,6 +818,14 @@ onMounted(load)
 @media (max-width: 760px) {
   .effective-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tester-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tester-grid .span-2 {
+    grid-column: auto;
   }
 }
 </style>

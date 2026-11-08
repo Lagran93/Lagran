@@ -5,7 +5,7 @@ const { state, settle } = useConfirm()
 <template>
   <Teleport to="body">
     <Transition name="confirm">
-      <div v-if="state.open" class="confirm-mask" @click.self="settle(false)">
+      <div v-if="state.open" class="confirm-mask">
         <div class="confirm-panel" role="alertdialog" aria-modal="true">
           <div class="confirm-head">
             <span class="confirm-icon" :class="state.danger ? 'danger' : ''">

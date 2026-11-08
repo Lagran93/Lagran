@@ -295,7 +295,7 @@
     </BaseModal>
 
     <!-- 节点详情 -->
-    <BaseDrawer v-model="detailOpen" :title="`节点 · ${detail?.node?.name || ''}`">
+    <BaseDrawer v-model="detailOpen" :title="`节点 · ${detail?.node?.name || ''}`" :close-on-overlay="true">
       <template #footer>
         <button class="btn btn-default" type="button" @click="detailOpen = false">关闭</button>
         <button v-if="detail" class="btn" :class="detail.node.status === 'disabled' ? 'btn-primary' : 'btn-default'"

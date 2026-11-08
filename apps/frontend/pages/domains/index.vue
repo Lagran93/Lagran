@@ -317,7 +317,7 @@
 
     <!-- 高级设置 -->
     <BaseDrawer v-model="settingsOpen" :title="`高级设置 · ${settingsDomain?.name || ''}`" :loading="submitting"
-      @confirm="saveSettings">
+      :close-on-overlay="true" @confirm="saveSettings">
       <div class="form-col">
         <div class="alert alert-info">
           <AppIcon name="info" :size="16" class="icon" />

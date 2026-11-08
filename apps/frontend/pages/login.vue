@@ -802,4 +802,26 @@ onMounted(async () => {
     gap: 8px;
   }
 }
+
+/* The captcha SVG already has its own rounded background. Keep the button
+   chrome transparent so dark mode does not show a second frame around it. */
+.captcha-image {
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  line-height: 0;
+  box-shadow: none;
+  appearance: none;
+}
+
+.captcha-image img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
 </style>
