@@ -185,6 +185,7 @@ CODE=$(get "/big" -H 'Range: bytes=0-3')
 check "range status 206" "$CODE" "206"
 contains "range content-range" "$(hdr content-range)" "bytes 0-3/"
 check "range served from cache" "$(hdr x-cache)" "HIT"
+check "range source is L1" "$(hdr x-lagran-cache-source)" "l1"
 check "range cache uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
 check "range body length" "$(wc -c < "$LOG_DIR/b")" "4"
 

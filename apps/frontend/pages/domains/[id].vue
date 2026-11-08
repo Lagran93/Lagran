@@ -178,7 +178,7 @@
                   <span class="kv-val mono">{{ settings.hotlink_allow_referers || '关闭' }}</span>
                 </div>
                 <div class="kv">
-                  <span class="kv-key">回源超时</span>
+                  <span class="kv-key">回源连接超时</span>
                   <span class="kv-val">{{ settings.origin_timeout_ms }} ms</span>
                 </div>
                 <div class="kv">

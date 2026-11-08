@@ -392,8 +392,7 @@
           </div>
           <div class="field">
             <label class="field-label">当前签名密钥</label>
-            <input v-model="settings.signed_url_secret" class="input" type="text"
-              placeholder="开启后自动生成；可手动填写" />
+            <input v-model="settings.signed_url_secret" class="input" type="text" placeholder="开启后自动生成；可手动填写" />
           </div>
         </div>
         <div class="field">
@@ -407,7 +406,7 @@
 
         <div class="form-grid">
           <div class="field">
-            <label class="field-label">回源超时（毫秒）</label>
+            <label class="field-label">回源连接超时（毫秒）</label>
             <input v-model.number="settings.origin_timeout_ms" class="input" type="number" />
           </div>
           <div class="field">

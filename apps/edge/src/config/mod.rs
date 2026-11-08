@@ -76,6 +76,12 @@ pub struct EdgeConfig {
     /// from the per-domain connect/header timeout so media streams are not
     /// aborted just because the whole object takes longer than 10s.
     pub origin_read_timeout_ms: u64,
+    /// Idle read timeout for Range/media streaming. Longer than the normal
+    /// origin read timeout so slow video origins do not become 504s.
+    pub origin_stream_read_timeout_ms: u64,
+    /// Maximum bounded Range size that will be written into the large cache.
+    /// Open-ended video ranges are always proxied without filling.
+    pub range_fill_max_bytes: u64,
     /// Downstream HTTP/1.1 keepalive idle timeout.
     pub downstream_keepalive_secs: u64,
     /// Downstream HTTP/2 idle timeout after the last active stream.
@@ -218,6 +224,16 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30_000)
                 .clamp(1_000, 600_000),
+            origin_stream_read_timeout_ms: std::env::var("ORIGIN_STREAM_READ_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120_000)
+                .clamp(5_000, 1_800_000),
+            range_fill_max_bytes: std::env::var("RANGE_FILL_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32 * 1024 * 1024)
+                .clamp(0, 1024 * 1024 * 1024),
             downstream_keepalive_secs: std::env::var("DOWNSTREAM_KEEPALIVE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

@@ -64,6 +64,10 @@
 
     <section class="login-panel">
       <div class="login-card">
+        <div class="login-eyebrow">
+          <span class="status-dot" />
+          LAGRAN EDGE · SECURE CONSOLE
+        </div>
         <h2>登录控制台</h2>
         <p class="login-sub">使用账号登录，管理域名、缓存与边缘节点</p>
 
@@ -117,6 +121,11 @@
           <button class="btn btn-primary btn-lg w-full" type="submit" :disabled="loading">
             {{ loading ? '登录中…' : '登 录' }}
           </button>
+
+          <div class="login-trust">
+            <AppIcon name="shield" :size="14" />
+            <span>凭据仅发送到控制面 API，不写入浏览器日志</span>
+          </div>
         </form>
 
         <p v-if="allowRegister" class="register-link">
@@ -574,6 +583,223 @@ onMounted(async () => {
   .login-card {
     width: 100%;
     max-width: 360px;
+  }
+}
+
+/* ---------------------------------------------------------------
+   Login refresh + dark theme
+   --------------------------------------------------------------- */
+
+.login-shell {
+  position: relative;
+  z-index: 1;
+  min-height: 640px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 2px 6px rgba(15, 23, 42, 0.04),
+    0 30px 90px rgba(15, 23, 42, 0.14);
+}
+
+.login-brand {
+  background:
+    radial-gradient(620px 420px at 100% 0%, rgba(34, 211, 238, 0.22), transparent 62%),
+    linear-gradient(150deg, #1d4ed8 0%, #2563eb 46%, #0f2f6b 100%);
+}
+
+.login-brand::after {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.login-brand::before {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.brand-logo {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.26);
+  box-shadow: 0 8px 20px rgba(2, 8, 20, 0.16);
+}
+
+.brand-copy h1 {
+  letter-spacing: 0.2px;
+}
+
+.brand-points li {
+  padding: 2px 0;
+}
+
+.point-icon {
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.login-panel {
+  background: var(--card);
+  position: relative;
+}
+
+.login-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(420px 260px at 100% 0%, rgba(37, 99, 235, 0.05), transparent 70%);
+  pointer-events: none;
+}
+
+.login-card {
+  position: relative;
+}
+
+.login-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 14px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 3px rgba(0, 185, 42, 0.1);
+}
+
+.login-card h2 {
+  font-size: 27px;
+  letter-spacing: -0.03em;
+}
+
+.login-sub {
+  margin-top: 7px;
+  line-height: 1.65;
+}
+
+.login-form {
+  margin-top: 26px;
+  gap: 17px;
+}
+
+.password-toggle:hover {
+  background: var(--bg);
+}
+
+.captcha-image {
+  background: var(--bg);
+}
+
+.captcha-image img {
+  filter: none;
+}
+
+.login-trust {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 2px;
+  color: var(--text-4);
+  font-size: 11.5px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.login-trust .app-icon {
+  flex: none;
+}
+
+.login-error {
+  border-radius: 9px;
+}
+
+.register-link {
+  margin-top: 18px;
+}
+
+.login-foot {
+  margin-top: 14px;
+  color: var(--text-4);
+}
+
+:global(html[data-theme='dark']) .login-shell {
+  border-color: var(--border);
+  box-shadow:
+    0 2px 8px rgba(0, 0, 0, 0.35),
+    0 34px 100px rgba(0, 0, 0, 0.5);
+}
+
+:global(html[data-theme='dark']) .login-brand {
+  background:
+    radial-gradient(620px 420px at 100% 0%, rgba(34, 211, 238, 0.18), transparent 62%),
+    linear-gradient(150deg, #102a5c 0%, #173f86 48%, #081a38 100%);
+}
+
+:global(html[data-theme='dark']) .login-panel {
+  background: var(--card);
+}
+
+:global(html[data-theme='dark']) .login-panel::before {
+  background:
+    radial-gradient(420px 260px at 100% 0%, rgba(59, 130, 246, 0.11), transparent 70%);
+}
+
+:global(html[data-theme='dark']) .login-eyebrow {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text-3);
+}
+
+:global(html[data-theme='dark']) .status-dot {
+  box-shadow: 0 0 0 3px rgba(61, 220, 132, 0.12);
+}
+
+:global(html[data-theme='dark']) .captcha-image {
+  background: #0b1420;
+}
+
+:global(html[data-theme='dark']) .password-toggle:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+@media (max-width: 900px) {
+  .login-shell {
+    min-height: 0;
+    border-radius: 18px;
+  }
+
+  .login-panel {
+    padding: 34px 24px;
+  }
+
+  .login-panel::before {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .login-panel {
+    padding: 28px 18px;
+  }
+
+  .login-card h2 {
+    font-size: 24px;
+  }
+
+  .login-options {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
   }
 }
 </style>

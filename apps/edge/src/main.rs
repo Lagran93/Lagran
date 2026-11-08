@@ -202,6 +202,8 @@ async fn main() -> anyhow::Result<()> {
         https_redirect_port: config.https_redirect_port,
         max_cacheable_body: config.max_cacheable_body,
         origin_read_timeout_ms: config.origin_read_timeout_ms,
+        origin_stream_read_timeout_ms: config.origin_stream_read_timeout_ms,
+        range_fill_max_bytes: config.range_fill_max_bytes,
         downstream_keepalive_secs: config.downstream_keepalive_secs,
         downstream_h2_idle_secs: config.downstream_h2_idle_secs,
         downstream_keepalive_requests: config.downstream_keepalive_requests,
@@ -321,6 +323,9 @@ fn check_config(config: &EdgeConfig) -> anyhow::Result<()> {
     println!("redis: {}", if config.redis_url.trim().is_empty() { "disabled" } else { "configured" });
     println!("cert_dir: {}", config.cert_dir);
     println!("waf_rulepack_cache_dir: {}", config.waf_rulepack_cache_dir);
+    println!("origin_read_timeout_ms: {}", config.origin_read_timeout_ms);
+    println!("origin_stream_read_timeout_ms: {}", config.origin_stream_read_timeout_ms);
+    println!("range_fill_max_bytes: {}", config.range_fill_max_bytes);
     println!("access_log: {}", config.access_log_path.as_deref().unwrap_or("disabled"));
     println!("large_cache: {}", config.large_cache_enabled);
     Ok(())

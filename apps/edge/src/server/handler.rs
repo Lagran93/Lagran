@@ -89,6 +89,8 @@ pub struct AppState {
     pub max_cacheable_body: usize,
     /// Idle origin read timeout; separate from per-domain connect timeout.
     pub origin_read_timeout_ms: u64,
+    pub origin_stream_read_timeout_ms: u64,
+    pub range_fill_max_bytes: u64,
     pub downstream_keepalive_secs: u64,
     pub downstream_h2_idle_secs: u64,
     pub downstream_keepalive_requests: u32,
@@ -1144,8 +1146,8 @@ async fn bypass_to_origin_streaming(
         return default_page::origin_error_page(host, path_only, OriginFailure::Unhealthy);
     }
 
-    let header_timeout = Duration::from_millis(eff.timeout_ms);
-    let idle_timeout = Duration::from_millis(state.origin_read_timeout_ms.max(1_000));
+    let header_timeout = Duration::from_millis(state.origin_stream_read_timeout_ms.max(1_000));
+    let idle_timeout = Duration::from_millis(state.origin_stream_read_timeout_ms.max(1_000));
     let mut result = Err(FetchError::Unhealthy);
     for target in sequence {
         let mut target_headers = headers.clone();

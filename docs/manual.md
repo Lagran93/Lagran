@@ -918,6 +918,8 @@ Control 的 CONTROL_PUBLIC_URL
 | `CACHE_L2_WRITE_TIMEOUT_MS` | Redis L2 写超时，默认 3000ms；跨区域时适当增大 |
 | `CACHE_L2_READ_TIMEOUT_MS` | Redis L2 读超时，默认 250ms；跨区域时适当增大 |
 | `ORIGIN_READ_TIMEOUT_MS` | 回源读取空闲超时，默认 30000；流媒体不会因总时长被中断 |
+| `ORIGIN_STREAM_READ_TIMEOUT_MS` | Range/流媒体的回源读取空闲超时，默认 120000；避免视频首字节慢导致 504 |
+| `RANGE_FILL_MAX_BYTES` | 允许写入大缓存的单段 Range 上限，默认 32 MiB；开放式 `bytes=0-` 不填充 |
 | `DOWNSTREAM_KEEPALIVE_SECS` | 下游 HTTP/1.1 keepalive 空闲超时，默认 60 |
 | `DOWNSTREAM_H2_IDLE_SECS` | 下游 HTTP/2 空闲超时，默认 120 |
 | `DOWNSTREAM_KEEPALIVE_REQUESTS` | 单连接最大请求数，默认 1000 |
@@ -1601,6 +1603,256 @@ Partial 对象不能响应完整 GET。完整 GET 需要：
 "complete": true
 ```
 
+### 5.9 视频 Range 与 504 优化
+
+Chrome、DPlayer 等播放器常见的请求：
+
+```http
+Range: bytes=0-
+```
+
+这种开放式 Range 表示“从 0 到文件末尾”。
+
+Edge 的策略：
+
+```text
+开放式 Range
+  → 直接透传源站
+  → 不启动大缓存填充
+  → 客户端边下边播
+```
+
+原因：
+
+```text
+视频文件可能数百 MB
+首次播放就写入完整大缓存会与客户端读取竞争磁盘
+还可能写满缓存目录或拖慢其他请求
+```
+
+只有有明确结束位置且大小受限的 Range 才会填充：
+
+```http
+Range: bytes=0-1048575
+```
+
+上限：
+
+```env
+RANGE_FILL_MAX_BYTES=33554432
+```
+
+流媒体读取超时单独配置：
+
+```env
+ORIGIN_STREAM_READ_TIMEOUT_MS=120000
+```
+
+这样：
+
+```text
+普通 API 回源仍使用 30 秒空闲超时
+视频 Range 使用更长超时
+```
+
+如果 Caddy 在 Edge 前面，建议关闭响应缓冲：
+
+```caddyfile
+reverse_proxy 127.0.0.1:8081 {
+    flush_interval -1
+}
+```
+
+`flush_interval -1` 让 Caddy 尽快把字节刷给播放器，避免中间层缓冲导致播放器等待。
+
+### 5.9.1 回源超时体系
+
+Edge 的“回源超时”不是一个单一值，而是按阶段和路径分开控制。
+
+## 配置对照
+
+| 配置 | 作用域 | 默认值 | 生效阶段 |
+|---|---|---:|---|
+| `origin_timeout_ms` | 单域名 | 10000 ms | Pingora 建连/连接超时；legacy 普通回源单次总超时 |
+| `ORIGIN_READ_TIMEOUT_MS` | 整个 Edge | 30000 ms | Pingora 普通请求连接建立后的读空闲超时 |
+| `ORIGIN_STREAM_READ_TIMEOUT_MS` | 整个 Edge | 120000 ms | Range/流式回源读空闲超时 |
+
+`origin_timeout_ms = 0` 时按 10000 ms 处理。
+
+## 域名“回源连接超时”
+
+域名高级设置中的字段现在显示为：
+
+```text
+回源连接超时（毫秒）
+```
+
+对应：
+
+```text
+domains.origin_timeout_ms
+```
+
+Pingora 数据面：
+
+```rust
+peer.options.connection_timeout = Some(domain_timeout);
+```
+
+主要覆盖：
+
+```text
+TCP 建连
+TLS 握手
+源站连接建立阶段
+```
+
+它不负责：
+
+```text
+连接建立后等待响应头的空闲时间
+视频持续传输的总时长
+```
+
+Legacy 普通回源：
+
+```rust
+tokio::time::timeout(domain_timeout, origin.request(...))
+```
+
+这里它是单次回源的总超时，包含：
+
+```text
+连接
+发送请求
+等待响应头
+读取响应体
+```
+
+Legacy 流式回源现在使用 `ORIGIN_STREAM_READ_TIMEOUT_MS`，不再使用域名的连接超时。
+
+## ORIGIN_READ_TIMEOUT_MS
+
+Pingora 普通请求：
+
+```rust
+peer.options.read_timeout = Some(ORIGIN_READ_TIMEOUT_MS);
+```
+
+含义：
+
+```text
+连接建立后，等待/读取上游数据的空闲超时
+```
+
+它通常是空闲超时，而不是整个请求总时长：
+
+```text
+源站持续返回数据
+→ 可以传输数小时
+源站超过 30 秒没有任何数据
+→ ReadTimedout
+→ 504
+```
+
+它不覆盖：
+
+```text
+Range/视频流请求
+Legacy 流式请求
+```
+
+## ORIGIN_STREAM_READ_TIMEOUT_MS
+
+Range 请求和 legacy 流式回源使用：
+
+```text
+ORIGIN_STREAM_READ_TIMEOUT_MS
+```
+
+默认 120 秒，范围 5000–1800000 ms。
+
+适用：
+
+```text
+Range: bytes=0-
+Range: bytes=0-1048575
+视频/音频流
+legacy request_stream_with_sni
+```
+
+Pingora 仍使用域名的 `origin_timeout_ms` 建立连接；连接建立后使用 stream read timeout 等待数据。
+
+## 选择原则
+
+```text
+源站 IP/端口不通、TLS 握手慢
+→ 调整域名“回源连接超时”
+
+连接成功，但普通 API 响应头/数据迟迟不来
+→ 调整 ORIGIN_READ_TIMEOUT_MS
+
+视频 Range 首字节慢
+→ 调整 ORIGIN_STREAM_READ_TIMEOUT_MS
+
+源站持续有数据但传输很久
+→ 不需要调大；这是空闲超时，不是总时长
+```
+
+## 504 排查
+
+500/504 响应头：
+
+```http
+x-lagran-error: ORIGIN_TIMEOUT
+x-lagran-datapath: pingora
+```
+
+说明 Edge 到源站超时。
+
+Edge 日志：
+
+```text
+proxy error while reading upstream
+ReadTimedout
+```
+
+根据耗时判断：
+
+| 现象 | 更可能的原因 |
+|---|---|
+| 约 10 秒失败 | 域名连接超时 |
+| 约 30 秒失败 | 普通读空闲超时 |
+| 约 120 秒失败 | 视频流读空闲超时 |
+| 无 `x-lagran-*` 头、Caddy 报 upstream timeout | Caddy → Edge 层超时 |
+
+Caddy 在 Edge 前面时，建议：
+
+```caddyfile
+reverse_proxy 127.0.0.1:8081 {
+    flush_interval -1
+}
+```
+
+并根据 Caddy 版本检查其上游超时配置。
+
+## 推荐值
+
+普通站点：
+
+```env
+ORIGIN_READ_TIMEOUT_MS=30000
+ORIGIN_STREAM_READ_TIMEOUT_MS=120000
+```
+
+跨区域对象存储、冷启动视频：
+
+```env
+ORIGIN_READ_TIMEOUT_MS=60000
+ORIGIN_STREAM_READ_TIMEOUT_MS=300000
+```
+
+源站连接本身较慢时，再单独调大域名的回源连接超时。
 #### Age、TTL 与 SWR
 
 `Age` 表示对象从写入缓存到现在的时间，不是剩余 TTL：

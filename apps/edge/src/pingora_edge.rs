@@ -7,6 +7,7 @@
 //! bypass/dynamic traffic, disk/hybrid cache, control endpoints and
 //! WebSocket) are handed to the in-process handler.
 
+use crate::cache::CacheSource;
 use crate::cache::policy::{
     compute_etag, decide_storage_reason, request_bypass_reason_headers,
     resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
@@ -509,11 +510,20 @@ impl ProxyHttp for DataPlaneProxy {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if let Some(raw_range) = raw_range {
-                    if let Some(entry) = self.state.cache.get(&plan.key).await {
+                    let (cache_result, source) =
+                        self.state.cache.get_result_with_source(&plan.key).await;
+                    let entry = match cache_result {
+                        crate::cache::CacheGetResult::Hit(entry)
+                        | crate::cache::CacheGetResult::Stale(entry) => Some(entry),
+                        _ => None,
+                    };
+                    if let Some(entry) = entry {
                         let total = entry.body.len() as u64;
                         if let Some((start, end)) = parse_single_range(&raw_range, total) {
                             if self
-                                .serve_normal_range(session, &entry, start, end, total, &plan)
+                                .serve_normal_range(
+                                    session, &entry, start, end, total, &plan, source,
+                                )
                                 .await
                             {
                                 ctx.cache_label = "HIT";
@@ -570,7 +580,7 @@ impl ProxyHttp for DataPlaneProxy {
                             }
                         }
                     }
-                    if is_single_range_syntax(&raw_range) {
+                    if range_fill_is_safe(&raw_range, self.state.range_fill_max_bytes) {
                         ctx.range_fill = Some(RangeFill {
                             key: plan.key.clone(),
                         });
@@ -661,7 +671,7 @@ impl ProxyHttp for DataPlaneProxy {
 
     async fn upstream_peer(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let plan = ctx
@@ -697,7 +707,11 @@ impl ProxyHttp for DataPlaneProxy {
             port,
             tls,
             plan.timeout_ms,
-            plan.read_timeout_ms,
+            if session.req_header().headers.contains_key("range") {
+                self.state.origin_stream_read_timeout_ms
+            } else {
+                plan.read_timeout_ms
+            },
             if sni.is_empty() { None } else { Some(&sni) },
         )
             .await
@@ -1645,6 +1659,7 @@ impl DataPlaneProxy {
         end: u64,
         total: u64,
         plan: &NativePlan,
+        source: CacheSource,
     ) -> bool {
         let len = end.saturating_sub(start).saturating_add(1);
         if len == 0 || end >= total {
@@ -1678,6 +1693,7 @@ impl DataPlaneProxy {
         let _ = response.insert_header("accept-ranges", "bytes");
         let _ = response.insert_header("x-cache", "HIT");
         let _ = response.insert_header("x-cache-status", "HIT");
+        let _ = response.insert_header("x-lagran-cache-source", source.as_str());
         let _ = response.insert_header("x-lagran-cache-reason", "range-shared-cache");
         let _ = response.insert_header("x-powered-by", "lagran-edge");
         let _ = response.insert_header("x-lagran-datapath", "pingora");
@@ -2074,6 +2090,7 @@ impl DataPlaneProxy {
                 || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
                 || name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("content-range")
+                || name.eq_ignore_ascii_case("cache-status")
                 || is_hop_by_hop(name)
             {
                 continue;
@@ -2097,6 +2114,9 @@ impl DataPlaneProxy {
             || response.insert_header("x-cache", cache_label).is_err()
             || response
                 .insert_header("x-cache-status", cache_label)
+                .is_err()
+            || response
+                .insert_header("x-lagran-cache-source", "l3")
                 .is_err()
             || (!fresh
                 && response
@@ -2917,7 +2937,14 @@ fn parse_content_range(raw: &str) -> Option<(u64, u64, u64)> {
     (start <= end && end < total).then_some((start, end, total))
 }
 
-fn is_single_range_syntax(raw: &str) -> bool {
+/// Only fill bounded, reasonably small ranges into the large cache.
+/// Chrome usually starts a video with `Range: bytes=0-`; filling the entire
+/// 700MB+ object on the first play would compete with the client stream and
+/// can fill the disk. Open-ended ranges are proxied but not cached this way.
+fn range_fill_is_safe(raw: &str, max_fill_bytes: u64) -> bool {
+    if max_fill_bytes == 0 {
+        return false;
+    }
     let Some(value) = raw.trim().strip_prefix("bytes=") else {
         return false;
     };
@@ -2927,13 +2954,10 @@ fn is_single_range_syntax(raw: &str) -> bool {
     let Some((start, end)) = value.split_once('-') else {
         return false;
     };
-    let start = start.trim();
-    let end = end.trim();
-    if start.is_empty() && end.is_empty() {
+    let (Ok(start), Ok(end)) = (start.trim().parse::<u64>(), end.trim().parse::<u64>()) else {
         return false;
-    }
-    (start.is_empty() || start.parse::<u64>().is_ok())
-        && (end.is_empty() || end.parse::<u64>().is_ok())
+    };
+    end >= start && end.saturating_sub(start).saturating_add(1) <= max_fill_bytes
 }
 
 fn parse_single_range(raw: &str, total: u64) -> Option<(u64, u64)> {
@@ -3184,7 +3208,7 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 
 #[cfg(test)]
 mod tests {
-    use super::{head_content_length_for_protocol, parse_single_range, valid_release_tag};
+    use super::{head_content_length_for_protocol, parse_single_range, range_fill_is_safe, valid_release_tag};
 
     #[test]
     fn release_tag_validation() {
@@ -3201,6 +3225,16 @@ mod tests {
         assert_eq!(head_content_length_for_protocol(true, 1234), "1234");
         assert_eq!(head_content_length_for_protocol(false, 1234), "0");
         assert_eq!(head_content_length_for_protocol(true, 0), "0");
+    }
+
+    #[test]
+    fn only_small_bounded_ranges_fill_large_cache() {
+        assert!(range_fill_is_safe("bytes=0-1023", 32 * 1024 * 1024));
+        assert!(range_fill_is_safe("bytes=0-1048575", 32 * 1024 * 1024));
+        assert!(!range_fill_is_safe("bytes=0-", 32 * 1024 * 1024));
+        assert!(!range_fill_is_safe("bytes=-512", 32 * 1024 * 1024));
+        assert!(!range_fill_is_safe("bytes=0-33554432", 32 * 1024 * 1024));
+        assert!(!range_fill_is_safe("bytes=0-1023", 0));
     }
 
     #[test]
