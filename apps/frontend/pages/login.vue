@@ -479,7 +479,7 @@ onMounted(async () => {
 
 .captcha-image img {
   display: block;
-  width: 132px;
+  width: 110px;
   height: 34px;
 }
 
