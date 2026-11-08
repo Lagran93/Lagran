@@ -121,11 +121,6 @@
           <button class="btn btn-primary btn-lg w-full" type="submit" :disabled="loading">
             {{ loading ? '登录中…' : '登 录' }}
           </button>
-
-          <div class="login-trust">
-            <AppIcon name="shield" :size="14" />
-            <span>凭据仅发送到控制面 API，不写入浏览器日志</span>
-          </div>
         </form>
 
         <p v-if="allowRegister" class="register-link">
@@ -472,7 +467,7 @@ onMounted(async () => {
 
 .captcha-image {
   height: 34px;
-  min-width: 132px;
+  min-width: 110px;
   padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -823,5 +818,4 @@ onMounted(async () => {
   border-radius: 6px;
   object-fit: cover;
 }
-
 </style>

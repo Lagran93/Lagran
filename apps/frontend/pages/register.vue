@@ -44,8 +44,7 @@
           <div class="password-wrap">
             <input id="password" v-model="password" class="input" :type="showPassword ? 'text' : 'password'"
               placeholder="至少 8 位，包含字母和数字" autocomplete="new-password" required />
-            <button tabindex="-1" class="password-toggle" type="button"
-              :aria-label="showPassword ? '隐藏密码' : '显示密码'"
+            <button tabindex="-1" class="password-toggle" type="button" :aria-label="showPassword ? '隐藏密码' : '显示密码'"
               @click="showPassword = !showPassword">
               <AppIcon :name="showPassword ? 'eye-off' : 'eye'" :size="15" />
             </button>
@@ -56,8 +55,7 @@
           <div class="password-wrap">
             <input id="confirm" v-model="confirm" class="input" :type="showConfirm ? 'text' : 'password'"
               placeholder="再次输入密码" autocomplete="new-password" required />
-            <button tabindex="-1" class="password-toggle" type="button"
-              :aria-label="showConfirm ? '隐藏密码' : '显示密码'"
+            <button tabindex="-1" class="password-toggle" type="button" :aria-label="showConfirm ? '隐藏密码' : '显示密码'"
               @click="showConfirm = !showConfirm">
               <AppIcon :name="showConfirm ? 'eye-off' : 'eye'" :size="15" />
             </button>
@@ -86,11 +84,6 @@
         {{ loading ? '注册中…' : '注册并登录' }}
       </button>
     </form>
-
-    <div class="register-trust">
-      <AppIcon name="shield" :size="14" />
-      密码仅提交到控制面 API，不会写入前端存储
-    </div>
 
     <p class="register-foot">
       已有账号？<NuxtLink to="/login">返回登录</NuxtLink>
@@ -279,7 +272,7 @@ onMounted(async () => {
 
 .captcha-image {
   height: 34px;
-  min-width: 132px;
+  min-width: 110px;
   padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -550,5 +543,4 @@ onMounted(async () => {
   border-radius: 6px;
   object-fit: cover;
 }
-
 </style>
