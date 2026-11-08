@@ -141,6 +141,13 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => tracing::warn!(error = %e, "telemetry retention failed"),
                     _ => {}
                 }
+                match control::repository::purge_old_login_logs(&pool, days).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(login_logs = n, days, "login log retention purge")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "login log retention failed"),
+                    _ => {}
+                }
             }
         });
     }

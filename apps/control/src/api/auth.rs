@@ -4,7 +4,11 @@ use crate::middleware::AuthUser;
 use crate::repository;
 use crate::state::AppState;
 use crate::utils::{issue_token, verify_password};
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{header::USER_AGENT, HeaderMap, StatusCode},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -172,18 +176,99 @@ async fn check_captcha(
     ))
 }
 
+fn log_value(value: &str, max: usize) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn login_client_ip(headers: &HeaderMap) -> String {
+    for name in ["x-forwarded-for", "x-real-ip"] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            let first = value.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return log_value(first, 64);
+            }
+        }
+    }
+    String::new()
+}
+
+fn login_user_agent(headers: &HeaderMap) -> String {
+    headers
+        .get(USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| log_value(v, 512))
+        .unwrap_or_default()
+}
+
+async fn record_login(
+    state: &AppState,
+    email: &str,
+    user_id: Option<Uuid>,
+    client_ip: &str,
+    user_agent: &str,
+    success: bool,
+    reason: &str,
+) {
+    if let Err(e) = repository::insert_login_log(
+        &state.pool,
+        user_id,
+        &log_value(email, 320),
+        client_ip,
+        user_agent,
+        success,
+        reason,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, reason, "record login attempt failed");
+    }
+}
+
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorBody>)> {
     let email = normalize_email(&req.email);
-    check_captcha(&state, &req.captcha_id, &req.captcha_code).await?;
+    let client_ip = login_client_ip(&headers);
+    let user_agent = login_user_agent(&headers);
+
+    if let Err(err) = check_captcha(&state, &req.captcha_id, &req.captcha_code).await {
+        record_login(
+            &state,
+            &email,
+            None,
+            &client_ip,
+            &user_agent,
+            false,
+            "captcha_failed",
+        )
+        .await;
+        return Err(err);
+    }
+
     let limit_key = format!("login:{email}");
     if !state
         .login_limiter
         .check_shared(state.redis.as_deref(), &limit_key)
         .await
     {
+        record_login(
+            &state,
+            &email,
+            None,
+            &client_ip,
+            &user_agent,
+            false,
+            "rate_limited",
+        )
+        .await;
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorBody {
@@ -191,28 +276,60 @@ pub async fn login(
             }),
         ));
     }
-    let user = repository::find_user_by_email(&state.pool, &email)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "db error");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: "database error".into(),
-                }),
+
+    let user = match repository::find_user_by_email(&state.pool, &email).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            record_login(
+                &state,
+                &email,
+                None,
+                &client_ip,
+                &user_agent,
+                false,
+                "invalid_credentials",
             )
-        })?
-        .ok_or_else(|| {
-            (
+            .await;
+            return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorBody {
                     error: "invalid email or password".into(),
                 }),
+            ));
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "db error");
+            record_login(
+                &state,
+                &email,
+                None,
+                &client_ip,
+                &user_agent,
+                false,
+                "db_error",
             )
-        })?;
+            .await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "database error".into(),
+                }),
+            ));
+        }
+    };
 
     let ok = verify_password(&req.password, &user.password_hash).unwrap_or(false);
     if !ok {
+        record_login(
+            &state,
+            &email,
+            Some(user.id),
+            &client_ip,
+            &user_agent,
+            false,
+            "invalid_password",
+        )
+        .await;
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorBody {
@@ -221,6 +338,16 @@ pub async fn login(
         ));
     }
     if !user.is_active {
+        record_login(
+            &state,
+            &email,
+            Some(user.id),
+            &client_ip,
+            &user_agent,
+            false,
+            "account_disabled",
+        )
+        .await;
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorBody {
@@ -230,22 +357,45 @@ pub async fn login(
     }
     let _ = repository::touch_last_login(&state.pool, user.id).await;
 
-    let token = issue_token(
+    let token = match issue_token(
         user.id,
         &user.email,
         &user.name,
         &state.config.jwt_secret,
         state.config.jwt_expire_hours,
         user.token_version,
+    ) {
+        Ok(token) => token,
+        Err(_) => {
+            record_login(
+                &state,
+                &email,
+                Some(user.id),
+                &client_ip,
+                &user_agent,
+                false,
+                "token_error",
+            )
+            .await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "token error".into(),
+                }),
+            ));
+        }
+    };
+
+    record_login(
+        &state,
+        &email,
+        Some(user.id),
+        &client_ip,
+        &user_agent,
+        true,
+        "success",
     )
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: "token error".into(),
-            }),
-        )
-    })?;
+    .await;
 
     Ok(Json(LoginResponse {
         token,
@@ -255,6 +405,7 @@ pub async fn login(
 
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<LoginResponse>), (StatusCode, Json<ErrorBody>)> {
     if !state.config.allow_register {
@@ -266,6 +417,8 @@ pub async fn register(
         ));
     }
     let email = normalize_email(&req.email);
+    let client_ip = login_client_ip(&headers);
+    let user_agent = login_user_agent(&headers);
     check_captcha(&state, &req.captcha_id, &req.captcha_code).await?;
     if let Err(msg) = validate_email(&email) {
         return Err((
@@ -384,6 +537,17 @@ pub async fn register(
             }),
         )
     })?;
+
+    record_login(
+        &state,
+        &email,
+        Some(user.id),
+        &client_ip,
+        &user_agent,
+        true,
+        "register",
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,

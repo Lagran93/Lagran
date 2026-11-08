@@ -185,6 +185,47 @@ REQUIRE_SECURE_SECRETS=true
 JWT_SECRET=<至少 32 字节随机值>
 ```
 
+### 2.3.1 登录日志
+
+控制台会记录每次账号认证结果，包含：
+
+```text
+时间
+账号邮箱
+结果（成功 / 失败）
+来源 IP
+User-Agent
+原因
+```
+
+记录入口：
+
+```text
+运维监控 → 登录日志
+```
+
+管理员可查看全部账号的登录记录；普通用户只能查看与自己邮箱关联的记录。
+
+失败原因包括：
+
+```text
+invalid_credentials  账号或密码错误
+invalid_password     密码错误
+account_disabled     账号已禁用
+captcha_failed       验证码错误
+rate_limited         尝试过于频繁
+db_error             数据库错误
+token_error          令牌签发失败
+```
+
+登录日志保存于 `login_logs` 表，默认保留 30 天。调整：
+
+```env
+LOG_RETENTION_DAYS=90
+```
+
+后会与访问日志、指标一起按保留天数清理；设为 `0` 表示不自动清理。
+
 ### 2.4 安装后验收
 
 ```bash
@@ -2843,13 +2884,21 @@ find /var/lib/lagran/large-cache -name '*.meta.json' \
   | grep 'file.mp4'
 ```
 
-### 13.6 查看普通缓存
+### 13.6 查询登录日志
+
+```bash
+curl -sS -H "$AUTH" 'https://console.example.com/api/v1/login-logs?limit=200' | jq
+```
+
+管理员调用时返回全部账号记录；普通用户调用时仅返回本人邮箱关联的记录。返回字段包含邮箱、来源 IP、User-Agent 与失败原因。
+
+### 13.7 查看普通缓存
 
 ```bash
 find /var/lib/lagran/cache -name '*.bin' -printf '%p %s\n' | head
 ```
 
-### 13.7 Range 验证
+### 13.8 Range 验证
 
 ```bash
 URL='https://cdn.example.com/file.mp4'
@@ -2869,7 +2918,7 @@ curl -sS -D /tmp/r2.h -o /dev/null \
 grep -Ei 'HTTP/|content-range|x-cache' /tmp/r2.h
 ```
 
-### 13.8 检查 Edge 配置
+### 13.9 检查 Edge 配置
 
 ```bash
 systemctl show lagran-edge -p EnvironmentFiles -p ExecStart -p WorkingDirectory
@@ -2880,7 +2929,7 @@ tr '\0' '\n' < /proc/$(pgrep -f lagran-edge | head -1)/environ \
 
 注意不要在不安全终端打印 token 等敏感值。
 
-### 13.9 常用 systemd
+### 13.10 常用 systemd
 
 ```bash
 systemctl restart lagran-control
@@ -2892,7 +2941,7 @@ journalctl -u lagran-control -n 200 --no-pager
 journalctl -u lagran-dns -n 200 --no-pager
 ```
 
-### 13.10 前端发布
+### 13.11 前端发布
 
 ```bash
 cd apps/frontend

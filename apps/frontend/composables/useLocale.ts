@@ -21,6 +21,7 @@ const DICT: Record<string, { zh: string; en: string }> = {
   'nav.alerts': { zh: '告警中心', en: 'Alerts' },
   'nav.logs': { zh: '访问日志', en: 'Access Logs' },
   'nav.audit': { zh: '操作审计', en: 'Audit Log' },
+  'nav.loginLogs': { zh: '登录日志', en: 'Login Log' },
   'nav.projects': { zh: '项目管理', en: 'Projects' },
   'nav.users': { zh: '用户管理', en: 'Users' },
   'nav.groups': { zh: '用户组', en: 'Groups' },

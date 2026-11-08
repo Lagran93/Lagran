@@ -1464,6 +1464,77 @@ pub async fn save_acme_account(
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LoginLogRow {
+    pub id: i64,
+    pub created_at: DateTime<Utc>,
+    pub user_id: Option<Uuid>,
+    pub email: String,
+    pub client_ip: String,
+    pub user_agent: String,
+    pub success: bool,
+    pub reason: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_login_log(
+    pool: &PgPool,
+    user_id: Option<Uuid>,
+    email: &str,
+    client_ip: &str,
+    user_agent: &str,
+    success: bool,
+    reason: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO login_logs (user_id, email, client_ip, user_agent, success, reason)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(user_id)
+    .bind(email)
+    .bind(client_ip)
+    .bind(user_agent)
+    .bind(success)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_login_logs(
+    pool: &PgPool,
+    limit: i64,
+    owner_email: Option<&str>,
+) -> sqlx::Result<Vec<LoginLogRow>> {
+    sqlx::query_as::<_, LoginLogRow>(
+        r#"
+        SELECT id, created_at, user_id, email, client_ip, user_agent, success, reason
+        FROM login_logs
+        WHERE ($2::text IS NULL OR email = $2)
+        ORDER BY created_at DESC, id DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit.clamp(1, 1000))
+    .bind(owner_email)
+    .fetch_all(pool)
+    .await
+}
+
+/// Retention for authentication attempt history.
+pub async fn purge_old_login_logs(pool: &PgPool, days: i64) -> sqlx::Result<u64> {
+    let days = days.max(1);
+    let result = sqlx::query(
+        r#"DELETE FROM login_logs WHERE created_at < NOW() - ($1::text || ' days')::interval"#,
+    )
+    .bind(days.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AuditRow {
     pub id: Uuid,
     pub actor: String,

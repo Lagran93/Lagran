@@ -17,6 +17,7 @@ pub mod edge_endpoints;
 pub mod group;
 pub mod health;
 pub mod health_origin;
+pub mod login_log;
 pub mod metrics;
 pub mod node;
 pub mod prefetch;
@@ -185,6 +186,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/stats/realtime", get(stats::realtime))
                 .route("/stats/summary", get(stats::summary))
                 .route("/audit", get(audit::list))
+                .route("/login-logs", get(login_log::list))
                 .route(
                     "/alert-channels",
                     get(alert::list_channels).post(alert::create_channel),

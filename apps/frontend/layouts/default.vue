@@ -39,6 +39,7 @@ const MENU: MenuGroup[] = [
       { label: '告警中心', to: '/alerts', icon: 'alert' },
       { label: '访问日志', to: '/access-logs', icon: 'logs' },
       { label: '操作审计', to: '/audit', icon: 'audit', admin: true },
+      { label: '登录日志', to: '/login-logs', icon: 'shield' },
     ],
   },
   {
@@ -74,6 +75,7 @@ const NAV_KEYS: Record<string, string> = {
   '/alerts': 'nav.alerts',
   '/access-logs': 'nav.logs',
   '/audit': 'nav.audit',
+  '/login-logs': 'nav.loginLogs',
   '/projects': 'nav.projects',
   '/users': 'nav.users',
   '/groups': 'nav.groups',
