@@ -9,6 +9,7 @@ export function useTheme() {
     if (!import.meta.client) return
     document.documentElement.dataset.theme = next
     document.documentElement.style.colorScheme = next
+    document.documentElement.style.backgroundColor = next === 'dark' ? '#080d15' : '#f3f6fb'
     try {
       localStorage.setItem('lagran_theme', next)
     } catch {

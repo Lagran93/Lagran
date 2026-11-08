@@ -11,6 +11,9 @@ export default defineNuxtConfig({
   ssr: false,
   modules: ['@pinia/nuxt'],
   css: ['~/assets/css/main.css'],
+  // Branded SPA boot screen: covers the empty #__nuxt container while the
+  // client bundle and the first API calls are still loading.
+  spaLoadingTemplate: 'spa-loading-template.html',
   runtimeConfig: {
     public: {
       // In production the console is served by Caddy and calls the API on the
@@ -26,6 +29,25 @@ export default defineNuxtConfig({
     head: {
       htmlAttrs: { lang: 'zh-CN' },
       title: 'Lagran CDN 控制台',
+      script: [
+        {
+          tagPosition: 'head',
+          textContent: `(function () {
+            try {
+              var saved = localStorage.getItem('lagran_theme');
+              var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+              var theme = saved === 'dark' || (!saved && prefersDark) ? 'dark' : 'light';
+              document.documentElement.dataset.theme = theme;
+              document.documentElement.style.colorScheme = theme;
+              document.documentElement.style.backgroundColor = theme === 'dark' ? '#080d15' : '#f3f6fb';
+              setTimeout(function () {
+                var hint = document.querySelector('.lagran-boot-sub');
+                if (hint) hint.textContent = '网络较慢，仍在加载控制台…';
+              }, 10000);
+            } catch (e) {}
+          })();`,
+        },
+      ],
       meta: [
         { charset: 'utf-8' },
         { name: 'viewport', content: 'width=device-width, initial-scale=1' },
