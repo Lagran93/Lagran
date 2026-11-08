@@ -2690,3 +2690,22 @@ html[data-theme='dark'] .menu-item.active .icon svg {
     font-size: 31px;
   }
 }
+
+/* Stable list tables: fixed layout prevents pagination-width jumps. */
+.table-fixed {
+  table-layout: fixed;
+}
+
+.table-fixed th,
+.table-fixed td {
+  overflow: hidden;
+}
+
+.cell-ellipsis {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

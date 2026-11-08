@@ -20,18 +20,20 @@
 
     <div class="card">
       <div class="filter-bar">
-        <input
-          v-model="keyword"
-          class="input"
-          placeholder="搜索操作者、资源或动作"
-          style="min-width: 260px"
-        />
+        <input v-model="keyword" class="input" placeholder="搜索操作者、资源或动作" style="min-width: 260px" />
         <span class="spacer" />
         <span class="text-muted" style="font-size: 13px">最近 {{ filtered.length }} 条记录</span>
       </div>
 
       <div v-if="filtered.length" class="table-wrap">
-        <table class="table">
+        <table class="table table-fixed audit-table">
+          <colgroup>
+            <col style="width: var(--col-time)" />
+            <col style="width: var(--col-actor)" />
+            <col style="width: var(--col-action)" />
+            <col style="width: var(--col-resource)" />
+            <col />
+          </colgroup>
           <thead>
             <tr>
               <th style="min-width: 160px">时间</th>
@@ -43,11 +45,19 @@
           </thead>
           <tbody>
             <tr v-for="a in paged" :key="a.id">
-              <td class="text-muted nowrap">{{ formatDateTime(a.created_at) }}</td>
-              <td>{{ a.actor }}</td>
-              <td><StatusTag :tone="actionTone(a.action)">{{ a.action }}</StatusTag></td>
-              <td class="cell-main">{{ a.resource || '—' }}</td>
-              <td class="text-muted">{{ a.detail || '—' }}</td>
+              <td class="time-cell text-muted nowrap">{{ formatDateTime(a.created_at) }}</td>
+              <td>
+                <span class="cell-ellipsis" :title="a.actor || '—'">{{ a.actor || '—' }}</span>
+              </td>
+              <td>
+                <StatusTag :tone="actionTone(a.action)">{{ a.action }}</StatusTag>
+              </td>
+              <td class="resource-cell cell-main">
+                <span class="cell-ellipsis" :title="a.resource || '—'">{{ a.resource || '—' }}</span>
+              </td>
+              <td class="detail-cell text-muted">
+                <span class="cell-ellipsis" :title="a.detail || '—'">{{ a.detail || '—' }}</span>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -57,12 +67,8 @@
         <div class="skeleton" style="height: 34px; width: 100%" />
       </div>
 
-      <EmptyState
-        v-else
-        icon="audit"
-        :title="logs.length ? '没有匹配的记录' : '暂无审计记录'"
-        :text="logs.length ? '试试其他关键词。' : '域名启停、规则变更、缓存刷新等操作会自动记录在这里。'"
-      />
+      <EmptyState v-else icon="audit" :title="logs.length ? '没有匹配的记录' : '暂无审计记录'"
+        :text="logs.length ? '试试其他关键词。' : '域名启停、规则变更、缓存刷新等操作会自动记录在这里。'" />
 
       <div v-if="filtered.length > pageSize" class="table-footer">
         <AppPagination v-model:page="page" :total="filtered.length" :page-size="pageSize" />
@@ -125,3 +131,133 @@ async function load() {
 
 onMounted(load)
 </script>
+
+<style scoped>
+.audit-table {
+  --col-time: 164px;
+  --col-actor: 160px;
+  --col-action: 164px;
+  --col-resource: 220px;
+  min-width: 900px;
+}
+
+
+@media (min-width: 1920px) {
+  .audit-table {
+    --col-time: 180px;
+    --col-actor: 180px;
+    --col-action: 190px;
+    --col-resource: 300px;
+  }
+}
+
+@media (min-width: 2560px) {
+  .audit-table {
+    --col-time: 250px;
+    --col-actor: 250px;
+    --col-action: 240px;
+    --col-resource: 400px;
+  }
+
+  .audit-table th,
+  .audit-table td {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  .audit-table .cell-ellipsis {
+    font-size: 14.5px;
+  }
+}
+
+@media (min-width: 3200px) {
+  .audit-table {
+    --col-time: 250px;
+    --col-actor: 250px;
+    --col-action: 300px;
+    --col-resource: 500px;
+  }
+}
+
+.audit-table th,
+.audit-table td {
+  overflow: hidden;
+}
+
+.audit-table td .cell-ellipsis {
+  color: var(--text-2);
+}
+
+/* ---------------------------------------------------------------
+   List typography
+   --------------------------------------------------------------- */
+
+.audit-table {
+  font-size: 13px;
+}
+
+.audit-table th {
+  padding: 10px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.audit-table td {
+  padding: 11px 14px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.audit-table td .cell-ellipsis {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.audit-table .time-cell {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+
+.audit-table .resource-cell .cell-ellipsis {
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+.audit-table .detail-cell .cell-ellipsis {
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
+@media (min-width: 2560px) {
+  .audit-table {
+    font-size: 14px;
+  }
+
+  .audit-table th {
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+  }
+
+  .audit-table th,
+  .audit-table td {
+    padding: 12px 18px;
+  }
+
+  .audit-table td,
+  .audit-table td .cell-ellipsis {
+    font-size: 14px;
+  }
+
+  .audit-table .time-cell {
+    font-size: 13px;
+  }
+
+  .audit-table .detail-cell .cell-ellipsis {
+    font-size: 13px;
+  }
+}
+</style>

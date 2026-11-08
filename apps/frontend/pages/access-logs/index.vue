@@ -19,13 +19,8 @@
 
     <div class="card">
       <div class="filter-bar">
-        <input
-          v-model="host"
-          class="input"
-          placeholder="按域名筛选，如 cdn.example.com"
-          style="min-width: 240px"
-          @keyup.enter="load"
-        />
+        <input v-model="host" class="input" placeholder="按域名筛选，如 cdn.example.com" style="min-width: 240px"
+          @keyup.enter="load" />
         <select v-model="statusClass" class="select">
           <option value="">全部状态码</option>
           <option value="2xx">2xx 成功</option>
@@ -44,7 +39,21 @@
       </div>
 
       <div v-if="filtered.length" class="table-wrap">
-        <table class="table">
+        <table class="table table-fixed log-table">
+          <colgroup>
+            <col style="width: var(--col-time)" />
+            <col style="width: var(--col-node)" />
+            <col style="width: var(--col-ip)" />
+            <col style="width: var(--col-method)" />
+            <col style="width: var(--col-host)" />
+            <col />
+            <col style="width: var(--col-ua)" />
+            <col style="width: var(--col-status)" />
+            <col style="width: var(--col-cache)" />
+            <col style="width: var(--col-action)" />
+            <col style="width: var(--col-size)" />
+            <col style="width: var(--col-latency)" />
+          </colgroup>
           <thead>
             <tr>
               <th>时间</th>
@@ -53,6 +62,7 @@
               <th>方法</th>
               <th>域名</th>
               <th style="min-width: 220px">路径</th>
+              <th>User-Agent</th>
               <th>状态</th>
               <th>缓存</th>
               <th>动作</th>
@@ -62,15 +72,24 @@
           </thead>
           <tbody>
             <tr v-for="r in paged" :key="r.id">
-              <td class="text-muted nowrap">{{ formatDateTime(r.ts) }}</td>
-              <td class="text-2">{{ r.node_id }}</td>
-              <td class="mono">{{ r.client_ip }}</td>
+              <td class="time-cell text-muted nowrap">{{ formatDateTime(r.ts) }}</td>
+              <td class="text-2">
+                <span class="cell-ellipsis" :title="r.node_id || '—'">{{ r.node_id || '—' }}</span>
+              </td>
+              <td class="mono">
+                <span class="cell-ellipsis" :title="r.client_ip || '—'">{{ r.client_ip || '—' }}</span>
+              </td>
               <td>
                 <span class="method" :class="r.method?.toLowerCase()">{{ r.method }}</span>
               </td>
-              <td class="text-2">{{ r.host }}</td>
+              <td class="text-2">
+                <span class="cell-ellipsis" :title="r.host || '—'">{{ r.host || '—' }}</span>
+              </td>
               <td>
-                <div class="mono path-cell" :title="r.path">{{ r.path }}</div>
+                <span class="mono cell-ellipsis" :title="r.path">{{ r.path }}</span>
+              </td>
+              <td class="ua-cell text-2">
+                <span class="cell-ellipsis" :title="r.user_agent || '—'">{{ r.user_agent || '—' }}</span>
               </td>
               <td>
                 <StatusTag :tone="statusTone(r.status)">{{ r.status }}</StatusTag>
@@ -79,8 +98,8 @@
                 <StatusTag :status="r.cache_status">{{ r.cache_status }}</StatusTag>
               </td>
               <td>
-                <span v-if="r.action" class="text-2">{{ r.action }}</span>
-                <span v-else class="text-muted">-</span>
+                <span v-if="r.action" class="text-2 cell-ellipsis" :title="r.action">{{ r.action }}</span>
+                <span v-else class="text-muted">—</span>
               </td>
               <td class="num text-2">{{ formatBytes(r.bytes) }}</td>
               <td class="num" :class="r.latency_ms > 1000 ? 'text-danger' : 'text-2'">
@@ -95,12 +114,7 @@
         <div class="skeleton" style="height: 34px; width: 100%" />
       </div>
 
-      <EmptyState
-        v-else
-        icon="logs"
-        title="暂无访问日志"
-        text="边缘端开启 ACCESS_LOG_REPORT=true 后，约 30 秒上报一次批量日志。"
-      />
+      <EmptyState v-else icon="logs" title="暂无访问日志" text="边缘端开启 ACCESS_LOG_REPORT=true 后，约 30 秒上报一次批量日志。" />
 
       <div v-if="filtered.length > pageSize" class="table-footer">
         <AppPagination v-model:page="page" :total="filtered.length" :page-size="pageSize" />
@@ -213,5 +227,183 @@ onMounted(load)
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-2);
+}
+
+/* Width presets are defined on the table so scoped col selectors below
+   inherit the same custom properties. */
+.log-table {
+  --col-time: 160px;
+  --col-node: 105px;
+  --col-ip: 125px;
+  --col-method: 68px;
+  --col-host: 150px;
+  --col-ua: 180px;
+  --col-status: 68px;
+  --col-cache: 78px;
+  --col-action: 88px;
+  --col-size: 78px;
+  --col-latency: 78px;
+  min-width: 1400px;
+}
+
+
+@media (min-width: 1920px) {
+  .log-table {
+    --col-time: 170px;
+    --col-node: 125px;
+    --col-ip: 145px;
+    --col-method: 72px;
+    --col-host: 190px;
+    --col-ua: 300px;
+    --col-status: 72px;
+    --col-cache: 88px;
+    --col-action: 105px;
+    --col-size: 88px;
+    --col-latency: 88px;
+  }
+}
+
+@media (min-width: 2560px) {
+  .log-table {
+    --col-time: 220px;
+    --col-node: 180px;
+    --col-ip: 200px;
+    --col-method: 90px;
+    --col-host: 260px;
+    --col-ua: 500px;
+    --col-status: 90px;
+    --col-cache: 110px;
+    --col-action: 140px;
+    --col-size: 110px;
+    --col-latency: 110px;
+  }
+
+  .log-table th,
+  .log-table td {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  .log-table .cell-ellipsis {
+    font-size: 14.5px;
+  }
+}
+
+@media (min-width: 3200px) {
+  .log-table {
+    --col-time: 240px;
+    --col-node: 200px;
+    --col-ip: 220px;
+    --col-method: 96px;
+    --col-host: 300px;
+    --col-ua: 500px;
+    --col-status: 96px;
+    --col-cache: 120px;
+    --col-action: 160px;
+    --col-size: 120px;
+    --col-latency: 120px;
+  }
+}
+
+.log-table th,
+.log-table td {
+  overflow: hidden;
+}
+
+.log-table td .cell-ellipsis {
+  color: var(--text-2);
+}
+
+.log-table .method {
+  display: inline-flex;
+  max-width: 100%;
+}
+
+/* ---------------------------------------------------------------
+   List typography
+   --------------------------------------------------------------- */
+
+.log-table {
+  font-size: 13px;
+}
+
+.log-table th {
+  padding: 10px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.log-table td {
+  padding: 11px 14px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.log-table .cell-ellipsis {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.log-table .time-cell {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+
+.log-table td.mono,
+.log-table .mono.cell-ellipsis {
+  font-size: 12.5px;
+  letter-spacing: -0.01em;
+}
+
+.log-table .num {
+  font-size: 12.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+.log-table .method {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.045em;
+  padding: 1px 6px;
+}
+
+.log-table .ua-cell .cell-ellipsis {
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
+@media (min-width: 2560px) {
+  .log-table {
+    font-size: 14px;
+  }
+
+  .log-table th {
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+  }
+
+  .log-table th,
+  .log-table td {
+    padding: 12px 18px;
+  }
+
+  .log-table td,
+  .log-table .cell-ellipsis {
+    font-size: 14px;
+  }
+
+  .log-table .time-cell,
+  .log-table td.mono,
+  .log-table .mono.cell-ellipsis,
+  .log-table .num,
+  .log-table .ua-cell .cell-ellipsis {
+    font-size: 13px;
+  }
 }
 </style>
