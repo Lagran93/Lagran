@@ -856,6 +856,8 @@ PUBLIC_IP=<公网IP>
 5. 替换 control/edge/dns 与 Web。
 6. 重启已启用服务。
 
+升级请求是单实例的：存在 update.request 或状态为 queued/running/downloading/installing/restarting 时，Control 返回 409 update already in progress，前端按钮保持禁用，避免重复排队。页面刷新后会从 update.status 恢复禁用状态。
+
 旧部署需要重新执行一次：
 
 ```bash

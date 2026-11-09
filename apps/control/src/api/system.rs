@@ -46,6 +46,31 @@ fn status_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STATUS))
 }
 
+/// Serializes apply-update requests inside this control process. The request
+/// file and status file are the cross-process truth; this lock closes the
+/// read-check-write race between two simultaneous clicks.
+static UPDATE_APPLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn status_state() -> String {
+    std::fs::read_to_string(status_path())
+        .ok()
+        .and_then(|raw| {
+            raw.trim()
+                .split('|')
+                .next()
+                .map(|value| value.trim().to_ascii_lowercase())
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "idle".to_string())
+}
+
+fn update_active(state: &str) -> bool {
+    matches!(
+        state,
+        "queued" | "pending" | "downloading" | "installing" | "restarting" | "running"
+    )
+}
+
 fn updater_available() -> bool {
     let helper = std::env::var("LAGRAN_UPDATE_HELPER")
         .unwrap_or_else(|_| "/opt/lagran/bin/lagran-update".to_string());
@@ -280,18 +305,35 @@ pub async fn apply_update(
             .map_err(internal)?;
         validate_tag(&release.tag_name).ok_or_else(|| bad_request("invalid latest release tag"))?
     };
-    let request = request_path();
-    if let Some(parent) = request.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| internal(format!("cannot create update request directory: {e}")))?;
+    // The lock is held only around the status check and request-file write. It
+    // must not span an await, otherwise the Axum handler future is !Send.
+    {
+        let _guard = UPDATE_APPLY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let update_state = status_state();
+        let request = request_path();
+        if request.exists() || update_active(&update_state) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!("an update is already queued or running (state: {update_state})"),
+                    "state": update_state,
+                })),
+            ));
+        }
+        if let Some(parent) = request.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| internal(format!("cannot create update request directory: {e}")))?;
+        }
+        // Recreate the file so the systemd .path unit always observes a change.
+        let _ = std::fs::remove_file(&request);
+        let tmp = request.with_extension("request.tmp");
+        std::fs::write(&tmp, format!("{tag}\n"))
+            .map_err(|e| internal(format!("cannot write update request: {e}")))?;
+        std::fs::rename(&tmp, &request)
+            .map_err(|e| internal(format!("cannot queue update request: {e}")))?;
     }
-    // Recreate the file so the systemd .path unit always observes a change.
-    let _ = std::fs::remove_file(&request);
-    let tmp = request.with_extension("request.tmp");
-    std::fs::write(&tmp, format!("{tag}\n"))
-        .map_err(|e| internal(format!("cannot write update request: {e}")))?;
-    std::fs::rename(&tmp, &request)
-        .map_err(|e| internal(format!("cannot queue update request: {e}")))?;
     let _ = crate::repository::insert_audit(
         &state.pool,
         &actor.email,
@@ -352,4 +394,27 @@ pub async fn update_status(
         updater_available: updater_available(),
         raw,
     }))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_update_states_block_a_second_request() {
+        for state in [
+            "queued",
+            "pending",
+            "downloading",
+            "installing",
+            "restarting",
+            "running",
+        ] {
+            assert!(update_active(state), "{state}");
+        }
+        for state in ["idle", "success", "failed", "unknown"] {
+            assert!(!update_active(state), "{state}");
+        }
+    }
 }

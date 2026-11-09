@@ -186,11 +186,11 @@
             v-if="updateInfo?.update_available"
             class="btn btn-primary btn-sm"
             type="button"
-            :disabled="updateApplying || !updateInfo.updater_available"
+            :disabled="updateBusy || !updateInfo.updater_available"
             @click="applyUpdate"
           >
             <AppIcon name="upload" :size="15" />
-            {{ updateApplying ? '更新中…' : '立即更新' }}
+            {{ updateBusy ? '更新中…' : '立即更新' }}
           </button>
           <a
             v-if="updateInfo?.release_url"
@@ -327,8 +327,43 @@ interface UpdateInfo {
 const updateInfo = ref<UpdateInfo | null>(null)
 const updateChecking = ref(false)
 const updateApplying = ref(false)
+const UPDATE_PENDING_KEY = 'lagran-update-pending'
+try {
+  updateApplying.value = window.localStorage.getItem(UPDATE_PENDING_KEY) === '1'
+} catch {
+  // localStorage can be unavailable in privacy mode; server status still wins.
+}
 const updateMessage = ref('')
 const updateStatusInfo = ref<{ state: string; message: string | null } | null>(null)
+const ACTIVE_UPDATE_STATES = new Set([
+  'queued',
+  'pending',
+  'downloading',
+  'installing',
+  'restarting',
+  'running',
+])
+const updateBusy = computed(
+  () =>
+    updateApplying.value ||
+    ACTIVE_UPDATE_STATES.has(String(updateStatusInfo.value?.state || '').toLowerCase()),
+)
+let updatePollTimer: number | null = null
+
+function clearUpdatePoll() {
+  if (updatePollTimer != null) {
+    window.clearTimeout(updatePollTimer)
+    updatePollTimer = null
+  }
+}
+
+function scheduleUpdatePoll(delay = 5000) {
+  clearUpdatePoll()
+  updatePollTimer = window.setTimeout(async () => {
+    await loadUpdateStatus()
+    if (updateBusy.value) scheduleUpdatePoll()
+  }, delay)
+}
 
 async function loadDonations() {
   try {
@@ -365,20 +400,43 @@ async function loadUpdateStatus() {
       '/api/v1/system/update/status',
     )
     updateStatusInfo.value = res
-    if (res.state === 'failed' || res.state === 'success') {
+    const state = String(res.state || '').toLowerCase()
+    if (ACTIVE_UPDATE_STATES.has(state)) {
+      updateApplying.value = true
+      scheduleUpdatePoll()
+    } else if (state === 'success') {
       updateApplying.value = false
+      try {
+        window.localStorage.removeItem(UPDATE_PENDING_KEY)
+      } catch {}
+      clearUpdatePoll()
+      // Refresh current/latest versions so the now-obsolete update button is
+      // removed immediately after the control plane comes back.
+      checkUpdate()
+    } else if (state === 'failed') {
+      updateApplying.value = false
+      try {
+        window.localStorage.removeItem(UPDATE_PENDING_KEY)
+      } catch {}
+      clearUpdatePoll()
     }
   } catch {
-    // The control plane restarts during an update; the next poll can recover.
+    // The control plane restarts during an update; keep the button disabled
+    // and retry until the status endpoint is reachable again.
+    if (updateApplying.value) scheduleUpdatePoll()
   }
 }
 
 async function applyUpdate() {
   if (!updateInfo.value?.latest_version) return
+  if (updateBusy.value) return
   if (!window.confirm(`确定更新到 ${updateInfo.value.latest_version}？控制面会短暂重启。`)) {
     return
   }
   updateApplying.value = true
+  try {
+    window.localStorage.setItem(UPDATE_PENDING_KEY, '1')
+  } catch {}
   updateMessage.value = '更新任务已提交，正在下载并校验 Release…'
   try {
     const res = await api.post<{ queued: boolean; version: string; message: string }>(
@@ -387,15 +445,31 @@ async function applyUpdate() {
     )
     updateMessage.value = res.message || '更新任务已排队'
     toast.success('更新任务已提交')
-    for (const delay of [3000, 8000, 15000]) {
-      window.setTimeout(() => {
-        loadUpdateStatus()
-        checkUpdate()
-      }, delay)
-    }
+    scheduleUpdatePoll(3000)
   } catch (e: any) {
-    updateApplying.value = false
     updateMessage.value = e?.data?.error || e?.message || '提交更新失败'
+    // A 409 from the backend means another update is already running. Re-read
+    // status so the button stays disabled until it finishes.
+    const state = String(e?.data?.state || '').toLowerCase()
+    if (
+      e?.status === 409 ||
+      e?.statusCode === 409 ||
+      e?.response?.status === 409 ||
+      ACTIVE_UPDATE_STATES.has(state)
+    ) {
+      updateApplying.value = true
+      try {
+        window.localStorage.setItem(UPDATE_PENDING_KEY, '1')
+      } catch {}
+      await loadUpdateStatus()
+      scheduleUpdatePoll()
+    } else {
+      updateApplying.value = false
+      try {
+        window.localStorage.removeItem(UPDATE_PENDING_KEY)
+      } catch {}
+      clearUpdatePoll()
+    }
     toast.error(updateMessage.value)
   }
 }
@@ -519,6 +593,8 @@ onMounted(() => {
     })
     .catch(() => {})
 })
+
+onUnmounted(clearUpdatePoll)
 </script>
 
 <style scoped>
