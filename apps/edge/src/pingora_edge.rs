@@ -371,12 +371,32 @@ impl ProxyHttp for DataPlaneProxy {
             .req_header_mut()
             .remove_header(signed_url::HOTLINK_OK_HEADER);
 
+        // Control-plane prefetch connects to the loopback public listener.
+        // It must pass through the native cache path, but is trusted to skip
+        // hotlink/signed-URL checks that would block a server-side warmup.
+        let internal_prefetch = session
+            .req_header()
+            .headers
+            .get("x-lagran-prefetch")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "1")
+            && ctx
+                .client_ip
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        if internal_prefetch {
+            session
+                .req_header_mut()
+                .remove_header("x-lagran-prefetch");
+        }
+
         // WebSocket is intentionally legacy-only: Pingora's HTTP proxy does
         // not tunnel upgraded connections on this path.
         if let Some(domain) = self.state.domains.get(&ctx.host).await {
             let mut signed_verified = false;
             let mode = signed_url::effective_mode(&domain);
-            if mode != "off" {
+            if mode != "off" && !internal_prefetch {
                 let uri = session.req_header().uri.clone();
                 let protected = signed_url::normalize_path(uri.path())
                     .map(|path| signed_url::path_protected(&domain, &path))
@@ -413,7 +433,7 @@ impl ProxyHttp for DataPlaneProxy {
                 }
             }
 
-            if domain.hotlink_signature_enabled && !signed_verified {
+            if domain.hotlink_signature_enabled && !signed_verified && !internal_prefetch {
                 let referer = session
                     .req_header()
                     .headers
@@ -483,9 +503,11 @@ impl ProxyHttp for DataPlaneProxy {
                 is_https,
                 start: ctx.start,
             };
-            if let Some(resp) = pipeline.preflight(&plan.domain, &facts).await {
-                write_axum_response(session, resp, false).await;
-                return Ok(true);
+            if !internal_prefetch {
+                if let Some(resp) = pipeline.preflight(&plan.domain, &facts).await {
+                    write_axum_response(session, resp, false).await;
+                    return Ok(true);
+                }
             }
             let small_range =
                 headers.contains_key("range") && range_is_small_bounded(&headers);

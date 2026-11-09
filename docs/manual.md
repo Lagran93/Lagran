@@ -785,7 +785,7 @@ DSL 仍然只检查 path/query/UA/Referer/Method/Header/IP，不读取请求体�
 - 定时任务 `prefetch_schedules`
 - 查看任务状态和每个节点的 warmed/failed 信息
 
-预热是 Edge 本地执行的真实 GET，不是只写元数据。
+预热是 Edge 本地通过 Pingora 数据面执行的真实 GET，不是只写元数据；会经过与普通客户端相同的普通缓存、Range 和大对象缓存路径。
 
 ### 3.7 证书
 
@@ -953,6 +953,7 @@ Control 的 CONTROL_PUBLIC_URL
 | `CACHE_BACKEND` | `memory` / `disk` / `hybrid` / `redis` / `l2`；`redis` 与 `l2` 当前等价，均启用本地 MemoryCache + Redis L2 |
 | `DISK_CACHE_DIR` | 普通磁盘缓存目录 |
 | `MAX_CACHEABLE_BODY` | 普通缓存单对象上限，8 MiB 默认 |
+| `CACHE_KEY_IGNORE_HEADERS` | 从 cache key 排除的请求头，如 `accept-language,origin` |
 | `CACHE_MAX_BYTES` | 内存缓存近似字节上限，默认 512 MiB；超限按 LRU 淘汰 |
 | `CACHE_REDIS_URL` | 所有 Edge 共享的 Redis L2 地址；为空复用 `REDIS_URL`。不是节点本地 Redis |
 | `CACHE_REDIS_PREFIX` | Redis L2 key 前缀 |
@@ -1462,12 +1463,11 @@ METHOD:host:path[?query]
 追加变体：
 
 ```text
-|lang=<hash>       Vary: Accept-Language
-|origin=<hash>     Vary: Origin / CORS
-|acrm=<hash>       Access-Control-Request-Method
-|acrh=<hash>       Access-Control-Request-Headers
-|acrpn=<hash>      Access-Control-Request-Private-Network
+|lang=<hash>       Accept-Language
+|origin=<hash>     Origin / CORS
 ```
+
+`Access-Control-Request-*` 只属于 OPTIONS 预检。当前 GET/HEAD key 不包含它们，OPTIONS 预检缓存启用后再按请求方法加入。
 
 规则开启 `ignore_query` 时 key 不含查询串。
 
@@ -1515,12 +1515,10 @@ SWR：
 - `Accept-Encoding`
 - `Accept-Language`
 - `Origin`
-- `Access-Control-Request-Method`
-- `Access-Control-Request-Headers`
-- `Access-Control-Request-Private-Network`
-- `Cookie`（仅 `ignore_cookie=true`）
+- `Access-Control-Request-*`：当前拒绝缓存，等待 OPTIONS 预检缓存
+- `Cookie`：拒绝缓存（Cookie 不在 cache key 中）
 
-其他字段（例如 `User-Agent`）会拒绝缓存。
+其他字段（例如 `User-Agent`）和 `Vary: *` 会拒绝缓存。
 
 CORS `Vary` 会被哈希进 cache key，避免不同 Origin 串缓存。
 
@@ -2144,8 +2142,17 @@ Age > TTL       → X-Cache: STALE
 
 ```text
 POST /api/v1/prefetch
-{ "domain": "cdn.example.com", "paths": ["/file.mp4"] }
+{
+  "domain": "cdn.example.com",
+  "paths": ["/file.mp4"],
+  "headers": {
+    "accept-language": "zh-CN,zh;q=0.9",
+    "origin": "https://www.example.com"
+  }
+}
 ```
+
+`headers` 只接受 `accept-language` 和 `origin`。`Access-Control-Request-*` 属于 OPTIONS 预检，当前预热固定 GET 且预检缓存未启用，因此不接受。
 
 预热行为：
 
@@ -2154,17 +2161,73 @@ POST /api/v1/prefetch
 - Edge 执行真实 GET
 - 大对象会写入大缓存
 - 普通对象写入普通缓存
+- 预热请求可携带 `Accept-Language` / `Origin`，用于命中源站 `Vary` 变体
 - Control → Edge 的预热回调超时为 60 秒
 - 任务记录 warmed/failed
 
 常见预热失败：
 
-- 域名 `ssl_enabled=true`，但 Edge 收到 HTTP 请求返回 301
 - 域名配置未同步
 - 源站不可达
 - 路径返回 404
-- 大缓存关闭或超过最大对象限制
+- 普通对象超过 `MAX_CACHEABLE_BODY`，且大缓存关闭或超限
 - 控制面回调 Edge 超时/`agent_url` 错误
+
+预热路径必须与真实用户的 **cache key** 一致。默认 cache key 包含完整 query string，因此：
+
+```text
+用户请求：/app.js?lang=zh&label=prod
+预热路径：/app.js
+→ 两个不同的 cache key，预热无效
+```
+
+处理方式：
+
+1. 预热时填写与用户完全一致的 URL，包括 `lang`、`label`、`code` 等参数；
+2. 如果这些参数不影响内容，在域名高级设置中开启“忽略 Query”；
+3. 或为有限的语言/标签组合分别创建预热任务。
+
+不要对包含 `code`、`token`、签名参数的动态 URL 开启“忽略 Query”，否则不同用户会命中同一份缓存。
+
+cache key 还可能包含请求头：
+
+```text
+Accept-Language → |lang=<hash>
+Origin          → |origin=<hash>
+```
+
+如果这些头不影响响应体（例如单语言站点、固定的 CORS Origin），可以在 Edge 配置：
+
+```env
+CACHE_KEY_IGNORE_HEADERS=accept-language,origin
+```
+
+这样预热请求（不带这些头）与浏览器请求会命中同一个对象。
+
+如果响应确实随语言或 Origin 变化，不能忽略；需要按实际请求头分别预热，或改用 `Vary` 响应头配合支持变体的缓存层。
+
+### 5.9.1 源站 `Vary`
+
+当前 Edge 对 `Vary` 的处理：
+
+| Vary 字段 | 行为 |
+|---|---|
+| `Accept-Encoding` | 允许；只缓存 identity 表示 |
+| `Accept-Language` | 参与 cache key |
+| `Origin` | 参与 cache key |
+| `Access-Control-Request-*` | 当前拒绝缓存；仅 OPTIONS 预检缓存启用后按方法加入 key |
+| `Cookie` | 拒绝缓存（key 不包含 Cookie） |
+| `User-Agent` / 其它字段 | 拒绝缓存 |
+| `*` | 拒绝缓存 |
+
+同时：
+
+- 响应 `Vary` 会原样返回给客户端；
+- 如果运维通过 `CACHE_KEY_IGNORE_HEADERS` 把某个头移出 key，而源站又对它有 `Vary`，该响应不会写入共享缓存，避免把不同变体混在一起；
+- HEAD 复用 GET 的表示；
+- 预热请求携带的 `headers` 会进入同一套 key 计算。
+
+因此预热一个变体时，必须让 `headers` 与真实用户请求一致，或者确认该头已被配置为不参与 key。
 
 ### 5.10 缓存诊断
 
@@ -2458,7 +2521,10 @@ status=304 + cache_status=REVALIDATED
 | `origin-empty-fallback` | 条件回源返回异常空 200，改为使用缓存 body |
 | `vary` | Vary 不受支持 |
 | `vary:user-agent` | Vary User-Agent |
-| `vary:cookie` | Vary Cookie 且未 ignore |
+| `vary:cookie` | Vary Cookie（Cookie 不参与 key） |
+| `vary:key-ignored` | Vary 的字段被 `CACHE_KEY_IGNORE_HEADERS` 移出 key |
+| `vary:preflight` | GET/HEAD 的 Vary 包含 Access-Control-Request-* |
+| `vary:*` | Vary: * |
 | `rule-bypass` | 规则 bypass |
 | `content-type-bypass` | 响应 Content-Type 规则 bypass |
 | `set-cookie` | 响应 Set-Cookie |
@@ -2724,12 +2790,12 @@ Accept-Ranges: bytes
 
 | 现象 | 原因 |
 |---|---|
-| `warmed=0 failed=1`，状态 301 | 域名 SSL=true，预热请求先跳 HTTPS |
 | `agent_url` 连接失败 | Edge 管理口不可达/端口错误 |
 | 回调超时 | Edge 管理口被防火墙阻断；网络抖动 |
-| 大文件无文件 | 大缓存关闭/超限/响应不可缓存 |
+| 大文件无文件 | `MAX_CACHEABLE_BODY` 不足且大缓存关闭/超限 |
 | 预热 404 | 路径错误或源站返回 404 |
-| 预热后仍 MISS | 预热只影响对应 Edge；检查节点/缓存 key |
+| 预热后仍 MISS | 预热只影响对应 Edge；检查节点/cache key/query 参数 |
+| 小文件预热后仍 MISS | 检查 `MAX_CACHEABLE_BODY`、响应 cache-control/Vary |
 
 ### 9.9 缓存诊断超时 / client error Connect
 

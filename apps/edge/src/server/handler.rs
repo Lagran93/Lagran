@@ -87,6 +87,8 @@ pub struct AppState {
     pub https_redirect_port: Option<u16>,
     /// Responses larger than this are proxied but not stored in cache.
     pub max_cacheable_body: usize,
+    /// Header names intentionally excluded from the shared-cache key.
+    pub cache_key_ignore_headers: Vec<String>,
     /// Idle origin read timeout; separate from per-domain connect timeout.
     pub origin_read_timeout_ms: u64,
     pub origin_stream_read_timeout_ms: u64,
@@ -95,6 +97,9 @@ pub struct AppState {
     pub downstream_h2_idle_secs: u64,
     pub downstream_keepalive_requests: u32,
     pub websocket_idle_secs: u64,
+    /// Loopback address of the public Pingora HTTP listener, used by internal
+    /// prefetch so it goes through the native cache/large-cache data plane.
+    pub local_http_addr: SocketAddr,
 }
 
 /// Per-request view of the effective domain configuration.

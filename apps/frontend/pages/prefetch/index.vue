@@ -41,7 +41,27 @@
               rows="5"
               placeholder="/index.html&#10;/static/app.js&#10;/images/logo.png"
             />
-            <span class="field-hint">每行一个路径；任务会在约 15 秒内被后台执行。</span>
+            <span class="field-hint">每行一个路径；请包含真实用户 URL 的查询参数。任务会在约 15 秒内被后台执行。</span>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label class="field-label">Accept-Language</label>
+              <input
+                v-model="manual.acceptLanguage"
+                class="input"
+                placeholder="例如 zh-CN,zh;q=0.9"
+              />
+              <span class="field-hint">留空表示按“无该请求头”预热；源站 Vary 包含它时必须填写目标语言。</span>
+            </div>
+            <div class="field">
+              <label class="field-label">Origin</label>
+              <input
+                v-model="manual.origin"
+                class="input"
+                placeholder="例如 https://www.example.com"
+              />
+              <span class="field-hint">源站 Vary 包含 Origin 时填写；留空表示不带 Origin。</span>
+            </div>
           </div>
           <div class="flex-between">
             <span class="text-muted" style="font-size: 12px">预热请求经过真实边缘节点</span>
@@ -108,6 +128,9 @@
                     {{ s.paths.join(', ') }}
                   </span>
                   <div class="cell-sub">{{ s.paths.length }} 个路径</div>
+                  <div v-if="Object.keys(s.headers || {}).length" class="cell-sub mono">
+                    {{ Object.entries(s.headers).map(([k, v]) => `${k}=${v}`).join(' · ') }}
+                  </div>
                 </td>
                 <td>{{ s.interval_minutes }} 分钟</td>
                 <td>
@@ -163,7 +186,12 @@
               <tr v-for="t in pagedTasks" :key="t.id">
                 <td class="text-2">{{ formatTime(t.created_at) }}</td>
                 <td class="cell-main">{{ t.domain }}</td>
-                <td class="mono text-2">{{ t.url_path }}</td>
+                <td class="mono text-2">
+                  {{ t.url_path }}
+                  <div v-if="Object.keys(t.headers || {}).length" class="cell-sub">
+                    {{ Object.entries(t.headers).map(([k, v]) => `${k}=${v}`).join(' · ') }}
+                  </div>
+                </td>
                 <td>
                   <StatusTag :tone="t.source === 'schedule' ? 'info' : 'neutral'">
                     {{ t.source === 'schedule' ? '定时' : '手动' }}
@@ -209,6 +237,16 @@
         <div class="field">
           <label class="field-label">路径列表 <span class="req">*</span></label>
           <textarea v-model="scheduleForm.paths" class="textarea" rows="6" placeholder="/index.html&#10;/static/app.js" />
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label class="field-label">Accept-Language</label>
+            <input v-model="scheduleForm.acceptLanguage" class="input" placeholder="例如 zh-CN,zh;q=0.9" />
+          </div>
+          <div class="field">
+            <label class="field-label">Origin</label>
+            <input v-model="scheduleForm.origin" class="input" placeholder="例如 https://www.example.com" />
+          </div>
         </div>
         <label class="check">
           <input v-model="scheduleForm.enabled" type="checkbox" />
@@ -256,13 +294,20 @@ const loading = ref(false)
 const submitting = ref(false)
 const error = ref('')
 
-const manual = ref({ domain: '', paths: '' })
+const manual = ref({
+  domain: '',
+  paths: '',
+  acceptLanguage: '',
+  origin: '',
+})
 
 const scheduleOpen = ref(false)
 const editingSchedule = ref<any>(null)
 const scheduleForm = ref({
   domain: '',
   paths: '',
+  acceptLanguage: '',
+  origin: '',
   interval_minutes: 60,
   enabled: true,
 })
@@ -299,6 +344,15 @@ function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
 
+function cacheKeyHeaders(form: { acceptLanguage: string; origin: string }) {
+  const headers: Record<string, string> = {}
+  const lang = form.acceptLanguage.trim()
+  const origin = form.origin.trim()
+  if (lang) headers['accept-language'] = lang
+  if (origin) headers.origin = origin
+  return headers
+}
+
 async function createManual() {
   if (!manual.value.domain) {
     toast.error('请选择域名')
@@ -317,9 +371,12 @@ async function createManual() {
     const res = await api.post<any>('/api/v1/prefetch', {
       domain: manual.value.domain,
       paths,
+      headers: cacheKeyHeaders(manual.value),
     })
     toast.success(`已创建 ${res.created} 个预热任务`)
     manual.value.paths = ''
+    manual.value.acceptLanguage = ''
+    manual.value.origin = ''
     await load()
   } catch (e: any) {
     toast.error(e?.data?.error || '创建失败')
@@ -331,7 +388,14 @@ async function createManual() {
 function openCreateSchedule() {
   error.value = ''
   editingSchedule.value = null
-  scheduleForm.value = { domain: '', paths: '', interval_minutes: 60, enabled: true }
+  scheduleForm.value = {
+    domain: '',
+    paths: '',
+    acceptLanguage: '',
+    origin: '',
+    interval_minutes: 60,
+    enabled: true,
+  }
   scheduleOpen.value = true
 }
 
@@ -341,6 +405,8 @@ function openEditSchedule(s: any) {
   scheduleForm.value = {
     domain: s.domain,
     paths: (s.paths || []).join('\n'),
+    acceptLanguage: s.headers?.['accept-language'] || '',
+    origin: s.headers?.origin || '',
     interval_minutes: s.interval_minutes || 60,
     enabled: !!s.enabled,
   }
@@ -366,6 +432,7 @@ async function saveSchedule() {
     const body = {
       domain: scheduleForm.value.domain,
       paths,
+      headers: cacheKeyHeaders(scheduleForm.value),
       interval_minutes: Math.max(5, Number(scheduleForm.value.interval_minutes) || 60),
       enabled: scheduleForm.value.enabled,
     }

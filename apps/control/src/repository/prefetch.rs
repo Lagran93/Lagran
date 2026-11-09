@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::types::Json;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -10,6 +11,7 @@ pub struct PrefetchScheduleRow {
     pub id: Uuid,
     pub domain: String,
     pub paths: Json<Vec<String>>,
+    pub headers: Json<HashMap<String, String>>,
     pub interval_minutes: i32,
     pub enabled: bool,
     pub last_run_at: Option<DateTime<Utc>>,
@@ -22,6 +24,7 @@ pub struct PrefetchTaskRow {
     pub id: Uuid,
     pub domain: String,
     pub url_path: String,
+    pub headers: Json<HashMap<String, String>>,
     pub status: String,
     pub message: String,
     pub source: String,
@@ -32,7 +35,7 @@ pub struct PrefetchTaskRow {
 pub async fn list_prefetch_schedules(pool: &PgPool) -> sqlx::Result<Vec<PrefetchScheduleRow>> {
     sqlx::query_as::<_, PrefetchScheduleRow>(
         r#"
-        SELECT id, domain, paths, interval_minutes, enabled,
+        SELECT id, domain, paths, headers, interval_minutes, enabled,
                last_run_at, next_run_at, created_at
         FROM prefetch_schedules
         ORDER BY created_at DESC
@@ -46,18 +49,20 @@ pub async fn create_prefetch_schedule(
     pool: &PgPool,
     domain: &str,
     paths: &[String],
+    headers: &HashMap<String, String>,
     interval_minutes: i32,
 ) -> sqlx::Result<PrefetchScheduleRow> {
     sqlx::query_as::<_, PrefetchScheduleRow>(
         r#"
-        INSERT INTO prefetch_schedules (domain, paths, interval_minutes, next_run_at)
-        VALUES ($1, $2, $3, NOW())
-        RETURNING id, domain, paths, interval_minutes, enabled,
+        INSERT INTO prefetch_schedules (domain, paths, headers, interval_minutes, next_run_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        RETURNING id, domain, paths, headers, interval_minutes, enabled,
                   last_run_at, next_run_at, created_at
         "#,
     )
     .bind(domain)
     .bind(Json(paths.to_vec()))
+    .bind(Json(headers.clone()))
     .bind(interval_minutes)
     .fetch_one(pool)
     .await
@@ -69,7 +74,7 @@ pub async fn get_prefetch_schedule(
 ) -> sqlx::Result<Option<PrefetchScheduleRow>> {
     sqlx::query_as::<_, PrefetchScheduleRow>(
         r#"
-        SELECT id, domain, paths, interval_minutes, enabled,
+        SELECT id, domain, paths, headers, interval_minutes, enabled,
                last_run_at, next_run_at, created_at
         FROM prefetch_schedules WHERE id = $1
         "#,
@@ -84,23 +89,25 @@ pub async fn update_prefetch_schedule(
     id: Uuid,
     domain: &str,
     paths: &[String],
+    headers: &HashMap<String, String>,
     interval_minutes: i32,
     enabled: bool,
 ) -> sqlx::Result<Option<PrefetchScheduleRow>> {
     sqlx::query_as::<_, PrefetchScheduleRow>(
         r#"
         UPDATE prefetch_schedules SET
-            domain = $2, paths = $3, interval_minutes = $4, enabled = $5,
-            next_run_at = CASE WHEN $5 THEN NOW() ELSE next_run_at END,
+            domain = $2, paths = $3, headers = $4, interval_minutes = $5, enabled = $6,
+            next_run_at = CASE WHEN $6 THEN NOW() ELSE next_run_at END,
             updated_at = NOW()
         WHERE id = $1
-        RETURNING id, domain, paths, interval_minutes, enabled,
+        RETURNING id, domain, paths, headers, interval_minutes, enabled,
                   last_run_at, next_run_at, created_at
         "#,
     )
     .bind(id)
     .bind(domain)
     .bind(Json(paths.to_vec()))
+    .bind(Json(headers.clone()))
     .bind(interval_minutes)
     .bind(enabled)
     .fetch_optional(pool)
@@ -121,7 +128,7 @@ pub async fn due_prefetch_schedules(
 ) -> sqlx::Result<Vec<PrefetchScheduleRow>> {
     sqlx::query_as::<_, PrefetchScheduleRow>(
         r#"
-        SELECT id, domain, paths, interval_minutes, enabled,
+        SELECT id, domain, paths, headers, interval_minutes, enabled,
                last_run_at, next_run_at, created_at
         FROM prefetch_schedules
         WHERE enabled = TRUE AND next_run_at <= NOW()
@@ -159,17 +166,19 @@ pub async fn create_prefetch_source(
     pool: &PgPool,
     domain: &str,
     path: &str,
+    headers: &HashMap<String, String>,
     source: &str,
 ) -> sqlx::Result<Uuid> {
     let id: Uuid = sqlx::query_scalar(
         r#"
-        INSERT INTO prefetch_tasks (domain, url_path, source)
-        VALUES ($1, $2, $3)
+        INSERT INTO prefetch_tasks (domain, url_path, headers, source)
+        VALUES ($1, $2, $3, $4)
         RETURNING id
         "#,
     )
     .bind(domain)
     .bind(path)
+    .bind(Json(headers.clone()))
     .bind(source)
     .fetch_one(pool)
     .await?;
@@ -189,7 +198,7 @@ pub async fn claim_prefetch_tasks(pool: &PgPool, limit: i64) -> sqlx::Result<Vec
         UPDATE prefetch_tasks t SET status = 'running'
         FROM claimed
         WHERE t.id = claimed.id
-        RETURNING t.id, t.domain, t.url_path, t.status, t.message,
+        RETURNING t.id, t.domain, t.url_path, t.headers, t.status, t.message,
                   t.source, t.created_at, t.finished_at
         "#,
     )
@@ -224,7 +233,7 @@ pub async fn finish_prefetch_task(
 pub async fn list_prefetch_tasks(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<PrefetchTaskRow>> {
     sqlx::query_as::<_, PrefetchTaskRow>(
         r#"
-        SELECT id, domain, url_path, status, message, source, created_at, finished_at
+        SELECT id, domain, url_path, headers, status, message, source, created_at, finished_at
         FROM prefetch_tasks
         ORDER BY created_at DESC
         LIMIT $1

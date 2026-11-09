@@ -9,12 +9,15 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub struct PrefetchRequest {
     pub domain: String,
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -29,6 +32,7 @@ pub struct PrefetchTaskDto {
     pub id: String,
     pub domain: String,
     pub url_path: String,
+    pub headers: HashMap<String, String>,
     pub status: String,
     pub message: String,
 }
@@ -63,6 +67,7 @@ pub async fn create(
     if !actor.can_write_domain_name(&state, &req.domain).await {
         return Err(forbidden());
     }
+    let headers = normalize_key_headers(req.headers);
     let mut ids = Vec::new();
     for path in &req.paths {
         let p = if path.starts_with('/') {
@@ -70,7 +75,7 @@ pub async fn create(
         } else {
             format!("/{path}")
         };
-        match repository::create_prefetch(&state.pool, &req.domain, &p).await {
+        match repository::create_prefetch(&state.pool, &req.domain, &p, &headers).await {
             Ok(id) => ids.push(id.to_string()),
             Err(e) => tracing::error!(error = %e, "prefetch insert"),
         }
@@ -120,6 +125,7 @@ pub async fn list(State(state): State<AppState>, actor: Actor) -> Json<Vec<Prefe
                 id: id.to_string(),
                 domain,
                 url_path,
+                headers: HashMap::new(),
                 status,
                 message,
             })
@@ -132,6 +138,7 @@ pub struct PrefetchScheduleDto {
     pub id: String,
     pub domain: String,
     pub paths: Vec<String>,
+    pub headers: HashMap<String, String>,
     pub interval_minutes: u32,
     pub enabled: bool,
     pub last_run_at: Option<String>,
@@ -142,6 +149,8 @@ pub struct PrefetchScheduleDto {
 pub struct ScheduleRequest {
     pub domain: String,
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     #[serde(default = "default_interval")]
     pub interval_minutes: u32,
     #[serde(default = "default_enabled")]
@@ -161,11 +170,32 @@ fn schedule_dto(row: repository::PrefetchScheduleRow) -> PrefetchScheduleDto {
         id: row.id.to_string(),
         domain: row.domain,
         paths: row.paths.0,
+        headers: row.headers.0,
         interval_minutes: row.interval_minutes.max(0) as u32,
         enabled: row.enabled,
         last_run_at: row.last_run_at.map(|t| t.to_rfc3339()),
         next_run_at: row.next_run_at.to_rfc3339(),
     }
+}
+
+/// Request headers that can affect the shared-cache key and are safe to set
+/// on an internal prefetch request.
+fn normalize_key_headers(input: HashMap<String, String>) -> HashMap<String, String> {
+    // ACR* headers are intentionally absent: prefetch is GET-only and those
+    // headers only belong to an OPTIONS preflight, which is not cached yet.
+    const ALLOWED: &[&str] = &["accept-language", "origin"];
+    input
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if value.is_empty() || !ALLOWED.contains(&name.as_str()) {
+                None
+            } else {
+                Some((name, value))
+            }
+        })
+        .collect()
 }
 
 fn normalize_paths(paths: Vec<String>) -> Vec<String> {
@@ -237,7 +267,8 @@ pub async fn create_schedule(
         return Err(forbidden());
     }
     let interval = req.interval_minutes.clamp(5, 10_080) as i32;
-    let row = repository::create_prefetch_schedule(&state.pool, &domain, &paths, interval)
+    let headers = normalize_key_headers(req.headers);
+    let row = repository::create_prefetch_schedule(&state.pool, &domain, &paths, &headers, interval)
         .await
         .map_err(|_| {
             (
@@ -306,11 +337,13 @@ pub async fn update_schedule(
         return Err(forbidden());
     }
     let interval = req.interval_minutes.clamp(5, 10_080) as i32;
+    let headers = normalize_key_headers(req.headers);
     let row = repository::update_prefetch_schedule(
         &state.pool,
         uid,
         &domain,
         &paths,
+        &headers,
         interval,
         req.enabled,
     )
@@ -381,6 +414,7 @@ pub struct PrefetchTaskV2 {
     pub id: String,
     pub domain: String,
     pub url_path: String,
+    pub headers: HashMap<String, String>,
     pub status: String,
     pub message: String,
     pub source: String,
@@ -417,6 +451,7 @@ pub async fn list_tasks(State(state): State<AppState>, actor: Actor) -> Json<Vec
                 id: r.id.to_string(),
                 domain: r.domain,
                 url_path: r.url_path,
+                headers: r.headers.0,
                 status: r.status,
                 message: r.message,
                 source: r.source,

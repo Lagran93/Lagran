@@ -12,7 +12,8 @@
 //! revalidates before every reuse, and this edge either serves fresh entries
 //! or bypasses, so it must not be kept as a fresh entry. `s-maxage`,
 //! `must-revalidate` and `proxy-revalidate` disable stale serving.
-//! `ignore_cookie` allows `Vary: Cookie` for deliberately shared static assets.
+//! `ignore_cookie` lets cookie-bearing requests share a cache object, but a
+//! `Vary: Cookie` response is still rejected because Cookie is not in the key.
 
 use axum::http::{header, HeaderMap, Method, Request};
 use lagran_cache::CacheEntry;
@@ -536,20 +537,33 @@ pub fn decide_storage(
     decide_storage_reason(status, headers, policy, default_ttl_secs).ok()
 }
 
-fn vary_reject_reason(vary: Option<&str>, ignore_cookie: bool) -> Option<&'static str> {
+fn vary_reject_reason(vary: Option<&str>, _ignore_cookie: bool) -> Option<&'static str> {
     let Some(v) = vary else {
         return None;
     };
     for field in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        if field.eq_ignore_ascii_case("accept-encoding")
-            || field.eq_ignore_ascii_case("accept-language")
+        if field.eq_ignore_ascii_case("accept-encoding") {
+            // Only the identity representation is fetched/stored, so it is
+            // safe to serve it to any Accept-Encoding client.
+            continue;
+        }
+        if field.eq_ignore_ascii_case("accept-language")
             || field.eq_ignore_ascii_case("origin")
-            || field.eq_ignore_ascii_case("access-control-request-method")
+        {
+            if cache_key_header_ignored(field) {
+                // The operator removed this header from the key. Honouring a
+                // Vary on it would mix representations, so do not store.
+                return Some("vary:key-ignored");
+            }
+            continue;
+        }
+        if field.eq_ignore_ascii_case("access-control-request-method")
             || field.eq_ignore_ascii_case("access-control-request-headers")
             || field.eq_ignore_ascii_case("access-control-request-private-network")
-            || (ignore_cookie && field.eq_ignore_ascii_case("cookie"))
         {
-            continue;
+            // These are OPTIONS preflight headers. GET/HEAD keys do not carry
+            // them, and preflight caching is not enabled yet.
+            return Some("vary:preflight");
         }
         if field.eq_ignore_ascii_case("user-agent") {
             return Some("vary:user-agent");
@@ -557,9 +571,32 @@ fn vary_reject_reason(vary: Option<&str>, ignore_cookie: bool) -> Option<&'stati
         if field.eq_ignore_ascii_case("cookie") {
             return Some("vary:cookie");
         }
+        if field == "*" {
+            return Some("vary:*");
+        }
         return Some("vary");
     }
     None
+}
+
+/// Header names removed from the cache key by edge configuration. Vary on any
+/// of these must make the response uncacheable instead of mixing variants.
+static CACHE_KEY_IGNORED_HEADERS: std::sync::OnceLock<Vec<String>> =
+    std::sync::OnceLock::new();
+
+pub fn configure_cache_key_ignored_headers(headers: Vec<String>) {
+    let normalized: Vec<String> = headers
+        .into_iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    let _ = CACHE_KEY_IGNORED_HEADERS.set(normalized);
+}
+
+fn cache_key_header_ignored(name: &str) -> bool {
+    CACHE_KEY_IGNORED_HEADERS
+        .get()
+        .is_some_and(|headers| headers.iter().any(|entry| entry.eq_ignore_ascii_case(name)))
 }
 
 pub fn request_method_cacheable(method: &Method) -> bool {
@@ -683,26 +720,62 @@ pub fn cache_key_for_request(
     path: &str,
     headers: &HeaderMap,
 ) -> String {
+    cache_key_for_request_with_ignored(method, host, path, headers, &[])
+}
+
+/// Cache key with an explicit list of request headers that must not
+/// participate. Used when a deployment knows those headers do not vary the
+/// response body (for example a single-language site ignoring
+/// `Accept-Language`, or a fixed CORS origin ignoring `Origin`).
+pub fn cache_key_for_request_with_ignored(
+    method: &Method,
+    host: &str,
+    path: &str,
+    headers: &HeaderMap,
+    ignore_headers: &[String],
+) -> String {
+    let ignored = |name: &str| {
+        ignore_headers
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(name))
+    };
     let mut key = cache_key_for(method, host, path);
-    if let Some(lang) = headers
-        .get(header::ACCEPT_LANGUAGE)
-        .and_then(|v| v.to_str().ok())
-    {
-        let normalized = normalize_vary_value(lang);
-        if !normalized.is_empty() {
-            key.push_str(&format!("|lang={:x}", fnv1a64(normalized.as_bytes())));
+    if !ignored("accept-language") {
+        if let Some(lang) = headers
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|v| v.to_str().ok())
+        {
+            let normalized = normalize_vary_value(lang);
+            if !normalized.is_empty() {
+                key.push_str(&format!("|lang={:x}", fnv1a64(normalized.as_bytes())));
+            }
         }
     }
-    for (name, label) in [
-        ("origin", "origin"),
-        ("access-control-request-method", "acrm"),
-        ("access-control-request-headers", "acrh"),
-        ("access-control-request-private-network", "acrpn"),
-    ] {
-        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+    if !ignored("origin") {
+        if let Some(value) = headers.get("origin").and_then(|v| v.to_str().ok()) {
             let normalized = normalize_vary_value(value);
             if !normalized.is_empty() {
-                key.push_str(&format!("|{label}={:x}", fnv1a64(normalized.as_bytes())));
+                key.push_str(&format!("|origin={:x}", fnv1a64(normalized.as_bytes())));
+            }
+        }
+    }
+    // Access-Control-Request-* only exist on CORS preflight OPTIONS. They are
+    // deliberately not part of GET/HEAD keys: preflight caching is not enabled
+    // yet, and adding them to ordinary requests only fragments the cache.
+    if *method == Method::OPTIONS {
+        for (name, label) in [
+            ("access-control-request-method", "acrm"),
+            ("access-control-request-headers", "acrh"),
+            ("access-control-request-private-network", "acrpn"),
+        ] {
+            if ignored(name) {
+                continue;
+            }
+            if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+                let normalized = normalize_vary_value(value);
+                if !normalized.is_empty() {
+                    key.push_str(&format!("|{label}={:x}", fnv1a64(normalized.as_bytes())));
+                }
             }
         }
     }
@@ -1130,17 +1203,18 @@ mod tests {
     fn cors_vary_is_allowed_and_cache_keyed() {
         let policy = ResolvedPolicy::default();
         assert!(
+            decide_storage(200, &hdrs(&[("vary", "origin")]), policy, 60).is_some(),
+            "Origin Vary is cacheable because GET/HEAD keys carry Origin"
+        );
+        assert!(
             decide_storage(
                 200,
-                &hdrs(&[(
-                    "vary",
-                    "origin, access-control-request-method, access-control-request-headers"
-                )]),
+                &hdrs(&[("vary", "access-control-request-method")]),
                 policy,
                 60
             )
-            .is_some(),
-            "CORS Vary fields must be cacheable when the key carries them"
+            .is_none(),
+            "preflight Vary is rejected until OPTIONS caching is supported"
         );
 
         let method = Method::GET;
@@ -1157,13 +1231,50 @@ mod tests {
     }
 
     #[test]
-    fn ignore_cookie_allows_vary_cookie() {
+    fn preflight_headers_only_affect_options_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "access-control-request-method",
+            "PUT".parse().unwrap(),
+        );
+        headers.insert("origin", "https://a.example".parse().unwrap());
+        let get = cache_key_for_request(&Method::GET, "cdn.test", "/api", &headers);
+        let mut origin_only = HeaderMap::new();
+        origin_only.insert("origin", "https://a.example".parse().unwrap());
+        let get_origin =
+            cache_key_for_request(&Method::GET, "cdn.test", "/api", &origin_only);
+        assert!(!get.contains("|acrm="));
+        assert_eq!(get, get_origin, "ACR* must not fragment GET keys");
+
+        let options = cache_key_for_request(&Method::OPTIONS, "cdn.test", "/api", &headers);
+        assert!(options.contains("|acrm="));
+        assert_ne!(options, get);
+    }
+
+    #[test]
+    fn ignored_cache_key_headers_share_one_object() {
+        let method = Method::GET;
+        let mut headers = HeaderMap::new();
+        headers.insert("accept-language", "zh-CN,zh;q=0.9".parse().unwrap());
+        headers.insert("origin", "https://www.example.com".parse().unwrap());
+        let plain = cache_key_for_request(&method, "cdn.test", "/app.js", &HeaderMap::new());
+        let varied = cache_key_for_request(&method, "cdn.test", "/app.js", &headers);
+        assert_ne!(plain, varied);
+        let ignored = vec!["accept-language".to_string(), "origin".to_string()];
+        assert_eq!(
+            cache_key_for_request_with_ignored(&method, "cdn.test", "/app.js", &headers, &ignored),
+            plain
+        );
+    }
+
+    #[test]
+    fn vary_cookie_is_rejected() {
         let mut policy = ResolvedPolicy::default();
         assert!(decide_storage(200, &hdrs(&[("vary", "Cookie")]), policy, 60).is_none());
         policy.ignore_cookie = true;
         assert!(
-            decide_storage(200, &hdrs(&[("vary", "Cookie")]), policy, 60).is_some(),
-            "explicit ignore_cookie must allow Vary: Cookie static assets"
+            decide_storage(200, &hdrs(&[("vary", "Cookie")]), policy, 60).is_none(),
+            "the key does not carry Cookie, so a Vary: Cookie response must not be stored"
         );
         assert!(decide_storage(
             200,
@@ -1171,7 +1282,24 @@ mod tests {
             policy,
             60
         )
-        .is_some());
+        .is_none());
+    }
+
+    #[test]
+    fn vary_on_key_ignored_header_is_rejected() {
+        configure_cache_key_ignored_headers(vec!["accept-language".into()]);
+        assert!(decide_storage(
+            200,
+            &hdrs(&[("vary", "Accept-Language")]),
+            ResolvedPolicy::default(),
+            60
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn vary_star_is_rejected() {
+        assert!(decide_storage(200, &hdrs(&[("vary", "*")]), ResolvedPolicy::default(), 60).is_none());
     }
 
     #[test]

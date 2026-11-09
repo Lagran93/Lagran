@@ -40,7 +40,7 @@
    TTL、SWR、浏览器 TTL、是否忽略 Query；同优先级取先配置的规则。Content-Type 条件在响应头到达后判定，
    请求阶段先跳过；命中 bypass/no_store 时即使已有旧缓存也不服务。
 7. 决定是否走缓存：仅 GET/HEAD，且无 Authorization、客户端未要求 no-store；Cookie 默认绕过，
-   规则显式 `ignore_cookie` 时放行（并允许源站 `Vary: Cookie`）。Range GET 在完整对象已缓存时切片返回；
+   规则显式 `ignore_cookie` 时放行；`Vary: Cookie` 仍拒绝缓存，因为 Cookie 不在 cache key 中。Range GET 在完整对象已缓存时切片返回；
    未命中时透传 Range，避免视频等大文件整包回源。
    所有绕过/未存储响应带 `X-Lagran-Cache-Reason`（cookie / authorization / no-store / no-cache /
    vary:user-agent / rule-bypass / content-type-bypass / set-cookie 等）。

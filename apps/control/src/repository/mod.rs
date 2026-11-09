@@ -2099,16 +2099,22 @@ pub async fn update_domain_security(
     Ok(r.rows_affected())
 }
 
-pub async fn create_prefetch(pool: &PgPool, domain: &str, url_path: &str) -> sqlx::Result<Uuid> {
+pub async fn create_prefetch(
+    pool: &PgPool,
+    domain: &str,
+    url_path: &str,
+    headers: &std::collections::HashMap<String, String>,
+) -> sqlx::Result<Uuid> {
     let (id,): (Uuid,) = sqlx::query_as(
         r#"
-        INSERT INTO prefetch_tasks (domain, url_path, status)
-        VALUES ($1, $2, 'pending')
+        INSERT INTO prefetch_tasks (domain, url_path, headers, status)
+        VALUES ($1, $2, $3, 'pending')
         RETURNING id
         "#,
     )
     .bind(domain)
     .bind(url_path)
+    .bind(sqlx::types::Json(headers.clone()))
     .fetch_one(pool)
     .await?;
     Ok(id)

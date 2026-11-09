@@ -80,9 +80,14 @@ async fn enqueue_due_schedules(state: &AppState) -> Result<(), sqlx::Error> {
     let schedules = repository::due_prefetch_schedules(&state.pool, 20).await?;
     for schedule in schedules {
         for path in &schedule.paths.0 {
-            if let Err(e) =
-                repository::create_prefetch_source(&state.pool, &schedule.domain, path, "schedule")
-                    .await
+            if let Err(e) = repository::create_prefetch_source(
+                &state.pool,
+                &schedule.domain,
+                path,
+                &schedule.headers.0,
+                "schedule",
+            )
+            .await
             {
                 tracing::warn!(schedule = %schedule.id, error = %e, "enqueue scheduled prefetch");
             }
@@ -110,6 +115,7 @@ async fn process_task(state: &AppState, task: &PrefetchTaskRow, nodes: &[reposit
         let body = serde_json::json!({
             "domain": task.domain,
             "paths": [task.url_path],
+            "headers": task.headers.0,
         });
         match agent_http::request_json_timeout::<EdgePrefetchReply, _>(
             "POST",

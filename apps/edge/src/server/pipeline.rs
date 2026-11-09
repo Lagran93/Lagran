@@ -6,7 +6,8 @@
 //! incrementally; the public entry points are stable.
 
 use crate::cache::policy::{
-    cache_key_for_request, request_bypass_reason_headers, resolve_rule_policy, ResolvedPolicy,
+    cache_key_for_request_with_ignored, request_bypass_reason_headers, resolve_rule_policy,
+    ResolvedPolicy,
     RuleAction,
 };
 use crate::config::registry::DomainEntry;
@@ -187,7 +188,13 @@ impl<'a> RequestPipeline<'a> {
         } else {
             method.clone()
         };
-        cache_key_for_request(&method, host, &lookup_path, headers)
+        cache_key_for_request_with_ignored(
+            &method,
+            host,
+            &lookup_path,
+            headers,
+            &self.state.cache_key_ignore_headers,
+        )
     }
 
     /// HTTPS redirect, bot challenge, CC, rate limit, WAF and hotlink checks.

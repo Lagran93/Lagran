@@ -8,7 +8,7 @@ use edge::server::access_log::AccessLog;
 use edge::server::handler::AppState;
 use edge::server::inflight::Inflight;
 use edge::server::{listener, tls};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -175,6 +175,22 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    crate::cache::policy::configure_cache_key_ignored_headers(
+        config.cache_key_ignore_headers.clone(),
+    );
+    let listen_addr: SocketAddr = config.listen_addr.parse()?;
+    let local_http_addr = SocketAddr::new(
+        if listen_addr.ip().is_unspecified() {
+            if listen_addr.is_ipv4() {
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            }
+        } else {
+            listen_addr.ip()
+        },
+        listen_addr.port(),
+    );
     let state = Arc::new(AppState {
         cache,
         flight,
@@ -201,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
         node_control,
         https_redirect_port: config.https_redirect_port,
         max_cacheable_body: config.max_cacheable_body,
+        cache_key_ignore_headers: config.cache_key_ignore_headers.clone(),
         origin_read_timeout_ms: config.origin_read_timeout_ms,
         origin_stream_read_timeout_ms: config.origin_stream_read_timeout_ms,
         range_fill_max_bytes: config.range_fill_max_bytes,
@@ -208,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         downstream_h2_idle_secs: config.downstream_h2_idle_secs,
         downstream_keepalive_requests: config.downstream_keepalive_requests,
         websocket_idle_secs: config.websocket_idle_secs,
+        local_http_addr,
     });
 
     agent::cc_sync::spawn_cc_sync(config.clone(), control.clone(), state.cc.clone());

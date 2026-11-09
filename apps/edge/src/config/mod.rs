@@ -72,6 +72,10 @@ pub struct EdgeConfig {
     /// Max response body size stored in cache (bytes). Larger responses are
     /// still proxied but not written to cache.
     pub max_cacheable_body: usize,
+    /// Request header names excluded from the shared-cache key. This is for
+    /// headers that do not vary the response body, such as Accept-Language on
+    /// a single-language site, so prefetch and browsers share one object.
+    pub cache_key_ignore_headers: Vec<String>,
     /// Idle timeout while waiting for origin response bytes. This is separate
     /// from the per-domain connect/header timeout so media streams are not
     /// aborted just because the whole object takes longer than 10s.
@@ -224,6 +228,12 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8 * 1024 * 1024)
                 .clamp(64 * 1024, 64 * 1024 * 1024),
+            cache_key_ignore_headers: std::env::var("CACHE_KEY_IGNORE_HEADERS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect(),
             origin_read_timeout_ms: std::env::var("ORIGIN_READ_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
