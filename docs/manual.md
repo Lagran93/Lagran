@@ -926,7 +926,8 @@ Control 的 CONTROL_PUBLIC_URL
 | `CAPTCHA_ENABLED` | 登录/注册验证码 |
 | `SEED_DEMO` | 是否创建演示账号，生产设为 false |
 | `AGENT_TOKEN` | 全局 DNS/调度 Agent Token |
-| `GEOIP_PATH` | GeoIP 数据路径 |
+| `GEOIP_PATH` | 地理位置库路径，推荐 ip2region `ip2region_v4.xdb` |
+| `GEOIP_IPV6_PATH` | 可选 ip2region IPv6 `ip2region_v6.xdb` |
 | `DNS_TEST_SERVER` | 控制台 DNS 测试上游 |
 | `LOG_RETENTION_DAYS` | 日志保留天数 |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP Trace 导出 |
@@ -2895,7 +2896,8 @@ dig @127.0.0.1 -p 53 edge.lagran.net SOA
 - `DNS_ZONE`
 - `DNS_NS_NAME` / `DNS_NS_IP`
 - `CONTROL_URL` / `AGENT_TOKEN`
-- `GEOIP_PATH`
+- `GEOIP_PATH`（推荐 `ip2region_v4.xdb`）
+- `GEOIP_IPV6_PATH`（可选 `ip2region_v6.xdb`）
 - 53 端口是否被 systemd-resolved 占用
 - 防火墙 UDP/TCP 53
 

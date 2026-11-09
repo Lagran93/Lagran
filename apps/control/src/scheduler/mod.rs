@@ -1,8 +1,11 @@
 //! Geo/ISP-aware edge node selection (Phase 1).
 //!
 //! Client geo can come from an explicit override (DNS plugin already resolved
-//! it) or from a local JSON CIDR table (`GEOIP_JSON_PATH`). Node scoring is
-//! intentionally simple: province/city/ISP match + weight - load.
+//! it), the ip2region XDB database, a V2Ray/Loyalsoldier CIDR table, or a
+//! legacy JSON table. Node scoring is intentionally simple:
+//! country/province/city/ISP match + weight - load.
+
+mod ip2region;
 
 use crate::repository;
 use crate::state::AppState;
@@ -79,58 +82,142 @@ struct Rule {
     geo: GeoInfo,
 }
 
-/// CIDR -> geo table. Supports the V2Ray/Loyalsoldier `geoip.dat` protobuf
-/// format and the legacy JSON format.
+/// Geo lookup table. Prefers ip2region XDB; DAT/JSON remain supported.
 #[derive(Clone, Default)]
 pub struct GeoTable {
     rules: Arc<Vec<Rule>>,
+    ip2_v4: Option<Arc<ip2region::Ip2RegionDb>>,
+    ip2_v6: Option<Arc<ip2region::Ip2RegionDb>>,
 }
 
 impl GeoTable {
     pub fn load(path: &str) -> Self {
-        if path.trim().is_empty() {
-            return Self::default();
-        }
-        let Ok(raw) = std::fs::read(path) else {
-            tracing::warn!(
-                path,
-                "geoip file not found; scheduling falls back to weights"
-            );
-            return Self::default();
-        };
+        Self::load_with_ipv6(path, "")
+    }
 
-        let dat = is_dat(path, &raw);
-        let parsed = if dat {
-            parse_dat(&raw)
-        } else {
-            parse_json(&raw)
-        };
-        let mut rules = match parsed {
-            Ok(rules) => rules,
-            Err(e) => {
-                tracing::error!(path, dat, error = %e, "invalid geoip file");
-                return Self::default();
+    pub fn load_with_ipv6(path: &str, ipv6_path: &str) -> Self {
+        let mut table = Self::default();
+
+        if !path.trim().is_empty() {
+            match std::fs::read(path) {
+                Ok(raw) if ip2region::is_xdb_file(path, &raw) => {
+                    table.assign_xdb(path, raw);
+                }
+                Ok(raw) => {
+                    let dat = is_dat(path, &raw);
+                    let parsed = if dat {
+                        parse_dat(&raw)
+                    } else {
+                        parse_json(&raw)
+                    };
+                    match parsed {
+                        Ok(mut rules) => {
+                            rules.sort_by_key(|r| std::cmp::Reverse(r.cidr.prefix));
+                            tracing::info!(
+                                count = rules.len(),
+                                path,
+                                format = if dat { "dat" } else { "json" },
+                                "geoip table loaded"
+                            );
+                            table.rules = Arc::new(rules);
+                        }
+                        Err(e) => {
+                            tracing::error!(path, dat, error = %e, "invalid geoip file");
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        path,
+                        "geoip file not found; scheduling falls back to weights"
+                    );
+                }
             }
-        };
+        }
 
-        // Longest prefix wins; sort descending once.
-        rules.sort_by_key(|r| std::cmp::Reverse(r.cidr.prefix));
-        tracing::info!(
-            count = rules.len(),
-            path,
-            format = if dat { "dat" } else { "json" },
-            "geoip table loaded"
-        );
-        Self {
-            rules: Arc::new(rules),
+        if !ipv6_path.trim().is_empty() {
+            match std::fs::read(ipv6_path) {
+                Ok(raw) if ip2region::is_xdb_file(ipv6_path, &raw) => {
+                    table.assign_xdb(ipv6_path, raw);
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        path = ipv6_path,
+                        "IPv6 geoip file is not an ip2region xdb; ignoring"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(path = ipv6_path, "IPv6 geoip file not found");
+                }
+            }
+        }
+
+        table
+    }
+
+    fn assign_xdb(&mut self, path: &str, raw: Vec<u8>) {
+        let bytes = raw.len();
+        match ip2region::Ip2RegionDb::parse(raw) {
+            Ok(db) => {
+                let db = Arc::new(db);
+                let ip_version = db.ip_version();
+                tracing::info!(
+                    path,
+                    bytes,
+                    ip_version,
+                    format = "ip2region-xdb",
+                    "geoip table loaded"
+                );
+                match ip_version {
+                    4 => self.ip2_v4 = Some(db),
+                    6 => self.ip2_v6 = Some(db),
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                tracing::error!(path, error = %e, "invalid ip2region xdb");
+            }
         }
     }
 
     pub fn lookup(&self, ip: IpAddr) -> Option<GeoInfo> {
+        let rule_ip = match ip {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
+            IpAddr::V4(_) => ip,
+        };
+        match ip {
+            IpAddr::V4(_) => {
+                if let Some(db) = self.ip2_v4.as_ref() {
+                    return db.lookup(ip).map(to_geo);
+                }
+            }
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    if let Some(db) = self.ip2_v4.as_ref() {
+                        return db.lookup(IpAddr::V4(v4)).map(to_geo);
+                    }
+                }
+                if let Some(db) = self.ip2_v6.as_ref() {
+                    return db.lookup(ip).map(to_geo);
+                }
+            }
+        }
         self.rules
             .iter()
-            .find(|r| r.cidr.contains(ip))
+            .find(|r| r.cidr.contains(rule_ip))
             .map(|r| r.geo.clone())
+    }
+}
+
+fn to_geo(record: ip2region::Ip2RegionRecord) -> GeoInfo {
+    GeoInfo {
+        country: record.country,
+        province: record.province,
+        city: record.city,
+        isp: record.isp,
     }
 }
 
@@ -481,6 +568,7 @@ fn score_node(node: &repository::NodeRow, geo: &GeoInfo) -> (i32, String) {
     let mut reasons = vec![format!("weight={}", node.weight)];
     if eq_ignore(&node.country, &geo.country) {
         score += 5;
+        reasons.push("same-country".into());
     }
     if eq_ignore(&node.province, &geo.province) {
         score += 80;
@@ -563,7 +651,9 @@ pub async fn resolve(state: &AppState, req: ScheduleRequest) -> ScheduleResponse
     tracing::info!(
         domain = %domain,
         client_ip = ?_ip,
+        country = %client.country,
         province = %client.province,
+        city = %client.city,
         isp = %client.isp,
         primary = ?primary.as_ref().map(|p| p.name.as_str()),
         "scheduling decision"
@@ -665,6 +755,7 @@ mod tests {
         assert_eq!(rules[0].geo.country, "CN");
         let table = GeoTable {
             rules: Arc::new(rules),
+            ..Default::default()
         };
         assert_eq!(
             table.lookup("1.2.3.9".parse().unwrap()).unwrap().country,

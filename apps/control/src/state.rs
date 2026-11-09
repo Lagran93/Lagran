@@ -24,7 +24,8 @@ impl AppState {
         config: AppConfig,
         redis: Option<Arc<crate::service::redis::RedisService>>,
     ) -> Self {
-        let geo = crate::scheduler::GeoTable::load(&config.geoip_path);
+        let geo =
+            crate::scheduler::GeoTable::load_with_ipv6(&config.geoip_path, &config.geoip_ipv6_path);
         let schedule_ttl = config.schedule_ttl;
         let config_cache_ttl_secs = config.config_cache_ttl_secs;
         Self {

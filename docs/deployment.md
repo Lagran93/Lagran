@@ -226,7 +226,9 @@ CONTROL_BIND=127.0.0.1:8080
 AGENT_TOKEN=替换成强随机串
 CONTROL_PUBLIC_URL=https://console.example.com
 
-GEOIP_PATH=/var/lib/lagran/geoip.dat
+GEOIP_PATH=/var/lib/lagran/ip2region_v4.xdb
+# 可选：IPv6 客户端
+# GEOIP_IPV6_PATH=/var/lib/lagran/ip2region_v6.xdb
 SCHEDULE_TTL=30
 DNS_TEST_SERVER=203.0.113.53:53
 
@@ -245,7 +247,8 @@ RUST_LOG=control=info,tower_http=warn,sqlx=warn
 | `CONTROL_BIND` | 是 | `0.0.0.0:8080` | 控制面监听地址。生产放在 Caddy 后面时用 `127.0.0.1:8080`，只让本机访问。 |
 | `AGENT_TOKEN` | 生产必填 | 空 | DNS 调度接口的全局令牌，也是旧节点回调的兜底令牌。**边缘心跳/配置必须使用节点 `auth_token`，不能使用该全局令牌**；为空只影响调度接口，不会放行未注册边缘。详见 4.3。 |
 | `CONTROL_PUBLIC_URL` | 推荐 | 空 | 控制台公网地址，用于生成节点安装命令。为空时按请求 Host 推导；反向代理场景建议显式设置。 |
-| `GEOIP_PATH` | 调度必填 | `./data/geoip.dat` | GeoIP 文件：支持 V2Ray/Loyalsoldier `geoip.dat` 或旧版 CIDR JSON。缺失时按权重/负载调度；启动时加载，修改后需重启。 |
+| `GEOIP_PATH` | 调度必填 | `./data/ip2region_v4.xdb` | 地理位置库：推荐 ip2region XDB；兼容 V2Ray/Loyalsoldier `geoip.dat` 与旧版 CIDR JSON。缺失时按权重/负载调度；启动时加载，修改后需重启。 |
+| `GEOIP_IPV6_PATH` | 否 | 空 | 可选 ip2region IPv6 XDB（`ip2region_v6.xdb`）。 |
 | `GEOIP_JSON_PATH` | 否 | 空 | 兼容旧配置的 JSON 路径别名；设置了 `GEOIP_PATH` 时以 `GEOIP_PATH` 为准。 |
 | `SCHEDULE_TTL` | 否 | `30` | `/api/v1/schedule` 返回的 TTL（秒），范围 5–3600。DNS 最终还会受 `DNS_TTL` 限制。 |
 | `DNS_TEST_SERVER` | 否 | `127.0.0.1:53` | 控制台「DNS 测试」发起真实查询的目标 DNS 地址。应指向一台 `lagran-dns`。 |
@@ -797,55 +800,62 @@ Caddy 在控制台机器占用 443，边缘不能同时用 443。生产建议分
 
 ## 6. 部署 DNS
 
-### 6.1 GeoIP 数据
+### 6.1 地理位置库（ip2region）
 
-控制面支持两种格式：
+控制面推荐使用 [ip2region](https://ip2region.net/) XDB：
 
-1. **V2Ray `geoip.dat`（推荐）**：来自
-   [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip)，按国家代码提供 CIDR。
-2. **旧版 JSON**：CIDR → 国家/省/市/运营商，适合需要省市运营商打分的场景。
+- `ip2region_v4.xdb`：IPv4 客户端
+- `ip2region_v6.xdb`：IPv6 客户端（可选）
 
-下载 `geoip.dat`：
+数据字段：
+
+```text
+Country|Province|City|ISP|ISO-alpha2
+```
+
+下载：
 
 ```bash
 sudo mkdir -p /var/lib/lagran
-sudo wget -O /var/lib/lagran/geoip.dat \
-  https://raw.githubusercontent.com/Loyalsoldier/geoip/release/geoip.dat
+
+# IPv4
+sudo wget -O /var/lib/lagran/ip2region_v4.xdb \
+  https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb
+
+# IPv6（可选）
+sudo wget -O /var/lib/lagran/ip2region_v6.xdb \
+  https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v6.xdb
 ```
 
 控制面：
 
 ```bash
-GEOIP_PATH=/var/lib/lagran/geoip.dat
+GEOIP_PATH=/var/lib/lagran/ip2region_v4.xdb
+GEOIP_IPV6_PATH=/var/lib/lagran/ip2region_v6.xdb
 ```
 
-修改后重启控制面：
+修改后重启：
 
 ```bash
 sudo systemctl restart lagran-control
 ```
 
-`geoip.dat` 是 V2Ray `GeoIPList` protobuf；控制面只取 **两个字母的国家代码**
-（如 `cn` → `CN`），会忽略 `private`、`telegram`、`cloudflare` 等非国家分类。
-DAT 不包含省/市/运营商，因此调度只能按 `country` 匹配；节点库里的 `province`、
-`city`、`isp` 字段会保持为空，节点打分只剩国家加分、权重和负载。
+匹配后用于调度：
 
-如果确实需要省/市/运营商，继续用旧 JSON：
-
-```json
-[
-  {"cidr":"203.0.113.0/24","country":"CN","province":"广东","city":"深圳","isp":"电信"},
-  {"cidr":"198.51.100.0/24","country":"CN","province":"北京","city":"北京","isp":"联通"}
-]
+```text
+country  = ISO-alpha2（例如 CN）
+province = 广东省
+city     = 深圳市
+isp      = 电信
 ```
 
-```bash
-GEOIP_PATH=/var/lib/lagran/geoip.dat
-# 或 GEOIP_PATH=/var/lib/lagran/geoip.json
-```
+兼容格式：
 
-文件按扩展名识别：`.dat` 走 protobuf，`.json` 走 JSON；未知扩展名按内容探测。
-文件不存在或解析失败时不会阻止控制面启动，调度退化为按权重/负载。
+- V2Ray/Loyalsoldier `geoip.dat`（仅国家代码）
+- 旧版 CIDR JSON
+
+`.xdb` 优先按 ip2region 解析；`.dat` 走 protobuf；`.json` 走 JSON。
+文件不存在或解析失败不会阻止控制面启动，调度退化为按权重/负载。
 
 ### 6.2 `dns.env` 参数详解
 
@@ -1119,7 +1129,7 @@ pg_dump "$DATABASE_URL" > /var/backups/lagran-$(date +%F).sql
 
 - `/etc/lagran/*.env`
 - `/var/lib/lagran/certs`
-- `/var/lib/lagran/geoip.dat`（或旧版 `geoip.json`）
+- `/var/lib/lagran/ip2region_v4.xdb`（可选 `ip2region_v6.xdb`）
 - `/var/lib/caddy`（Caddy 证书）
 - `/opt/lagran/web`
 
@@ -1271,7 +1281,7 @@ dig @DNS1 ns1.example.com A +short
 6. 控制台添加节点，得到 auth_token
 7. 配置 edge.env，启动 lagran-edge
 8. 上传证书，开启域名 HTTPS
-9. 配置 geoip.dat（或 geoip.json）、dns.env
+9. 配置 ip2region_v4.xdb（可选 v6 xdb）、dns.env
 10. 启动两台 lagran-dns
 11. Cloudflare/注册商配置 ns1/ns2 + glue
 12. 验证 NS/A/TCP/ECS/调度

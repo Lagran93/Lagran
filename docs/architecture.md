@@ -127,7 +127,7 @@ Internet
 
 ## 调度（Phase 1）
 
-控制面 `scheduler` 模块读取 `GEOIP_PATH`（V2Ray/Loyalsoldier `geoip.dat` 国家代码，
+控制面 `scheduler` 模块读取 `GEOIP_PATH`（推荐 ip2region XDB，含国家/省/市/ISP/ISO 代码；
 或旧版 CIDR JSON 的省/市/运营商），按
 `weight + 同国家/同省/同城/同运营商加分 - CPU/内存惩罚` 对在线节点排序，暴露
 `/api/v1/schedule` 给 DNS 插件/SDK。`apps/dns` 是自研权威 DNS（UDP/TCP、EDNS0+ECS、

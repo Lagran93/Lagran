@@ -195,7 +195,7 @@
               <option value="AU">澳大利亚</option>
               <option value="RU">俄罗斯</option>
             </datalist>
-            <span class="field-hint">ISO 3166-1 两位代码，需与 GeoIP 的 country 一致，如 CN / HK / US。</span>
+            <span class="field-hint">ISO 3166-1 两位代码，需与 ip2region 返回的 country 一致，如 CN / HK / US。</span>
           </div>
           <div class="field">
             <label class="field-label">公网 IP</label>
@@ -440,9 +440,8 @@
           <div class="alert alert-info" style="margin-top: 4px">
             <AppIcon name="info" :size="16" class="icon" />
             <span>
-              客户端：{{ schedResult.client.province || '未知省份' }} /
-              {{ schedResult.client.isp || '未知运营商' }} · TTL {{ schedResult.ttl }}s ·
-              {{ schedResult.note }}
+              客户端：{{ [schedResult.client.country, schedResult.client.province, schedResult.client.city, schedResult.client.isp].filter(Boolean).join(' · ') || '未知位置' }}
+              · TTL {{ schedResult.ttl }}s · {{ schedResult.note }}
             </span>
           </div>
           <div class="sched-pick">
@@ -451,7 +450,7 @@
               <div class="sched-name">{{ schedResult.primary?.name || '无可用节点' }}</div>
               <div class="mono">{{ schedResult.primary?.public_ip || '—' }}</div>
               <div class="cell-sub">
-                {{ [schedResult.primary?.province, schedResult.primary?.isp].filter(Boolean).join(' · ') || '未设置线路' }}
+                {{ [schedResult.primary?.country, schedResult.primary?.province, schedResult.primary?.city, schedResult.primary?.isp].filter(Boolean).join(' · ') || '未设置线路' }}
               </div>
             </div>
             <div class="sched-card">
@@ -459,7 +458,7 @@
               <div class="sched-name">{{ schedResult.backup?.name || '无' }}</div>
               <div class="mono">{{ schedResult.backup?.public_ip || '—' }}</div>
               <div class="cell-sub">
-                {{ [schedResult.backup?.province, schedResult.backup?.isp].filter(Boolean).join(' · ') || '—' }}
+                {{ [schedResult.backup?.country, schedResult.backup?.province, schedResult.backup?.city, schedResult.backup?.isp].filter(Boolean).join(' · ') || '—' }}
               </div>
             </div>
           </div>
@@ -469,7 +468,7 @@
               <thead>
                 <tr>
                   <th>候选节点</th>
-                  <th>省份 / 运营商</th>
+                  <th>国家 / 省 / 市 / 运营商</th>
                   <th class="num">权重</th>
                   <th class="num">得分</th>
                   <th>原因</th>
@@ -478,7 +477,7 @@
               <tbody>
                 <tr v-for="c in schedResult.candidates" :key="c.name">
                   <td class="mono">{{ c.name }}</td>
-                  <td>{{ [c.province, c.isp].filter(Boolean).join(' · ') || '—' }}</td>
+                  <td>{{ [c.country, c.province, c.city, c.isp].filter(Boolean).join(' · ') || '—' }}</td>
                   <td class="num">{{ c.weight }}</td>
                   <td class="num">{{ c.score }}</td>
                   <td class="text-2" style="font-size: 12px">{{ c.reason }}</td>

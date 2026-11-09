@@ -298,23 +298,29 @@ TTL 优先级同时有契约测试（`apps/edge/tests/ttl_policy.rs`），直接
 
 ### GeoIP 数据
 
-`GEOIP_PATH`（默认 `./data/geoip.dat`）支持两种格式，最长前缀匹配：
+`GEOIP_PATH`（默认 `./data/ip2region_v4.xdb`）优先使用 ip2region XDB；
+同时保留 V2Ray/Loyalsoldier `geoip.dat` 与 JSON 兼容：
 
-1. **V2Ray `geoip.dat`**：来自
-   [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip)，按国家代码提供 CIDR。
-2. **旧版 JSON**：CIDR → 国家/省/市/运营商。
+1. **ip2region XDB（推荐）**：来自 <https://ip2region.net/>，
+   下载 `ip2region_v4.xdb` / `ip2region_v6.xdb`。
+2. **V2Ray/Loyalsoldier `geoip.dat`**：按国家代码提供 CIDR。
+3. **旧版 JSON**：CIDR → 国家/省/市/运营商。
 
 ```bash
-wget -O data/geoip.dat \
-  https://raw.githubusercontent.com/Loyalsoldier/geoip/release/geoip.dat
+wget -O data/ip2region_v4.xdb \
+  https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb
 
-GEOIP_PATH=./data/geoip.dat
+GEOIP_PATH=./data/ip2region_v4.xdb
+# 可选：
+GEOIP_IPV6_PATH=./data/ip2region_v6.xdb
 ```
 
 解析规则：
 
+- `.xdb` 优先按 ip2region XDB 解析；v4/v6 文件分别对应 `GEOIP_PATH` / `GEOIP_IPV6_PATH`
+- ip2region v2 字段 `Country|Province|City|ISP|ISO-alpha2` 映射为 `GeoInfo`
+- 旧版 ip2region 字段 `国家|区域|省份|城市|ISP` 也兼容
 - `.dat` 按 V2Ray `GeoIPList` protobuf 解析（`country_code` / `cidr` / `inverse_match`）
-- `.json` 或 `GEOIP_JSON_PATH` 按旧 JSON 解析
 - 未知扩展名自动探测内容
 - DAT 只保留两个字母的国家代码（`cn` → `CN`），忽略 `private`、`telegram` 等分类
 - DAT 没有省/市/运营商，`GeoInfo` 中这些字段为空，只参与国家加分

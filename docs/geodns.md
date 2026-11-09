@@ -21,7 +21,7 @@
 | 权威 DNS `lagran-dns` | 对 `edge.lagran.net` 提供 A/NS/SOA，执行 Geo 调度 |
 | 控制面 `lagran-control` | 提供 `/api/v1/schedule`，读取节点与 GeoIP 并打分 |
 | PostgreSQL | 保存节点、域名、规则、证书等 |
-| GeoIP DAT / JSON | `geoip.dat`（国家代码）或旧版 CIDR JSON（省/市/运营商） |
+| 地理位置库 | ip2region XDB（国家/省/市/ISP/ISO 代码）；兼容 DAT / JSON |
 | 边缘节点 `lagran-edge` | 实际提供缓存、回源、HTTPS、WAF |
 
 关键点：
@@ -205,49 +205,69 @@ subnet = 1.2.3.0/24
 ip = 1.2.3.4
 ```
 
-然后查 `GEOIP_PATH` 指向的 GeoIP 表。推荐使用
-[Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip) 的 `geoip.dat`：
+然后查 `GEOIP_PATH` 指向的地理位置库。推荐
+[ip2region](https://ip2region.net/) XDB：
 
 ```bash
-wget -O /var/lib/lagran/geoip.dat \
-  https://raw.githubusercontent.com/Loyalsoldier/geoip/release/geoip.dat
+wget -O /var/lib/lagran/ip2region_v4.xdb \
+  https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb
 
-GEOIP_PATH=/var/lib/lagran/geoip.dat
+# 可选：IPv6 客户端
+wget -O /var/lib/lagran/ip2region_v6.xdb \
+  https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v6.xdb
+
+GEOIP_PATH=/var/lib/lagran/ip2region_v4.xdb
+GEOIP_IPV6_PATH=/var/lib/lagran/ip2region_v6.xdb
 ```
 
-`geoip.dat` 是 V2Ray `GeoIPList` protobuf，只提供国家代码（如 `cn` → `CN`），
-不包含省/市/运营商。匹配后：
+ip2region v2 数据字段格式：
+
+```text
+Country|Province|City|ISP|ISO-alpha2
+```
+
+例如：
+
+```text
+中国|广东省|深圳市|电信|CN
+```
+
+控制面映射为：
 
 ```text
 country  = CN
-province = ""
-city     = ""
-isp      = ""
+province = 广东省
+city     = 深圳市
+isp      = 电信
 ```
 
-如果仍需要省/市/运营商，可使用旧版 JSON（`GEOIP_JSON_PATH` 或 `GEOIP_PATH=.json`）：
+匹配结果直接参与节点打分：
 
-```json
-[
-  {
-    "cidr": "1.2.3.0/24",
-    "country": "CN",
-    "province": "广东",
-    "city": "深圳",
-    "isp": "电信"
-  }
-]
+```text
+同省  +80
+同城  +20
+同 ISP +40
+同国家 +5
 ```
 
-匹配规则：
+旧版字段格式：
 
-- 按 CIDR 前缀长度从长到短
-- **最长前缀优先**
-- 例如 `/24` 优先于 `/16`
-- DAT 中 `private`、`telegram` 等非国家分类会被忽略
+```text
+国家|区域|省份|城市|ISP
+```
 
-GeoIP 文件不存在时不会报错，会退化为只按权重和负载调度。使用 DAT 时
-`province/city/isp` 为空，调度只会有国家加分。
+也会被识别。`0` 表示未知字段，会被忽略。
+
+兼容格式：
+
+- ip2region `.xdb`（推荐；v4/v6 分开加载）
+- V2Ray/Loyalsoldier `geoip.dat`（仅国家代码）
+- 旧版 CIDR JSON
+
+XDB 或 GeoIP 文件不存在时不会报错，会退化为只按权重和负载调度。
+
+ip2region 采用 Apache-2.0 许可证；数据更新方式见
+<https://ip2region.net/>。
 
 请求中也可以显式覆盖：
 

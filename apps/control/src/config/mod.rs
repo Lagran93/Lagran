@@ -35,9 +35,11 @@ pub struct AppConfig {
     /// Public base URL of the control plane (used in node install commands).
     /// Empty = derive from the incoming request Host header.
     pub public_url: String,
-    /// CIDR -> geo table used by the scheduler. Supports V2Ray `geoip.dat`
-    /// (Loyalsoldier) and the legacy JSON format.
+    /// Geo database used by the scheduler. Prefers ip2region XDB
+    /// (`ip2region_v4.xdb`); V2Ray `geoip.dat` and legacy JSON remain supported.
     pub geoip_path: String,
+    /// Optional ip2region XDB for IPv6 clients (`ip2region_v6.xdb`).
+    pub geoip_ipv6_path: String,
     /// TTL returned by the scheduling API (seconds).
     pub schedule_ttl: u64,
     /// DNS server used by the console "DNS test" endpoint (host:port).
@@ -115,9 +117,11 @@ impl Default for AppConfig {
                 &std::env::var("CONTROL_PUBLIC_URL").unwrap_or_default(),
             ),
             geoip_path: env_nonempty("GEOIP_PATH")
+                .or_else(|| env_nonempty("GEOIP_IP2REGION_PATH"))
                 .or_else(|| env_nonempty("GEOIP_DAT_PATH"))
                 .or_else(|| env_nonempty("GEOIP_JSON_PATH"))
-                .unwrap_or_else(|| "./data/geoip.dat".into()),
+                .unwrap_or_else(|| "./data/ip2region_v4.xdb".into()),
+            geoip_ipv6_path: env_nonempty("GEOIP_IPV6_PATH").unwrap_or_default(),
             schedule_ttl: std::env::var("SCHEDULE_TTL")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
