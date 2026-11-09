@@ -9,7 +9,7 @@
 
 use crate::cache::CacheSource;
 use crate::cache::policy::{
-    compute_etag, decide_storage_reason, request_bypass_reason_headers,
+    apply_key_ignore_default, compute_etag, decide_storage_reason, request_bypass_reason_headers,
     resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
     VALIDATOR_SOURCE_HEADER,
 };
@@ -697,13 +697,14 @@ impl ProxyHttp for DataPlaneProxy {
             return Ok(None);
         }
         let query = session.req_header().uri.query().unwrap_or("");
-        let response_policy = resolve_rule_policy_for_response(
+        let mut response_policy = resolve_rule_policy_for_response(
             &plan.domain.rules,
             &ctx.path,
             ctx.method.as_str(),
             query,
             content_type,
         );
+        apply_key_ignore_default(&mut response_policy, &plan.domain.cache_key_ignore_headers);
         if response_policy.action != RuleAction::Cache {
             return Ok(Some(ForcedFreshness::ForceMiss));
         }
@@ -902,13 +903,14 @@ impl ProxyHttp for DataPlaneProxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let query = session.req_header().uri.query().unwrap_or("");
-        let response_policy = resolve_rule_policy_for_response(
+        let mut response_policy = resolve_rule_policy_for_response(
             &plan.domain.rules,
             &ctx.path,
             ctx.method.as_str(),
             query,
             content_type,
         );
+        apply_key_ignore_default(&mut response_policy, &plan.domain.cache_key_ignore_headers);
         if response_policy.action != RuleAction::Cache {
             ctx.response_bypass = true;
             ctx.cache_reason = Some("content-type-bypass");
@@ -974,13 +976,14 @@ impl ProxyHttp for DataPlaneProxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let query = session.req_header().uri.query().unwrap_or("");
-        let response_policy = resolve_rule_policy_for_response(
+        let mut response_policy = resolve_rule_policy_for_response(
             &plan.domain.rules,
             &ctx.path,
             ctx.method.as_str(),
             query,
             content_type,
         );
+        apply_key_ignore_default(&mut response_policy, &plan.domain.cache_key_ignore_headers);
         let mut label = if ctx.response_bypass {
             "BYPASS"
         } else if plan.is_websocket {

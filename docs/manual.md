@@ -1471,6 +1471,68 @@ METHOD:host:path[?query]
 
 规则开启 `ignore_query` 时 key 不含查询串。
 
+### 5.1.1 按域名/规则忽略 Cache Key 请求头
+
+域名高级设置提供：
+
+```text
+Cache Key 忽略请求头
+[ ] Origin
+[ ] Accept-Language
+```
+
+缓存规则提供三行独立三态：
+
+```text
+Cache Key 组成
+Query            [继承域名] [忽略] [区分]
+Origin           [继承域名] [忽略 Origin] [区分]
+Accept-Language  [继承域名] [忽略语言] [区分]
+```
+
+每一行：
+
+```text
+继承域名 → 使用域名设置
+忽略     → 该头不进入 key
+区分     → 该头进入 key
+```
+
+优先级：
+
+```text
+规则按请求头逐项覆盖域名
+  > 域名默认
+  > 全局 CACHE_KEY_IGNORE_HEADERS
+```
+
+语义：
+
+- `origin` 被忽略后，请求 `Origin` 不进入 cache key；
+- `accept-language` 被忽略后，`Accept-Language` 不进入 cache key；
+- 对 GET/HEAD，`Vary: Origin` / `Vary: Accept-Language` 也按忽略处理，否则源站 CORS 中间件的 Vary 会阻止缓存；
+- OPTIONS 预检缓存尚未启用，不受该配置影响；
+- Content-Type 规则不能配置该字段，因为 Content-Type 在响应阶段才知道，不能参与请求阶段的 key。
+
+规则 API 的 `ignore_key_headers` 使用三态编码：
+
+```text
+origin=inherit,accept-language=inherit
+origin=ignore,accept-language=keep
+origin=keep,accept-language=ignore
+```
+
+兼容旧值：
+
+```text
+null                  → 两项都继承域名
+""                    → 两项都区分
+"origin"              → Origin 忽略，语言区分
+"origin,accept-language" → 两项都忽略
+```
+
+只建议在响应内容确实不随该头变化时使用。忽略 Origin 前必须确认 `Access-Control-Allow-Origin` 固定；忽略 Accept-Language 前必须确认站点不是多语言变体。
+
 ### 5.2 TTL 优先级
 
 ```text
@@ -1515,7 +1577,7 @@ SWR：
 - `Accept-Encoding`
 - `Accept-Language`
 - `Origin`
-- `Access-Control-Request-*`：当前拒绝缓存，等待 OPTIONS 预检缓存
+- `Access-Control-Request-*`：GET/HEAD 忽略，不参与 key，也不因此拒绝缓存
 - `Cookie`：拒绝缓存（Cookie 不在 cache key 中）
 
 其他字段（例如 `User-Agent`）和 `Vary: *` 会拒绝缓存。
@@ -2162,7 +2224,8 @@ POST /api/v1/prefetch
 - 大对象会写入大缓存
 - 普通对象写入普通缓存
 - 预热请求可携带 `Accept-Language` / `Origin`，用于命中源站 `Vary` 变体
-- Control → Edge 的预热回调超时为 60 秒
+- 大对象超过 `RANGE_FILL_MAX_BYTES`（默认 32 MiB）时自动按 `Range: bytes=0-...` 预热前缀，避免完整下载导致回调超时
+- Control → Edge 的预热回调默认 300 秒，可用 `PREFETCH_TIMEOUT_SECS` 调整
 - 任务记录 warmed/failed
 
 常见预热失败：
@@ -2215,15 +2278,16 @@ CACHE_KEY_IGNORE_HEADERS=accept-language,origin
 | `Accept-Encoding` | 允许；只缓存 identity 表示 |
 | `Accept-Language` | 参与 cache key |
 | `Origin` | 参与 cache key |
-| `Access-Control-Request-*` | 当前拒绝缓存；仅 OPTIONS 预检缓存启用后按方法加入 key |
+| `Access-Control-Request-*` | GET/HEAD 兼容忽略；不参与 key；OPTIONS 预检缓存启用后再按方法处理 |
 | `Cookie` | 拒绝缓存（key 不包含 Cookie） |
 | `User-Agent` / 其它字段 | 拒绝缓存 |
 | `*` | 拒绝缓存 |
 
 同时：
 
+- 部分 CORS 中间件会把 `Access-Control-Request-*` 加到所有响应的 `Vary`；GET/HEAD 会忽略这些字段，避免误拒绝缓存；
 - 响应 `Vary` 会原样返回给客户端；
-- 如果运维通过 `CACHE_KEY_IGNORE_HEADERS` 把某个头移出 key，而源站又对它有 `Vary`，该响应不会写入共享缓存，避免把不同变体混在一起；
+- 如果运维通过域名/规则或 `CACHE_KEY_IGNORE_HEADERS` 把某个头移出 key，对该头的 `Vary` 也按忽略处理；
 - HEAD 复用 GET 的表示；
 - 预热请求携带的 `headers` 会进入同一套 key 计算。
 
@@ -2522,8 +2586,6 @@ status=304 + cache_status=REVALIDATED
 | `vary` | Vary 不受支持 |
 | `vary:user-agent` | Vary User-Agent |
 | `vary:cookie` | Vary Cookie（Cookie 不参与 key） |
-| `vary:key-ignored` | Vary 的字段被 `CACHE_KEY_IGNORE_HEADERS` 移出 key |
-| `vary:preflight` | GET/HEAD 的 Vary 包含 Access-Control-Request-* |
 | `vary:*` | Vary: * |
 | `rule-bypass` | 规则 bypass |
 | `content-type-bypass` | 响应 Content-Type 规则 bypass |

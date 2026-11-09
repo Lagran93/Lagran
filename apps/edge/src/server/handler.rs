@@ -15,7 +15,8 @@ use crate::agent::{ControlClient, NodeControl};
 use crate::cache::policy::{
     compute_etag, decide_storage_reason, etag_matches,
     is_uncacheable_header, request_method_cacheable, resolve_rule_policy,
-    resolve_rule_policy_for_response, strip_response_headers, CacheDecision, CacheRule,
+    resolve_rule_policy_for_response_with_domain, strip_response_headers, CacheDecision,
+    CacheRule,
     CacheStatus, ResolvedPolicy, RuleAction, RuleSet, VALIDATOR_SOURCE_HEADER,
 };
 use crate::cache::{CacheEntry, CacheGetResult, LargeCache, SharedCache};
@@ -112,6 +113,8 @@ struct Effective {
     path: String,
     method: Method,
     ignore_query: bool,
+    key_ignore: u8,
+    key_ignore_headers: String,
     cors: String,
     custom_headers: String,
     origin_auth_header: String,
@@ -389,6 +392,8 @@ async fn proxy_handler_inner(
                 path: path_only.clone(),
                 method: method.clone(),
                 ignore_query: policy.ignore_query.unwrap_or(e.ignore_query_string),
+                key_ignore: policy.key_ignore,
+                key_ignore_headers: e.cache_key_ignore_headers.clone(),
                 cors: e.cors_origins.clone(),
                 custom_headers: e.custom_headers.clone(),
                 origin_auth_header: e.origin_auth_header.clone(),
@@ -414,6 +419,8 @@ async fn proxy_handler_inner(
                 backup_url: String::new(),
                 origins: Vec::new(),
                 ignore_query,
+                key_ignore: policy.key_ignore,
+                key_ignore_headers: String::new(),
                 policy,
                 rules: Vec::new(),
                 path: path_only.clone(),
@@ -521,6 +528,7 @@ async fn proxy_handler_inner(
         &path_and_query,
         &headers,
         eff.ignore_query,
+        eff.key_ignore,
     );
 
     // Strict client revalidation (`no-cache` / `max-age=0` / Pragma) must not
@@ -788,12 +796,13 @@ async fn proxy_handler_inner(
                         .get("content-type")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
-                    let response_policy = resolve_rule_policy_for_response(
+                    let response_policy = resolve_rule_policy_for_response_with_domain(
                         &eff.rules,
                         &eff.path,
                         method.as_str(),
                         path_and_query.split_once('?').map(|(_, q)| q).unwrap_or(""),
                         content_type,
+                        &eff.key_ignore_headers,
                     );
                     let response_bypass = response_policy.action != RuleAction::Cache;
                     if !response_bypass && (200..300).contains(&status.as_u16()) {
@@ -1010,12 +1019,13 @@ async fn bypass_to_origin(
                         .get("content-type")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
-                    let response_policy = resolve_rule_policy_for_response(
+                    let response_policy = resolve_rule_policy_for_response_with_domain(
                         &eff.rules,
                         &eff.path,
                         method.as_str(),
                         path_and_query.split_once('?').map(|(_, q)| q).unwrap_or(""),
                         content_type,
+                        &eff.key_ignore_headers,
                     );
                     if response_policy.action == RuleAction::Cache {
                         if let Ok(decision) = decide_storage_reason(
@@ -1350,12 +1360,13 @@ async fn fetch_with_single_flight(
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 let query = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
-                let response_policy = resolve_rule_policy_for_response(
+                let response_policy = resolve_rule_policy_for_response_with_domain(
                     &eff.rules,
                     &eff.path,
                     method.as_str(),
                     query,
                     content_type,
+                    &eff.key_ignore_headers,
                 );
                 let mut reason = None;
                 if response_policy.action != RuleAction::Cache {
@@ -1570,12 +1581,13 @@ async fn revalidate_cached_entry(
                 .unwrap_or(0);
 
             let content_type = refreshed.header("content-type").unwrap_or("");
-            let response_policy = resolve_rule_policy_for_response(
+            let response_policy = resolve_rule_policy_for_response_with_domain(
                 &eff.rules,
                 &eff.path,
                 method.as_str(),
                 path_and_query.split_once('?').map(|(_, q)| q).unwrap_or(""),
                 content_type,
+                &eff.key_ignore_headers,
             );
             if response_policy.action == RuleAction::Cache {
                 match decide_storage_reason(
@@ -1707,12 +1719,13 @@ async fn revalidate_cached_entry(
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            let response_policy = resolve_rule_policy_for_response(
+            let response_policy = resolve_rule_policy_for_response_with_domain(
                 &eff.rules,
                 &eff.path,
                 method.as_str(),
                 path_and_query.split_once('?').map(|(_, q)| q).unwrap_or(""),
                 content_type,
+                &eff.key_ignore_headers,
             );
             if response_policy.action == RuleAction::Cache
                 && (200..300).contains(&status.as_u16())
@@ -1835,6 +1848,8 @@ fn spawn_revalidation(
             path,
             method: Method::GET,
             ignore_query: false,
+            key_ignore: 0,
+            key_ignore_headers: String::new(),
             cors: String::new(),
             custom_headers: String::new(),
             origin_auth_header: String::new(),
@@ -1849,12 +1864,13 @@ fn spawn_revalidation(
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 let query = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
-                let response_policy = resolve_rule_policy_for_response(
+                let response_policy = resolve_rule_policy_for_response_with_domain(
                     &eff.rules,
                     &eff.path,
                     "GET",
                     query,
                     content_type,
+                    &eff.key_ignore_headers,
                 );
                 if response_policy.action == RuleAction::Cache {
                     if let Ok(decision) = decide_storage_reason(
@@ -2117,7 +2133,14 @@ fn entry_response_bypass(eff: &Effective, entry: &CacheEntry) -> bool {
     if content_type.is_empty() {
         return false;
     }
-    resolve_rule_policy_for_response(&eff.rules, &eff.path, eff.method.as_str(), "", content_type)
+    resolve_rule_policy_for_response_with_domain(
+        &eff.rules,
+        &eff.path,
+        eff.method.as_str(),
+        "",
+        content_type,
+        &eff.key_ignore_headers,
+    )
         .action
         != RuleAction::Cache
 }

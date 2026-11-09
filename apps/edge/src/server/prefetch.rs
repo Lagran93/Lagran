@@ -94,7 +94,7 @@ pub async fn prefetch_handler(
         // Range and large-cache path is used as a real client request. Calling
         // proxy_handler directly bypassed that path and hit the legacy body
         // limit for large objects.
-        let origin = match state
+        let first = match state
             .origin
             .request_stream_with_sni(&base, &Method::GET, &path, &headers, None, true, None)
             .await
@@ -106,8 +106,8 @@ pub async fn prefetch_handler(
                 continue;
             }
         };
-        let status = origin.status;
-        let content_length = origin
+        let status = first.status;
+        let content_length = first
             .headers
             .get("content-length")
             .and_then(|value| value.to_str().ok())
@@ -121,8 +121,55 @@ pub async fn prefetch_handler(
                         .is_some_and(|large| large.accepts(length))
             })
             .unwrap_or(true);
+
+        let range_limit = state.range_fill_max_bytes.max(1024 * 1024);
+        let use_range = state.large_cache.is_some()
+            && (content_length.is_none()
+                || content_length.is_some_and(|length| length > range_limit))
+            && (status.is_success() || status == axum::http::StatusCode::NOT_MODIFIED);
+
+        let mut origin = first;
+        if use_range {
+            drop(origin);
+            let end = content_length
+                .map(|length| length.saturating_sub(1).min(range_limit.saturating_sub(1)))
+                .unwrap_or_else(|| range_limit.saturating_sub(1));
+            let mut range_headers = headers.clone();
+            range_headers.insert(
+                "range",
+                match HeaderValue::from_str(&format!("bytes=0-{end}")) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                },
+            );
+            origin = match state
+                .origin
+                .request_stream_with_sni(
+                    &base,
+                    &Method::GET,
+                    &path,
+                    &range_headers,
+                    None,
+                    true,
+                    None,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(%domain, %path, error = %e, "prefetch range request failed");
+                    continue;
+                }
+            };
+        }
+
+        let status = origin.status;
         if !(status.is_success() || status == axum::http::StatusCode::NOT_MODIFIED)
-            || !size_cacheable
+            || (!use_range && !size_cacheable)
         {
             failed += 1;
             tracing::warn!(
@@ -131,20 +178,33 @@ pub async fn prefetch_handler(
                 %status,
                 content_length,
                 size_cacheable,
+                use_range,
                 "prefetch request failed"
             );
-            // Dropping the body cancels the local stream, avoiding a
-            // pointless multi-GB download for an object neither cache can
-            // accept.
             continue;
         }
         warmed += 1;
-        // Drain the body so the data plane completes and can commit cache
-        // entries. Never buffer the full object in the prefetch worker.
+        tracing::info!(
+            %domain,
+            %path,
+            content_length,
+            use_range,
+            range_limit,
+            status = %origin.status,
+            "prefetch warmed"
+        );
         let mut body = origin.body;
+        let mut received = 0u64;
         while let Some(frame) = body.frame().await {
-            if frame.is_err() {
+            let Ok(frame) = frame else {
                 break;
+            };
+            if let Some(data) = frame.data_ref() {
+                received += data.len() as u64;
+                if use_range && received > range_limit.saturating_add(1024 * 1024) {
+                    tracing::warn!(%domain, %path, received, "prefetch range body exceeded limit");
+                    break;
+                }
             }
         }
     }

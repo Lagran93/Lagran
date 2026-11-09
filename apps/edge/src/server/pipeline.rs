@@ -6,9 +6,8 @@
 //! incrementally; the public entry points are stable.
 
 use crate::cache::policy::{
-    cache_key_for_request_with_ignored, request_bypass_reason_headers, resolve_rule_policy,
-    ResolvedPolicy,
-    RuleAction,
+    apply_key_ignore_default, cache_key_for_request_with_mask, request_bypass_reason_headers,
+    resolve_rule_policy, ResolvedPolicy, RuleAction,
 };
 use crate::config::registry::DomainEntry;
 use crate::server::handler::{preflight_cacheable, AppState};
@@ -84,7 +83,9 @@ impl<'a> RequestPipeline<'a> {
         path_only: &str,
         query: &str,
     ) -> ResolvedPolicy {
-        resolve_rule_policy(&domain.rules, path_only, method.as_str(), query)
+        let mut policy = resolve_rule_policy(&domain.rules, path_only, method.as_str(), query);
+        apply_key_ignore_default(&mut policy, &domain.cache_key_ignore_headers);
+        policy
     }
 
     /// Classify the request for data-plane routing. Range handling stays with
@@ -165,6 +166,7 @@ impl<'a> RequestPipeline<'a> {
             path_and_query,
             headers,
             ignore_query,
+            policy.key_ignore,
         )
     }
 
@@ -177,6 +179,7 @@ impl<'a> RequestPipeline<'a> {
         path_and_query: &str,
         headers: &HeaderMap,
         ignore_query: bool,
+        key_ignore: u8,
     ) -> String {
         let lookup_path = if ignore_query {
             path_only.to_string()
@@ -188,11 +191,12 @@ impl<'a> RequestPipeline<'a> {
         } else {
             method.clone()
         };
-        cache_key_for_request_with_ignored(
+        cache_key_for_request_with_mask(
             &method,
             host,
             &lookup_path,
             headers,
+            key_ignore,
             &self.state.cache_key_ignore_headers,
         )
     }

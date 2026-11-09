@@ -34,6 +34,7 @@ pub struct RuleDto {
     pub browser_ttl_seconds: u64,
     pub ignore_query: Option<bool>,
     pub ignore_cookie: bool,
+    pub ignore_key_headers: Option<String>,
     pub match_content_type: String,
     pub note: String,
 }
@@ -56,6 +57,7 @@ impl RuleDto {
             browser_ttl_seconds: r.browser_ttl_seconds.max(0) as u64,
             ignore_query: r.ignore_query,
             ignore_cookie: r.ignore_cookie,
+            ignore_key_headers: r.ignore_key_headers,
             match_content_type: r.match_content_type,
             note: r.note,
         }
@@ -82,6 +84,10 @@ pub struct RulePayload {
     pub ignore_query: Option<Option<bool>>,
     /// Cache static assets even when the request carries cookies.
     pub ignore_cookie: Option<bool>,
+    /// `null` = inherit the domain, `""` = ignore none, CSV = origin /
+    /// accept-language. Double option so null can be sent explicitly.
+    #[serde(default, deserialize_with = "deserialize_double_string_option")]
+    pub ignore_key_headers: Option<Option<String>>,
     /// Optional case-insensitive Content-Type substring (e.g. text/html).
     #[serde(default)]
     pub match_content_type: Option<String>,
@@ -93,6 +99,15 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<bool>::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_double_string_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -120,6 +135,7 @@ struct Normalized {
     browser_ttl_seconds: i64,
     ignore_query: Option<bool>,
     ignore_cookie: bool,
+    ignore_key_headers: Option<String>,
     match_content_type: String,
     note: String,
 }
@@ -173,6 +189,54 @@ fn normalize_methods(raw: &str) -> Result<String, String> {
     Ok(out.join(","))
 }
 
+fn normalize_key_header_list(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let (origin, language) = if value.contains('=') {
+        let mut origin: Option<Option<bool>> = None;
+        let mut language: Option<Option<bool>> = None;
+        for part in value.split(',') {
+            let Some((name, state)) = part.split_once('=') else {
+                return Err(format!("invalid cache key header mode: {part}"));
+            };
+            let state = match state.trim().to_ascii_lowercase().as_str() {
+                "inherit" => None,
+                "ignore" => Some(true),
+                "keep" => Some(false),
+                other => {
+                    return Err(format!("invalid cache key header state: {other}"));
+                }
+            };
+            match name.trim().to_ascii_lowercase().as_str() {
+                "origin" => origin = Some(state),
+                "accept-language" => language = Some(state),
+                other => {
+                    return Err(format!("unsupported cache key header: {other}"));
+                }
+            }
+        }
+        (origin.unwrap_or(None), language.unwrap_or(None))
+    } else {
+        // Legacy full-list override: omitted headers meant "keep", not inherit.
+        let origin = value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case("origin"));
+        let language = value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case("accept-language"));
+        (Some(origin), Some(language))
+    };
+    let fmt = |value: Option<bool>| match value {
+        None => "inherit",
+        Some(true) => "ignore",
+        Some(false) => "keep",
+    };
+    Ok(format!(
+        "origin={},accept-language={}",
+        fmt(origin),
+        fmt(language)
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn normalize(
     payload: &RulePayload,
@@ -188,6 +252,7 @@ fn normalize(
     enabled: bool,
     ignore_query: Option<bool>,
     ignore_cookie: bool,
+    ignore_key_headers: Option<String>,
     match_content_type: &str,
     note: &str,
 ) -> Result<Normalized, String> {
@@ -231,6 +296,19 @@ fn normalize(
     {
         return Err("invalid match_content_type".into());
     }
+    let ignore_key_headers = match ignore_key_headers {
+        Some(value) => Some(normalize_key_header_list(&value)?),
+        None => None,
+    };
+    if !match_content_type.trim().is_empty()
+        && ignore_key_headers.as_deref().is_some_and(|value| {
+            value.contains("=ignore")
+        })
+    {
+        return Err(
+            "cache key headers cannot be configured on a Content-Type rule".into(),
+        );
+    }
     Ok(Normalized {
         path_pattern,
         match_type,
@@ -244,6 +322,7 @@ fn normalize(
         browser_ttl_seconds: browser_ttl_seconds as i64,
         ignore_query,
         ignore_cookie,
+        ignore_key_headers,
         match_content_type,
         note,
     })
@@ -298,6 +377,7 @@ pub async fn create(
         true,
         req.rule.ignore_query.flatten(),
         req.rule.ignore_cookie.unwrap_or(false),
+        req.rule.ignore_key_headers.clone().flatten(),
         req.rule.match_content_type.as_deref().unwrap_or(""),
         req.rule.note.as_deref().unwrap_or(""),
     )
@@ -316,6 +396,7 @@ pub async fn create(
         browser_ttl_seconds: normalized.browser_ttl_seconds,
         ignore_query: normalized.ignore_query,
         ignore_cookie: normalized.ignore_cookie,
+        ignore_key_headers: normalized.ignore_key_headers.as_deref(),
         match_content_type: &normalized.match_content_type,
         note: &normalized.note,
     };
@@ -401,6 +482,9 @@ pub async fn update(
         current.enabled,
         req.ignore_query.unwrap_or(current.ignore_query),
         req.ignore_cookie.unwrap_or(current.ignore_cookie),
+        req.ignore_key_headers
+            .clone()
+            .unwrap_or_else(|| current.ignore_key_headers.clone()),
         req.match_content_type
             .as_deref()
             .unwrap_or(&current.match_content_type),
@@ -421,6 +505,7 @@ pub async fn update(
         browser_ttl_seconds: normalized.browser_ttl_seconds,
         ignore_query: normalized.ignore_query,
         ignore_cookie: normalized.ignore_cookie,
+        ignore_key_headers: normalized.ignore_key_headers.as_deref(),
         match_content_type: &normalized.match_content_type,
         note: &normalized.note,
     };
@@ -774,9 +859,31 @@ mod tests {
             browser_ttl_seconds: 0,
             ignore_query: None,
             ignore_cookie: false,
+            ignore_key_headers: None,
             match_content_type: String::new(),
             note: String::new(),
         }
+    }
+
+    #[test]
+    fn cache_key_header_modes_are_canonical() {
+        assert_eq!(
+            normalize_key_header_list("origin=ignore,accept-language=inherit").unwrap(),
+            "origin=ignore,accept-language=inherit"
+        );
+        assert_eq!(
+            normalize_key_header_list("origin=keep,accept-language=ignore").unwrap(),
+            "origin=keep,accept-language=ignore"
+        );
+        assert_eq!(
+            normalize_key_header_list("origin").unwrap(),
+            "origin=ignore,accept-language=keep"
+        );
+        assert_eq!(
+            normalize_key_header_list("").unwrap(),
+            "origin=keep,accept-language=keep"
+        );
+        assert!(normalize_key_header_list("origin=invalid").is_err());
     }
 
     #[test]

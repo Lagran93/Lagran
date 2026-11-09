@@ -10,6 +10,10 @@
           <AppIcon name="refresh" :size="15" />
           刷新
         </button>
+        <button class="btn btn-default" type="button" @click="openManual">
+          <AppIcon name="upload" :size="15" />
+          手动预热
+        </button>
         <button class="btn btn-primary" type="button" @click="openCreateSchedule">
           <AppIcon name="plus" :size="15" />
           新建定时任务
@@ -17,89 +21,37 @@
       </div>
     </div>
 
-    <div class="grid grid-2">
-      <div class="card">
-        <div class="card-head">
-          <div>
-            <div class="card-title">手动预热</div>
-            <div class="card-desc">立即创建一个预热任务，由后台分发到在线边缘节点</div>
-          </div>
-        </div>
-        <div class="card-body">
-          <div class="field">
-            <label class="field-label">域名 <span class="req">*</span></label>
-            <select v-model="manual.domain" class="select">
-              <option value="">请选择域名</option>
-              <option v-for="d in domains" :key="d.id" :value="d.name">{{ d.name }}</option>
-            </select>
-          </div>
-          <div class="field">
-            <label class="field-label">路径列表 <span class="req">*</span></label>
-            <textarea
-              v-model="manual.paths"
-              class="textarea"
-              rows="5"
-              placeholder="/index.html&#10;/static/app.js&#10;/images/logo.png"
-            />
-            <span class="field-hint">每行一个路径；请包含真实用户 URL 的查询参数。任务会在约 15 秒内被后台执行。</span>
-          </div>
-          <div class="form-grid">
-            <div class="field">
-              <label class="field-label">Accept-Language</label>
-              <input
-                v-model="manual.acceptLanguage"
-                class="input"
-                placeholder="例如 zh-CN,zh;q=0.9"
-              />
-              <span class="field-hint">留空表示按“无该请求头”预热；源站 Vary 包含它时必须填写目标语言。</span>
-            </div>
-            <div class="field">
-              <label class="field-label">Origin</label>
-              <input
-                v-model="manual.origin"
-                class="input"
-                placeholder="例如 https://www.example.com"
-              />
-              <span class="field-hint">源站 Vary 包含 Origin 时填写；留空表示不带 Origin。</span>
-            </div>
-          </div>
-          <div class="flex-between">
-            <span class="text-muted" style="font-size: 12px">预热请求经过真实边缘节点</span>
-            <button class="btn btn-primary" type="button" :disabled="submitting" @click="createManual">
-              {{ submitting ? '创建中…' : '创建预热任务' }}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-head">
-          <div class="card-title">执行概览</div>
-        </div>
-        <div class="card-body">
-          <div class="mini-stats">
-            <div>
-              <div class="mini-num">{{ tasks.filter((t) => t.status === 'pending' || t.status === 'running').length }}</div>
-              <div class="mini-label">等待 / 执行中</div>
-            </div>
-            <div>
-              <div class="mini-num text-success">{{ tasks.filter((t) => t.status === 'done').length }}</div>
-              <div class="mini-label">已完成</div>
-            </div>
-            <div>
-              <div class="mini-num text-danger">{{ tasks.filter((t) => t.status === 'failed').length }}</div>
-              <div class="mini-label">失败</div>
-            </div>
-            <div>
-              <div class="mini-num">{{ schedules.filter((s) => s.enabled).length }}</div>
-              <div class="mini-label">启用的定时任务</div>
-            </div>
-          </div>
-        </div>
-      </div>
+    <div class="stat-grid">
+      <StatCard
+        label="等待 / 执行中"
+        :value="tasks.filter((t) => t.status === 'pending' || t.status === 'running').length"
+        hint="后台队列中的任务"
+        icon="activity"
+      />
+      <StatCard
+        label="已完成"
+        :value="tasks.filter((t) => t.status === 'done').length"
+        hint="最近 100 条任务"
+        icon="check"
+        tone="green"
+      />
+      <StatCard
+        label="失败"
+        :value="tasks.filter((t) => t.status === 'failed').length"
+        hint="需要检查源站或缓存配置"
+        icon="alert"
+        tone="red"
+      />
+      <StatCard
+        label="启用的定时任务"
+        :value="schedules.filter((s) => s.enabled).length"
+        hint="按固定间隔自动叠加预热"
+        icon="clock"
+        tone="orange"
+      />
     </div>
 
-    <div class="card mt-16">
+    <div class="card">
       <div class="card-head">
         <div>
           <div class="card-title">定时预热</div>
@@ -213,6 +165,56 @@
     </div>
 
     <BaseModal
+      v-model="manualOpen"
+      title="手动预热"
+      width="680px"
+      confirm-text="开始预热"
+      :loading="submitting"
+      @confirm="createManual"
+    >
+      <div class="form-col">
+        <div class="field">
+          <label class="field-label">域名 <span class="req">*</span></label>
+          <select v-model="manual.domain" class="select">
+            <option value="">请选择域名</option>
+            <option v-for="d in domains" :key="d.id" :value="d.name">{{ d.name }}</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="field-label">路径列表 <span class="req">*</span></label>
+          <textarea
+            v-model="manual.paths"
+            class="textarea"
+            rows="6"
+            placeholder="/index.html&#10;/static/app.js&#10;/images/logo.png"
+          />
+          <span class="field-hint">每行一个路径；请包含真实用户 URL 的查询参数。任务会在约 15 秒内被后台执行。</span>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label class="field-label">Accept-Language</label>
+            <input
+              v-model="manual.acceptLanguage"
+              class="input"
+              placeholder="例如 zh-CN,zh;q=0.9"
+            />
+            <span class="field-hint">留空表示按“无该请求头”预热；源站 Vary 包含它时必须填写目标语言。</span>
+          </div>
+          <div class="field">
+            <label class="field-label">Origin</label>
+            <input
+              v-model="manual.origin"
+              class="input"
+              placeholder="例如 https://www.example.com"
+            />
+            <span class="field-hint">源站 Vary 包含 Origin 时填写；留空表示不带 Origin。</span>
+          </div>
+        </div>
+        <span class="text-muted" style="font-size: 12px">预热请求经过真实边缘节点</span>
+      </div>
+    </BaseModal>
+
+    <BaseModal
       v-model="scheduleOpen"
       :title="editingSchedule ? '编辑定时预热' : '新建定时预热'"
       width="680px"
@@ -301,6 +303,7 @@ const manual = ref({
   origin: '',
 })
 
+const manualOpen = ref(false)
 const scheduleOpen = ref(false)
 const editingSchedule = ref<any>(null)
 const scheduleForm = ref({
@@ -353,6 +356,16 @@ function cacheKeyHeaders(form: { acceptLanguage: string; origin: string }) {
   return headers
 }
 
+function openManual() {
+  manual.value = {
+    domain: domains.value[0]?.name || '',
+    paths: '',
+    acceptLanguage: '',
+    origin: '',
+  }
+  manualOpen.value = true
+}
+
 async function createManual() {
   if (!manual.value.domain) {
     toast.error('请选择域名')
@@ -374,6 +387,7 @@ async function createManual() {
       headers: cacheKeyHeaders(manual.value),
     })
     toast.success(`已创建 ${res.created} 个预热任务`)
+    manualOpen.value = false
     manual.value.paths = ''
     manual.value.acceptLanguage = ''
     manual.value.origin = ''
@@ -470,29 +484,3 @@ async function removeSchedule(s: any) {
 
 onMounted(load)
 </script>
-
-<style scoped>
-.mini-stats {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.mini-num {
-  font-size: 26px;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.mini-label {
-  margin-top: 2px;
-  font-size: 12px;
-  color: var(--text-3);
-}
-
-@media (max-width: 640px) {
-  .mini-stats {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-</style>

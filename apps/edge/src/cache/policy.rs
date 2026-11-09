@@ -118,6 +118,9 @@ pub struct CacheRule {
     pub ignore_query: Option<bool>,
     /// Cache this rule's responses even when the request carries cookies.
     pub ignore_cookie: bool,
+    /// Rule override for cache-key header ignore. None inherits the domain.
+    /// Empty string explicitly ignores none.
+    pub ignore_key_headers: Option<String>,
 }
 
 impl CacheRule {
@@ -136,6 +139,7 @@ impl CacheRule {
             browser_ttl_seconds: 0,
             ignore_query: None,
             ignore_cookie: false,
+            ignore_key_headers: None,
             match_content_type: String::new(),
         }
     }
@@ -158,6 +162,13 @@ pub struct ResolvedPolicy {
     pub ignore_query: Option<bool>,
     /// Cache despite request cookies (opt-in per rule).
     pub ignore_cookie: bool,
+    /// Effective key-header ignore mask (ORIGIN / ACCEPT_LANGUAGE).
+    pub key_ignore: u8,
+    /// Rule tri-state for Origin: None inherits the domain, Some(true) ignores,
+    /// Some(false) keeps it in the key.
+    pub key_ignore_origin: Option<bool>,
+    /// Rule tri-state for Accept-Language.
+    pub key_ignore_language: Option<bool>,
 }
 
 impl Default for ResolvedPolicy {
@@ -169,6 +180,9 @@ impl Default for ResolvedPolicy {
             browser_ttl_secs: None,
             ignore_query: None,
             ignore_cookie: false,
+            key_ignore: 0,
+            key_ignore_origin: None,
+            key_ignore_language: None,
         }
     }
 }
@@ -333,6 +347,83 @@ pub fn rule_policy(rule: &CacheRule) -> ResolvedPolicy {
         browser_ttl_secs: (rule.browser_ttl_seconds > 0).then_some(rule.browser_ttl_seconds),
         ignore_query: rule.ignore_query,
         ignore_cookie: rule.ignore_cookie,
+        key_ignore: 0,
+        key_ignore_origin: header_modes(rule.ignore_key_headers.as_deref()).origin,
+        key_ignore_language: header_modes(rule.ignore_key_headers.as_deref()).language,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyHeaderModes {
+    /// None = inherit the domain, Some(true) = ignore, Some(false) = keep.
+    pub origin: Option<bool>,
+    pub language: Option<bool>,
+}
+
+/// Parse the rule's tri-state header policy. New values look like
+/// `origin=inherit,accept-language=ignore`; old values remain supported as a
+/// full override list (`origin,accept-language`, `''`, or absent).
+pub fn header_modes(value: Option<&str>) -> KeyHeaderModes {
+    let Some(value) = value else {
+        return KeyHeaderModes::default();
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return KeyHeaderModes {
+            origin: Some(false),
+            language: Some(false),
+        };
+    }
+    if !value.contains('=') {
+        let lower = value.to_ascii_lowercase();
+        return KeyHeaderModes {
+            origin: Some(lower.split(',').any(|v| v.trim() == "origin")),
+            language: Some(lower.split(',').any(|v| v.trim() == "accept-language")),
+        };
+    }
+    let mut modes = KeyHeaderModes::default();
+    for part in value.split(',') {
+        let Some((name, state)) = part.split_once('=') else {
+            continue;
+        };
+        let state = match state.trim().to_ascii_lowercase().as_str() {
+            "ignore" => Some(true),
+            "keep" => Some(false),
+            "inherit" => None,
+            _ => continue,
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "origin" => modes.origin = state,
+            "accept-language" => modes.language = state,
+            _ => {}
+        }
+    }
+    modes
+}
+
+pub const KEY_IGNORE_ORIGIN: u8 = 1;
+pub const KEY_IGNORE_ACCEPT_LANGUAGE: u8 = 2;
+
+pub fn parse_key_ignore_headers(value: &str) -> u8 {
+    let mut mask = 0;
+    for part in value.split(',') {
+        let name = part.trim();
+        if name.eq_ignore_ascii_case("origin") {
+            mask |= KEY_IGNORE_ORIGIN;
+        } else if name.eq_ignore_ascii_case("accept-language") {
+            mask |= KEY_IGNORE_ACCEPT_LANGUAGE;
+        }
+    }
+    mask
+}
+
+pub fn key_ignore_mask_for_header(name: &str) -> u8 {
+    if name.eq_ignore_ascii_case("origin") {
+        KEY_IGNORE_ORIGIN
+    } else if name.eq_ignore_ascii_case("accept-language") {
+        KEY_IGNORE_ACCEPT_LANGUAGE
+    } else {
+        0
     }
 }
 
@@ -348,6 +439,27 @@ pub fn resolve_rule_policy(
         .unwrap_or_default()
 }
 
+/// Fill the domain default when the matched rule did not explicitly set a
+/// cache-key header policy.
+pub fn apply_key_ignore_default(policy: &mut ResolvedPolicy, domain_value: &str) {
+    let mut mask = parse_key_ignore_headers(domain_value);
+    if let Some(ignore) = policy.key_ignore_origin {
+        if ignore {
+            mask |= KEY_IGNORE_ORIGIN;
+        } else {
+            mask &= !KEY_IGNORE_ORIGIN;
+        }
+    }
+    if let Some(ignore) = policy.key_ignore_language {
+        if ignore {
+            mask |= KEY_IGNORE_ACCEPT_LANGUAGE;
+        } else {
+            mask &= !KEY_IGNORE_ACCEPT_LANGUAGE;
+        }
+    }
+    policy.key_ignore = mask;
+}
+
 pub fn resolve_rule_policy_for_response(
     rules: &[CacheRule],
     path: &str,
@@ -358,6 +470,19 @@ pub fn resolve_rule_policy_for_response(
     match_rule_for_response(rules, path, method, query, content_type)
         .map(rule_policy)
         .unwrap_or_default()
+}
+
+pub fn resolve_rule_policy_for_response_with_domain(
+    rules: &[CacheRule],
+    path: &str,
+    method: &str,
+    query: &str,
+    content_type: &str,
+    domain_key_ignore: &str,
+) -> ResolvedPolicy {
+    let mut policy = resolve_rule_policy_for_response(rules, path, method, query, content_type);
+    apply_key_ignore_default(&mut policy, domain_key_ignore);
+    policy
 }
 
 pub fn path_matches(pattern: &str, path: &str) -> bool {
@@ -474,6 +599,7 @@ pub fn decide_storage_reason(
     if let Some(field) = vary_reject_reason(
         joined_header_value(headers, "vary").as_deref(),
         policy.ignore_cookie,
+        policy.key_ignore,
     ) {
         return Err(field);
     }
@@ -537,7 +663,11 @@ pub fn decide_storage(
     decide_storage_reason(status, headers, policy, default_ttl_secs).ok()
 }
 
-fn vary_reject_reason(vary: Option<&str>, _ignore_cookie: bool) -> Option<&'static str> {
+fn vary_reject_reason(
+    vary: Option<&str>,
+    _ignore_cookie: bool,
+    key_ignore: u8,
+) -> Option<&'static str> {
     let Some(v) = vary else {
         return None;
     };
@@ -550,10 +680,11 @@ fn vary_reject_reason(vary: Option<&str>, _ignore_cookie: bool) -> Option<&'stat
         if field.eq_ignore_ascii_case("accept-language")
             || field.eq_ignore_ascii_case("origin")
         {
-            if cache_key_header_ignored(field) {
-                // The operator removed this header from the key. Honouring a
-                // Vary on it would mix representations, so do not store.
-                return Some("vary:key-ignored");
+            if cache_key_header_ignored(field, key_ignore) {
+                // The operator explicitly removed this header from the key.
+                // Treat the Vary field as ignored too, otherwise the response
+                // cannot be cached at all on sites with a blanket CORS Vary.
+                continue;
             }
             continue;
         }
@@ -561,9 +692,12 @@ fn vary_reject_reason(vary: Option<&str>, _ignore_cookie: bool) -> Option<&'stat
             || field.eq_ignore_ascii_case("access-control-request-headers")
             || field.eq_ignore_ascii_case("access-control-request-private-network")
         {
-            // These are OPTIONS preflight headers. GET/HEAD keys do not carry
-            // them, and preflight caching is not enabled yet.
-            return Some("vary:preflight");
+            // These are OPTIONS preflight headers and are absent from normal
+            // GET/HEAD requests. Some CORS middlewares add them to every
+            // response's Vary; ignoring them here keeps GET/HEAD cacheable
+            // without putting ACR* into the GET/HEAD cache key. OPTIONS
+            // preflight caching is not enabled yet; revisit this when it is.
+            continue;
         }
         if field.eq_ignore_ascii_case("user-agent") {
             return Some("vary:user-agent");
@@ -593,10 +727,11 @@ pub fn configure_cache_key_ignored_headers(headers: Vec<String>) {
     let _ = CACHE_KEY_IGNORED_HEADERS.set(normalized);
 }
 
-fn cache_key_header_ignored(name: &str) -> bool {
-    CACHE_KEY_IGNORED_HEADERS
-        .get()
-        .is_some_and(|headers| headers.iter().any(|entry| entry.eq_ignore_ascii_case(name)))
+fn cache_key_header_ignored(name: &str, key_ignore: u8) -> bool {
+    (key_ignore & key_ignore_mask_for_header(name)) != 0
+        || CACHE_KEY_IGNORED_HEADERS
+            .get()
+            .is_some_and(|headers| headers.iter().any(|entry| entry.eq_ignore_ascii_case(name)))
 }
 
 pub fn request_method_cacheable(method: &Method) -> bool {
@@ -720,7 +855,7 @@ pub fn cache_key_for_request(
     path: &str,
     headers: &HeaderMap,
 ) -> String {
-    cache_key_for_request_with_ignored(method, host, path, headers, &[])
+    cache_key_for_request_with_mask(method, host, path, headers, 0, &[])
 }
 
 /// Cache key with an explicit list of request headers that must not
@@ -734,10 +869,22 @@ pub fn cache_key_for_request_with_ignored(
     headers: &HeaderMap,
     ignore_headers: &[String],
 ) -> String {
+    cache_key_for_request_with_mask(method, host, path, headers, 0, ignore_headers)
+}
+
+pub fn cache_key_for_request_with_mask(
+    method: &Method,
+    host: &str,
+    path: &str,
+    headers: &HeaderMap,
+    key_ignore: u8,
+    ignore_headers: &[String],
+) -> String {
     let ignored = |name: &str| {
-        ignore_headers
-            .iter()
-            .any(|entry| entry.eq_ignore_ascii_case(name))
+        (key_ignore & key_ignore_mask_for_header(name)) != 0
+            || ignore_headers
+                .iter()
+                .any(|entry| entry.eq_ignore_ascii_case(name))
     };
     let mut key = cache_key_for(method, host, path);
     if !ignored("accept-language") {
@@ -951,6 +1098,7 @@ mod tests {
             browser_ttl_seconds: 0,
             ignore_query: None,
             ignore_cookie: false,
+            ignore_key_headers: None,
             match_content_type: String::new(),
         }
     }
@@ -978,6 +1126,7 @@ mod tests {
             browser_ttl_seconds: browser_ttl,
             ignore_query,
             ignore_cookie: false,
+            ignore_key_headers: None,
             match_content_type: String::new(),
         }
     }
@@ -1136,6 +1285,9 @@ mod tests {
             browser_ttl_secs: None,
             ignore_query: None,
             ignore_cookie: false,
+            key_ignore: 0,
+            key_ignore_origin: None,
+            key_ignore_language: None,
         };
         let d =
             decide_storage(200, &hdrs(&[("cache-control", "max-age=600")]), policy, 60).unwrap();
@@ -1209,12 +1361,15 @@ mod tests {
         assert!(
             decide_storage(
                 200,
-                &hdrs(&[("vary", "access-control-request-method")]),
+                &hdrs(&[(
+                    "vary",
+                    "access-control-request-method, access-control-request-headers"
+                )]),
                 policy,
                 60
             )
-            .is_none(),
-            "preflight Vary is rejected until OPTIONS caching is supported"
+            .is_some(),
+            "GET/HEAD ignore preflight-only Vary fields so CORS middleware headers do not disable caching"
         );
 
         let method = Method::GET;
@@ -1228,6 +1383,92 @@ mod tests {
         assert!(a.contains("|origin="));
         let plain = cache_key_for_request(&method, "cdn.test", "/file.mp4", &HeaderMap::new());
         assert_ne!(plain, a);
+    }
+
+    #[test]
+    fn domain_and_rule_key_ignore_masks() {
+        assert_eq!(parse_key_ignore_headers("origin"), KEY_IGNORE_ORIGIN);
+        assert_eq!(
+            parse_key_ignore_headers("accept-language, origin"),
+            KEY_IGNORE_ORIGIN | KEY_IGNORE_ACCEPT_LANGUAGE
+        );
+        let mut policy = ResolvedPolicy::default();
+        apply_key_ignore_default(&mut policy, "accept-language");
+        assert_eq!(policy.key_ignore, KEY_IGNORE_ACCEPT_LANGUAGE);
+        policy.key_ignore_origin = Some(true);
+        apply_key_ignore_default(&mut policy, "accept-language");
+        assert_eq!(
+            policy.key_ignore,
+            KEY_IGNORE_ORIGIN | KEY_IGNORE_ACCEPT_LANGUAGE
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://a.example".parse().unwrap());
+        headers.insert("accept-language", "zh-CN".parse().unwrap());
+        let no_ignore = cache_key_for_request(&Method::GET, "cdn.test", "/x", &headers);
+        let ignored = cache_key_for_request_with_mask(
+            &Method::GET,
+            "cdn.test",
+            "/x",
+            &headers,
+            KEY_IGNORE_ORIGIN | KEY_IGNORE_ACCEPT_LANGUAGE,
+            &[],
+        );
+        assert!(!ignored.contains("|origin="));
+        assert!(!ignored.contains("|lang="));
+        assert_ne!(no_ignore, ignored);
+
+        let mut policy = ResolvedPolicy::default();
+        policy.key_ignore = KEY_IGNORE_ORIGIN;
+        assert!(decide_storage(
+            200,
+            &hdrs(&[("vary", "origin")]),
+            policy,
+            60
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn rule_key_ignore_overrides_domain() {
+        let mut rule = CacheRule::simple("/api/*".into(), 60, 10);
+        rule.ignore_key_headers = Some("origin=ignore,accept-language=inherit".into());
+        let mut policy = rule_policy(&rule);
+        assert_eq!(policy.key_ignore_origin, Some(true));
+        assert_eq!(policy.key_ignore_language, None);
+        apply_key_ignore_default(&mut policy, "accept-language");
+        assert_eq!(
+            policy.key_ignore,
+            KEY_IGNORE_ORIGIN | KEY_IGNORE_ACCEPT_LANGUAGE
+        );
+
+        rule.ignore_key_headers = Some("origin=keep,accept-language=keep".into());
+        let mut policy = rule_policy(&rule);
+        apply_key_ignore_default(&mut policy, "accept-language");
+        assert_eq!(policy.key_ignore, 0);
+    }
+
+    #[test]
+    fn regex_rule_can_ignore_language() {
+        let mut rule = CacheRule::simple(r"\.(css|js|bin)$".into(), 60, 0);
+        rule.match_type = "regex".into();
+        rule.regex = Some(regex::Regex::new(r"\.(css|js|bin)$").unwrap());
+        rule.ignore_key_headers = Some("origin=ignore,accept-language=ignore".into());
+        let mut policy = rule_policy(&rule);
+        apply_key_ignore_default(&mut policy, "");
+        assert_eq!(policy.key_ignore, KEY_IGNORE_ORIGIN | KEY_IGNORE_ACCEPT_LANGUAGE);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("accept-language", "zh-CN,zh;q=0.9".parse().unwrap());
+        let key = cache_key_for_request_with_mask(
+            &Method::GET,
+            "test.akgo.net",
+            "/testfile.10m.bin",
+            &headers,
+            policy.key_ignore,
+            &[],
+        );
+        assert_eq!(key, "GET:test.akgo.net:/testfile.10m.bin");
     }
 
     #[test]
@@ -1286,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn vary_on_key_ignored_header_is_rejected() {
+    fn vary_on_ignored_header_is_ignored() {
         configure_cache_key_ignored_headers(vec!["accept-language".into()]);
         assert!(decide_storage(
             200,
@@ -1294,7 +1535,7 @@ mod tests {
             ResolvedPolicy::default(),
             60
         )
-        .is_none());
+        .is_some());
     }
 
     #[test]

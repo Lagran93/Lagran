@@ -130,6 +130,7 @@ pub struct CacheRuleRow {
     pub browser_ttl_seconds: i64,
     pub ignore_query: Option<bool>,
     pub ignore_cookie: bool,
+    pub ignore_key_headers: Option<String>,
     pub match_content_type: String,
     pub note: String,
 }
@@ -149,6 +150,7 @@ pub struct RuleInput<'a> {
     pub browser_ttl_seconds: i64,
     pub ignore_query: Option<bool>,
     pub ignore_cookie: bool,
+    pub ignore_key_headers: Option<&'a str>,
     pub match_content_type: &'a str,
     pub note: &'a str,
 }
@@ -788,7 +790,7 @@ pub async fn list_rules_for_domain(
     sqlx::query_as::<_, CacheRuleRow>(
         r#"
         SELECT id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, match_content_type, note
+               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
         FROM cache_rules
         WHERE domain_id = $1
         ORDER BY priority DESC
@@ -889,6 +891,7 @@ pub async fn list_all_rules(pool: &PgPool) -> sqlx::Result<Vec<(CacheRuleRow, St
         browser_ttl_seconds: i64,
         ignore_query: Option<bool>,
         ignore_cookie: bool,
+        ignore_key_headers: Option<String>,
         match_content_type: String,
         note: String,
         domain_name: String,
@@ -897,7 +900,7 @@ pub async fn list_all_rules(pool: &PgPool) -> sqlx::Result<Vec<(CacheRuleRow, St
         r#"
         SELECT r.id, r.domain_id, r.path_pattern, r.match_type, r.ttl_seconds, r.priority,
                r.action, r.swr_seconds, r.enabled, r.match_methods, r.match_query,
-               r.browser_ttl_seconds, r.ignore_query, r.ignore_cookie, r.match_content_type, r.note, d.name AS domain_name
+               r.browser_ttl_seconds, r.ignore_query, r.ignore_cookie, r.ignore_key_headers, r.match_content_type, r.note, d.name AS domain_name
         FROM cache_rules r
         JOIN domains d ON d.id = r.domain_id
         ORDER BY r.priority DESC, r.path_pattern
@@ -924,6 +927,7 @@ pub async fn list_all_rules(pool: &PgPool) -> sqlx::Result<Vec<(CacheRuleRow, St
                     browser_ttl_seconds: r.browser_ttl_seconds,
                     ignore_query: r.ignore_query,
                     ignore_cookie: r.ignore_cookie,
+                    ignore_key_headers: r.ignore_key_headers,
                     match_content_type: r.match_content_type,
                     note: r.note,
                 },
@@ -942,10 +946,10 @@ pub async fn create_rule(
         r#"
         INSERT INTO cache_rules
             (domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-             enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, match_content_type, note)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         RETURNING id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, match_content_type, note
+                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
         "#,
     )
     .bind(domain_id)
@@ -961,6 +965,7 @@ pub async fn create_rule(
     .bind(input.browser_ttl_seconds)
     .bind(input.ignore_query)
     .bind(input.ignore_cookie)
+    .bind(input.ignore_key_headers)
     .bind(input.match_content_type)
     .bind(input.note)
     .fetch_one(pool)
@@ -978,10 +983,10 @@ pub async fn update_rule(
             path_pattern = $2, match_type = $3, ttl_seconds = $4, priority = $5, action = $6,
             swr_seconds = $7, enabled = $8, match_methods = $9, match_query = $10,
             browser_ttl_seconds = $11, ignore_query = $12, ignore_cookie = $13,
-            match_content_type = $14, note = $15
+            ignore_key_headers = $14, match_content_type = $15, note = $16
         WHERE id = $1
         RETURNING id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, match_content_type, note
+                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
         "#,
     )
     .bind(id)
@@ -997,6 +1002,7 @@ pub async fn update_rule(
     .bind(input.browser_ttl_seconds)
     .bind(input.ignore_query)
     .bind(input.ignore_cookie)
+    .bind(input.ignore_key_headers)
     .bind(input.match_content_type)
     .bind(input.note)
     .fetch_optional(pool)
@@ -1007,7 +1013,7 @@ pub async fn get_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<CacheRuleR
     sqlx::query_as::<_, CacheRuleRow>(
         r#"
         SELECT id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, match_content_type, note
+               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
         FROM cache_rules WHERE id = $1
         "#,
     )
@@ -1881,6 +1887,7 @@ pub async fn create_domain_with_project(
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DomainSettingsRow {
     pub ignore_query_string: bool,
+    pub cache_key_ignore_headers: String,
     pub cors_origins: String,
     pub hotlink_allow_referers: String,
     pub origin_timeout_ms: i32,
@@ -1922,8 +1929,9 @@ pub async fn get_domain_settings(
 ) -> sqlx::Result<Option<DomainSettingsRow>> {
     sqlx::query_as::<_, DomainSettingsRow>(
         r#"
-        SELECT ignore_query_string, cors_origins, hotlink_allow_referers,
-               origin_timeout_ms, custom_headers, rate_limit_rps, rate_limit_burst,
+        SELECT ignore_query_string, cache_key_ignore_headers, cors_origins,
+               hotlink_allow_referers, origin_timeout_ms, custom_headers,
+               rate_limit_rps, rate_limit_burst,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
                COALESCE(shield_url, '') AS shield_url,
                signed_url_enabled,
@@ -1944,21 +1952,22 @@ pub async fn get_domain_settings(
 }
 
 type DomainSettingsPatchRow = (
-    bool,
-    String,
-    String,
-    i32,
-    String,
-    i32,
-    i32,
-    bool,
-    i32,
-    i32,
-    i32,
-    i32,
-    String,
-    String,
-    String,
+    bool,   // ignore_query_string
+    String, // cache_key_ignore_headers
+    String, // cors_origins
+    String, // hotlink_allow_referers
+    i32,    // origin_timeout_ms
+    String, // custom_headers
+    i32,    // rate_limit_rps
+    i32,    // rate_limit_burst
+    bool,   // cc_enabled
+    i32,    // cc_rps
+    i32,    // cc_burst
+    i32,    // cc_ban_after
+    i32,    // cc_ban_seconds
+    String, // cc_mode
+    String, // cc_allow_ips
+    String, // shield_url
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -1980,12 +1989,14 @@ pub async fn update_domain_settings(
     cc_mode: Option<&str>,
     cc_allow_ips: Option<&str>,
     shield_url: Option<&str>,
+    cache_key_ignore_headers: Option<&str>,
 ) -> sqlx::Result<u64> {
     // load existing then patch
     let row: Option<DomainSettingsPatchRow> = sqlx::query_as(
         r#"
-        SELECT ignore_query_string, cors_origins, hotlink_allow_referers,
-               origin_timeout_ms, custom_headers, rate_limit_rps, rate_limit_burst,
+        SELECT ignore_query_string, cache_key_ignore_headers, cors_origins,
+               hotlink_allow_referers, origin_timeout_ms, custom_headers,
+               rate_limit_rps, rate_limit_burst,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
                COALESCE(shield_url, '') AS shield_url
         FROM domains WHERE id = $1
@@ -2013,26 +2024,28 @@ pub async fn update_domain_settings(
           cc_mode = $14,
           cc_allow_ips = $15,
           shield_url = $16,
+          cache_key_ignore_headers = $17,
           updated_at = NOW()
         WHERE id = $1
         "#,
     )
     .bind(id)
     .bind(ignore_query.unwrap_or(e.0))
-    .bind(cors.unwrap_or(&e.1))
-    .bind(hotlink.unwrap_or(&e.2))
-    .bind(timeout_ms.unwrap_or(e.3))
-    .bind(headers.unwrap_or(&e.4))
-    .bind(rps.unwrap_or(e.5))
-    .bind(burst.unwrap_or(e.6))
-    .bind(cc_enabled.unwrap_or(e.7))
-    .bind(cc_rps.unwrap_or(e.8))
-    .bind(cc_burst.unwrap_or(e.9))
-    .bind(cc_ban_after.unwrap_or(e.10))
-    .bind(cc_ban_seconds.unwrap_or(e.11))
-    .bind(cc_mode.unwrap_or(&e.12))
-    .bind(cc_allow_ips.unwrap_or(&e.13))
-    .bind(shield_url.unwrap_or(&e.14))
+    .bind(cors.unwrap_or(&e.2))
+    .bind(hotlink.unwrap_or(&e.3))
+    .bind(timeout_ms.unwrap_or(e.4))
+    .bind(headers.unwrap_or(&e.5))
+    .bind(rps.unwrap_or(e.6))
+    .bind(burst.unwrap_or(e.7))
+    .bind(cc_enabled.unwrap_or(e.8))
+    .bind(cc_rps.unwrap_or(e.9))
+    .bind(cc_burst.unwrap_or(e.10))
+    .bind(cc_ban_after.unwrap_or(e.11))
+    .bind(cc_ban_seconds.unwrap_or(e.12))
+    .bind(cc_mode.unwrap_or(&e.13))
+    .bind(cc_allow_ips.unwrap_or(&e.14))
+    .bind(shield_url.unwrap_or(&e.15))
+    .bind(cache_key_ignore_headers.unwrap_or(&e.1))
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
@@ -2547,6 +2560,7 @@ pub struct DomainFullRow {
     pub rate_limit_rps: i32,
     pub rate_limit_burst: i32,
     pub ignore_query_string: bool,
+    pub cache_key_ignore_headers: String,
     pub cors_origins: String,
     pub hotlink_allow_referers: String,
     pub origin_timeout_ms: i32,
@@ -2591,7 +2605,8 @@ pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>
     sqlx::query_as::<_, DomainFullRow>(
         r#"
         SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
-               rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
+               rate_limit_rps, rate_limit_burst, ignore_query_string,
+               COALESCE(cache_key_ignore_headers, '') AS cache_key_ignore_headers, cors_origins,
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
                COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
@@ -2621,7 +2636,8 @@ pub async fn get_domain_full_by_name(
     sqlx::query_as::<_, DomainFullRow>(
         r#"
         SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
-               rate_limit_rps, rate_limit_burst, ignore_query_string, cors_origins,
+               rate_limit_rps, rate_limit_burst, ignore_query_string,
+               COALESCE(cache_key_ignore_headers, '') AS cache_key_ignore_headers, cors_origins,
                hotlink_allow_referers, origin_timeout_ms, custom_headers,
                COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
                cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
@@ -2648,7 +2664,7 @@ pub async fn list_rules_flat(pool: &PgPool) -> sqlx::Result<Vec<CacheRuleRow>> {
     sqlx::query_as::<_, CacheRuleRow>(
         r#"
         SELECT id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
-               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, match_content_type, note
+               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
         FROM cache_rules
         ORDER BY domain_id, priority DESC, path_pattern
         "#,

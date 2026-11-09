@@ -336,6 +336,24 @@
         </label>
 
         <div class="field">
+          <label class="field-label">Cache Key 忽略请求头</label>
+          <div class="flex gap-16" style="flex-wrap: wrap">
+            <label class="check">
+              <input v-model="settings.ignore_origin" type="checkbox" />
+              Origin
+            </label>
+            <label class="check">
+              <input v-model="settings.ignore_accept_language" type="checkbox" />
+              Accept-Language
+            </label>
+          </div>
+          <span class="field-hint">
+            仅当响应内容不随该请求头变化时使用。忽略 Origin 前必须确认 Access-Control-Allow-Origin 固定；
+            忽略 Accept-Language 前必须确认站点不按语言返回不同内容。规则可覆盖此设置。
+          </span>
+        </div>
+
+        <div class="field">
           <label class="field-label">CORS 允许源</label>
           <input v-model="settings.cors_origins" class="input" placeholder="* 或 https://a.com,https://b.com" />
         </div>
@@ -541,6 +559,8 @@ const settingsOpen = ref(false)
 const settingsDomain = ref<any>(null)
 const settings = ref({
   ignore_query_string: false,
+  ignore_origin: false,
+  ignore_accept_language: false,
   cors_origins: '',
   hotlink_allow_referers: '',
   origin_timeout_ms: 10000,
@@ -819,8 +839,13 @@ async function openSettings(d: any) {
   settingsDomain.value = d
   try {
     const s = await api.get<any>(`/api/v1/domains/${d.id}/settings`)
+    const cachedHeaders = String(s.cache_key_ignore_headers || '')
+      .split(',')
+      .map((v) => v.trim().toLowerCase())
     settings.value = {
       ignore_query_string: !!s.ignore_query_string,
+      ignore_origin: cachedHeaders.includes('origin'),
+      ignore_accept_language: cachedHeaders.includes('accept-language'),
       cors_origins: s.cors_origins || '',
       hotlink_allow_referers: s.hotlink_allow_referers || '',
       origin_timeout_ms: s.origin_timeout_ms || 10000,
@@ -855,7 +880,16 @@ async function saveSettings() {
   if (!settingsDomain.value) return
   submitting.value = true
   try {
-    await api.put(`/api/v1/domains/${settingsDomain.value.id}/settings`, settings.value)
+    const payload: any = { ...settings.value }
+    payload.cache_key_ignore_headers = [
+      payload.ignore_origin ? 'origin' : '',
+      payload.ignore_accept_language ? 'accept-language' : '',
+    ]
+      .filter(Boolean)
+      .join(',')
+    delete payload.ignore_origin
+    delete payload.ignore_accept_language
+    await api.put(`/api/v1/domains/${settingsDomain.value.id}/settings`, payload)
     settingsOpen.value = false
     toast.success('高级设置已保存，边缘约 15 秒内同步')
     await load()

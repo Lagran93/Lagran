@@ -79,6 +79,8 @@ struct RuleCfg {
     ignore_query: Option<bool>,
     #[serde(default)]
     ignore_cookie: bool,
+    #[serde(default)]
+    ignore_key_headers: Option<String>,
 }
 
 impl RuleCfg {
@@ -109,6 +111,7 @@ impl RuleCfg {
             browser_ttl_seconds: self.browser_ttl_seconds,
             ignore_query: self.ignore_query,
             ignore_cookie: self.ignore_cookie,
+            ignore_key_headers: self.ignore_key_headers,
         }
     }
 }
@@ -166,6 +169,8 @@ struct DomainCfg {
     rate_limit_burst: u32,
     #[serde(default)]
     ignore_query_string: bool,
+    #[serde(default)]
+    cache_key_ignore_headers: String,
     #[serde(default)]
     cors_origins: String,
     #[serde(default)]
@@ -260,6 +265,7 @@ impl DomainCfg {
             rate_limit_rps: global_rps,
             rate_limit_burst: global_burst,
             ignore_query_string: self.ignore_query_string,
+            cache_key_ignore_headers: self.cache_key_ignore_headers,
             cors_origins: self.cors_origins,
             hotlink_allow_referers: self.hotlink_allow_referers,
             origin_timeout_ms: if self.origin_timeout_ms == 0 {

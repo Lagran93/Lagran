@@ -59,6 +59,8 @@ pub struct DomainEntry {
     pub rate_limit_rps: u32,
     pub rate_limit_burst: u32,
     pub ignore_query_string: bool,
+    /// Comma-separated cache-key headers to ignore (origin, accept-language).
+    pub cache_key_ignore_headers: String,
     pub cors_origins: String,
     pub hotlink_allow_referers: String,
     pub origin_timeout_ms: u32,
@@ -209,6 +211,7 @@ mod tests {
             rate_limit_rps: 0,
             rate_limit_burst: 0,
             ignore_query_string: false,
+            cache_key_ignore_headers: String::new(),
             cors_origins: String::new(),
             hotlink_allow_referers: String::new(),
             origin_timeout_ms: 10_000,

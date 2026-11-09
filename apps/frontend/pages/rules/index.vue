@@ -74,6 +74,9 @@
                   <span v-if="r.ignore_query === true" class="cond-chip warn">忽略 Query</span>
                   <span v-else-if="r.ignore_query === false" class="cond-chip">区分 Query</span>
                   <span v-if="r.ignore_cookie" class="cond-chip warn">忽略 Cookie</span>
+                  <span v-if="keyHeaderLabel(r.ignore_key_headers)" class="cond-chip warn">
+                    {{ keyHeaderLabel(r.ignore_key_headers) }}
+                  </span>
                   <span v-if="r.note" class="cond-chip muted" :title="r.note">{{ r.note }}</span>
                 </div>
               </td>
@@ -127,148 +130,260 @@
     </div>
 
     <BaseModal v-model="formOpen" :title="editing ? '编辑缓存规则' : '新建缓存规则'" :confirm-text="editing ? '保存修改' : '创建规则'"
-      :loading="submitting" width="640px" @confirm="submit">
-      <div class="form-col">
-        <div v-if="!editing" class="preset-row">
-          <span class="preset-label">快速模板</span>
-          <button v-for="p in presets" :key="p.label" class="btn btn-default btn-xs" type="button"
-            @click="applyPreset(p)">
-            {{ p.label }}
-          </button>
+      :loading="submitting" width="920px" @confirm="submit">
+      <div class="rule-editor">
+        <div class="rule-preview">
+          <div class="rule-preview-main">
+            <div class="rule-preview-kicker">{{ editing ? '正在编辑规则' : '新建规则预览' }}</div>
+            <div class="rule-preview-title">
+              <span class="rule-method">{{ previewMethods }}</span>
+              <span class="rule-path mono">{{ form.path_pattern || '未设置路径' }}</span>
+            </div>
+          </div>
+          <div class="rule-preview-meta">
+            <span class="rule-pill" :class="`tone-${actionTone(form.action)}`">{{ actionLabel(form.action) }}</span>
+            <span v-if="form.action === 'cache'" class="rule-pill subtle">{{ formatDuration(form.ttl_seconds) }}</span>
+            <span class="rule-pill subtle">P{{ form.priority }}</span>
+            <span class="rule-pill" :class="form.enabled ? 'tone-success' : 'subtle'">
+              {{ form.enabled ? '启用' : '停用' }}
+            </span>
+          </div>
         </div>
 
-        <div class="form-grid">
-          <div class="field span-2">
-            <label class="field-label">所属域名 <span class="req">*</span></label>
-            <select v-model="form.domain_id" class="select" :disabled="!!editing">
-              <option value="">请选择域名</option>
-              <option v-for="d in domains" :key="d.id" :value="d.id">{{ d.name }}</option>
-            </select>
-          </div>
-
-          <div class="field span-2">
-            <label class="field-label">匹配方式</label>
-            <select v-model="form.match_type" class="select">
-              <option value="glob">通配符（glob）</option>
-              <option value="regex">正则表达式（regex）</option>
-            </select>
-            <span class="field-hint">
-              通配符使用 `/static/*`、`/img*`；正则用于按后缀匹配，例如 `\.(css|js)$`。
-            </span>
-          </div>
-
-          <div class="field span-2">
-            <label class="field-label">路径 / 正则 <span class="req">*</span></label>
-            <input v-model="form.path_pattern" class="input"
-              :placeholder="form.match_type === 'regex' ? '\\.(css|js)$' : '/static/*'" />
-            <span class="field-hint">
-              {{ form.match_type === 'regex'
-                ? 'Rust regex 语法；例如 `\\.(css|js)$` 匹配所有 CSS/JS 文件，`^/assets/` 匹配目录前缀。'
-                : '支持 `/static/*` 前缀和 `/img*` 通配；`/*` 匹配全部路径。' }}
-            </span>
-          </div>
-
-          <div class="field span-2">
-            <label class="field-label">请求方法</label>
-            <div class="chip-row">
-              <button v-for="m in methodOptions" :key="m" type="button" class="chip"
-                :class="{ on: form.methods.includes(m) }" @click="toggleMethod(m)">
-                {{ m }}
-              </button>
-              <span class="field-hint" style="margin-left: 6px">不选表示全部方法</span>
-            </div>
-          </div>
-
-          <div class="field span-2">
-            <label class="field-label">查询串包含（可选）</label>
-            <input v-model="form.match_query" class="input" placeholder="例如 debug=1" />
-            <span class="field-hint">不区分大小写；留空表示不限制查询串。</span>
-          </div>
-
-          <div class="field span-2">
-            <label class="field-label">响应 Content-Type 包含（可选）</label>
-            <input v-model="form.match_content_type" class="input" placeholder="例如 text/html" />
-            <span class="field-hint">
-              响应头 Content-Type 不区分大小写子串匹配；留空匹配所有类型。
-              例如用 <code>text/html</code> + 绕过缓存，静态 JS/CSS 仍按高优先级规则缓存。
-            </span>
-          </div>
-
-          <div class="field span-2">
-            <label class="field-label">缓存动作</label>
-            <div class="segmented">
-              <button v-for="opt in actionOptions" :key="opt.value" type="button"
-                :class="{ active: form.action === opt.value }" @click="form.action = opt.value">
-                {{ opt.label }}
-              </button>
-            </div>
-            <span class="field-hint">{{ actionHint }}</span>
-          </div>
-
-          <template v-if="form.action === 'cache'">
-            <div class="field">
-              <label class="field-label">边缘 TTL（秒）</label>
-              <input v-model.number="form.ttl_seconds" class="input" type="number" min="1" />
-            </div>
-            <div class="field">
-              <label class="field-label">SWR（秒）</label>
-              <input v-model.number="form.swr_seconds" class="input" type="number" min="0" />
-              <span class="field-hint">过期先回旧内容再后台刷新。</span>
-            </div>
-            <div class="field">
-              <label class="field-label">浏览器 TTL（秒）</label>
-              <input v-model.number="form.browser_ttl_seconds" class="input" type="number" min="0" />
-              <span class="field-hint">0 = 跟随源站 Cache-Control；只影响客户端缓存。</span>
-            </div>
-          </template>
-
-          <div class="field">
-            <label class="field-label">优先级</label>
-            <input v-model.number="form.priority" class="input" type="number" />
-            <span class="field-hint">数值越大越优先。</span>
-          </div>
-
-          <div class="field span-2">
-            <label class="field-label">Query 缓存键</label>
-            <div class="segmented">
-              <button type="button" :class="{ active: form.ignore_query === 'inherit' }"
-                @click="form.ignore_query = 'inherit'">
-                继承域名
-              </button>
-              <button type="button" :class="{ active: form.ignore_query === 'on' }" @click="form.ignore_query = 'on'">
-                忽略 Query
-              </button>
-              <button type="button" :class="{ active: form.ignore_query === 'off' }" @click="form.ignore_query = 'off'">
-                区分 Query
-              </button>
-            </div>
-            <span class="field-hint">忽略 Query 时 /a?x=1 与 /a?x=2 共用同一份缓存。</span>
-          </div>
-
-          <div class="field span-2">
-            <label class="check">
-              <input v-model="form.ignore_cookie" type="checkbox" />
-              忽略 Cookie（静态资源可缓存）
-            </label>
-            <span class="field-hint">
-              勾选后，带 Cookie 的请求仍可读写此规则的缓存。仅用于 CSS/JS/图片等公共静态资源，
-              不要用于登录态或个性化内容。
-            </span>
-          </div>
-
-          <div class="field span-2">
-            <label class="field-label">备注</label>
-            <input v-model="form.note" class="input" placeholder="可选，便于团队识别这条规则" maxlength="200" />
-          </div>
-
-          <div class="field span-2">
-            <label class="check">
-              <input v-model="form.enabled" type="checkbox" />
-              启用这条规则（停用后边缘忽略它）
-            </label>
+        <div v-if="!editing" class="rule-preset-bar">
+          <span class="rule-preset-label">快速模板</span>
+          <div class="rule-preset-list">
+            <button v-for="p in presets" :key="p.label" class="rule-preset" type="button" @click="applyPreset(p)">
+              {{ p.label }}
+            </button>
           </div>
         </div>
-        <p v-if="error" class="text-danger" style="font-size: 13px">{{ error }}</p>
+
+        <div class="rule-editor-grid">
+          <section class="rule-section">
+            <div class="rule-section-head">
+              <span class="rule-section-num">01</span>
+              <div>
+                <div class="rule-section-title">基本信息</div>
+                <div class="rule-section-desc">选择域名与要匹配的路径</div>
+              </div>
+            </div>
+            <div class="rule-section-body">
+              <div class="field">
+                <label class="field-label">所属域名 <span class="req">*</span></label>
+                <select v-model="form.domain_id" class="select" :disabled="!!editing">
+                  <option value="">请选择域名</option>
+                  <option v-for="d in domains" :key="d.id" :value="d.id">{{ d.name }}</option>
+                </select>
+              </div>
+
+              <div class="field">
+                <label class="field-label">匹配路径 <span class="req">*</span></label>
+                <div class="path-combo">
+                  <select v-model="form.match_type" class="select">
+                    <option value="glob">通配符</option>
+                    <option value="regex">正则</option>
+                  </select>
+                  <input v-model="form.path_pattern" class="input mono"
+                    :placeholder="form.match_type === 'regex' ? '\\.(css|js)$' : '/static/*'" />
+                </div>
+                <span class="field-hint">
+                  {{ form.match_type === 'regex'
+                    ? 'Rust regex；例如 `\\.(css|js)$`。'
+                    : '支持 `/static/*` 和 `/img*`；`/*` 匹配全部。' }}
+                </span>
+              </div>
+
+              <div class="field">
+                <label class="field-label">请求方法</label>
+                <div class="chip-row">
+                  <button v-for="m in methodOptions" :key="m" type="button" class="chip"
+                    :class="{ on: form.methods.includes(m) }" @click="toggleMethod(m)">
+                    {{ m }}
+                  </button>
+                </div>
+                <span class="field-hint">不选表示全部方法</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="rule-section">
+            <div class="rule-section-head">
+              <span class="rule-section-num">02</span>
+              <div>
+                <div class="rule-section-title">匹配条件</div>
+                <div class="rule-section-desc">进一步缩小规则命中范围</div>
+              </div>
+            </div>
+            <div class="rule-section-body">
+              <div class="field">
+                <label class="field-label">查询串包含</label>
+                <input v-model="form.match_query" class="input" placeholder="例如 debug=1" />
+                <span class="field-hint">不区分大小写；留空不限制查询串。</span>
+              </div>
+
+              <div class="field">
+                <label class="field-label">响应 Content-Type 包含</label>
+                <input v-model="form.match_content_type" class="input" placeholder="例如 text/html" />
+                <span class="field-hint">
+                  留空匹配所有类型；例如 `text/html` + 绕过缓存。
+                </span>
+              </div>
+
+              <div class="rule-tip">
+                <AppIcon name="info" :size="14" />
+                <span>Content-Type 规则在响应阶段匹配，不能配置 Cache Key 请求头。</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="rule-section">
+            <div class="rule-section-head">
+              <span class="rule-section-num">03</span>
+              <div>
+                <div class="rule-section-title">缓存策略</div>
+                <div class="rule-section-desc">命中后如何处理与缓存多久</div>
+              </div>
+            </div>
+            <div class="rule-section-body">
+              <div class="field">
+                <label class="field-label">缓存动作</label>
+                <div class="segmented">
+                  <button v-for="opt in actionOptions" :key="opt.value" type="button"
+                    :class="{ active: form.action === opt.value }" @click="form.action = opt.value">
+                    {{ opt.label }}
+                  </button>
+                </div>
+                <span class="field-hint">{{ actionHint }}</span>
+              </div>
+
+              <div v-if="form.action === 'cache'" class="ttl-grid">
+                <div class="field">
+                  <label class="field-label">边缘 TTL</label>
+                  <div class="input-affix">
+                    <input v-model.number="form.ttl_seconds" class="input" type="number" min="1" />
+                    <span>秒</span>
+                  </div>
+                </div>
+                <div class="field">
+                  <label class="field-label">SWR</label>
+                  <div class="input-affix">
+                    <input v-model.number="form.swr_seconds" class="input" type="number" min="0" />
+                    <span>秒</span>
+                  </div>
+                </div>
+                <div class="field">
+                  <label class="field-label">浏览器 TTL</label>
+                  <div class="input-affix">
+                    <input v-model.number="form.browser_ttl_seconds" class="input" type="number" min="0" />
+                    <span>秒</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="field">
+                <label class="field-label">优先级</label>
+                <input v-model.number="form.priority" class="input" type="number" />
+                <span class="field-hint">数值越大越优先。</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="rule-section">
+            <div class="rule-section-head">
+              <span class="rule-section-num">04</span>
+              <div>
+                <div class="rule-section-title">附加选项</div>
+                <div class="rule-section-desc">Cookie、备注与启用状态</div>
+              </div>
+            </div>
+            <div class="rule-section-body">
+              <label class="option-row">
+                <div>
+                  <div class="option-title">忽略 Cookie</div>
+                  <div class="option-desc">仅用于公共静态资源，不要用于登录态内容。</div>
+                </div>
+                <input v-model="form.ignore_cookie" type="checkbox" class="option-switch" />
+              </label>
+
+              <label class="option-row">
+                <div>
+                  <div class="option-title">启用规则</div>
+                  <div class="option-desc">停用后边缘忽略此规则。</div>
+                </div>
+                <input v-model="form.enabled" type="checkbox" class="option-switch" />
+              </label>
+
+              <div class="field">
+                <label class="field-label">备注</label>
+                <input v-model="form.note" class="input" placeholder="可选，便于团队识别" maxlength="200" />
+              </div>
+            </div>
+          </section>
+
+          <section class="rule-section span-2">
+            <div class="rule-section-head">
+              <span class="rule-section-num">05</span>
+              <div>
+                <div class="rule-section-title">Cache Key 组成</div>
+                <div class="rule-section-desc">选择哪些请求维度用于区分缓存对象</div>
+              </div>
+            </div>
+            <div class="rule-section-body">
+              <div class="key-table">
+                <div class="key-row">
+                  <div class="key-name">
+                    <div>Query</div>
+                    <small>URL 查询串</small>
+                  </div>
+                  <div class="key-toggle">
+                    <button type="button" :class="{ active: form.ignore_query === 'inherit' }"
+                      @click="form.ignore_query = 'inherit'">继承域名</button>
+                    <button type="button" :class="{ active: form.ignore_query === 'on' }"
+                      @click="form.ignore_query = 'on'">忽略</button>
+                    <button type="button" :class="{ active: form.ignore_query === 'off' }"
+                      @click="form.ignore_query = 'off'">区分</button>
+                  </div>
+                </div>
+
+                <div class="key-row">
+                  <div class="key-name">
+                    <div>Origin</div>
+                    <small>CORS 来源</small>
+                  </div>
+                  <div class="key-toggle">
+                    <button type="button" :class="{ active: form.origin_mode === 'inherit' }"
+                      @click="form.origin_mode = 'inherit'">继承域名</button>
+                    <button type="button" :class="{ active: form.origin_mode === 'ignore' }"
+                      @click="form.origin_mode = 'ignore'">忽略</button>
+                    <button type="button" :class="{ active: form.origin_mode === 'keep' }"
+                      @click="form.origin_mode = 'keep'">区分</button>
+                  </div>
+                </div>
+
+                <div class="key-row">
+                  <div class="key-name">
+                    <div>Accept-Language</div>
+                    <small>请求语言</small>
+                  </div>
+                  <div class="key-toggle">
+                    <button type="button" :class="{ active: form.language_mode === 'inherit' }"
+                      @click="form.language_mode = 'inherit'">继承域名</button>
+                    <button type="button" :class="{ active: form.language_mode === 'ignore' }"
+                      @click="form.language_mode = 'ignore'">忽略</button>
+                    <button type="button" :class="{ active: form.language_mode === 'keep' }"
+                      @click="form.language_mode = 'keep'">区分</button>
+                  </div>
+                </div>
+              </div>
+              <div class="key-note">
+                继承域名跟随域名设置；忽略后对应 Vary 也按忽略处理。仅在响应内容不受该维度影响时忽略。
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <p v-if="error" class="rule-error">{{ error }}</p>
       </div>
     </BaseModal>
 
@@ -331,7 +446,8 @@
               </div>
               <div class="effective-item">
                 <span class="eff-label">边缘 TTL</span>
-                <span class="eff-value">{{ testResult.effective.action === 'cache' ? `${testResult.effective.ttl_seconds}
+                <span class="eff-value">{{ testResult.effective.action === 'cache' ?
+                  `${testResult.effective.ttl_seconds}
                   秒` : '—' }}</span>
               </div>
               <div class="effective-item">
@@ -406,6 +522,8 @@ const form = ref({
   match_content_type: '',
   ignore_query: 'inherit' as 'inherit' | 'on' | 'off',
   ignore_cookie: false,
+  origin_mode: 'inherit' as 'inherit' | 'ignore' | 'keep',
+  language_mode: 'inherit' as 'inherit' | 'ignore' | 'keep',
   priority: 0,
   enabled: true,
   note: '',
@@ -463,6 +581,19 @@ function actionLabel(action: string) {
 
 function actionTone(action: string) {
   return action === 'bypass' ? 'warning' : action === 'no_store' ? 'danger' : 'success'
+}
+
+const previewMethods = computed(() =>
+  form.value.methods.length ? form.value.methods.join(' · ') : 'ALL',
+)
+
+function formatDuration(seconds: number) {
+  const value = Number(seconds) || 0
+  if (value <= 0) return '跟随源站'
+  if (value % 86400 === 0) return `${value / 86400} 天`
+  if (value % 3600 === 0) return `${value / 3600} 小时`
+  if (value % 60 === 0) return `${value / 60} 分钟`
+  return `${value} 秒`
 }
 
 function queryModeLabel(value: boolean | null) {
@@ -523,6 +654,8 @@ function openCreate() {
     match_content_type: '',
     ignore_query: 'inherit',
     ignore_cookie: false,
+    origin_mode: 'inherit',
+    language_mode: 'inherit',
     priority: 0,
     enabled: true,
     note: '',
@@ -546,11 +679,46 @@ function openEdit(rule: any) {
     match_content_type: rule.match_content_type || '',
     ignore_query: rule.ignore_query === true ? 'on' : rule.ignore_query === false ? 'off' : 'inherit',
     ignore_cookie: !!rule.ignore_cookie,
+    origin_mode: parseKeyHeaderMode(rule.ignore_key_headers, 'origin'),
+    language_mode: parseKeyHeaderMode(rule.ignore_key_headers, 'accept-language'),
     priority: rule.priority,
     enabled: rule.enabled,
     note: rule.note || '',
   }
   formOpen.value = true
+}
+
+type KeyHeaderMode = 'inherit' | 'ignore' | 'keep'
+
+function parseKeyHeaderMode(raw: any, name: string): KeyHeaderMode {
+  if (raw == null) return 'inherit'
+  const value = String(raw).trim()
+  if (value.includes('=')) {
+    const part = value
+      .split(',')
+      .map((v) => v.trim())
+      .find((v) => v.split('=')[0]?.trim().toLowerCase() === name)
+    const state = part?.split('=')[1]?.trim().toLowerCase()
+    return state === 'ignore' ? 'ignore' : state === 'keep' ? 'keep' : 'inherit'
+  }
+  if (!value) return 'keep'
+  return value
+    .split(',')
+    .some((v) => v.trim().toLowerCase() === name)
+    ? 'ignore'
+    : 'keep'
+}
+
+function keyHeaderLabel(raw: any) {
+  if (raw == null) return ''
+  const origin = parseKeyHeaderMode(raw, 'origin')
+  const language = parseKeyHeaderMode(raw, 'accept-language')
+  const labels: string[] = []
+  if (origin === 'ignore') labels.push('忽略 Origin')
+  else if (origin === 'keep') labels.push('区分 Origin')
+  if (language === 'ignore') labels.push('忽略语言')
+  else if (language === 'keep') labels.push('区分语言')
+  return labels.join(' · ')
 }
 
 function payload() {
@@ -566,6 +734,10 @@ function payload() {
     match_content_type: form.value.match_content_type.trim(),
     ignore_query: form.value.ignore_query === 'inherit' ? null : form.value.ignore_query === 'on',
     ignore_cookie: form.value.ignore_cookie,
+    ignore_key_headers:
+      form.value.origin_mode === 'inherit' && form.value.language_mode === 'inherit'
+        ? null
+        : `origin=${form.value.origin_mode},accept-language=${form.value.language_mode}`,
     priority: Number(form.value.priority) || 0,
     enabled: form.value.enabled,
     note: form.value.note.trim(),
@@ -773,33 +945,19 @@ onMounted(load)
   color: var(--warning);
 }
 
-.preset-row {
+.chip-row {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  padding-bottom: 4px;
-  border-bottom: 1px dashed var(--divider);
-}
-
-.preset-label {
-  font-size: 12px;
-  color: var(--text-3);
-}
-
-.chip-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
 }
 
 .chip {
-  padding: 3px 10px;
+  padding: 4px 8px;
   font-size: 12px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: #fff;
+  background: var(--card);
   color: var(--text-2);
   cursor: pointer;
 }
@@ -813,6 +971,397 @@ onMounted(load)
   background: var(--brand-bg);
   border-color: var(--brand);
   color: var(--brand);
+}
+
+/* --------------------------------------------------------- rule editor */
+
+.rule-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.rule-preview {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background:
+    linear-gradient(135deg, var(--brand-bg), transparent 55%),
+    var(--bg);
+}
+
+.rule-preview-main {
+  min-width: 0;
+}
+
+.rule-preview-kicker {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.rule-preview-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 5px;
+}
+
+.rule-method {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--brand);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.rule-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.rule-preview-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: none;
+}
+
+.rule-pill {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.rule-pill.subtle {
+  border-color: var(--border);
+  background: var(--card);
+  color: var(--text-3);
+}
+
+.rule-pill.tone-success {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.rule-pill.tone-warning {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.rule-pill.tone-danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.rule-preset-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 0 2px;
+}
+
+.rule-preset-label {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.rule-preset-list {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.rule-preset {
+  padding: 4px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.rule-preset:hover {
+  border-color: var(--brand);
+  background: var(--brand-bg);
+  color: var(--brand);
+}
+
+.rule-editor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+
+.rule-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  overflow: hidden;
+}
+
+.rule-section.span-2 {
+  grid-column: 1 / -1;
+}
+
+.rule-section-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 16px 0;
+}
+
+.rule-section-num {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-top: 1px;
+  border-radius: 7px;
+  background: var(--brand-bg);
+  color: var(--brand);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.rule-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.rule-section-desc {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.rule-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px 16px 16px;
+}
+
+.path-combo {
+  display: grid;
+  grid-template-columns: 128px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.path-combo .select,
+.path-combo .input {
+  height: 38px;
+}
+
+.ttl-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.input-affix {
+  position: relative;
+}
+
+.input-affix .input {
+  padding-right: 32px;
+}
+
+.input-affix>span {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  font-size: 11px;
+  color: var(--text-3);
+  pointer-events: none;
+}
+
+.rule-tip {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 9px 10px;
+  border-radius: var(--radius);
+  background: var(--brand-bg);
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.rule-tip .icon {
+  flex: none;
+  margin-top: 1px;
+  color: var(--brand);
+}
+
+.option-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius);
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.option-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.option-desc {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.option-switch {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--brand);
+}
+
+.key-table {
+  border: 1px solid var(--divider);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.key-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 180px) minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 10px 12px;
+  background: var(--bg);
+}
+
+.key-row+.key-row {
+  border-top: 1px solid var(--divider);
+}
+
+.key-name>div {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.key-name small {
+  display: block;
+  margin-top: 1px;
+  font-size: 10px;
+  color: var(--text-4);
+}
+
+.key-toggle {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 3px;
+  padding: 3px;
+  border-radius: 9px;
+  background: var(--card);
+}
+
+.key-toggle button {
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.key-toggle button:hover {
+  color: var(--text);
+}
+
+.key-toggle button.active {
+  background: var(--brand);
+  color: #fff;
+  font-weight: 500;
+  box-shadow: var(--shadow-sm);
+}
+
+.key-note {
+  margin-top: 9px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+.rule-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+@media (max-width: 760px) {
+  .rule-preview {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .rule-preview-meta {
+    justify-content: flex-start;
+  }
+
+  .rule-editor-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .rule-section.span-2 {
+    grid-column: auto;
+  }
+
+  .path-combo {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ttl-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .key-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .key-toggle button {
+    font-size: 11px;
+  }
 }
 
 @media (max-width: 760px) {

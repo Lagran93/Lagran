@@ -781,9 +781,27 @@ pub async fn set_status(
     Ok(Json(to_dto(row)))
 }
 
+fn normalize_cache_key_ignore_headers(value: &str) -> Result<String, String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in value.split(',') {
+        let name = part.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        if name != "origin" && name != "accept-language" {
+            return Err(format!("unsupported cache key header: {name}"));
+        }
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    Ok(out.join(","))
+}
+
 #[derive(Deserialize)]
 pub struct SettingsRequest {
     pub ignore_query_string: Option<bool>,
+    pub cache_key_ignore_headers: Option<String>,
     pub cors_origins: Option<String>,
     pub hotlink_allow_referers: Option<String>,
     pub origin_timeout_ms: Option<u32>,
@@ -812,6 +830,7 @@ pub struct SettingsRequest {
 #[derive(Serialize)]
 pub struct SettingsDto {
     pub ignore_query_string: bool,
+    pub cache_key_ignore_headers: String,
     pub cors_origins: String,
     pub hotlink_allow_referers: String,
     pub origin_timeout_ms: u32,
@@ -840,6 +859,7 @@ pub struct SettingsDto {
 fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
     SettingsDto {
         ignore_query_string: s.ignore_query_string,
+        cache_key_ignore_headers: s.cache_key_ignore_headers,
         cors_origins: s.cors_origins,
         hotlink_allow_referers: s.hotlink_allow_referers,
         origin_timeout_ms: s.origin_timeout_ms.max(0) as u32,
@@ -1216,6 +1236,18 @@ pub async fn put_settings(
             ));
         }
     }
+    let cache_key_ignore_headers = match req.cache_key_ignore_headers.as_deref() {
+        Some(value) => match normalize_cache_key_ignore_headers(value) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody { error }),
+                ));
+            }
+        },
+        None => None,
+    };
     let n = repository::update_domain_settings(
         &state.pool,
         uid,
@@ -1234,6 +1266,7 @@ pub async fn put_settings(
         cc_mode.as_deref(),
         req.cc_allow_ips.as_deref(),
         shield_url,
+        cache_key_ignore_headers.as_deref(),
     )
     .await
     .map_err(|e| {

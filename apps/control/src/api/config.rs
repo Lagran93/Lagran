@@ -50,6 +50,8 @@ pub struct CacheRuleConfig {
     pub browser_ttl_seconds: u64,
     pub ignore_query: Option<bool>,
     pub ignore_cookie: bool,
+    #[serde(default)]
+    pub ignore_key_headers: Option<String>,
     pub match_content_type: String,
 }
 
@@ -133,6 +135,7 @@ pub struct DomainConfigResponse {
     pub rate_limit_rps: u32,
     pub rate_limit_burst: u32,
     pub ignore_query_string: bool,
+    pub cache_key_ignore_headers: String,
     pub cors_origins: String,
     pub hotlink_allow_referers: String,
     pub origin_timeout_ms: u32,
@@ -182,6 +185,7 @@ fn rule_configs(rows: Vec<repository::CacheRuleRow>) -> Vec<CacheRuleConfig> {
             browser_ttl_seconds: r.browser_ttl_seconds.max(0) as u64,
             ignore_query: r.ignore_query,
             ignore_cookie: r.ignore_cookie,
+            ignore_key_headers: r.ignore_key_headers,
             match_content_type: r.match_content_type,
         })
         .collect()
@@ -400,6 +404,7 @@ pub(crate) fn build(
     cc.mode.hash(&mut h);
     cc.allow_ips.hash(&mut h);
     row.ignore_query_string.hash(&mut h);
+    row.cache_key_ignore_headers.hash(&mut h);
     row.cors_origins.hash(&mut h);
     row.hotlink_allow_referers.hash(&mut h);
     timeout.hash(&mut h);
@@ -432,6 +437,7 @@ pub(crate) fn build(
         r.browser_ttl_seconds.hash(&mut h);
         r.ignore_query.hash(&mut h);
         r.ignore_cookie.hash(&mut h);
+        r.ignore_key_headers.hash(&mut h);
         r.match_content_type.hash(&mut h);
     }
     match &waf {
@@ -500,6 +506,7 @@ pub(crate) fn build(
         rate_limit_rps: rps,
         rate_limit_burst: burst,
         ignore_query_string: row.ignore_query_string,
+        cache_key_ignore_headers: row.cache_key_ignore_headers.clone(),
         cors_origins: row.cors_origins.clone(),
         hotlink_allow_referers: row.hotlink_allow_referers.clone(),
         origin_timeout_ms: timeout,

@@ -117,12 +117,17 @@ async fn process_task(state: &AppState, task: &PrefetchTaskRow, nodes: &[reposit
             "paths": [task.url_path],
             "headers": task.headers.0,
         });
+        let prefetch_timeout = std::env::var("PREFETCH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(300)
+            .clamp(30, 1800);
         match agent_http::request_json_timeout::<EdgePrefetchReply, _>(
             "POST",
             &url,
             &body,
             &token,
-            Duration::from_secs(60),
+            Duration::from_secs(prefetch_timeout),
         )
         .await
         {
