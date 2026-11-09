@@ -127,6 +127,7 @@ struct NativePlan {
 
 struct RangeFill {
     key: String,
+    raw_range: String,
 }
 
 enum RangeMsg {
@@ -137,6 +138,10 @@ enum RangeMsg {
 struct RangeSink {
     tx: tokio::sync::mpsc::UnboundedSender<RangeMsg>,
     offset: u64,
+    end: u64,
+    /// Origin bytes to discard before the cacheable window starts. This is
+    /// non-zero for a large suffix request where only the tail is cached.
+    skip: u64,
     queued: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -555,11 +560,11 @@ impl ProxyHttp for DataPlaneProxy {
                         if let Some(mut entry) = large.get_any(&plan.key).await {
                             let total = entry.content_length();
                             if let Some((start, end)) = parse_single_range(&raw_range, total) {
+                                let fresh = SystemTime::now()
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() <= entry.meta.fresh_until)
+                                    .unwrap_or(false);
                                 if entry.covers(start, end) {
-                                    let fresh = SystemTime::now()
-                                        .duration_since(SystemTime::UNIX_EPOCH)
-                                        .map(|d| d.as_secs() <= entry.meta.fresh_until)
-                                        .unwrap_or(false);
                                     if self
                                         .serve_large_range(
                                             session, &mut entry, start, end, total, &plan, fresh,
@@ -576,13 +581,36 @@ impl ProxyHttp for DataPlaneProxy {
                                         ctx.plan = Some(plan);
                                         return Ok(true);
                                     }
+                                } else if fresh {
+                                    if let Some(cached_end) = entry.meta.contiguous_end(start) {
+                                        if cached_end < end
+                                            && self
+                                                .serve_large_range_splice(
+                                                    session,
+                                                    &mut entry,
+                                                    start,
+                                                    cached_end,
+                                                    end,
+                                                    total,
+                                                    &plan,
+                                                )
+                                                .await
+                                        {
+                                            ctx.cache_label = "HIT";
+                                            ctx.cache_reason = Some("range-splice");
+                                            ctx.status = StatusCode::PARTIAL_CONTENT.as_u16();
+                                            ctx.plan = Some(plan);
+                                            return Ok(true);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    if range_fill_is_safe(&raw_range, self.state.range_fill_max_bytes) {
+                    if range_fill_is_candidate(&raw_range, self.state.range_fill_max_bytes) {
                         ctx.range_fill = Some(RangeFill {
                             key: plan.key.clone(),
+                            raw_range,
                         });
                         ctx.cache_label = "MISS";
                         ctx.cache_reason = Some("range-fill");
@@ -1040,54 +1068,98 @@ impl ProxyHttp for DataPlaneProxy {
                                 && !name.eq_ignore_ascii_case("x-lagran-cache-reason")
                                 && !name.eq_ignore_ascii_case("x-powered-by")
                         });
-                        if let Ok(decision) = decide_storage_reason(
-                            200,
-                            &hdrs,
-                            response_policy,
-                            self.state.default_ttl_secs,
+                        if let Some((fill_start, fill_end)) = fill_window(
+                            &fill.raw_range,
+                            start,
+                            end,
+                            total,
+                            self.state.range_fill_max_bytes,
                         ) {
-                            if let Some(writer) = large
-                                .begin_range(
-                                    &fill.key,
-                                    200,
-                                    hdrs,
-                                    total,
-                                    start,
-                                    end,
-                                    decision.ttl_secs,
-                                    decision.swr_secs,
-                                )
-                                .await
-                            {
-                                let (tx, mut rx) =
-                                    tokio::sync::mpsc::unbounded_channel::<RangeMsg>();
-                                let queued =
-                                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                                let writer_queued = queued.clone();
-                                tokio::spawn(async move {
-                                    let mut writer = writer;
-                                    while let Some(msg) = rx.recv().await {
-                                        match msg {
-                                            RangeMsg::Chunk(data) => {
-                                                writer_queued.fetch_sub(
-                                                    data.len() as u64,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
-                                                writer.write_all(&data).await;
-                                            }
-                                            RangeMsg::End => {
-                                                let _ = writer.commit().await;
-                                                break;
+                            if let Ok(decision) = decide_storage_reason(
+                                200,
+                                &hdrs,
+                                response_policy,
+                                self.state.default_ttl_secs,
+                            ) {
+                                if let Some(writer) = large
+                                    .begin_range(
+                                        &fill.key,
+                                        200,
+                                        hdrs,
+                                        total,
+                                        fill_start,
+                                        fill_end,
+                                        decision.ttl_secs,
+                                        decision.swr_secs,
+                                    )
+                                    .await
+                                {
+                                    let (tx, mut rx) =
+                                        tokio::sync::mpsc::unbounded_channel::<RangeMsg>();
+                                    let queued =
+                                        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                                    let writer_queued = queued.clone();
+                                    tokio::spawn(async move {
+                                        let mut writer = Some(writer);
+                                        let mut finished = false;
+                                        while let Some(msg) = rx.recv().await {
+                                            match msg {
+                                                RangeMsg::Chunk(data) => {
+                                                    writer_queued.fetch_sub(
+                                                        data.len() as u64,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if let Some(w) = writer.as_mut() {
+                                                        w.write_all(&data).await;
+                                                    }
+                                                }
+                                                RangeMsg::End => {
+                                                    // A short origin response or
+                                                    // client disconnect still
+                                                    // commits the bytes actually
+                                                    // received; the metadata
+                                                    // never marks it complete.
+                                                    if let Some(w) = writer.take() {
+                                                        let _ = w.commit_partial().await;
+                                                    }
+                                                    finished = true;
+                                                    break;
+                                                }
                                             }
                                         }
-                                    }
-                                });
-                                ctx.range_sink = Some(RangeSink {
-                                    tx,
-                                    offset: start,
-                                    queued,
-                                });
+                                        if !finished {
+                                            // Client disconnected or the writer
+                                            // queue overflowed. Preserve the
+                                            // completed prefix instead of
+                                            // discarding the whole fill.
+                                            if let Some(w) = writer.take() {
+                                                let _ = w.commit_partial().await;
+                                            }
+                                        }
+                                    });
+                                    ctx.range_sink = Some(RangeSink {
+                                        tx,
+                                        offset: fill_start,
+                                        end: fill_end,
+                                        skip: fill_start.saturating_sub(start),
+                                        queued,
+                                    });
+                                } else {
+                                    ctx.cache_reason = Some(if fill_end
+                                        .saturating_sub(fill_start)
+                                        .saturating_add(1)
+                                        > large.max_object_bytes()
+                                    {
+                                        "range-too-large"
+                                    } else {
+                                        "range-fill-skipped"
+                                    });
+                                }
+                            } else {
+                                ctx.cache_reason = Some("range-uncacheable");
                             }
+                        } else {
+                            ctx.cache_reason = Some("range-fill-skipped");
                         }
                     }
                 }
@@ -1104,23 +1176,41 @@ impl ProxyHttp for DataPlaneProxy {
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
         if let Some(sink) = ctx.range_sink.as_mut() {
+            let mut reached_fill_end = false;
             if let Some(chunk) = body.as_ref() {
-                let queued = sink
-                    .queued
-                    .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed)
-                    + chunk.len() as u64;
-                if queued > 64 * 1024 * 1024
-                    || sink.tx.send(RangeMsg::Chunk(chunk.clone())).is_err()
-                {
-                    // Disk writer is slower than the origin. Drop the fill
-                    // rather than growing an unbounded queue; the client body
-                    // is still forwarded unchanged.
-                    ctx.range_sink = None;
-                    return Ok(None);
+                // Only write bytes inside the planned fill window. For an
+                // open-ended video request the client keeps receiving the
+                // stream, but the cache stops at the bounded prefix.
+                let mut chunk_ref = chunk.as_ref();
+                if sink.skip > 0 {
+                    let discard = (sink.skip as usize).min(chunk_ref.len());
+                    chunk_ref = &chunk_ref[discard..];
+                    sink.skip -= discard as u64;
                 }
-                sink.offset = sink.offset.saturating_add(chunk.len() as u64);
+                let remaining = sink.end.saturating_sub(sink.offset).saturating_add(1);
+                let take = (chunk_ref.len() as u64).min(remaining) as usize;
+                if take > 0 {
+                    let data = if take == chunk_ref.len() {
+                        Bytes::copy_from_slice(chunk_ref)
+                    } else {
+                        Bytes::copy_from_slice(&chunk_ref[..take])
+                    };
+                    let queued = sink
+                        .queued
+                        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                        + data.len() as u64;
+                    if queued > 64 * 1024 * 1024 || sink.tx.send(RangeMsg::Chunk(data)).is_err() {
+                        // Disk writer is slower than the origin. Drop the fill
+                        // rather than growing an unbounded queue; the client
+                        // body is still forwarded unchanged.
+                        ctx.range_sink = None;
+                        return Ok(None);
+                    }
+                    sink.offset = sink.offset.saturating_add(take as u64);
+                }
+                reached_fill_end = sink.offset > sink.end;
             }
-            if end_of_stream {
+            if end_of_stream || reached_fill_end {
                 if let Some(sink) = ctx.range_sink.take() {
                     let _ = sink.tx.send(RangeMsg::End);
                 }
@@ -2184,6 +2274,275 @@ impl DataPlaneProxy {
         true
     }
 
+    /// Serve a Range from a cached contiguous prefix plus the origin for the
+    /// remaining bytes. This makes a second `Range: bytes=0-` request use the
+    /// cached prefix immediately while still returning the complete object.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_large_range_splice(
+        &self,
+        session: &mut Session,
+        entry: &mut crate::cache::large::LargeEntry,
+        start: u64,
+        cached_end: u64,
+        end: u64,
+        total: u64,
+        plan: &NativePlan,
+    ) -> bool {
+        let len = end.saturating_sub(start).saturating_add(1);
+        if len == 0 || len > usize::MAX as u64 || cached_end < start || cached_end >= end {
+            return false;
+        }
+        // The prefix must be identity-encoded to concatenate with an identity
+        // origin remainder. Compressed prefixes fall back to the normal path.
+        if entry.meta.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding")
+                && !value.eq_ignore_ascii_case("identity")
+                && !value.is_empty()
+        }) {
+            return false;
+        }
+        let remainder_start = cached_end.saturating_add(1);
+        let path_and_query = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+
+        let target = plan
+            .origins
+            .iter()
+            .find(|origin| origin.enabled)
+            .cloned()
+            .unwrap_or_else(|| OriginTarget {
+                url: plan.domain.origin_url.clone(),
+                weight: 100,
+                priority: 0,
+                enabled: true,
+                host_header: None,
+                sni: None,
+            });
+
+        let mut origin_headers = session.req_header().headers.clone();
+        for name in [
+            "if-range",
+            "if-none-match",
+            "if-modified-since",
+            "if-match",
+            "if-unmodified-since",
+        ] {
+            origin_headers.remove(name);
+        }
+        if let Ok(range) = HeaderValue::from_str(&format!("bytes={remainder_start}-{end}")) {
+            origin_headers.insert("range", range);
+        } else {
+            return false;
+        }
+        origin_headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+        // If the cached prefix has a validator, make the origin return 206 only
+        // when the object is still the same. A changed object returns 200 and
+        // this splice attempt falls back to the normal origin path.
+        for (name, value) in &entry.meta.headers {
+            if (name.eq_ignore_ascii_case("etag") || name.eq_ignore_ascii_case("last-modified"))
+                && !value.is_empty()
+            {
+                if let Ok(value) = HeaderValue::from_str(value) {
+                    origin_headers.insert("if-range", value);
+                }
+                break;
+            }
+        }
+        let origin_host = target
+            .host_header
+            .clone()
+            .or_else(|| target.sni.clone())
+            .or_else(|| parse_origin(&target.url).map(|(host, _, _)| host));
+        if let Some(host) = origin_host {
+            if let Ok(value) = HeaderValue::from_str(&host) {
+                origin_headers.insert(axum::http::header::HOST, value);
+            }
+        }
+        origin_auth::apply(
+            &mut origin_headers,
+            &plan.domain.origin_auth_header,
+            &plan.domain.origin_auth_value,
+        );
+
+        let idle_timeout =
+            Duration::from_millis(self.state.origin_stream_read_timeout_ms.max(1_000));
+        let origin = match tokio::time::timeout(
+            idle_timeout,
+            self.state.origin.request_stream_with_sni(
+                &target.url,
+                &Method::GET,
+                &path_and_query,
+                &origin_headers,
+                None,
+                true,
+                target.sni.as_deref(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            _ => return false,
+        };
+        if origin.status != StatusCode::PARTIAL_CONTENT {
+            return false;
+        }
+        if origin.headers.get("content-encoding").is_some_and(|value| {
+            value
+                .to_str()
+                .map(|v| !v.eq_ignore_ascii_case("identity") && !v.is_empty())
+                .unwrap_or(true)
+        }) {
+            return false;
+        }
+        let Some((origin_start, origin_end, origin_total)) = origin
+            .headers
+            .get("content-range")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range)
+        else {
+            return false;
+        };
+        if origin_total != total || origin_start > remainder_start || origin_end < end {
+            return false;
+        }
+
+        let Ok(mut response) =
+            ResponseHeader::build(StatusCode::PARTIAL_CONTENT.as_u16(), Some(len as usize))
+        else {
+            return false;
+        };
+        for (name, value) in &entry.meta.headers {
+            if name.eq_ignore_ascii_case(META_HEADER)
+                || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                || name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("content-range")
+                || name.eq_ignore_ascii_case("cache-status")
+                || is_hop_by_hop(name)
+            {
+                continue;
+            }
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                if response.append_header(name, value).is_err() {
+                    return false;
+                }
+            }
+        }
+        if response
+            .insert_header("content-range", format!("bytes {start}-{end}/{total}"))
+            .is_err()
+            || response
+                .insert_header("content-length", len.to_string())
+                .is_err()
+            || response.insert_header("accept-ranges", "bytes").is_err()
+            || response.insert_header("x-cache", "HIT").is_err()
+            || response.insert_header("x-cache-status", "HIT").is_err()
+            || response
+                .insert_header("x-lagran-cache-source", "l3+origin")
+                .is_err()
+            || response
+                .insert_header("x-lagran-cache-reason", "range-splice")
+                .is_err()
+        {
+            return false;
+        }
+        let mut final_headers = response.headers.clone();
+        apply_security_headers(&mut final_headers);
+        apply_cors_and_custom(&mut final_headers, &plan.cors, &plan.custom);
+        let _ = final_headers.insert("x-powered-by", HeaderValue::from_static("lagran-edge"));
+        for (name, value) in final_headers.iter() {
+            if response.insert_header(name.clone(), value.clone()).is_err() {
+                return false;
+            }
+        }
+        if entry.meta.stored_at > 0 {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = response.insert_header("age", now.saturating_sub(entry.meta.stored_at).to_string());
+            let _ = response.insert_header(
+                "x-lagran-cache-ttl",
+                entry.meta.fresh_until.saturating_sub(now).to_string(),
+            );
+        }
+        if session
+            .write_response_header(Box::new(response), false)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        const CHUNK: u64 = 8 * 1024 * 1024;
+        let mut pos = start;
+        while pos <= cached_end {
+            let want = (cached_end - pos + 1).min(CHUNK) as usize;
+            let Ok(Some(chunk)) = entry.read_at(pos, want).await else {
+                return true;
+            };
+            if chunk.is_empty() {
+                return true;
+            }
+            pos += chunk.len() as u64;
+            if session
+                .write_response_body(Some(chunk), false)
+                .await
+                .is_err()
+            {
+                return true;
+            }
+        }
+
+        let mut body = origin.body;
+        let mut remaining = end.saturating_sub(remainder_start).saturating_add(1);
+        let mut skip = remainder_start.saturating_sub(origin_start);
+        while remaining > 0 {
+            let frame = match tokio::time::timeout(idle_timeout, body.frame()).await {
+                Ok(Some(Ok(frame))) => frame,
+                _ => {
+                    tracing::warn!(key = %plan.key, "range splice origin body ended early");
+                    return true;
+                }
+            };
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            if data.is_empty() {
+                continue;
+            }
+            let mut data = data.as_ref();
+            if skip > 0 {
+                let discard = (skip as usize).min(data.len());
+                data = &data[discard..];
+                skip -= discard as u64;
+            }
+            if data.is_empty() {
+                continue;
+            }
+            let take = (data.len() as u64).min(remaining) as usize;
+            remaining -= take as u64;
+            let done = remaining == 0;
+            if session
+                .write_response_body(Some(Bytes::copy_from_slice(&data[..take])), done)
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            if done {
+                break;
+            }
+        }
+        true
+    }
+
     async fn handle_management(&self, session: &mut Session, path: &str) -> Result<bool> {
         let method = session.req_header().method.clone();
         let expected = self.state.agent_token.as_str();
@@ -2937,11 +3296,10 @@ fn parse_content_range(raw: &str) -> Option<(u64, u64, u64)> {
     (start <= end && end < total).then_some((start, end, total))
 }
 
-/// Only fill bounded, reasonably small ranges into the large cache.
-/// Chrome usually starts a video with `Range: bytes=0-`; filling the entire
-/// 700MB+ object on the first play would compete with the client stream and
-/// can fill the disk. Open-ended ranges are proxied but not cached this way.
-fn range_fill_is_safe(raw: &str, max_fill_bytes: u64) -> bool {
+/// Whether a single Range request is worth attempting to fill. The actual
+/// cached window is chosen later from the origin `Content-Range`, because an
+/// open-ended `bytes=start-` does not reveal the object size at request time.
+fn range_fill_is_candidate(raw: &str, max_fill_bytes: u64) -> bool {
     if max_fill_bytes == 0 {
         return false;
     }
@@ -2954,10 +3312,96 @@ fn range_fill_is_safe(raw: &str, max_fill_bytes: u64) -> bool {
     let Some((start, end)) = value.split_once('-') else {
         return false;
     };
-    let (Ok(start), Ok(end)) = (start.trim().parse::<u64>(), end.trim().parse::<u64>()) else {
+    let (start, end) = (start.trim(), end.trim());
+    if start.is_empty() && end.is_empty() {
         return false;
+    }
+    if !start.is_empty() && start.parse::<u64>().is_err() {
+        return false;
+    }
+    if !end.is_empty() && end.parse::<u64>().is_err() {
+        return false;
+    }
+    true
+}
+
+/// Select the cacheable byte window for a Range response.
+///
+/// - bounded ranges: only when the requested span is <= max_fill_bytes
+/// - open-ended `bytes=start-`: cache up to max_fill_bytes from start
+/// - suffix `bytes=-N`: cache the last min(N, max_fill_bytes) bytes
+///
+/// The returned window must be covered by the origin `Content-Range` already
+/// received. Leaving a Range uncached is always allowed.
+fn fill_window(
+    raw: &str,
+    origin_start: u64,
+    origin_end: u64,
+    total: u64,
+    max_fill_bytes: u64,
+) -> Option<(u64, u64)> {
+    if max_fill_bytes == 0 || total == 0 || origin_start > origin_end || origin_end >= total {
+        return None;
+    }
+    let value = raw.trim().strip_prefix("bytes=")?;
+    if value.contains(',') {
+        return None;
+    }
+    let (start, end) = value.split_once('-')?;
+    let (start, end) = (start.trim(), end.trim());
+
+    let (fill_start, fill_end) = if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        if suffix >= total {
+            (0, total - 1)
+        } else {
+            (total - suffix, total - 1)
+        }
+    } else {
+        let start = start.parse::<u64>().ok()?;
+        if start >= total {
+            return None;
+        }
+        let requested_end = if end.is_empty() {
+            total - 1
+        } else {
+            end.parse::<u64>().ok()?.min(total - 1)
+        };
+        if requested_end < start {
+            return None;
+        }
+        (start, requested_end)
     };
-    end >= start && end.saturating_sub(start).saturating_add(1) <= max_fill_bytes
+
+    let requested_len = fill_end.saturating_sub(fill_start).saturating_add(1);
+    let (fill_start, fill_end) = if requested_len <= max_fill_bytes {
+        (fill_start, fill_end)
+    } else if start.is_empty() {
+        // A huge suffix request is effectively "the whole object"; cache its
+        // tail rather than the entire file.
+        (total.saturating_sub(max_fill_bytes), total - 1)
+    } else if end.is_empty() {
+        // Open-ended video/audio: cache a bounded prefix. The client still
+        // receives the complete stream from origin.
+        (
+            fill_start,
+            fill_start
+                .saturating_add(max_fill_bytes)
+                .saturating_sub(1)
+                .min(total - 1),
+        )
+    } else {
+        // A large bounded Range is left uncached to avoid a huge one-shot fill.
+        return None;
+    };
+
+    if fill_start < origin_start || fill_end > origin_end || fill_end < fill_start {
+        return None;
+    }
+    Some((fill_start, fill_end))
 }
 
 fn parse_single_range(raw: &str, total: u64) -> Option<(u64, u64)> {
@@ -3208,7 +3652,10 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 
 #[cfg(test)]
 mod tests {
-    use super::{head_content_length_for_protocol, parse_single_range, range_fill_is_safe, valid_release_tag};
+    use super::{
+        fill_window, head_content_length_for_protocol, parse_single_range,
+        range_fill_is_candidate, valid_release_tag,
+    };
 
     #[test]
     fn release_tag_validation() {
@@ -3228,13 +3675,49 @@ mod tests {
     }
 
     #[test]
-    fn only_small_bounded_ranges_fill_large_cache() {
-        assert!(range_fill_is_safe("bytes=0-1023", 32 * 1024 * 1024));
-        assert!(range_fill_is_safe("bytes=0-1048575", 32 * 1024 * 1024));
-        assert!(!range_fill_is_safe("bytes=0-", 32 * 1024 * 1024));
-        assert!(!range_fill_is_safe("bytes=-512", 32 * 1024 * 1024));
-        assert!(!range_fill_is_safe("bytes=0-33554432", 32 * 1024 * 1024));
-        assert!(!range_fill_is_safe("bytes=0-1023", 0));
+    fn range_fill_candidates_include_open_ended_and_suffix() {
+        let max = 32 * 1024 * 1024;
+        assert!(range_fill_is_candidate("bytes=0-1023", max));
+        assert!(range_fill_is_candidate("bytes=0-1048575", max));
+        assert!(range_fill_is_candidate("bytes=0-", max));
+        assert!(range_fill_is_candidate("bytes=-512", max));
+        assert!(!range_fill_is_candidate("bytes=0-1,4-5", max));
+        assert!(!range_fill_is_candidate("bytes=-", max));
+        assert!(!range_fill_is_candidate("bytes=0-1023", 0));
+    }
+
+    #[test]
+    fn fill_window_caps_open_ended_video_and_suffix() {
+        let max = 32 * 1024 * 1024;
+        let total = 100 * 1024 * 1024;
+        assert_eq!(
+            fill_window("bytes=0-", 0, total - 1, total, max),
+            Some((0, max - 1))
+        );
+        assert_eq!(
+            fill_window("bytes=10-", 0, total - 1, total, max),
+            Some((10, 10 + max - 1))
+        );
+        assert_eq!(
+            fill_window("bytes=-512", total - 512, total - 1, total, max),
+            Some((total - 512, total - 1))
+        );
+        assert_eq!(
+            fill_window(&format!("bytes=-{total}"), 0, total - 1, total, max),
+            Some((total - max, total - 1))
+        );
+        assert_eq!(
+            fill_window("bytes=0-1048575", 0, 1048575, total, max),
+            Some((0, 1048575))
+        );
+        assert_eq!(
+            fill_window("bytes=0-33554432", 0, 33554432, total, max),
+            None
+        );
+        assert_eq!(
+            fill_window("bytes=0-", 0, max - 2, total, max),
+            None
+        );
     }
 
     #[test]

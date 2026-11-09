@@ -1,20 +1,21 @@
 //! Disk-backed cache for large objects.
 //!
 //! Unlike `CacheEntry`, this store never buffers the full object in memory:
-//! origin bytes are streamed into a temporary file and a reader streams the
-//! committed file back in bounded chunks. It intentionally supports complete
-//! objects first (Phase 2); partial/Range chunk caching can build on the same
-//! sidecar metadata later.
+//! origin bytes are streamed into a sparse file and a reader streams committed
+//! ranges back in bounded chunks. The sidecar records inclusive byte segments,
+//! so bounded Range responses, open-ended prefixes and suffix tails can be
+//! served independently without treating a partial object as complete.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::policy::stable_hash_str;
 
@@ -37,6 +38,31 @@ pub struct LargeMeta {
 impl LargeMeta {
     pub fn covers(&self, start: u64, end: u64) -> bool {
         self.complete || self.segments.iter().any(|(s, e)| *s <= start && *e >= end)
+    }
+
+    /// Bytes resident in the sparse data file, not the sparse file's logical
+    /// length. This keeps eviction fair when a 700 MB video only has a 32 MiB
+    /// prefix cached.
+    pub fn stored_bytes(&self) -> u64 {
+        if self.complete {
+            return self.content_length;
+        }
+        self.segments
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start).saturating_add(1))
+            .sum()
+    }
+
+    /// End of the cached contiguous run that contains start, if any.
+    /// Used to splice a cached prefix with an origin remainder.
+    pub fn contiguous_end(&self, start: u64) -> Option<u64> {
+        if self.complete {
+            return self.content_length.checked_sub(1);
+        }
+        self.segments
+            .iter()
+            .find(|(s, e)| *s <= start && *e >= start)
+            .map(|(_, e)| *e)
     }
 }
 
@@ -81,6 +107,7 @@ pub struct LargeWriter {
     failed: bool,
     fresh_secs: u64,
     swr_secs: u64,
+    _range_guard: OwnedMutexGuard<()>,
 }
 
 impl LargeWriter {
@@ -116,14 +143,17 @@ impl LargeWriter {
             self.abort().await;
             return false;
         }
-        let old_len = fs::metadata(&self.data_path)
+        let old_meta_len = fs::metadata(&self.meta_path)
             .await
             .map(|m| m.len())
-            .unwrap_or(0)
-            + fs::metadata(&self.meta_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
+            .unwrap_or(0);
+        let old_stored = fs::read(&self.meta_path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<LargeMeta>(&bytes).ok())
+            .map(|meta| meta.stored_bytes())
+            .unwrap_or(0);
+        let old_len = old_stored + old_meta_len;
         if fs::rename(&self.temp_path, &self.data_path).await.is_err() {
             let _ = fs::remove_file(&self.temp_path).await;
             return false;
@@ -173,8 +203,8 @@ impl Drop for LargeWriter {
 }
 
 /// Writes one byte range (normally from an origin 206 response) into an
-/// existing or new partial object. Only fully received ranges are recorded in
-/// the sidecar metadata.
+/// existing or new partial object. Only bytes actually written are recorded in
+/// the sidecar metadata; a disconnected client can leave a committed prefix.
 pub struct RangeWriter {
     cache: Arc<LargeCache>,
     meta: LargeMeta,
@@ -186,8 +216,10 @@ pub struct RangeWriter {
     written: u64,
     new_entry: bool,
     committed: bool,
+    start_stored: u64,
     fresh_secs: u64,
     swr_secs: u64,
+    _range_guard: OwnedMutexGuard<()>,
 }
 
 impl RangeWriter {
@@ -200,9 +232,33 @@ impl RangeWriter {
         }
     }
 
-    pub async fn commit(mut self) -> bool {
+    /// Commit only when the complete planned range was received.
+    pub async fn commit(self) -> bool {
         let expected = self.end - self.start + 1;
         if self.written != expected {
+            let mut writer = self;
+            writer.abort().await;
+            return false;
+        }
+        let written = self.written;
+        self.finish(written).await
+    }
+
+    /// Commit a prefix received before the client disconnected or the fill
+    /// queue overflowed. Only bytes actually written are recorded, so a
+    /// truncated range is never advertised as complete.
+    pub async fn commit_partial(self) -> bool {
+        if self.written == 0 {
+            let mut writer = self;
+            writer.abort().await;
+            return false;
+        }
+        let written = self.written;
+        self.finish(written).await
+    }
+
+    async fn finish(mut self, written: u64) -> bool {
+        if written == 0 {
             self.abort().await;
             return false;
         }
@@ -210,7 +266,8 @@ impl RangeWriter {
             self.abort().await;
             return false;
         }
-        self.meta.segments.push((self.start, self.end));
+        let segment_end = self.start.saturating_add(written).saturating_sub(1);
+        self.meta.segments.push((self.start, segment_end));
         self.meta.segments.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.meta.segments.len());
         for (start, end) in self.meta.segments.drain(..) {
@@ -238,12 +295,16 @@ impl RangeWriter {
             self.abort().await;
             return false;
         }
+        let stored = self.meta.stored_bytes();
         if self.new_entry {
-            self.cache.used_bytes.fetch_add(
-                self.meta.content_length + meta_bytes.len() as u64,
-                Ordering::Relaxed,
-            );
+            self.cache
+                .used_bytes
+                .fetch_add(stored + meta_bytes.len() as u64, Ordering::Relaxed);
             self.cache.entries.fetch_add(1, Ordering::Relaxed);
+        } else if stored > self.start_stored {
+            self.cache
+                .used_bytes
+                .fetch_add(stored - self.start_stored, Ordering::Relaxed);
         }
         self.committed = true;
         self.cache.evict_overflow().await;
@@ -275,6 +336,9 @@ pub struct LargeCache {
     used_bytes: AtomicU64,
     entries: AtomicUsize,
     evict_lock: Mutex<()>,
+    /// One active range writer per object. A second request on the same key
+    /// streams from origin normally instead of racing the sparse file/meta.
+    range_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl LargeCache {
@@ -311,6 +375,7 @@ impl LargeCache {
             used_bytes: AtomicU64::new(used),
             entries: AtomicUsize::new(count),
             evict_lock: Mutex::new(()),
+            range_locks: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -365,9 +430,9 @@ impl LargeCache {
         let meta_bytes = fs::read(&meta_path).await.ok()?;
         let meta: LargeMeta = serde_json::from_slice(&meta_bytes).ok()?;
         if meta.key != key || now_unix() > meta.stale_until {
-            let data_len = fs::metadata(&data_path).await.map(|m| m.len()).unwrap_or(0);
+            let stored = meta.stored_bytes();
             if fs::remove_file(&data_path).await.is_ok() {
-                self.release_bytes(data_len + meta_bytes.len() as u64);
+                self.release_bytes(stored + meta_bytes.len() as u64);
                 self.entries
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         Some(n.saturating_sub(1))
@@ -432,10 +497,16 @@ impl LargeCache {
             .await
             .map(|m| m.len())
             .unwrap_or(0);
+        let stored = fs::read(&meta_path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<LargeMeta>(&bytes).ok())
+            .map(|meta| meta.stored_bytes())
+            .unwrap_or(data_len);
         let data_removed = fs::remove_file(&data_path).await.is_ok();
         let meta_removed = fs::remove_file(&meta_path).await.is_ok();
         if data_removed || meta_removed {
-            self.release_bytes(data_len + meta_len);
+            self.release_bytes(stored + meta_len);
             self.entries
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     Some(n.saturating_sub(1))
@@ -463,6 +534,15 @@ impl LargeCache {
         if fs::create_dir_all(parent).await.is_err() {
             return None;
         }
+        let key_lock = {
+            let mut locks = self.range_locks.lock().await;
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            locks
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let range_guard = key_lock.try_lock_owned().ok()?;
         let temp_path = parent.join(format!(
             "{}.part.{}.{}",
             data_path.file_stem()?.to_string_lossy(),
@@ -502,6 +582,7 @@ impl LargeCache {
             failed: false,
             fresh_secs: fresh,
             swr_secs,
+            _range_guard: range_guard,
         })
     }
 
@@ -517,9 +598,10 @@ impl LargeCache {
         swr_secs: u64,
     ) -> Option<RangeWriter> {
         if content_length == 0
-            || !self.accepts(content_length)
+            || content_length < self.min_object_bytes
             || start > end
             || end >= content_length
+            || end.saturating_sub(start).saturating_add(1) > self.max_object_bytes
         {
             return None;
         }
@@ -528,6 +610,15 @@ impl LargeCache {
         if fs::create_dir_all(parent).await.is_err() {
             return None;
         }
+        let key_lock = {
+            let mut locks = self.range_locks.lock().await;
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            locks
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let range_guard = key_lock.try_lock_owned().ok()?;
         let data_ok = fs::metadata(&data_path)
             .await
             .map(|m| m.len() >= content_length)
@@ -548,6 +639,7 @@ impl LargeCache {
             let _ = fs::remove_file(&data_path).await;
             let _ = fs::remove_file(&meta_path).await;
         }
+        let start_stored = existing.as_ref().map(LargeMeta::stored_bytes).unwrap_or(0);
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -584,8 +676,10 @@ impl LargeCache {
             written: 0,
             new_entry,
             committed: false,
+            start_stored,
             fresh_secs: fresh,
             swr_secs,
+            _range_guard: range_guard,
         })
     }
 
@@ -625,16 +719,15 @@ impl LargeCache {
                         .trim_end_matches(".meta.json")
                         .to_string();
                     let data = PathBuf::from(format!("{base}.data"));
-                    victims.push((path, data, bytes.len() as u64));
+                    victims.push((path, data, meta.stored_bytes(), bytes.len() as u64));
                 }
             }
         }
         let mut n = 0;
-        for (meta, data, meta_len) in victims {
-            let data_len = fs::metadata(&data).await.map(|m| m.len()).unwrap_or(0);
+        for (meta, data, stored, meta_len) in victims {
             if fs::remove_file(&data).await.is_ok() || fs::remove_file(&meta).await.is_ok() {
                 n += 1;
-                self.release_bytes(data_len + meta_len);
+                self.release_bytes(stored + meta_len);
                 self.entries
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         Some(n.saturating_sub(1))
@@ -704,8 +797,14 @@ impl LargeCache {
             let meta = data.with_extension("meta.json");
             let data_len = fs::metadata(&data).await.map(|m| m.len()).unwrap_or(0);
             let meta_len = fs::metadata(&meta).await.map(|m| m.len()).unwrap_or(0);
+            let stored = fs::read(&meta)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<LargeMeta>(&bytes).ok())
+                .map(|row| row.stored_bytes())
+                .unwrap_or(data_len);
             if fs::remove_file(&data).await.is_ok() {
-                freed += data_len + meta_len;
+                freed += stored + meta_len;
                 victims += 1;
             }
             let _ = fs::remove_file(&meta).await;
@@ -787,7 +886,8 @@ async fn cleanup_stale_parts(root: &Path, max_age_secs: u64) -> anyhow::Result<u
     Ok(removed)
 }
 
-async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {    let mut total = 0u64;
+async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {
+    let mut total = 0u64;
     let mut count = 0usize;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -799,12 +899,23 @@ async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {    let mut to
             let path = ent.path();
             if ft.is_dir() {
                 stack.push(path);
-            } else if let Ok(meta) = ent.metadata().await {
-                total += meta.len();
-                if path.extension().is_some_and(|e| e == "data") {
-                    count += 1;
-                }
+                continue;
             }
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".meta.json"))
+            {
+                continue;
+            }
+            let Ok(meta_bytes) = fs::read(&path).await else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<LargeMeta>(&meta_bytes) else {
+                continue;
+            };
+            total += meta.stored_bytes() + meta_bytes.len() as u64;
+            count += 1;
         }
     }
     Ok((total, count))
@@ -814,6 +925,26 @@ async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {    let mut to
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn contiguous_segments_expose_splice_boundary() {
+        let meta = LargeMeta {
+            key: "GET:video.test:/movie.mp4".into(),
+            status: 206,
+            headers: Vec::new(),
+            content_length: 1024,
+            fresh_until: u64::MAX,
+            stale_until: u64::MAX,
+            stored_at: 0,
+            complete: false,
+            segments: vec![(0, 255), (512, 767)],
+        };
+        assert_eq!(meta.contiguous_end(0), Some(255));
+        assert_eq!(meta.contiguous_end(128), Some(255));
+        assert_eq!(meta.contiguous_end(256), None);
+        assert_eq!(meta.contiguous_end(600), Some(767));
+        assert_eq!(meta.stored_bytes(), 512);
+    }
 
     #[tokio::test]
     async fn streams_complete_object_and_purges() {
@@ -880,6 +1011,70 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         writer.write_all(&vec![1_u8; 1024 * 1024]).await;
         assert!(writer.commit().await);
+        assert!(cache.get(key).await.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn partial_range_allows_object_above_complete_object_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-large-object-partial-test-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = LargeCache::open(&dir, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let key = "GET:video.test:/huge.mp4";
+        let total = 8_u64 * 1024 * 1024;
+        assert!(cache
+            .begin(key, 200, Vec::new(), total, 60, 0)
+            .await
+            .is_none());
+        let mut writer = cache
+            .begin_range(key, 206, Vec::new(), total, 0, 1024 * 1024 - 1, 60, 0)
+            .await
+            .expect("partial range above complete-object limit");
+        writer.write_all(&vec![9_u8; 1024 * 1024]).await;
+        assert!(writer.commit().await);
+        let mut entry = cache.get_any(key).await.expect("partial entry");
+        assert!(entry.covers(0, 1024 * 1024 - 1));
+        assert_eq!(entry.read_at(0, 8).await.unwrap().unwrap()[..], [9_u8; 8]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn interrupted_range_commits_only_completed_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-partial-prefix-test-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = LargeCache::open(&dir, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let key = "GET:video.test:/interrupted.mp4";
+        let total = 2_u64 * 1024 * 1024;
+        let mut writer = cache
+            .begin_range(key, 206, Vec::new(), total, 0, total - 1, 60, 0)
+            .await
+            .expect("writer");
+        writer.write_all(&vec![4_u8; 1024 * 1024]).await;
+        assert!(writer.commit_partial().await);
+
+        let mut entry = cache.get_any(key).await.expect("partial entry");
+        assert!(entry.covers(0, 1024 * 1024 - 1));
+        assert!(!entry.covers(0, total - 1));
+        assert_eq!(entry.read_at(0, 16).await.unwrap().unwrap()[..], [4_u8; 16]);
+
+        let mut rest = cache
+            .begin_range(key, 206, Vec::new(), total, 1024 * 1024, total - 1, 60, 0)
+            .await
+            .expect("rest writer");
+        rest.write_all(&vec![5_u8; 1024 * 1024]).await;
+        assert!(rest.commit().await);
         assert!(cache.get(key).await.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }

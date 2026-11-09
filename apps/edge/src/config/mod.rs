@@ -79,8 +79,10 @@ pub struct EdgeConfig {
     /// Idle read timeout for Range/media streaming. Longer than the normal
     /// origin read timeout so slow video origins do not become 504s.
     pub origin_stream_read_timeout_ms: u64,
-    /// Maximum bounded Range size that will be written into the large cache.
-    /// Open-ended video ranges are always proxied without filling.
+    /// Maximum bytes written into the large cache from one Range response.
+    /// Bounded ranges larger than this are proxied without filling; an
+    /// open-ended video range fills a bounded prefix, and a suffix range fills
+    /// the tail, both up to this limit.
     pub range_fill_max_bytes: u64,
     /// Downstream HTTP/1.1 keepalive idle timeout.
     pub downstream_keepalive_secs: u64,
@@ -94,6 +96,9 @@ pub struct EdgeConfig {
     pub large_cache_enabled: bool,
     pub large_cache_dir: String,
     pub large_cache_min_object_bytes: u64,
+    /// Maximum complete object admitted to the large cache. Partial Range
+    /// windows are still admitted for larger objects, limited by
+    /// `range_fill_max_bytes`, because only the written segments occupy disk.
     pub large_cache_max_object_bytes: u64,
     pub large_cache_max_bytes: u64,
     /// How often the edge pulls domain config from control (seconds).

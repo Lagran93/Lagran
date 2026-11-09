@@ -960,7 +960,7 @@ Control 的 CONTROL_PUBLIC_URL
 | `CACHE_L2_READ_TIMEOUT_MS` | Redis L2 读超时，默认 250ms；跨区域时适当增大 |
 | `ORIGIN_READ_TIMEOUT_MS` | 回源读取空闲超时，默认 30000；流媒体不会因总时长被中断 |
 | `ORIGIN_STREAM_READ_TIMEOUT_MS` | Range/流媒体的回源读取空闲超时，默认 120000；避免视频首字节慢导致 504 |
-| `RANGE_FILL_MAX_BYTES` | 允许写入大缓存的单段 Range 上限，默认 32 MiB；开放式 `bytes=0-` 不填充 |
+| `RANGE_FILL_MAX_BYTES` | 单次 Range 写入大缓存的上限，默认 32 MiB；开放式缓存前缀，后缀缓存尾部 |
 | `DOWNSTREAM_KEEPALIVE_SECS` | 下游 HTTP/1.1 keepalive 空闲超时，默认 60 |
 | `DOWNSTREAM_H2_IDLE_SECS` | 下游 HTTP/2 空闲超时，默认 120 |
 | `DOWNSTREAM_KEEPALIVE_REQUESTS` | 单连接最大请求数，默认 1000 |
@@ -1567,7 +1567,7 @@ Pragma: no-cache
 | 项目 | 普通缓存 | 大对象缓存 |
 |---|---|---|
 | 存储 | 内存/磁盘 | 独立磁盘流式 |
-| 单对象上限 | `MAX_CACHEABLE_BODY` | `LARGE_CACHE_MAX_OBJECT_BYTES` |
+| 单对象上限 | `MAX_CACHEABLE_BODY` | `LARGE_CACHE_MAX_OBJECT_BYTES`（完整对象；Range 片段可例外） |
 | 最小阈值 | 无 | `LARGE_CACHE_MIN_OBJECT_BYTES` |
 | 完整 GET | 是 | 需要 `complete=true` |
 | Range | 完整对象切片 | partial segment |
@@ -1586,8 +1586,8 @@ LARGE_CACHE_MAX_BYTES=21474836480
 
 大缓存写入要求：
 
-- 完整对象：状态码 `200`、存在 `Content-Length`、对象大小在阈值范围内
-- Partial Range：源站返回 `206`、`Content-Range`、`Content-Length`
+- 完整对象：状态码 `200`、存在 `Content-Length`、对象大小在 `LARGE_CACHE_MIN_OBJECT_BYTES .. LARGE_CACHE_MAX_OBJECT_BYTES` 范围内
+- Partial Range：源站返回 `206`、`Content-Range`、`Content-Length`；对象总大小可以超过 `LARGE_CACHE_MAX_OBJECT_BYTES`，只要单次缓存窗口不超过 `RANGE_FILL_MAX_BYTES`
 - 响应可缓存：无 `Set-Cookie`、无 `no-store/private`、`Vary` 受支持
 - 请求没有触发 Cookie/Authorization/no-store bypass
 - 磁盘目录可写、容量足够
@@ -1601,7 +1601,8 @@ Range 请求
   → 大缓存有覆盖该区间的 segment？
       ├─ 有：HIT，直接读磁盘返回 206
       └─ 无：透传源站 206
-             → 后台把该区间写入 .data
+             → 后台按分段写入稀疏 .data
+             → 只提交完整收到的字节段
              → 更新 segments
 ```
 
@@ -1624,11 +1625,23 @@ X-Cache: HIT
 
 ```json
 {
-  "content_length": 35800956,
+  "content_length": 748814277,
   "complete": false,
-  "segments": [[0, 1023]]
+  "segments": [[0, 33554431], [734003200, 748814276]]
 }
 ```
+
+这里表示：
+
+```text
+已缓存前 32 MiB
+已缓存最后约 14 MiB
+中间未缓存
+```
+
+开放式 Range 只缓存前缀，后缀 Range 只缓存尾部；带明确范围且不超过 `RANGE_FILL_MAX_BYTES` 的 Range 会缓存完整区间。客户端断开时，已经完整落盘的前缀仍会保留，但 `complete` 保持 `false`。
+
+同一对象同时只允许一个 Range 写入者，避免多个请求并发写同一个稀疏 `.data` 文件导致元数据交错。
 
 要求：
 
@@ -1644,6 +1657,69 @@ Partial 对象不能响应完整 GET。完整 GET 需要：
 "complete": true
 ```
 
+#### 稀疏文件与 `ls` 显示大小
+
+大缓存 `.data` 文件使用稀疏文件：
+
+```text
+逻辑长度 = content_length
+实际磁盘块 = 已写入 segment 覆盖的字节
+```
+
+因此：
+
+```bash
+ls -la 27557ef1a93d2e85.data
+```
+
+显示的：
+
+```text
+748814277
+```
+
+是**逻辑长度**，不是实际磁盘占用。
+
+目录中的 `total` 更能反映实际块占用，例如：
+
+```text
+total 4768
+```
+
+约等于：
+
+```text
+segments 覆盖的字节数
++ 文件系统块开销
+```
+
+检查实际占用：
+
+```bash
+du -h 27557ef1a93d2e85.data
+du -h --apparent-size 27557ef1a93d2e85.data
+ls -lsh 27557ef1a93d2e85.data
+stat -c 'size=%s blocks=%b block_size=%B' 27557ef1a93d2e85.data
+```
+
+示例：
+
+```text
+size     = 748814277   逻辑大小
+blocks   = 已分配的 512B 块数量
+实际字节 ≈ blocks × 512
+```
+
+不要把 `.data` 文件复制成非稀疏文件；备份时使用：
+
+```bash
+cp --sparse=always
+rsync --sparse
+tar --sparse
+```
+
+否则会实际占用完整逻辑大小。
+
 ### 5.9 视频 Range 与 504 优化
 
 Chrome、DPlayer 等播放器常见的请求：
@@ -1658,9 +1734,131 @@ Edge 的策略：
 
 ```text
 开放式 Range
-  → 直接透传源站
-  → 不启动大缓存填充
-  → 客户端边下边播
+  → 客户端继续从源站边下边播
+  → 同时只把前 N 字节写入大缓存
+  → 不等待整个视频下载完成
+```
+
+例如：
+
+```http
+Range: bytes=0-
+```
+
+不会缓存完整 700 MB 视频，而是缓存前：
+
+```text
+RANGE_FILL_MAX_BYTES
+```
+
+个字节。客户端仍会收到完整响应，不受缓存上限影响。
+
+后续播放器如果请求：
+
+```http
+Range: bytes=1048576-2097151
+```
+
+且该区间已在前缀片段内，则直接命中大缓存。
+
+`RANGE_FILL_MAX_BYTES` 是单次写入的**上限**，不是每次都会缓存这么多。实际 segment 大小取决于：
+
+```text
+客户端实际请求的 Range
+源站实际返回的 Content-Range
+客户端是否在达到上限前停止读取或断开
+```
+
+因此看到：
+
+```json
+"segments": [[0, 83746]]
+```
+
+是正常现象：播放器可能只请求了前 83,747 字节作为 MP4 头部，或在 32 MiB 前就断开了。它不会为了凑满 32 MiB 继续向源站读取。
+
+带明确结束位置且不超过上限的 Range 会完整缓存：
+
+```http
+Range: bytes=0-1048575
+```
+
+后缀 Range 只缓存尾部：
+
+```http
+Range: bytes=-1048576
+```
+
+上限：
+
+```env
+RANGE_FILL_MAX_BYTES=33554432
+```
+
+大缓存使用稀疏文件保存对象，并在 sidecar 元数据中记录已完成的字节段：
+
+```json
+{
+  "content_length": 748814277,
+  "complete": false,
+  "segments": [[0, 33554431]]
+}
+```
+
+只有完整落盘的片段才会出现在 `segments` 中；客户端中断时，已完成的前缀仍会保留，不会被标记为完整对象。
+
+说明：
+
+```text
+开放式 Range 本身仍需要源站补齐剩余区间
+因为缓存中只有前缀
+但前缀部分不再重复从源站下载
+```
+
+## 前缀 + 源站剩余区间拼接
+
+当同一对象已有可用的连续前缀时，Edge 会把请求拆成两段：
+
+```text
+客户端 Range: bytes=0-
+
+  [0 .. cached_end]      从 L3 大缓存读取
+  [cached_end+1 .. end]  向源站请求剩余区间
+  → 合并为一个 206 响应
+```
+
+响应头示例：
+
+```http
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 0-748814276/748814277
+X-Cache: HIT
+X-Lagran-Cache-Source: l3+origin
+X-Lagran-Cache-Reason: range-splice
+```
+
+特点：
+
+```text
+前缀从磁盘读取，降低源站回源字节数
+剩余区间按流式转发，不把完整对象读入内存
+如果缓存前缀带 ETag / Last-Modified，会带 If-Range 校验对象未变化
+源站返回 200（对象已变化）时回退普通回源
+缓存内容带非 identity Content-Encoding 时不做拼接
+```
+
+拼接仍有源站请求，因此不是“纯缓存命中”；它优化的是：
+
+```text
+已经缓存的前缀不再重复下载
+播放器 seek 回到开头时首段从磁盘返回，不再重复下载
+```
+
+仍需注意：
+
+```text
+多段 Range 不拼接
+源站不支持 Range 时不拼接
 ```
 
 原因：
@@ -1669,18 +1867,6 @@ Edge 的策略：
 视频文件可能数百 MB
 首次播放就写入完整大缓存会与客户端读取竞争磁盘
 还可能写满缓存目录或拖慢其他请求
-```
-
-只有有明确结束位置且大小受限的 Range 才会填充：
-
-```http
-Range: bytes=0-1048575
-```
-
-上限：
-
-```env
-RANGE_FILL_MAX_BYTES=33554432
 ```
 
 流媒体读取超时单独配置：
