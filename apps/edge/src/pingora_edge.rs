@@ -8,6 +8,7 @@
 //! WebSocket) are handed to the in-process handler.
 
 use crate::cache::CacheSource;
+use crate::origin_dns::OriginDnsCache;
 use crate::cache::policy::{
     apply_key_ignore_default, compute_etag, decide_storage_reason, request_bypass_reason_headers,
     resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
@@ -51,6 +52,7 @@ use pingora_cache::{
     RespCacheable,
 };
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -162,8 +164,10 @@ struct ReqCtx {
     cache_age_secs: Option<u64>,
     cache_ttl_secs: Option<u64>,
     status: u16,
-    attempt: u8,
+    attempt: usize,
     origin_order: Vec<String>,
+    current_addresses: Vec<SocketAddr>,
+    current_address_index: usize,
     current_origin: String,
     current_host_header: String,
     response_bypass: bool,
@@ -196,6 +200,8 @@ impl Default for ReqCtx {
             status: 0,
             attempt: 0,
             origin_order: Vec::new(),
+            current_addresses: Vec::new(),
+            current_address_index: 0,
             current_origin: String::new(),
             current_host_header: String::new(),
             response_bypass: false,
@@ -219,6 +225,7 @@ struct DataPlaneProxy {
     management_on_data: bool,
     /// Weighted round-robin seed for origin selection.
     origin_counter: std::sync::atomic::AtomicU64,
+    dns_cache: OriginDnsCache,
 }
 
 #[async_trait]
@@ -727,45 +734,64 @@ impl ProxyHttp for DataPlaneProxy {
     ) -> Result<Box<HttpPeer>> {
         let plan = ctx
             .plan
-            .as_ref()
+            .clone()
             .ok_or_else(|| pingora::Error::new_str("native plan missing"))?;
         if ctx.origin_order.is_empty() {
-            let order = self.origin_order(&ctx.host, plan).await;
+            let order = self.origin_order(&ctx.host, &plan).await;
             if order.is_empty() {
                 return Err(pingora::Error::new_str("no origin available"));
             }
             ctx.origin_order = order.into_iter().map(|o| o.url).collect();
         }
-        let index = (ctx.attempt as usize).min(ctx.origin_order.len() - 1);
-        let url = ctx.origin_order[index].clone();
-        ctx.current_origin = url.clone();
-        ctx.current_host_header = plan
-            .origins
-            .iter()
-            .find(|o| o.url == url)
-            .and_then(|o| o.host_header.clone())
-            .unwrap_or_default();
-        let sni = plan
-            .origins
-            .iter()
-            .find(|o| o.url == url)
-            .and_then(|o| o.sni.clone())
-            .unwrap_or_default();
-        let (host, port, tls) =
-            parse_origin(&url).ok_or_else(|| pingora::Error::new_str("invalid origin URL"))?;
-        self.peer_for(
-            &host,
-            port,
-            tls,
-            plan.timeout_ms,
-            if session.req_header().headers.contains_key("range") {
-                self.state.origin_stream_read_timeout_ms
-            } else {
-                plan.read_timeout_ms
-            },
-            if sni.is_empty() { None } else { Some(&sni) },
-        )
-            .await
+
+        loop {
+            let index = ctx.attempt.min(ctx.origin_order.len() - 1);
+            let url = ctx.origin_order[index].clone();
+            ctx.current_origin = url.clone();
+            let origin = plan.origins.iter().find(|o| o.url == url);
+            ctx.current_host_header = origin
+                .and_then(|o| o.host_header.clone())
+                .unwrap_or_default();
+            let sni = origin.and_then(|o| o.sni.clone()).unwrap_or_default();
+            let (host, port, tls) =
+                parse_origin(&url).ok_or_else(|| pingora::Error::new_str("invalid origin URL"))?;
+
+            if ctx.current_addresses.is_empty() {
+                match self.dns_cache.resolve(&host, port).await {
+                    Ok(addresses) => {
+                        ctx.current_addresses = addresses;
+                        ctx.current_address_index = 0;
+                    }
+                    Err(error) => {
+                        tracing::debug!(origin = %url, %error, "origin DNS resolution failed");
+                        if !Self::advance_origin(ctx) {
+                            return Err(pingora::Error::because(
+                                pingora::ErrorType::ConnectError,
+                                "resolve origin address",
+                                error,
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let addr = ctx.current_addresses[ctx.current_address_index];
+            return self
+                .peer_for(
+                    addr,
+                    &host,
+                    tls,
+                    plan.timeout_ms,
+                    if session.req_header().headers.contains_key("range") {
+                        self.state.origin_stream_read_timeout_ms
+                    } else {
+                        plan.read_timeout_ms
+                    },
+                    if sni.is_empty() { None } else { Some(&sni) },
+                )
+                .await;
+        }
     }
 
     fn fail_to_connect(
@@ -776,8 +802,7 @@ impl ProxyHttp for DataPlaneProxy {
         e: Box<pingora::Error>,
     ) -> Box<pingora::Error> {
         let mut e = e;
-        if (ctx.attempt as usize) + 1 < ctx.origin_order.len() {
-            ctx.attempt = ctx.attempt.saturating_add(1);
+        if Self::advance_peer(ctx) {
             e.set_retry(true);
         }
         e
@@ -808,6 +833,7 @@ impl ProxyHttp for DataPlaneProxy {
             domain = %ctx.host,
             attempt = ctx.attempt,
             origins = ctx.origin_order.len(),
+            addresses = ctx.current_addresses.len(),
             idempotent,
             safe_to_retry,
             error = %e,
@@ -815,10 +841,9 @@ impl ProxyHttp for DataPlaneProxy {
         );
         if idempotent
             && safe_to_retry
-            && (ctx.attempt as usize) + 1 < ctx.origin_order.len()
             && !session.as_ref().retry_buffer_truncated()
+            && Self::advance_peer(ctx)
         {
-            ctx.attempt = ctx.attempt.saturating_add(1);
             e.set_retry(true);
         } else {
             e.set_retry(false);
@@ -2960,6 +2985,24 @@ impl DataPlaneProxy {
         true
     }
 
+    fn advance_origin(ctx: &mut ReqCtx) -> bool {
+        if ctx.attempt + 1 >= ctx.origin_order.len() {
+            return false;
+        }
+        ctx.attempt += 1;
+        ctx.current_addresses.clear();
+        ctx.current_address_index = 0;
+        true
+    }
+
+    fn advance_peer(ctx: &mut ReqCtx) -> bool {
+        if ctx.current_address_index + 1 < ctx.current_addresses.len() {
+            ctx.current_address_index += 1;
+            return true;
+        }
+        Self::advance_origin(ctx)
+    }
+
     async fn origin_order(&self, domain: &str, plan: &NativePlan) -> Vec<OriginTarget> {
         let mut pool: Vec<OriginTarget> = if plan.origins.is_empty() {
             let mut list = vec![OriginTarget {
@@ -3027,28 +3070,14 @@ impl DataPlaneProxy {
 
     async fn peer_for(
         &self,
+        addr: SocketAddr,
         host: &str,
-        port: u16,
         tls: bool,
         timeout_ms: u64,
         read_timeout_ms: u64,
         sni: Option<&str>,
     ) -> Result<Box<HttpPeer>> {
-        // HttpPeer::new() unwraps DNS resolution in Pingora 0.9 and panics on
-        // NXDOMAIN. Resolve here so a dead/misconfigured origin becomes a
-        // normal 502 page instead of taking the Pingora service down.
-        let addr = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| {
-                pingora::Error::because(
-                    pingora::ErrorType::ConnectError,
-                    "resolve origin address",
-                    e,
-                )
-            })?
-            .next()
-            .ok_or_else(|| pingora::Error::new_str("origin DNS returned no addresses"))?;
-        // Passing a resolved SocketAddr avoids the panicking DNS path.
+        // Pass a resolved address to avoid Pingora's panicking DNS path.
         let server_name = sni.filter(|s| !s.is_empty()).unwrap_or(host);
         let mut peer = HttpPeer::new(addr, tls, server_name.to_string());
         peer.options.connection_timeout = Some(Duration::from_millis(timeout_ms));
@@ -3637,6 +3666,7 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
         cache_lock,
         management_on_data: config.admin_listen_addr.is_none(),
         origin_counter: std::sync::atomic::AtomicU64::new(0),
+        dns_cache: OriginDnsCache::new(),
     };
     match std::net::TcpListener::bind(&config.listen_addr) {
         Ok(probe) => drop(probe),
@@ -3681,6 +3711,27 @@ mod tests {
         fill_window, head_content_length_for_protocol, parse_single_range,
         range_fill_is_candidate, valid_release_tag,
     };
+
+    #[test]
+    fn address_failure_retries_same_origin_before_failing_over() {
+        let mut ctx = super::ReqCtx::default();
+        ctx.origin_order = vec!["https://one.example".into(), "https://two.example".into()];
+        ctx.current_addresses = vec![
+            "192.0.2.1:443".parse().unwrap(),
+            "192.0.2.2:443".parse().unwrap(),
+        ];
+
+        assert!(super::DataPlaneProxy::advance_peer(&mut ctx));
+        assert_eq!(ctx.attempt, 0);
+        assert_eq!(ctx.current_address_index, 1);
+
+        assert!(super::DataPlaneProxy::advance_peer(&mut ctx));
+        assert_eq!(ctx.attempt, 1);
+        assert!(ctx.current_addresses.is_empty());
+        assert_eq!(ctx.current_address_index, 0);
+
+        assert!(!super::DataPlaneProxy::advance_peer(&mut ctx));
+    }
 
     #[test]
     fn release_tag_validation() {
