@@ -59,6 +59,10 @@ pub struct EdgeConfig {
     pub cert_dir: String,
     /// Directory to cache verified signed WAF rulepacks.
     pub waf_rulepack_cache_dir: String,
+    /// MaxMind GeoLite2-Country database used by the WAF country rules.
+    pub geoip_country_db: String,
+    /// MaxMind GeoLite2-ASN database used by the WAF ASN rules.
+    pub geoip_asn_db: String,
     /// Trust `X-Forwarded-For` for the client IP (only behind a trusted proxy).
     pub trust_proxy_headers: bool,
     /// Ship WAF events to the control plane.
@@ -215,6 +219,10 @@ impl Default for EdgeConfig {
             cert_dir: std::env::var("CERT_DIR").unwrap_or_else(|_| "./data/certs".into()),
             waf_rulepack_cache_dir: std::env::var("WAF_RULEPACK_CACHE_DIR")
                 .unwrap_or_else(|_| "./data/waf-rulepacks".into()),
+            geoip_country_db: std::env::var("GEOIP_COUNTRY_DB")
+                .unwrap_or_else(|_| "./data/maxmind/GeoLite2-Country.mmdb".into()),
+            geoip_asn_db: std::env::var("GEOIP_ASN_DB")
+                .unwrap_or_else(|_| "./data/maxmind/GeoLite2-ASN.mmdb".into()),
             trust_proxy_headers: bool_env("TRUST_PROXY_HEADERS", false),
             waf_report: bool_env("WAF_REPORT", true),
             waf_report_interval_secs: std::env::var("WAF_REPORT_INTERVAL")

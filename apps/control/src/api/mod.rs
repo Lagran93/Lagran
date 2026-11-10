@@ -131,7 +131,18 @@ pub fn create_router(state: AppState) -> Router {
                     "/domains/:id/waf/ips",
                     get(waf::list_ips).post(waf::create_ip),
                 )
-                .route("/waf/ips/:id", delete(waf::delete_ip))
+                .route(
+                    "/waf/ips/:id",
+                    put(waf::update_ip).delete(waf::delete_ip),
+                )
+                .route(
+                    "/domains/:id/waf/geo",
+                    get(waf::list_geo).post(waf::create_geo),
+                )
+                .route(
+                    "/waf/geo/:id",
+                    put(waf::update_geo).delete(waf::delete_geo),
+                )
                 .route("/waf/rulesets", get(waf::list_rulesets))
                 .route("/waf/rulepacks", get(waf::list_rulepacks))
                 .route("/waf/rulepacks/publish", post(waf::publish_rulepack))

@@ -109,6 +109,16 @@ pub struct WafConfigOut {
     pub rules: Vec<WafRuleOut>,
     pub ip_allow: Vec<String>,
     pub ip_deny: Vec<String>,
+    /// ISO 3166-1 alpha-2 codes; a match clears the Geo/ASN gate only.
+    #[serde(default)]
+    pub country_allow: Vec<String>,
+    #[serde(default)]
+    pub country_deny: Vec<String>,
+    /// Autonomous system numbers blocked or allowed by the Geo/ASN layer.
+    #[serde(default)]
+    pub asn_allow: Vec<u32>,
+    #[serde(default)]
+    pub asn_deny: Vec<u32>,
     pub challenge_difficulty: u8,
     pub challenge_ttl_secs: u64,
     pub security_level: String,
@@ -259,6 +269,7 @@ fn waf_config_from(
     settings: repository::WafSettingsRow,
     rules: Vec<repository::WafRuleRow>,
     ips: Vec<repository::WafIpRow>,
+    geo: Vec<repository::WafGeoRow>,
     rulepacks: &[crate::waf_rulepack::RulepackRow],
 ) -> WafConfigOut {
     let managed_rulesets = crate::waf_rulesets::parse_csv(&settings.managed_rulesets);
@@ -304,10 +315,37 @@ fn waf_config_from(
     let mut ip_allow = Vec::new();
     let mut ip_deny = Vec::new();
     for ip in ips {
+        if !ip.enabled {
+            continue;
+        }
         if ip.kind == "allow" {
             ip_allow.push(ip.ip);
         } else {
             ip_deny.push(ip.ip);
+        }
+    }
+    let mut country_allow = Vec::new();
+    let mut country_deny = Vec::new();
+    let mut asn_allow = Vec::new();
+    let mut asn_deny = Vec::new();
+    for row in geo {
+        if !row.enabled {
+            continue;
+        }
+        match row.kind.as_str() {
+            "country_allow" => country_allow.push(row.value),
+            "country_deny" => country_deny.push(row.value),
+            "asn_allow" => {
+                if let Ok(asn) = row.value.parse::<u32>() {
+                    asn_allow.push(asn);
+                }
+            }
+            "asn_deny" => {
+                if let Ok(asn) = row.value.parse::<u32>() {
+                    asn_deny.push(asn);
+                }
+            }
+            _ => {}
         }
     }
     WafConfigOut {
@@ -348,6 +386,10 @@ fn waf_config_from(
             .collect(),
         ip_allow,
         ip_deny,
+        country_allow,
+        country_deny,
+        asn_allow,
+        asn_deny,
         challenge_difficulty: settings.challenge_difficulty.clamp(1, 6) as u8,
         challenge_ttl_secs: settings.challenge_ttl_secs.clamp(60, 86_400) as u64,
         security_level: settings.security_level,
@@ -476,6 +518,13 @@ pub(crate) fn build(
             for ip in &w.ip_deny {
                 ip.hash(&mut h);
             }
+            // Geo/ASN policies participate in both the HTTP ETag and the
+            // Edge's version guard. Hash vectors separately (including lengths)
+            // so moving entries between allow and deny changes the version too.
+            w.country_allow.hash(&mut h);
+            w.country_deny.hash(&mut h);
+            w.asn_allow.hash(&mut h);
+            w.asn_deny.hash(&mut h);
             w.challenge_difficulty.hash(&mut h);
             w.challenge_ttl_secs.hash(&mut h);
             w.rulepack_version.hash(&mut h);
@@ -557,11 +606,15 @@ pub async fn snapshot_domain(
             let waf_ips = repository::list_waf_ips(pool, row.id)
                 .await
                 .unwrap_or_default();
+            let waf_geo = repository::list_waf_geo(pool, row.id)
+                .await
+                .unwrap_or_default();
             Some(waf_config_from(
                 &row.name,
                 settings,
                 waf_rules,
                 waf_ips,
+                waf_geo,
                 &rulepacks,
             ))
         }
@@ -598,11 +651,15 @@ pub async fn get_domain_config(
             let waf_ips = repository::list_waf_ips(&state.pool, row.id)
                 .await
                 .unwrap_or_default();
+            let waf_geo = repository::list_waf_geo(&state.pool, row.id)
+                .await
+                .unwrap_or_default();
             Some(waf_config_from(
                 &row.name,
                 settings,
                 waf_rules,
                 waf_ips,
+                waf_geo,
                 &rulepacks,
             ))
         }
@@ -700,6 +757,12 @@ pub async fn list_all_configs(
             tracing::error!(error = %e, "list waf ips for config");
             db_error()
         })?;
+    let waf_geo = repository::list_waf_geo_all(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list waf geo rules for config");
+            db_error()
+        })?;
 
     let rulepacks = crate::waf_rulepack::list(&state.pool)
         .await
@@ -713,6 +776,10 @@ pub async fn list_all_configs(
     let mut waf_ips_by: HashMap<Uuid, Vec<repository::WafIpRow>> = HashMap::new();
     for ip in waf_ips {
         waf_ips_by.entry(ip.domain_id).or_default().push(ip);
+    }
+    let mut waf_geo_by: HashMap<Uuid, Vec<repository::WafGeoRow>> = HashMap::new();
+    for rule in waf_geo {
+        waf_geo_by.entry(rule.domain_id).or_default().push(rule);
     }
 
     let mut release_snapshots: HashMap<String, DomainConfigResponse> = HashMap::new();
@@ -752,6 +819,7 @@ pub async fn list_all_configs(
                 settings,
                 waf_rules_by.remove(&row.id).unwrap_or_default(),
                 waf_ips_by.remove(&row.id).unwrap_or_default(),
+                waf_geo_by.remove(&row.id).unwrap_or_default(),
                 &rulepacks,
             )
         });
@@ -894,4 +962,270 @@ fn not_found() -> (StatusCode, Json<ErrorBody>) {
             error: "domain not found".into(),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings() -> repository::WafSettingsRow {
+        repository::WafSettingsRow {
+            domain_id: uuid::Uuid::nil(),
+            enabled: true,
+            mode: "block".into(),
+            sqli: true,
+            xss: true,
+            traversal: true,
+            scanners: true,
+            rce: true,
+            ssrf: true,
+            xxe: true,
+            log4shell: true,
+            crlf: true,
+            ssti: true,
+            nosql: true,
+            ldap: true,
+            java: true,
+            webshell: true,
+            protocol: true,
+            challenge_difficulty: 4,
+            challenge_ttl_secs: 1800,
+            security_level: "off".into(),
+            managed_rulesets: String::new(),
+            waf_rulepack_version: String::new(),
+            waf_gray_percent: 0,
+        }
+    }
+
+    fn geo(kind: &str, value: &str) -> repository::WafGeoRow {
+        repository::WafGeoRow {
+            id: uuid::Uuid::nil(),
+            domain_id: uuid::Uuid::nil(),
+            kind: kind.into(),
+            value: value.into(),
+            note: String::new(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn disabled_geo(kind: &str, value: &str) -> repository::WafGeoRow {
+        let mut row = geo(kind, value);
+        row.enabled = false;
+        row
+    }
+
+    fn ip(kind: &str, value: &str, enabled: bool) -> repository::WafIpRow {
+        repository::WafIpRow {
+            id: uuid::Uuid::nil(),
+            domain_id: uuid::Uuid::nil(),
+            kind: kind.into(),
+            ip: value.into(),
+            note: String::new(),
+            enabled,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn domain() -> repository::DomainFullRow {
+        repository::DomainFullRow {
+            id: Uuid::nil(),
+            name: "example.com".into(),
+            origin_host: "127.0.0.1".into(),
+            origin_port: 80,
+            origin_proto: "http".into(),
+            ssl_enabled: false,
+            status: "active".into(),
+            rate_limit_rps: 0,
+            rate_limit_burst: 0,
+            ignore_query_string: false,
+            cache_key_ignore_headers: String::new(),
+            cors_origins: String::new(),
+            hotlink_allow_referers: String::new(),
+            origin_timeout_ms: 10_000,
+            custom_headers: String::new(),
+            origins: sqlx::types::Json(Vec::new()),
+            backup_origin_host: String::new(),
+            backup_origin_port: 80,
+            backup_origin_proto: "http".into(),
+            cc_enabled: false,
+            cc_rps: 0,
+            cc_burst: 0,
+            cc_ban_after: 0,
+            cc_ban_seconds: 0,
+            cc_mode: "block".into(),
+            cc_allow_ips: String::new(),
+            shield_url: String::new(),
+            signed_url_enabled: false,
+            signed_url_mode: "off".into(),
+            signed_url_paths: String::new(),
+            signed_url_secret: String::new(),
+            signed_url_previous_secret: String::new(),
+            signed_url_ttl_secs: 3600,
+            origin_auth_header: String::new(),
+            origin_auth_value: String::new(),
+            hotlink_signature_enabled: false,
+            published_version_id: None,
+        }
+    }
+
+    fn config_with_geo(entries: Vec<repository::WafGeoRow>) -> DomainConfigResponse {
+        let waf = waf_config_from(
+            "example.com",
+            settings(),
+            Vec::new(),
+            Vec::new(),
+            entries,
+            &[],
+        );
+        build(&domain(), Vec::new(), Some(waf))
+    }
+
+    #[test]
+    fn geo_mutations_change_versions_and_invalidate_conditional_requests() {
+        let empty = config_with_geo(Vec::new());
+        for (kind, value) in [
+            ("country_allow", "CN"),
+            ("country_deny", "CN"),
+            ("asn_allow", "13335"),
+            ("asn_deny", "13335"),
+        ] {
+            let added = config_with_geo(vec![geo(kind, value)]);
+            assert_ne!(empty.version, added.version, "adding {kind}");
+            let removed = config_with_geo(Vec::new());
+            assert_ne!(added.version, removed.version, "deleting {kind}");
+            assert_eq!(empty.version, removed.version);
+            assert_eq!(
+                added.version,
+                config_with_geo(vec![geo(kind, value)]).version
+            );
+
+            // The aggregate ETag is derived from domain versions, as in
+            // get_all_config. Exercise the conditional response path as well.
+            let etag = |cfg: &DomainConfigResponse| {
+                let parts = [format!("{}:{:?}", cfg.version, None::<Uuid>)];
+                let mut h = DefaultHasher::new();
+                parts.join("|").hash(&mut h);
+                None::<String>.hash(&mut h);
+                format!("\"{:x}\"", h.finish())
+            };
+            for (before, after) in [(&empty, &added), (&added, &removed)] {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::IF_NONE_MATCH, etag(before).parse().unwrap());
+                let current_etag = etag(after);
+                let response = cached_response(&headers, &current_etag, Bytes::new());
+                assert_eq!(response.status(), StatusCode::OK, "changed {kind}");
+                headers.insert(header::IF_NONE_MATCH, current_etag.parse().unwrap());
+                assert_eq!(
+                    cached_response(&headers, &current_etag, Bytes::new()).status(),
+                    StatusCode::NOT_MODIFIED
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moving_geo_entries_between_allow_and_deny_changes_version() {
+        for (allow, deny, value) in [
+            ("country_allow", "country_deny", "CN"),
+            ("asn_allow", "asn_deny", "13335"),
+        ] {
+            assert_ne!(
+                config_with_geo(vec![geo(allow, value)]).version,
+                config_with_geo(vec![geo(deny, value)]).version,
+            );
+        }
+    }
+
+    #[test]
+    fn geo_rules_are_split_into_config_arrays() {
+        let out = waf_config_from(
+            "example.com",
+            settings(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                geo("country_allow", "CN"),
+                geo("country_deny", "KP"),
+                geo("asn_allow", "13335"),
+                geo("asn_deny", "4134"),
+                // Malformed rows must be dropped instead of reaching the Edge.
+                geo("asn_deny", "not-a-number"),
+                geo("bogus_kind", "US"),
+            ],
+            &[],
+        );
+
+        assert_eq!(out.country_allow, vec!["CN".to_string()]);
+        assert_eq!(out.country_deny, vec!["KP".to_string()]);
+        assert_eq!(out.asn_allow, vec![13335]);
+        assert_eq!(out.asn_deny, vec![4134]);
+        assert!(out.ip_allow.is_empty() && out.ip_deny.is_empty());
+
+        // The Edge agent deserializes this payload, so the wire names matter.
+        let json = serde_json::to_value(&out).expect("serialize waf config");
+        assert_eq!(json["country_allow"][0], "CN");
+        assert_eq!(json["country_deny"][0], "KP");
+        assert_eq!(json["asn_allow"][0], 13335);
+        assert_eq!(json["asn_deny"][0], 4134);
+        assert!(json["ip_allow"].as_array().is_some_and(|a| a.is_empty()));
+    }
+
+    #[test]
+    fn disabled_geo_entries_are_kept_out_of_edge_config() {
+        let out = config_with_geo(vec![
+            geo("country_allow", "CN"),
+            disabled_geo("country_deny", "KP"),
+            disabled_geo("asn_deny", "4134"),
+        ]);
+
+        let waf = out.waf.expect("waf config");
+        assert_eq!(waf.country_allow, vec!["CN".to_string()]);
+        assert!(waf.country_deny.is_empty());
+        assert!(waf.asn_deny.is_empty());
+    }
+
+    #[test]
+    fn disabled_ip_entries_are_kept_out_of_edge_config() {
+        let out = waf_config_from(
+            "example.com",
+            settings(),
+            Vec::new(),
+            vec![ip("allow", "203.0.113.10", true), ip("deny", "198.51.100.10", false)],
+            Vec::new(),
+            &[],
+        );
+
+        assert_eq!(out.ip_allow, vec!["203.0.113.10".to_string()]);
+        assert!(out.ip_deny.is_empty());
+    }
+
+    #[test]
+    fn empty_geo_config_keeps_backward_compatible_defaults() {
+        let out = waf_config_from(
+            "example.com",
+            settings(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        assert!(out.country_allow.is_empty());
+        assert!(out.country_deny.is_empty());
+        assert!(out.asn_allow.is_empty());
+        assert!(out.asn_deny.is_empty());
+
+        // A payload written by an older Control (no geo keys) must still
+        // deserialize, because Edge agents and release snapshots are rolled
+        // forward independently.
+        let mut legacy = serde_json::to_value(&out).expect("serialize");
+        for key in ["country_allow", "country_deny", "asn_allow", "asn_deny"] {
+            legacy.as_object_mut().expect("object").remove(key);
+        }
+        let parsed: WafConfigOut = serde_json::from_value(legacy).expect("legacy payload");
+        assert!(parsed.country_allow.is_empty());
+        assert!(parsed.country_deny.is_empty());
+        assert!(parsed.asn_allow.is_empty());
+        assert!(parsed.asn_deny.is_empty());
+    }
 }

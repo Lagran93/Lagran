@@ -203,7 +203,7 @@ const toast = useToast()
 const { ask } = useConfirm()
 
 const domains = ref<any[]>([])
-const mode = ref<'url' | 'prefix' | 'tag' | 'all'>('url')
+const mode = ref<PurgeMode>('url')
 const urlsText = ref('')
 const prefixesText = ref('')
 const tagsText = ref('')
@@ -211,7 +211,9 @@ const loading = ref(false)
 const result = ref<any>(null)
 const form = ref({ domain: '' })
 
-const modes = [
+type PurgeMode = 'url' | 'prefix' | 'tag' | 'all'
+
+const modes: Array<{ value: PurgeMode; label: string }> = [
   { value: 'url', label: '按 URL' },
   { value: 'prefix', label: '按目录' },
   { value: 'tag', label: '按标签' },

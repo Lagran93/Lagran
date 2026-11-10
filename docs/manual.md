@@ -89,6 +89,7 @@ lagran-dns:53（权威 DNS）── /api/v1/schedule → lagran-control
 | `/var/lib/lagran/certs` | 边缘证书 |
 | `/var/lib/lagran/cache` | 普通磁盘缓存（`CACHE_BACKEND=disk/hybrid`） |
 | `/var/lib/lagran/large-cache` | 大对象缓存 |
+| `/var/lib/lagran/maxmind` | 建议的 WAF Geo/ASN 数据库目录（用 `GEOIP_*_DB` 指向） |
 
 systemd 服务：
 
@@ -438,6 +439,7 @@ no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 - 托管规则集：OWASP 核心防护、注入扩展防护、SSRF/XXE 防护、扫描器与协议基线
 - 自定义规则：路径、Query、UA、Referer、Method、请求头、IP
 - IP 黑白名单：支持单 IP 与 CIDR
+- Geo/ASN 黑白名单：按国家/地区（ISO 3166-1 两位代码）与 ASN 控制访问，见下方「Geo/ASN 黑白名单」
 - 安全级别：低/中/高/攻击中
 - 共享封禁：跨 Edge 自动封禁、手动 IP/CIDR 封禁、解封、24h 统计
 - 事件列表：block/challenge/monitor/log
@@ -473,6 +475,9 @@ WAF 目前不读取请求体（在代理读取 body 前执行），GET/HEAD 的 
 GET  /api/v1/waf/rulesets
 GET  /api/v1/domains/{id}/waf
 PUT  /api/v1/domains/{id}/waf
+GET  /api/v1/domains/{id}/waf/geo
+POST /api/v1/domains/{id}/waf/geo
+DELETE /api/v1/waf/geo/{rule_id}
 ```
 
 `PUT` 请求新增：
@@ -491,6 +496,121 @@ explicit category switches OR ruleset categories
 
 因此规则集升级时，只要新增类别，域名会自动获得新增签名，不需要重新保存设置。
 因此规则集升级时，只要新增类别，域名会自动获得新增签名，不需要重新保存设置。
+
+#### Geo/ASN 黑白名单
+
+按域名维护国家/地区与 ASN 两类规则，每类各有白名单与黑名单。判定在 Edge 本地完成，不产生外部查询。
+
+数据来源是 MaxMind GeoLite2 数据库：
+
+```text
+GEOIP_COUNTRY_DB   默认 ./data/maxmind/GeoLite2-Country.mmdb
+GEOIP_ASN_DB       默认 ./data/maxmind/GeoLite2-ASN.mmdb
+```
+
+**策略优先级**（与 WAF 其他检查的先后关系）：
+
+```text
+1. IP 白名单      命中即放行，短路全部检查（保持原有语义，Geo/ASN 也在其内）
+2. IP 黑名单      命中即拦截
+3. Geo/ASN 黑名单  国家/地区或 ASN 命中任一即拦截，优先于白名单
+4. Geo/ASN 白名单  仅当配置了白名单时生效：命中任一国家/地区或 ASN 才通过这一层
+5. 托管规则 / 自定义规则 / 安全级别   照常执行
+```
+
+关键语义：
+
+- **Geo/ASN 白名单不是全局放行**。它只是“能否进入后续 WAF 检查”的门槛，命中后仍会继续执行托管规则、
+  自定义规则与安全级别质询。这一点与 IP 白名单不同，不要混用。
+- **黑名单优先于白名单**。同一条规则同时命中白名单与黑名单时按黑名单处理。
+- 国家/地区代码统一大写，`cn` 与 `CN` 等价；ASN 可写 `13335` 或 `AS13335`。
+- 判定使用 Edge 已解析出的**可信客户端 IP**：`TRUST_PROXY_HEADERS=true` 时取 `X-Forwarded-For` 中
+  的可信地址，否则取连接对端地址。不会直接信任请求里自带的头。
+
+#### IP 与 Geo/ASN 的九种组合
+
+下面的“Geo/ASN 状态”是指**在 Geo/ASN 黑名单优先处理之后**的有效结果：
+
+- **黑名单**：客户端命中了任一国家/地区黑名单或 ASN 黑名单。即使同时命中白名单，也按黑名单处理。
+- **白名单**：客户端没有命中 Geo/ASN 黑名单，且命中了任一国家/地区白名单或 ASN 白名单。
+- **既不是黑名单也不是白名单**：没有命中任何 Geo/ASN 规则。若域名配置了 Geo/ASN 白名单，
+  这仍然不能通过白名单门槛；只有未配置任何 Geo/ASN 白名单时，才表示 Geo/ASN 层不限制该客户端。
+
+同理，“IP 状态”按客户端可信 IP 分类：命中 IP 黑名单、命中 IP 白名单、或两者都未命中。
+如果同一个 IP 同时出现在 IP 黑名单和 IP 白名单中，实际顺序是 **IP 白名单先短路放行**，
+因此它按 IP 白名单处理（这是 IP 白名单原有语义，与 Geo/ASN 的“黑名单优先”不同）。
+
+| IP 状态 \ Geo/ASN 状态 | 命中 Geo/ASN 黑名单 | 命中 Geo/ASN 白名单 | 两者都未命中 |
+|---|---|---|---|
+| **命中 IP 黑名单** | **拦截**：IP 黑名单在 Geo/ASN 之前命中，后续 Geo/ASN 不再判断。 | **拦截**：Geo/ASN 白名单不能覆盖 IP 黑名单。 | **拦截**：IP 黑名单直接拦截。 |
+| **命中 IP 白名单** | **放行**：IP 白名单短路全部检查，Geo/ASN 黑名单也不会执行。 | **放行**：同样短路全部检查。 | **放行**：同样短路全部检查。 |
+| **IP 既非黑名单也非白名单** | **拦截**：Geo/ASN 黑名单命中，优先于 Geo/ASN 白名单。 | **通过 Geo/ASN 层**：但这不是最终放行，仍继续执行托管规则、自定义规则、安全级别、质询等后续 WAF 检查。 | **分两种情况**：未配置 Geo/ASN 白名单时通过 Geo/ASN 层并继续后续 WAF；已配置 Geo/ASN 白名单但未命中时，**拦截**（白名单门槛 fail-closed）。 |
+
+因此，严格按最终结果看，九种情况可以归纳为：
+
+1. **IP 白名单的三种组合（第 2 行）全部直接放行**，不执行 IP 黑名单、Geo/ASN、托管规则或其他后续检查。
+2. **IP 黑名单的三种组合（第 1 行）全部拦截**，不会因为命中 Geo/ASN 白名单而放行。
+3. **IP 两者都未命中的三种组合（第 3 行）**：Geo/ASN 黑名单命中则拦截；Geo/ASN 白名单命中则只是进入后续 WAF；Geo/ASN 无命中时取决于是否配置了 Geo/ASN 白名单。
+
+#### 请求示例
+
+假设域名配置如下：
+
+```text
+IP 黑名单：      198.51.100.10
+IP 白名单：      203.0.113.10
+国家黑名单：     KP
+国家白名单：     CN
+ASN 白名单：     AS13335
+```
+
+- `198.51.100.10`：无论国家是 `CN`、`KP` 还是其他国家，先命中 IP 黑名单，**拦截**。
+- `203.0.113.10`：无论国家是 `KP`、ASN 是否为 `AS13335`，先命中 IP 白名单，**直接放行**。
+- 一个可信 IP 不在任何 IP 名单，且国家为 `KP`：命中 Geo/ASN 黑名单，**拦截**。
+- 一个可信 IP 不在任何 IP 名单，且国家为 `CN`：命中 Geo/ASN 白名单，**通过 Geo/ASN 层**，
+  但仍可能被 SQLi、XSS、自定义规则或安全级别拦截/质询。
+- 一个可信 IP 不在任何 IP 名单，且国家既不是 `KP` 也不是 `CN`，同时 ASN 也不是 `AS13335`：
+  因为域名配置了 Geo/ASN 白名单，未命中白名单，**拦截**。
+- 如果删除所有 Geo/ASN 白名单，仅保留国家 `KP` 黑名单，那么最后一种客户端不会被 Geo/ASN 层拦截，
+  会继续进入后续 WAF；它仍可能被其他 WAF 规则拦截。
+
+**数据库缺失时的行为**（文件不存在或不可读取）：Country 与 ASN 数据库独立加载，影响范围按缺失的库分别计算：
+
+- Country 库缺失：国家/地区黑名单无法命中；配置了国家白名单时，国家维度无法提供命中，
+  但 ASN 白名单仍可命中并通过 Geo/ASN 门槛。
+- ASN 库缺失：ASN 黑名单无法命中；配置了 ASN 白名单时，ASN 维度无法提供命中，
+  但国家/地区白名单仍可命中并通过 Geo/ASN 门槛。
+- 两个库都缺失：Geo/ASN 黑名单都无法命中；若配置了任一 Geo/ASN 白名单，因没有国家或 ASN
+  数据可供匹配，未命中白名单门槛的请求会被拦截。若没有配置 Geo/ASN 白名单，Geo/ASN 层不拦截，
+  请求仍继续经过其他 WAF 检查。
+- IP 黑白名单及其他 WAF 规则不依赖 MaxMind 数据库，照常生效。
+
+缺库不会让 Edge 崩溃；每个无法加载的数据库会记录告警。数据库在 Edge 启动时加载，替换或修复文件后
+需重启 Edge 进程重新加载。
+
+数据库需自行定期更新（GeoLite2 每周更新），并遵守 MaxMind GeoLite2 EULA 的分发与署名要求；
+不要把 mmdb 提交到公开仓库或对外提供下载。
+
+可用接口：
+
+```http
+GET    /api/v1/domains/{id}/waf/geo
+POST   /api/v1/domains/{id}/waf/geo
+DELETE /api/v1/waf/geo/{rule_id}
+```
+
+`POST` 请求体：
+
+```json
+{
+  "kind": "country_deny",
+  "value": "KP",
+  "note": "高风险来源"
+}
+```
+
+`kind` 取值：`country_allow`、`country_deny`、`asn_allow`、`asn_deny`。
+同域名、同类型、同值重复提交会返回 400。
 
 ### 签名规则包、缓存与灰度
 
@@ -980,6 +1100,8 @@ Control 的 CONTROL_PUBLIC_URL
 | `CC_BEHAVIOR_ENABLED` | 行为评分开关 |
 | `CC_BEHAVIOR_SCORE` | 行为评分阈值 |
 | `TRUST_PROXY_HEADERS` | 是否信任前置代理 XFF |
+| `GEOIP_COUNTRY_DB` | WAF Geo 名单使用的 GeoLite2-Country 路径，默认 `./data/maxmind/GeoLite2-Country.mmdb` |
+| `GEOIP_ASN_DB` | WAF ASN 名单使用的 GeoLite2-ASN 路径，默认 `./data/maxmind/GeoLite2-ASN.mmdb` |
 | `ACCESS_LOG_*` | 访问日志路径/JSON/缓冲/上报 |
 | `RUST_LOG` | 日志级别 |
 

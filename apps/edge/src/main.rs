@@ -214,6 +214,10 @@ async fn main() -> anyhow::Result<()> {
         // peer, and the engine is bound only to loopback.
         trust_proxy_headers: true,
         challenge_secret,
+        geo: Arc::new(edge::waf::geo::GeoLookup::load(
+            &config.geoip_country_db,
+            &config.geoip_asn_db,
+        )),
         node_control,
         https_redirect_port: config.https_redirect_port,
         max_cacheable_body: config.max_cacheable_body,

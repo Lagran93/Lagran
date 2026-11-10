@@ -2727,6 +2727,18 @@ pub struct WafIpRow {
     pub kind: String,
     pub ip: String,
     pub note: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafGeoRow {
+    pub id: Uuid,
+    pub domain_id: Uuid,
+    pub kind: String,
+    pub value: String,
+    pub note: String,
+    pub enabled: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -2996,7 +3008,7 @@ pub async fn delete_waf_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
 pub async fn list_waf_ips(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<WafIpRow>> {
     sqlx::query_as::<_, WafIpRow>(
         r#"
-        SELECT id, domain_id, kind, ip, note, created_at
+        SELECT id, domain_id, kind, ip, note, enabled, created_at
         FROM waf_ip_rules WHERE domain_id = $1
         ORDER BY kind, created_at
         "#,
@@ -3008,7 +3020,7 @@ pub async fn list_waf_ips(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<Wa
 
 pub async fn list_waf_ips_all(pool: &PgPool) -> sqlx::Result<Vec<WafIpRow>> {
     sqlx::query_as::<_, WafIpRow>(
-        "SELECT id, domain_id, kind, ip, note, created_at FROM waf_ip_rules ORDER BY domain_id, kind",
+        "SELECT id, domain_id, kind, ip, note, enabled, created_at FROM waf_ip_rules ORDER BY domain_id, kind",
     )
     .fetch_all(pool)
     .await
@@ -3016,7 +3028,7 @@ pub async fn list_waf_ips_all(pool: &PgPool) -> sqlx::Result<Vec<WafIpRow>> {
 
 pub async fn get_waf_ip(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<WafIpRow>> {
     sqlx::query_as::<_, WafIpRow>(
-        "SELECT id, domain_id, kind, ip, note, created_at FROM waf_ip_rules WHERE id = $1",
+        "SELECT id, domain_id, kind, ip, note, enabled, created_at FROM waf_ip_rules WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -3034,7 +3046,7 @@ pub async fn create_waf_ip(
         r#"
         INSERT INTO waf_ip_rules (domain_id, kind, ip, note)
         VALUES ($1, $2, $3, $4)
-        RETURNING id, domain_id, kind, ip, note, created_at
+        RETURNING id, domain_id, kind, ip, note, enabled, created_at
         "#,
     )
     .bind(domain_id)
@@ -3045,8 +3057,150 @@ pub async fn create_waf_ip(
     .await
 }
 
+pub async fn update_waf_ip(
+    pool: &PgPool,
+    id: Uuid,
+    kind: &str,
+    ip: &str,
+    note: &str,
+    enabled: bool,
+) -> sqlx::Result<Option<WafIpRow>> {
+    sqlx::query_as::<_, WafIpRow>(
+        r#"
+        UPDATE waf_ip_rules SET kind = $2, ip = $3, note = $4, enabled = $5
+        WHERE id = $1
+        RETURNING id, domain_id, kind, ip, note, enabled, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(ip)
+    .bind(note)
+    .bind(enabled)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn delete_waf_ip(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
     let r = sqlx::query("DELETE FROM waf_ip_rules WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn list_waf_geo(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<WafGeoRow>> {
+    sqlx::query_as::<_, WafGeoRow>(
+        r#"
+        SELECT id, domain_id, kind, value, note, enabled, created_at
+        FROM waf_geo_rules WHERE domain_id = $1
+        ORDER BY kind, value
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_waf_geo_all(pool: &PgPool) -> sqlx::Result<Vec<WafGeoRow>> {
+    sqlx::query_as::<_, WafGeoRow>(
+        "SELECT id, domain_id, kind, value, note, enabled, created_at FROM waf_geo_rules ORDER BY domain_id, kind, value",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_waf_geo(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<WafGeoRow>> {
+    sqlx::query_as::<_, WafGeoRow>(
+        "SELECT id, domain_id, kind, value, note, enabled, created_at FROM waf_geo_rules WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn waf_geo_exists(
+    pool: &PgPool,
+    domain_id: Uuid,
+    kind: &str,
+    value: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM waf_geo_rules WHERE domain_id = $1 AND kind = $2 AND value = $3)",
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(value)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn waf_geo_exists_except(
+    pool: &PgPool,
+    id: Uuid,
+    domain_id: Uuid,
+    kind: &str,
+    value: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM waf_geo_rules WHERE domain_id = $1 AND kind = $2 AND value = $3 AND id <> $4)",
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(value)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn create_waf_geo(
+    pool: &PgPool,
+    domain_id: Uuid,
+    kind: &str,
+    value: &str,
+    note: &str,
+) -> sqlx::Result<WafGeoRow> {
+    sqlx::query_as::<_, WafGeoRow>(
+        r#"
+        INSERT INTO waf_geo_rules (domain_id, kind, value, note)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, domain_id, kind, value, note, enabled, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(value)
+    .bind(note)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_waf_geo(
+    pool: &PgPool,
+    id: Uuid,
+    kind: &str,
+    value: &str,
+    note: &str,
+    enabled: bool,
+) -> sqlx::Result<Option<WafGeoRow>> {
+    sqlx::query_as::<_, WafGeoRow>(
+        r#"
+        UPDATE waf_geo_rules SET kind = $2, value = $3, note = $4, enabled = $5
+        WHERE id = $1
+        RETURNING id, domain_id, kind, value, note, enabled, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(value)
+    .bind(note)
+    .bind(enabled)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_waf_geo(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM waf_geo_rules WHERE id = $1")
         .bind(id)
         .execute(pool)
         .await?;

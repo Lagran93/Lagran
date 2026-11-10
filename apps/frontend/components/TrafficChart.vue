@@ -85,7 +85,9 @@ const labels = computed(() => {
   const maxLabels = Math.max(3, Math.min(8, Math.floor(W.value / 120)))
   const step = Math.max(1, Math.ceil(data.length / maxLabels))
   for (let i = 0; i < data.length; i += step) {
-    const d = new Date(data[i].ts)
+    const point = data[i]
+    if (!point) continue
+    const d = new Date(point.ts)
     out.push({
       x: x(i, data.length),
       text: d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),

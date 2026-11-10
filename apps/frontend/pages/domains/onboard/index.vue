@@ -127,7 +127,7 @@
               <code>{{ form.name }}</code>
               <span class="text-muted">→</span>
               <code>{{ nodeIps[0] }}</code>
-              <button class="btn btn-text btn-sm" type="button" @click="copy(nodeIps[0])">复制</button>
+              <button class="btn btn-text btn-sm" type="button" @click="copyFirstNodeIp()">复制</button>
             </div>
             <div v-else class="alert alert-warning">
               <AppIcon name="alert" :size="16" class="icon" />
@@ -274,6 +274,11 @@ async function loadNodes() {
   } catch {
     endpoints.value = { cname: '', ips: [], nodes: [] }
   }
+}
+
+function copyFirstNodeIp() {
+  const ip = nodeIps.value[0]
+  if (ip) copy(ip)
 }
 
 function copy(text: string) {

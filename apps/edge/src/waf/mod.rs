@@ -10,6 +10,7 @@
 //! and CDN traffic is dominated by GET/HEAD. Managed checks cover the
 //! path/query/UA/referer, which is where most automated attacks show up.
 
+pub mod geo;
 pub mod rulepack;
 
 use axum::http::HeaderMap;
@@ -254,6 +255,14 @@ pub struct WafConfig {
     pub rules: Vec<WafRule>,
     pub ip_allow: Vec<IpNet>,
     pub ip_deny: Vec<IpNet>,
+    /// ISO 3166-1 alpha-2 country codes that may pass the Geo/ASN gate.
+    pub country_allow: Vec<String>,
+    /// Country codes blocked outright (takes precedence over allow).
+    pub country_deny: Vec<String>,
+    /// Autonomous system numbers that may pass the Geo/ASN gate.
+    pub asn_allow: Vec<u32>,
+    /// ASNs blocked outright (takes precedence over allow).
+    pub asn_deny: Vec<u32>,
     /// Number of leading hex zeroes the challenge hash must have (1..=6).
     pub challenge_difficulty: u8,
     /// How long a solved challenge keeps the client cleared (seconds).
@@ -271,10 +280,30 @@ impl Default for WafConfig {
             rules: Vec::new(),
             ip_allow: Vec::new(),
             ip_deny: Vec::new(),
+            country_allow: Vec::new(),
+            country_deny: Vec::new(),
+            asn_allow: Vec::new(),
+            asn_deny: Vec::new(),
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
             security_level: SecurityLevel::Off,
         }
+    }
+}
+
+impl WafConfig {
+    /// True when this domain configured any Geo/ASN rule, so the request path
+    /// only pays for a MaxMind lookup when it can matter.
+    pub fn needs_geo(&self) -> bool {
+        !self.country_allow.is_empty()
+            || !self.country_deny.is_empty()
+            || !self.asn_allow.is_empty()
+            || !self.asn_deny.is_empty()
+    }
+
+    /// True when a Geo/ASN allow-list gate is active.
+    pub fn has_geo_allow(&self) -> bool {
+        !self.country_allow.is_empty() || !self.asn_allow.is_empty()
     }
 }
 
@@ -300,6 +329,11 @@ pub struct WafRequest<'a> {
     pub user_agent: &'a str,
     pub referer: &'a str,
     pub ip: Option<IpAddr>,
+    /// Country code resolved from the trusted client IP, when a database is
+    /// loaded and the address is present in it.
+    pub country: Option<&'a str>,
+    /// Autonomous system number resolved the same way.
+    pub asn: Option<u32>,
     pub headers: &'a HeaderMap,
 }
 
@@ -750,6 +784,45 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
         }
     }
 
+    // Geo/ASN policy is a separate layer from the IP lists. An IP allow entry
+    // still short-circuits every check above, but a Geo/ASN allow match only
+    // clears this layer and never skips the managed or custom rules below.
+    // Deny always wins over allow. When the MaxMind databases are unavailable
+    // the lookup yields nothing: deny rules cannot match, while an active
+    // allow-list gate fails closed (traffic is blocked) until data is loaded.
+    let country = req.country.map(str::to_ascii_uppercase);
+    if let Some(code) = country.as_deref() {
+        if cfg.country_deny.iter().any(|item| item == code) {
+            return Some(WafVerdict {
+                action: WafAction::Block,
+                rule_name: format!("国家/地区黑名单 ({code})"),
+                category: "geo_deny".into(),
+            });
+        }
+    }
+    if let Some(asn) = req.asn {
+        if cfg.asn_deny.contains(&asn) {
+            return Some(WafVerdict {
+                action: WafAction::Block,
+                rule_name: format!("ASN 黑名单 (AS{asn})"),
+                category: "asn_deny".into(),
+            });
+        }
+    }
+    if cfg.has_geo_allow() {
+        let country_ok = country
+            .as_deref()
+            .is_some_and(|code| cfg.country_allow.iter().any(|item| item == code));
+        let asn_ok = req.asn.is_some_and(|asn| cfg.asn_allow.contains(&asn));
+        if !country_ok && !asn_ok {
+            return Some(WafVerdict {
+                action: WafAction::Block,
+                rule_name: "Geo/ASN 白名单未命中".into(),
+                category: "geo_allow".into(),
+            });
+        }
+    }
+
     let path = decode_lower_twice(req.path);
     let query = decode_lower_twice(req.query);
     let ua = decode_lower_twice(req.user_agent);
@@ -879,6 +952,10 @@ mod tests {
             rules: vec![],
             ip_allow: vec![],
             ip_deny: vec![],
+            country_allow: vec![],
+            country_deny: vec![],
+            asn_allow: vec![],
+            asn_deny: vec![],
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
             security_level: SecurityLevel::Off,
@@ -898,6 +975,8 @@ mod tests {
             user_agent: ua,
             referer: "",
             ip: Some("198.51.100.10".parse().unwrap()),
+            country: None,
+            asn: None,
             headers,
         }
     }
@@ -1281,5 +1360,106 @@ mod tests {
         let verdict =
             evaluate(&c, &req(&h, "/api", "", "Mozilla/5.0")).expect("TE+CL must be rejected");
         assert_eq!(verdict.category, "protocol");
+    }
+}
+
+#[cfg(test)]
+mod geo_policy_tests {
+    use super::*;
+
+    fn cfg() -> WafConfig {
+        WafConfig {
+            enabled: true,
+            ..WafConfig::default()
+        }
+    }
+
+    fn req<'a>(
+        headers: &'a HeaderMap,
+        country: Option<&'a str>,
+        asn: Option<u32>,
+        path: &'a str,
+        query: &'a str,
+    ) -> WafRequest<'a> {
+        WafRequest {
+            method: "GET",
+            path,
+            query,
+            user_agent: "curl",
+            referer: "",
+            ip: Some("198.51.100.10".parse().unwrap()),
+            country,
+            asn,
+            headers,
+        }
+    }
+
+    #[test]
+    fn deny_wins_over_allow_and_blocks() {
+        let h = HeaderMap::new();
+        let mut c = cfg();
+        c.country_allow = vec!["CN".into()];
+        c.country_deny = vec!["KP".into()];
+        c.asn_deny = vec![4134];
+        assert_eq!(
+            evaluate(&c, &req(&h, Some("KP"), None, "/", "")).unwrap().category,
+            "geo_deny"
+        );
+        assert_eq!(
+            evaluate(&c, &req(&h, Some("CN"), Some(4134), "/", "")).unwrap().category,
+            "asn_deny"
+        );
+        assert!(evaluate(&c, &req(&h, Some("cn"), Some(4808), "/", "")).is_none());
+    }
+
+    #[test]
+    fn allow_gate_is_case_insensitive_and_independent_of_ip_allow() {
+        let h = HeaderMap::new();
+        let mut c = cfg();
+        c.country_allow = vec!["CN".into()];
+        // A Geo allow match does not bypass the managed rules.
+        let sqli = evaluate(&c, &req(&h, Some("CN"), None, "/search", "q=union select")).unwrap();
+        assert_eq!(sqli.category, "sqli");
+        // A miss on every allow entry is blocked by the gate itself.
+        let miss = evaluate(&c, &req(&h, Some("JP"), None, "/", "")).unwrap();
+        assert_eq!(miss.category, "geo_allow");
+    }
+
+    #[test]
+    fn asn_allow_matches_by_autonomous_system() {
+        let h = HeaderMap::new();
+        let mut c = cfg();
+        c.asn_allow = vec![13335];
+        assert!(evaluate(&c, &req(&h, None, Some(13335), "/", "")).is_none());
+        assert_eq!(
+            evaluate(&c, &req(&h, None, Some(16509), "/", "")).unwrap().category,
+            "geo_allow"
+        );
+    }
+
+    #[test]
+    fn missing_database_fails_open_for_deny_and_closed_for_allow() {
+        let h = HeaderMap::new();
+        let mut deny_only = cfg();
+        deny_only.country_deny = vec!["RU".into()];
+        assert!(evaluate(&deny_only, &req(&h, None, None, "/", "")).is_none());
+
+        let mut allow = cfg();
+        allow.country_allow = vec!["CN".into()];
+        assert_eq!(
+            evaluate(&allow, &req(&h, None, None, "/", "")).unwrap().category,
+            "geo_allow"
+        );
+    }
+
+    #[test]
+    fn needs_geo_tracks_configuration() {
+        let mut c = cfg();
+        assert!(!c.needs_geo());
+        c.asn_deny.push(64512);
+        assert!(c.needs_geo());
+        assert!(!c.has_geo_allow());
+        c.country_allow.push("CN".into());
+        assert!(c.has_geo_allow());
     }
 }

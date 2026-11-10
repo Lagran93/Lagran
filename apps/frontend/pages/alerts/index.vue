@@ -388,12 +388,14 @@ const auth = useAuthStore()
 const toast = useToast()
 const { ask } = useConfirm()
 
-const tabs = [
-  { label: '告警规则', value: 'rules' as const },
-  { label: '通知渠道', value: 'channels' as const },
-  { label: '告警事件', value: 'events' as const },
+type AlertTab = 'rules' | 'channels' | 'events'
+
+const tabs: Array<{ label: string; value: AlertTab; count?: number }> = [
+  { label: '告警规则', value: 'rules' },
+  { label: '通知渠道', value: 'channels' },
+  { label: '告警事件', value: 'events' },
 ]
-const tab = ref<'rules' | 'channels' | 'events'>('rules')
+const tab = ref<AlertTab>('rules')
 const loading = ref(false)
 const saving = ref(false)
 const testing = ref('')

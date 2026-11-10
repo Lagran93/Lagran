@@ -81,6 +81,8 @@ pub struct AppState {
     pub trust_proxy_headers: bool,
     /// HMAC secret for challenge nonces and clearance cookies.
     pub challenge_secret: String,
+    /// MaxMind-backed country/ASN lookup for the WAF Geo/ASN lists.
+    pub geo: Arc<crate::waf::geo::GeoLookup>,
     /// Set from the heartbeat reply; disabled nodes answer 503 and keep serving
     /// management/health endpoints.
     pub node_control: NodeControl,
@@ -2549,6 +2551,13 @@ pub(crate) async fn preflight_cacheable(
     }
 
     if domain.waf.enabled {
+        // Only pay for a database lookup when this domain configured Geo/ASN
+        // rules. The lookup uses the already-resolved trusted client IP.
+        let geo = if domain.waf.needs_geo() {
+            state.geo.lookup(client_ip_addr)
+        } else {
+            crate::waf::geo::GeoInfo::default()
+        };
         let waf_request = WafRequest {
             method: method.as_str(),
             path: path_only,
@@ -2556,6 +2565,8 @@ pub(crate) async fn preflight_cacheable(
             user_agent: &user_agent,
             referer: &referer,
             ip: client_ip_addr,
+            country: geo.country.as_deref(),
+            asn: geo.asn,
             headers,
         };
         if let Some(verdict) = waf_evaluate(&domain.waf, &waf_request) {

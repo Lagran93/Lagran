@@ -247,7 +247,7 @@ const wafBlocks = computed(
   () => wafStats.value.by_action?.find((r: any) => r.key === 'block')?.count || 0,
 )
 const topIsLive = computed(() => realtime.value.enabled && realtime.value.domains.length > 0)
-const topDomains = computed(() =>
+const topDomains = computed<any[]>(() =>
   topIsLive.value ? realtime.value.domains : byDomain.value,
 )
 const live = computed(() =>

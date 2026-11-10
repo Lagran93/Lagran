@@ -30,10 +30,13 @@
 1. 解析 Host/SNI → 域名注册表（多域名，未接入域名返回提示页）；域名开启 HTTPS 时，
    HTTP 请求在 WAF/缓存之前返回 301/308 跳转
 2. 每域名限流（令牌桶）；源站健康只影响回源，不影响缓存命中
-3. WAF 评估（按域名）：IP 白名单放行 → 黑名单拦截 → 托管规则（SQLi/XSS/路径穿越/扫描器/
-   RCE/SSRF/XXE/Log4Shell/CRLF）→ 自定义规则（按优先级，支持请求头）→ 安全级别
-   （低/中/高/攻击中）；动作为拦截时返回 403 页，动作为质询时返回 JS PoW 页面，
-   通过后签发 HMAC 免质询 Cookie；观察模式只记录事件
+3. WAF 评估（按域名）：IP 白名单放行 → IP 黑名单拦截 → Geo/ASN 黑名单拦截（国家/地区或 ASN，
+   优先于白名单）→ Geo/ASN 白名单门槛（配置了才生效，命中任一才继续，**不跳过**后续检查）→
+   托管规则（SQLi/XSS/路径穿越/扫描器/RCE/SSRF/XXE/Log4Shell/CRLF）→ 自定义规则（按优先级，
+   支持请求头）→ 安全级别（低/中/高/攻击中）；动作为拦截时返回 403 页，动作为质询时返回 JS PoW
+   页面，通过后签发 HMAC 免质询 Cookie；观察模式只记录事件。
+   Geo/ASN 判定使用 Edge 本地 MaxMind GeoLite2-Country / GeoLite2-ASN 查询可信客户端 IP；
+   数据库缺失时黑名单不生效、白名单 fail-closed，其余 WAF 功能不受影响
 4. WebSocket upgrade → 与源站完成 RFC 6455 握手后原样隧道
 5. 防盗链 Referer 校验
 6. 规则解析：**按域名**匹配 路径通配 + 请求方法 + 查询串 + **响应 Content-Type 子串** → `cache | bypass | no_store`、
@@ -70,6 +73,7 @@
 
 WAF 相关：`waf_settings`（域名级开关/模式/托管规则/RCE/SSRF/XXE/Log4Shell/CRLF/**security_level**）、
 `waf_rules`（自定义规则，字段支持 `header:<name>`）、`waf_ip_rules`（allow/deny + CIDR）、
+`waf_geo_rules`（国家/地区与 ASN 的 allow/deny，kind 为 country_/asn_ 前缀）、
 `waf_events`（边缘上报的命中记录，供事件列表与统计聚合）。
 
 节点：`edge_nodes`（name/region/agent_url/status=**pending|online|offline|disabled**、

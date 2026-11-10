@@ -127,7 +127,10 @@ const groups = computed<MenuGroup[]>(() =>
     title: i18n.t(GROUP_KEYS[group.title] || group.title),
     items: group.items
       .filter((item) => !item.admin || auth.isAdmin)
-      .filter((item) => !NAV_PERMISSIONS[item.to] || auth.can(NAV_PERMISSIONS[item.to]))
+      .filter((item) => {
+        const permission = NAV_PERMISSIONS[item.to]
+        return !permission || auth.can(permission)
+      })
       .map((item) => ({ ...item, label: i18n.t(NAV_KEYS[item.to] || item.label) })),
   })).filter((group) => group.items.length > 0),
 )

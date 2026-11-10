@@ -305,6 +305,14 @@ struct WafCfg {
     ip_allow: Vec<String>,
     #[serde(default)]
     ip_deny: Vec<String>,
+    #[serde(default)]
+    country_allow: Vec<String>,
+    #[serde(default)]
+    country_deny: Vec<String>,
+    #[serde(default)]
+    asn_allow: Vec<u32>,
+    #[serde(default)]
+    asn_deny: Vec<u32>,
     #[serde(default = "default_challenge_difficulty")]
     challenge_difficulty: u8,
     #[serde(default = "default_challenge_ttl")]
@@ -524,6 +532,10 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
         rules,
         ip_allow: parse_nets(cfg.ip_allow),
         ip_deny: parse_nets(cfg.ip_deny),
+        country_allow: parse_countries(cfg.country_allow),
+        country_deny: parse_countries(cfg.country_deny),
+        asn_allow: cfg.asn_allow,
+        asn_deny: cfg.asn_deny,
         challenge_difficulty: cfg.challenge_difficulty.clamp(1, 6),
         challenge_ttl_secs: cfg.challenge_ttl_secs.clamp(60, 86_400),
         security_level: SecurityLevel::parse(&cfg.security_level),
@@ -532,6 +544,16 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
 
 fn parse_nets(entries: Vec<String>) -> Vec<IpNet> {
     entries.iter().filter_map(|s| IpNet::parse(s)).collect()
+}
+
+/// Country codes are persisted uppercase; normalize defensively so a hand
+/// edited config row cannot silently never match.
+fn parse_countries(entries: Vec<String>) -> Vec<String> {
+    entries
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_uppercase()))
+        .collect()
 }
 
 fn format_origin(o: &OriginCfg) -> String {
@@ -722,4 +744,38 @@ pub fn spawn_config_sync(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod geo_config_tests {
+    use super::*;
+
+    #[test]
+    fn control_payload_geo_lists_are_normalized_for_the_edge() {
+        let json = r#"{
+            "enabled": true,
+            "mode": "block",
+            "country_allow": ["cn", "US", "bad", "  "],
+            "country_deny": ["KP"],
+            "asn_allow": [13335],
+            "asn_deny": [4134]
+        }"#;
+        let cfg: WafCfg = serde_json::from_str(json).expect("control waf payload");
+        assert_eq!(
+            parse_countries(cfg.country_allow),
+            vec!["CN".to_string(), "US".to_string()]
+        );
+        assert_eq!(parse_countries(cfg.country_deny), vec!["KP".to_string()]);
+        assert_eq!(cfg.asn_allow, vec![13335]);
+        assert_eq!(cfg.asn_deny, vec![4134]);
+    }
+
+    #[test]
+    fn payload_without_geo_keys_leaves_geo_policy_off() {
+        let cfg: WafCfg = serde_json::from_str(r#"{"enabled": true}"#).expect("legacy payload");
+        assert!(cfg.country_allow.is_empty());
+        assert!(cfg.country_deny.is_empty());
+        assert!(cfg.asn_allow.is_empty());
+        assert!(cfg.asn_deny.is_empty());
+    }
 }

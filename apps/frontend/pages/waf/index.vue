@@ -16,11 +16,7 @@
     </div>
 
     <div v-if="!domains.length" class="card">
-      <EmptyState
-        icon="shield"
-        title="还没有可配置的域名"
-        text="先在「域名管理」接入域名，再回到这里为它开启 WAF 防护。"
-      >
+      <EmptyState icon="shield" title="还没有可配置的域名" text="先在「域名管理」接入域名，再回到这里为它开启 WAF 防护。">
         <NuxtLink to="/domains" class="btn btn-primary btn-sm">去接入域名</NuxtLink>
       </EmptyState>
     </div>
@@ -47,14 +43,8 @@
 
       <div class="card">
         <div class="waf-tabs">
-          <button
-            v-for="t in tabs"
-            :key="t.value"
-            type="button"
-            class="waf-tab"
-            :class="{ active: tab === t.value }"
-            @click="switchTab(t.value)"
-          >
+          <button v-for="t in tabs" :key="t.value" type="button" class="waf-tab" :class="{ active: tab === t.value }"
+            @click="switchTab(t.value)">
             {{ t.label }}
             <span v-if="t.count !== undefined" class="tab-count">{{ t.count }}</span>
           </button>
@@ -66,22 +56,13 @@
             <StatCard label="事件总数" :value="stats.total" icon="shield" />
             <StatCard label="拦截" :value="actionCount('block')" tone="red" icon="alert" />
             <StatCard label="质询" :value="actionCount('challenge')" tone="orange" icon="zap" />
-            <StatCard
-              label="观察 / 记录"
-              :value="actionCount('monitor') + actionCount('log')"
-              tone="green"
-              icon="activity"
-            />
+            <StatCard label="观察 / 记录" :value="actionCount('monitor') + actionCount('log')" tone="green"
+              icon="activity" />
           </div>
 
           <div class="section-label">按天趋势（最近 {{ stats.days }} 天）</div>
           <div v-if="stats.by_day.length" class="bar-chart">
-            <div
-              v-for="d in stats.by_day"
-              :key="d.key"
-              class="bar-col"
-              :title="`${d.key}: ${d.count}`"
-            >
+            <div v-for="d in stats.by_day" :key="d.key" class="bar-col" :title="`${d.key}: ${d.count}`">
               <div class="bar" :style="{ height: barHeight(d.count) }" />
               <span class="bar-label">{{ d.key.slice(5) }}</span>
             </div>
@@ -155,18 +136,10 @@
               <div class="setting-desc">观察模式用于灰度验证规则，拦截模式用于正式防护</div>
             </div>
             <div class="segmented">
-              <button
-                type="button"
-                :class="{ active: settings.mode === 'monitor' }"
-                @click="settings.mode = 'monitor'"
-              >
+              <button type="button" :class="{ active: settings.mode === 'monitor' }" @click="settings.mode = 'monitor'">
                 观察
               </button>
-              <button
-                type="button"
-                :class="{ active: settings.mode === 'block' }"
-                @click="settings.mode = 'block'"
-              >
+              <button type="button" :class="{ active: settings.mode === 'block' }" @click="settings.mode = 'block'">
                 拦截
               </button>
             </div>
@@ -174,13 +147,8 @@
 
           <div class="section-label">安全级别</div>
           <div class="segmented level-seg">
-            <button
-              v-for="l in securityLevels"
-              :key="l.value"
-              type="button"
-              :class="{ active: settings.security_level === l.value }"
-              @click="settings.security_level = l.value"
-            >
+            <button v-for="l in securityLevels" :key="l.value" type="button"
+              :class="{ active: settings.security_level === l.value }" @click="settings.security_level = l.value">
               {{ l.label }}
             </button>
           </div>
@@ -190,17 +158,10 @@
 
           <div class="section-label">托管规则集</div>
           <div class="ruleset-grid">
-            <label
-              v-for="rs in rulesets"
-              :key="rs.id"
-              class="ruleset-card"
-              :class="{ on: settings.managed_rulesets.includes(rs.id) }"
-            >
-              <input
-                type="checkbox"
-                :checked="settings.managed_rulesets.includes(rs.id)"
-                @change="toggleRuleset(rs.id)"
-              />
+            <label v-for="rs in rulesets" :key="rs.id" class="ruleset-card"
+              :class="{ on: settings.managed_rulesets.includes(rs.id) }">
+              <input type="checkbox" :checked="settings.managed_rulesets.includes(rs.id)"
+                @change="toggleRuleset(rs.id)" />
               <span class="ruleset-body">
                 <span class="ruleset-head">
                   <strong>{{ rs.name }}</strong>
@@ -238,13 +199,7 @@
             </div>
             <div class="field">
               <label class="field-label">灰度比例</label>
-              <input
-                v-model.number="settings.waf_gray_percent"
-                class="input"
-                type="number"
-                min="0"
-                max="100"
-              />
+              <input v-model.number="settings.waf_gray_percent" class="input" type="number" min="0" max="100" />
               <span class="field-hint">0 = 全量 active；1~99 按域名稳定哈希切分到 active/previous。</span>
             </div>
           </div>
@@ -260,12 +215,8 @@
               </button>
             </div>
             <div v-if="rulepackVersions.length" class="rulepack-versions">
-              <div
-                v-for="p in rulepackVersions"
-                :key="p.version"
-                class="rulepack-version-row"
-                :class="`slot-${p.slot}`"
-              >
+              <div v-for="p in rulepackVersions" :key="p.version" class="rulepack-version-row"
+                :class="`slot-${p.slot}`">
                 <div class="version-main">
                   <div class="version-title">
                     <span class="mono version-name">{{ p.version }}</span>
@@ -287,30 +238,16 @@
                     当前生效
                   </span>
                   <template v-else>
-                    <button
-                      class="btn btn-default btn-sm version-action"
-                      type="button"
-                      :disabled="rulepackBusy"
-                      @click="rollbackRulepack(p.version)"
-                    >
+                    <button class="btn btn-default btn-sm version-action" type="button" :disabled="rulepackBusy"
+                      @click="rollbackRulepack(p.version)">
                       设为 active
                     </button>
-                    <button
-                      v-if="p.slot === 'previous'"
-                      class="btn btn-text btn-sm version-action"
-                      type="button"
-                      :disabled="rulepackBusy"
-                      @click="retireRulepack(p.version)"
-                    >
+                    <button v-if="p.slot === 'previous'" class="btn btn-text btn-sm version-action" type="button"
+                      :disabled="rulepackBusy" @click="retireRulepack(p.version)">
                       转为 retired
                     </button>
-                    <button
-                      v-if="p.slot === 'retired'"
-                      class="btn btn-text btn-sm danger version-action"
-                      type="button"
-                      :disabled="rulepackBusy"
-                      @click="deleteRulepack(p.version)"
-                    >
+                    <button v-if="p.slot === 'retired'" class="btn btn-text btn-sm danger version-action" type="button"
+                      :disabled="rulepackBusy" @click="deleteRulepack(p.version)">
                       删除
                     </button>
                   </template>
@@ -321,12 +258,7 @@
 
           <div class="section-label">单条托管规则</div>
           <div class="managed-grid">
-            <label
-              v-for="m in managedRules"
-              :key="m.key"
-              class="managed-item"
-              :class="{ on: settings[m.key] }"
-            >
+            <label v-for="m in managedRules" :key="m.key" class="managed-item" :class="{ on: settings[m.key] }">
               <input v-model="settings[m.key]" type="checkbox" />
               <span class="managed-info">
                 <strong>{{ m.label }}</strong>
@@ -340,24 +272,12 @@
           <div class="form-grid">
             <div class="field">
               <label class="field-label">质询难度（前导 0 的十六进制位数）</label>
-              <input
-                v-model.number="settings.challenge_difficulty"
-                class="input"
-                type="number"
-                min="1"
-                max="6"
-              />
+              <input v-model.number="settings.challenge_difficulty" class="input" type="number" min="1" max="6" />
               <span class="field-hint">1 最轻、6 最重，默认 4（约 6.5 万次哈希）。</span>
             </div>
             <div class="field">
               <label class="field-label">免质询有效期（秒）</label>
-              <input
-                v-model.number="settings.challenge_ttl_secs"
-                class="input"
-                type="number"
-                min="60"
-                max="86400"
-              />
+              <input v-model.number="settings.challenge_ttl_secs" class="input" type="number" min="60" max="86400" />
               <span class="field-hint">通过后签发 HttpOnly Cookie，默认 1800 秒。</span>
             </div>
           </div>
@@ -439,12 +359,8 @@
           <div v-if="rules.length > rulePageSize" class="table-footer">
             <AppPagination v-model:page="rulePage" :total="rules.length" :page-size="rulePageSize" />
           </div>
-          <EmptyState
-            v-if="!rules.length"
-            icon="rules"
-            title="还没有自定义规则"
-            text="例如：路径前缀 /admin 且来源不属于办公网时拦截，或对 /api/ 只记录日志。"
-          >
+          <EmptyState v-if="!rules.length" icon="rules" title="还没有自定义规则"
+            text="例如：路径前缀 /admin 且来源不属于办公网时拦截，或对 /api/ 只记录日志。">
             <button class="btn btn-primary btn-sm" type="button" @click="openRuleModal()">
               新建规则
             </button>
@@ -472,6 +388,7 @@
                   <th>IP / 网段</th>
                   <th>备注</th>
                   <th>添加时间</th>
+                  <th>状态</th>
                   <th class="text-right">操作</th>
                 </tr>
               </thead>
@@ -485,10 +402,23 @@
                   <td class="mono">{{ ip.ip }}</td>
                   <td class="text-2">{{ ip.note || '—' }}</td>
                   <td class="text-muted">{{ formatDateTime(ip.created_at) }}</td>
+                  <td>
+                    <StatusTag :tone="ip.enabled ? 'success' : 'neutral'" dot>
+                      {{ ip.enabled ? '启用' : '停用' }}
+                    </StatusTag>
+                  </td>
                   <td class="text-right">
-                    <button class="btn btn-text btn-sm danger" type="button" @click="removeIp(ip)">
-                      删除
-                    </button>
+                    <div class="ops" style="justify-content: flex-end">
+                      <button class="btn btn-text btn-sm" type="button" @click="toggleIp(ip)">
+                        {{ ip.enabled ? '停用' : '启用' }}
+                      </button>
+                      <button class="btn btn-text btn-sm" type="button" @click="openIpModal(ip.kind, ip)">
+                        编辑
+                      </button>
+                      <button class="btn btn-text btn-sm danger" type="button" @click="removeIp(ip)">
+                        删除
+                      </button>
+                    </div>
                   </td>
                 </tr>
               </tbody>
@@ -497,13 +427,74 @@
           <div v-if="ips.length > ipPageSize" class="table-footer">
             <AppPagination v-model:page="ipPage" :total="ips.length" :page-size="ipPageSize" />
           </div>
-          <EmptyState
-            v-if="!ips.length"
-            icon="shield"
-            title="还没有 IP 名单"
-            text="把攻击来源加入黑名单，或把办公网、监控探针加入白名单以跳过所有 WAF 检查。"
-          >
+          <EmptyState v-if="!ips.length" icon="shield" title="还没有 IP 名单" text="把攻击来源加入黑名单，或把办公网、监控探针加入白名单以跳过所有 WAF 检查。">
             <button class="btn btn-primary btn-sm" type="button" @click="openIpModal('deny')">
+              添加第一条
+            </button>
+          </EmptyState>
+        </div>
+
+        <!-- Geo / ASN 黑白名单 -->
+        <div v-else-if="tab === 'geo'" class="card-body tight">
+          <div class="filter-bar">
+            <span class="text-muted" style="font-size: 13px">
+              按国家/地区或 ASN 控制访问。黑名单优先；配置白名单后，只有命中任一白名单项才进入后续 WAF 检查
+            </span>
+            <span class="spacer" />
+            <button class="btn btn-primary btn-sm" type="button" @click="openGeoModal('deny')">
+              <AppIcon name="plus" :size="14" />
+              添加 Geo/ASN 规则
+            </button>
+          </div>
+
+          <div v-if="geoRules.length" class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>类型</th>
+                  <th>值</th>
+                  <th>备注</th>
+                  <th>添加时间</th>
+                  <th>状态</th>
+                  <th class="text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="rule in pagedGeo" :key="rule.id">
+                  <td>
+                    <StatusTag :tone="geoKindTone(rule.kind)">{{ geoKindLabel(rule.kind) }}</StatusTag>
+                  </td>
+                  <td class="mono">{{ geoValueLabel(rule) }}</td>
+                  <td class="text-2">{{ rule.note || '—' }}</td>
+                  <td class="text-muted">{{ formatDateTime(rule.created_at) }}</td>
+                  <td>
+                    <StatusTag :tone="rule.enabled ? 'success' : 'neutral'" dot>
+                      {{ rule.enabled ? '启用' : '停用' }}
+                    </StatusTag>
+                  </td>
+                  <td class="text-right">
+                    <div class="ops" style="justify-content: flex-end">
+                      <button class="btn btn-text btn-sm" type="button" @click="toggleGeo(rule)">
+                        {{ rule.enabled ? '停用' : '启用' }}
+                      </button>
+                      <button class="btn btn-text btn-sm" type="button" @click="openGeoModal('deny', rule)">
+                        编辑
+                      </button>
+                      <button class="btn btn-text btn-sm danger" type="button" @click="removeGeo(rule)">
+                        删除
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="geoRules.length > geoPageSize" class="table-footer">
+            <AppPagination v-model:page="geoPage" :total="geoRules.length" :page-size="geoPageSize" />
+          </div>
+          <EmptyState v-if="!geoRules.length" icon="shield" title="还没有 Geo/ASN 名单"
+            text="例如：只允许中国大陆访问，或封禁来自高风险国家与云厂商 ASN 的流量。">
+            <button class="btn btn-primary btn-sm" type="button" @click="openGeoModal('deny')">
               添加第一条
             </button>
           </EmptyState>
@@ -526,11 +517,7 @@
               <AppIcon name="refresh" :size="14" />
               刷新
             </button>
-            <button
-              class="btn btn-primary btn-sm"
-              type="button"
-              @click="openBanModal"
-            >
+            <button class="btn btn-primary btn-sm" type="button" @click="openBanModal">
               <AppIcon name="plus" :size="14" />
               添加封禁
             </button>
@@ -590,12 +577,8 @@
                     </template>
                   </td>
                   <td class="text-right">
-                    <button
-                      v-if="b.status === 'active'"
-                      class="btn btn-text btn-sm danger"
-                      type="button"
-                      @click="unbanIp(b)"
-                    >
+                    <button v-if="b.status === 'active'" class="btn btn-text btn-sm danger" type="button"
+                      @click="unbanIp(b)">
                       解封
                     </button>
                     <span v-else class="text-muted" style="font-size: 12px">—</span>
@@ -607,16 +590,10 @@
           <div v-else-if="bansLoading" class="card-body">
             <div class="skeleton" style="height: 32px; width: 100%" />
           </div>
-          <EmptyState
-            v-else-if="!bansError"
-            icon="shield"
-            :title="bans.length ? '没有匹配的封禁记录' : '暂无共享封禁'"
-            :text="
-              bans.length
-                ? '调整状态筛选条件后再试。'
-                : '当前防护域名暂无封禁记录；已过期和已解封记录也会保留。'
-            "
-          />
+          <EmptyState v-else-if="!bansError" icon="shield" :title="bans.length ? '没有匹配的封禁记录' : '暂无共享封禁'" :text="bans.length
+              ? '调整状态筛选条件后再试。'
+              : '当前防护域名暂无封禁记录；已过期和已解封记录也会保留。'
+            " />
         </div>
 
         <!-- 事件日志 -->
@@ -665,7 +642,9 @@
                   <td class="text-2">{{ e.rule_name || '—' }}</td>
                   <td class="mono">{{ e.client_ip }}</td>
                   <td class="mono">{{ e.method }}</td>
-                  <td><div class="mono path-cell" :title="e.path">{{ e.path }}</div></td>
+                  <td>
+                    <div class="mono path-cell" :title="e.path">{{ e.path }}</div>
+                  </td>
                   <td class="text-2">{{ e.node_id }}</td>
                 </tr>
               </tbody>
@@ -674,12 +653,7 @@
           <div v-else-if="eventsLoading" class="card-body">
             <div class="skeleton" style="height: 32px; width: 100%" />
           </div>
-          <EmptyState
-            v-else
-            icon="activity"
-            title="暂无 WAF 事件"
-            text="命中规则的请求会在这里展示；观察模式下只记录不拦截。"
-          />
+          <EmptyState v-else icon="activity" title="暂无 WAF 事件" text="命中规则的请求会在这里展示；观察模式下只记录不拦截。" />
           <div v-if="filteredEvents.length > eventPageSize" class="table-footer">
             <AppPagination v-model:page="eventPage" :total="filteredEvents.length" :page-size="eventPageSize" />
           </div>
@@ -687,13 +661,8 @@
       </div>
     </template>
 
-    <BaseModal
-      v-model="ruleModalOpen"
-      :title="editingRule ? '编辑 WAF 规则' : '新建 WAF 规则'"
-      confirm-text="保存"
-      :loading="saving"
-      @confirm="saveRule"
-    >
+    <BaseModal v-model="ruleModalOpen" :title="editingRule ? '编辑 WAF 规则' : '新建 WAF 规则'" confirm-text="保存"
+      :loading="saving" @confirm="saveRule">
       <div class="form-col">
         <div class="field">
           <label class="field-label">规则名称 <span class="req">*</span></label>
@@ -714,7 +683,8 @@
           </div>
           <div v-if="ruleForm.field === 'header'" class="field">
             <label class="field-label">请求头名称 <span class="req">*</span></label>
-            <input v-model="ruleForm.header_name" class="input" placeholder="例如 x-api-key" :disabled="!!ruleForm.expr.trim()" />
+            <input v-model="ruleForm.header_name" class="input" placeholder="例如 x-api-key"
+              :disabled="!!ruleForm.expr.trim()" />
           </div>
           <div class="field">
             <label class="field-label">匹配方式</label>
@@ -727,7 +697,8 @@
           </div>
           <div class="field span-2">
             <label class="field-label">匹配内容 <span v-if="!ruleForm.expr.trim()" class="req">*</span></label>
-            <input v-model="ruleForm.value" class="input" placeholder="例如 /admin 或 sqlmap" :disabled="!!ruleForm.expr.trim()" />
+            <input v-model="ruleForm.value" class="input" placeholder="例如 /admin 或 sqlmap"
+              :disabled="!!ruleForm.expr.trim()" />
           </div>
           <div class="field">
             <label class="field-label">命中动作</label>
@@ -746,27 +717,13 @@
         <div class="field">
           <label class="field-label">高级条件 DSL（可选）</label>
           <div class="dsl-editor">
-            <textarea
-              ref="dslTextarea"
-              v-model="ruleForm.expr"
-              class="textarea mono"
-              rows="4"
-              placeholder='例如：path prefix "/admin" AND ip in "10.0.0.0/8"'
-              @input="updateDslSuggestions"
-              @focus="updateDslSuggestions"
-              @click="updateDslSuggestions"
-              @keydown="onDslKeydown"
-              @blur="closeDslSuggestionsSoon"
-            />
+            <textarea ref="dslTextarea" v-model="ruleForm.expr" class="textarea mono" rows="4"
+              placeholder='例如：path prefix "/admin" AND ip in "10.0.0.0/8"' @input="updateDslSuggestions"
+              @focus="updateDslSuggestions" @click="updateDslSuggestions" @keydown="onDslKeydown"
+              @blur="closeDslSuggestionsSoon" />
             <div v-if="dslSuggestOpen && dslSuggestions.length" class="dsl-suggest">
-              <button
-                v-for="(item, i) in dslSuggestions"
-                :key="item.label"
-                type="button"
-                class="dsl-suggest-item"
-                :class="{ active: i === dslSuggestIndex }"
-                @mousedown.prevent="applyDslSuggestion(item)"
-              >
+              <button v-for="(item, i) in dslSuggestions" :key="item.label" type="button" class="dsl-suggest-item"
+                :class="{ active: i === dslSuggestIndex }" @mousedown.prevent="applyDslSuggestion(item)">
                 <span class="dsl-suggest-label mono">{{ item.label }}</span>
                 <span class="dsl-suggest-detail">{{ item.detail }}</span>
               </button>
@@ -786,13 +743,8 @@
       </div>
     </BaseModal>
 
-    <BaseModal
-      v-model="ipModalOpen"
-      title="添加 IP / 网段"
-      confirm-text="添加"
-      :loading="saving"
-      @confirm="saveIp"
-    >
+    <BaseModal v-model="ipModalOpen" :title="editingIp ? '编辑 IP 名单' : '添加 IP / 网段'"
+      :confirm-text="editingIp ? '保存' : '添加'" :loading="saving" @confirm="saveIp">
       <div class="form-col">
         <div class="field">
           <label class="field-label">名单类型</label>
@@ -813,17 +765,66 @@
           <label class="field-label">备注</label>
           <input v-model="ipForm.note" class="input" placeholder="例如：攻击来源 / 办公网出口" />
         </div>
+        <label class="check">
+          <input v-model="ipForm.enabled" type="checkbox" />
+          启用这条规则
+        </label>
         <p v-if="ipError" class="text-danger" style="font-size: 13px">{{ ipError }}</p>
       </div>
     </BaseModal>
 
-    <BaseModal
-      v-model="banModalOpen"
-      title="添加共享封禁"
-      confirm-text="封禁"
-      :loading="saving"
-      @confirm="saveBan"
-    >
+    <BaseModal v-model="geoModalOpen" :title="editingGeo ? '编辑 Geo/ASN 规则' : '添加 Geo/ASN 规则'"
+      :confirm-text="editingGeo ? '保存' : '添加'" :loading="saving" @confirm="saveGeo">
+      <div class="form-col">
+        <div class="field">
+          <label class="field-label">匹配维度</label>
+          <div class="segmented">
+            <button type="button" :class="{ active: geoForm.dimension === 'country' }"
+              @click="geoForm.dimension = 'country'">
+              国家/地区
+            </button>
+            <button type="button" :class="{ active: geoForm.dimension === 'asn' }" @click="geoForm.dimension = 'asn'">
+              ASN
+            </button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="field-label">名单类型</label>
+          <div class="segmented">
+            <button type="button" :class="{ active: geoForm.action === 'deny' }" @click="geoForm.action = 'deny'">
+              黑名单
+            </button>
+            <button type="button" :class="{ active: geoForm.action === 'allow' }" @click="geoForm.action = 'allow'">
+              白名单
+            </button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="field-label">
+            {{ geoForm.dimension === 'country' ? '国家/地区代码' : '自治系统号（ASN）' }}
+            <span class="req">*</span>
+          </label>
+          <input v-model="geoForm.value" class="input"
+            :placeholder="geoForm.dimension === 'country' ? 'CN / US / HK（ISO 3166-1 两位代码）' : '13335 或 AS13335'" />
+          <span class="field-hint">
+            {{ geoForm.dimension === 'country'
+              ? 'Edge 使用 MaxMind GeoLite2-Country 解析国家代码。'
+              : 'Edge 使用 MaxMind GeoLite2-ASN 解析自治系统号。' }}
+          </span>
+        </div>
+        <div class="field">
+          <label class="field-label">备注</label>
+          <input v-model="geoForm.note" class="input" placeholder="例如：仅允许国内访问 / 封禁某云厂商" />
+        </div>
+        <label class="check">
+          <input v-model="geoForm.enabled" type="checkbox" />
+          启用这条规则
+        </label>
+        <p v-if="geoError" class="text-danger" style="font-size: 13px">{{ geoError }}</p>
+      </div>
+    </BaseModal>
+
+    <BaseModal v-model="banModalOpen" title="添加共享封禁" confirm-text="封禁" :loading="saving" @confirm="saveBan">
       <div class="form-col">
         <div class="field">
           <label class="field-label">域名</label>
@@ -860,7 +861,7 @@ const toast = useToast()
 const { ask } = useConfirm()
 const auth = useAuthStore()
 
-type Tab = 'overview' | 'settings' | 'rules' | 'ips' | 'bans' | 'events'
+type Tab = 'overview' | 'settings' | 'rules' | 'ips' | 'geo' | 'bans' | 'events'
 
 const domains = ref<any[]>([])
 const domainId = ref('')
@@ -930,6 +931,13 @@ const rulesets = ref<any[]>([])
 const rulepackVersions = ref<any[]>([])
 const rulepackBusy = ref(false)
 const ips = ref<any[]>([])
+const geoRules = ref<any[]>([])
+const geoPage = ref(1)
+const geoPageSize = 10
+const pagedGeo = computed(() => {
+  const start = (geoPage.value - 1) * geoPageSize
+  return geoRules.value.slice(start, start + geoPageSize)
+})
 const rulePage = ref(1)
 const ipPage = ref(1)
 const rulePageSize = 10
@@ -952,6 +960,12 @@ watch(
   () => ips.value.length,
   (total) => {
     ipPage.value = Math.min(ipPage.value, Math.max(1, Math.ceil(total / ipPageSize)))
+  },
+)
+watch(
+  () => geoRules.value.length,
+  (total) => {
+    geoPage.value = Math.min(geoPage.value, Math.max(1, Math.ceil(total / geoPageSize)))
   },
 )
 const events = ref<any[]>([])
@@ -989,7 +1003,18 @@ const ruleForm = ref({
 
 const ipModalOpen = ref(false)
 const ipError = ref('')
-const ipForm = ref({ kind: 'deny', ip: '', note: '' })
+const editingIp = ref<any>(null)
+const ipForm = ref({ kind: 'deny', ip: '', note: '', enabled: true })
+const geoModalOpen = ref(false)
+const geoError = ref('')
+const editingGeo = ref<any>(null)
+const geoForm = ref({
+  dimension: 'country' as 'country' | 'asn',
+  action: 'deny' as 'allow' | 'deny',
+  value: '',
+  note: '',
+  enabled: true,
+})
 
 const banModalOpen = ref(false)
 const banError = ref('')
@@ -1018,6 +1043,7 @@ const tabs = computed(() => [
   { value: 'settings' as Tab, label: '防护设置' },
   { value: 'rules' as Tab, label: '自定义规则', count: rules.value.length },
   { value: 'ips' as Tab, label: 'IP 黑白名单', count: ips.value.length },
+  { value: 'geo' as Tab, label: 'Geo/ASN 黑白名单', count: geoRules.value.length },
   { value: 'bans' as Tab, label: '共享封禁', count: bans.value.length },
   { value: 'events' as Tab, label: '事件日志' },
 ])
@@ -1134,6 +1160,9 @@ function categoryLabel(category: string) {
       log4shell: 'Log4Shell',
       crlf: 'CRLF 注入',
       ip_deny: 'IP 黑名单',
+      geo_deny: '国家/地区黑名单',
+      asn_deny: 'ASN 黑名单',
+      geo_allow: 'Geo/ASN 白名单未命中',
       custom: '自定义规则',
       security_level: '安全级别',
     } as Record<string, string>
@@ -1232,7 +1261,7 @@ async function publishRulepack() {
 async function retireRulepack(version: string) {
   const ok = await ask({
     title: '转为 retired',
-    text: `将规则包 ${version} 转为 retired？转为 retired 后才能删除。`,
+    message: `将规则包 ${version} 转为 retired？转为 retired 后才能删除。`,
     confirmText: '转为 retired',
   })
   if (!ok) return
@@ -1251,7 +1280,7 @@ async function retireRulepack(version: string) {
 async function deleteRulepack(version: string) {
   const ok = await ask({
     title: '删除规则包',
-    text: `删除规则包 ${version}？此操作不可撤销；仍有域名固定该版本时会被拒绝。`,
+    message: `删除规则包 ${version}？此操作不可撤销；仍有域名固定该版本时会被拒绝。`,
     confirmText: '删除',
     danger: true,
   })
@@ -1296,6 +1325,31 @@ async function loadRules() {
 async function loadIps() {
   if (!domainId.value) return
   ips.value = (await api.get<any[]>(`/api/v1/domains/${domainId.value}/waf/ips`).catch(() => [])) || []
+}
+
+const GEO_KIND_LABELS: Record<string, string> = {
+  country_allow: '国家/地区白名单',
+  country_deny: '国家/地区黑名单',
+  asn_allow: 'ASN 白名单',
+  asn_deny: 'ASN 黑名单',
+}
+
+function geoKindLabel(kind: string) {
+  return GEO_KIND_LABELS[kind] || kind
+}
+
+function geoKindTone(kind: string) {
+  return kind.endsWith('_allow') ? 'success' : 'danger'
+}
+
+function geoValueLabel(rule: any) {
+  return rule.kind.startsWith('asn') ? `AS${rule.value}` : rule.value
+}
+
+async function loadGeo() {
+  if (!domainId.value) return
+  geoRules.value =
+    (await api.get<any[]>(`/api/v1/domains/${domainId.value}/waf/geo`).catch(() => [])) || []
 }
 
 async function loadEvents() {
@@ -1434,7 +1488,7 @@ async function reload() {
     await loadDomains()
     await loadRulesets()
     await loadRulepacks()
-    await Promise.all([loadSettings(), loadRules(), loadIps(), loadBans()])
+    await Promise.all([loadSettings(), loadRules(), loadIps(), loadGeo(), loadBans()])
     if (tab.value === 'events') await loadEvents()
     if (tab.value === 'overview') await loadStats()
   } finally {
@@ -1447,6 +1501,7 @@ async function switchTab(next: Tab) {
   if (next === 'events') await loadEvents()
   if (next === 'rules') await loadRules()
   if (next === 'ips') await loadIps()
+  if (next === 'geo') await loadGeo()
   if (next === 'bans') await loadBans()
   if (next === 'settings') await loadSettings()
   if (next === 'overview') await loadStats()
@@ -1495,27 +1550,27 @@ function openRuleModal(rule?: any) {
   editingRule.value = rule || null
   ruleForm.value = rule
     ? {
-        name: rule.name,
-        field: rule.field && rule.field.startsWith('header:') ? 'header' : rule.field,
-        header_name: rule.field && rule.field.startsWith('header:') ? rule.field.slice(7) : '',
-        operator: rule.operator,
-        value: rule.value,
-        action: rule.action,
-        priority: rule.priority,
-        enabled: rule.enabled,
-        expr: rule.expr || '',
-      }
+      name: rule.name,
+      field: rule.field && rule.field.startsWith('header:') ? 'header' : rule.field,
+      header_name: rule.field && rule.field.startsWith('header:') ? rule.field.slice(7) : '',
+      operator: rule.operator,
+      value: rule.value,
+      action: rule.action,
+      priority: rule.priority,
+      enabled: rule.enabled,
+      expr: rule.expr || '',
+    }
     : {
-        name: '',
-        field: 'path',
-        header_name: '',
-        operator: 'contains',
-        value: '',
-        action: 'block',
-        priority: 0,
-        enabled: true,
-        expr: '',
-      }
+      name: '',
+      field: 'path',
+      header_name: '',
+      operator: 'contains',
+      value: '',
+      action: 'block',
+      priority: 0,
+      enabled: true,
+      expr: '',
+    }
   ruleModalOpen.value = true
 }
 
@@ -1650,7 +1705,8 @@ function onDslKeydown(event: KeyboardEvent) {
       (dslSuggestIndex.value - 1 + dslSuggestions.value.length) % dslSuggestions.value.length
   } else if (event.key === 'Enter' || event.key === 'Tab') {
     event.preventDefault()
-    applyDslSuggestion(dslSuggestions.value[dslSuggestIndex.value])
+    const suggestion = dslSuggestions.value[dslSuggestIndex.value]
+    if (suggestion) applyDslSuggestion(suggestion)
   } else if (event.key === 'Escape') {
     dslSuggestOpen.value = false
   }
@@ -1725,9 +1781,12 @@ async function removeRule(rule: any) {
   }
 }
 
-function openIpModal(kind: 'allow' | 'deny') {
+function openIpModal(kind: 'allow' | 'deny', ip?: any) {
   ipError.value = ''
-  ipForm.value = { kind, ip: '', note: '' }
+  editingIp.value = ip || null
+  ipForm.value = ip
+    ? { kind: ip.kind, ip: ip.ip, note: ip.note || '', enabled: ip.enabled }
+    : { kind, ip: '', note: '', enabled: true }
   ipModalOpen.value = true
 }
 
@@ -1739,14 +1798,34 @@ async function saveIp() {
   }
   saving.value = true
   try {
-    await api.post(`/api/v1/domains/${domainId.value}/waf/ips`, ipForm.value)
+    if (editingIp.value) {
+      await api.put(`/api/v1/waf/ips/${editingIp.value.id}`, ipForm.value)
+      toast.success('IP 名单已更新')
+    } else {
+      await api.post(`/api/v1/domains/${domainId.value}/waf/ips`, ipForm.value)
+      toast.success('IP 名单已添加')
+    }
     ipModalOpen.value = false
-    toast.success('IP 名单已添加')
+    editingIp.value = null
     await loadIps()
   } catch (e: any) {
-    ipError.value = e?.data?.error || '添加失败，请检查 IP 格式'
+    ipError.value = e?.data?.error || '保存失败，请检查 IP 格式'
   } finally {
     saving.value = false
+  }
+}
+
+async function toggleIp(ip: any) {
+  try {
+    await api.put(`/api/v1/waf/ips/${ip.id}`, {
+      kind: ip.kind,
+      ip: ip.ip,
+      note: ip.note || '',
+      enabled: !ip.enabled,
+    })
+    await loadIps()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '更新失败')
   }
 }
 
@@ -1767,11 +1846,97 @@ async function removeIp(ip: any) {
   }
 }
 
+function openGeoModal(action: 'allow' | 'deny', rule?: any) {
+  geoError.value = ''
+  editingGeo.value = rule || null
+  geoForm.value = rule
+    ? {
+      dimension: rule.kind.startsWith('country') ? 'country' : 'asn',
+      action: rule.kind.endsWith('_allow') ? 'allow' : 'deny',
+      value: rule.value,
+      note: rule.note || '',
+      enabled: rule.enabled,
+    }
+    : { dimension: 'country', action, value: '', note: '', enabled: true }
+  geoModalOpen.value = true
+}
+
+async function saveGeo() {
+  geoError.value = ''
+  const value = geoForm.value.value.trim()
+  if (!value) {
+    geoError.value = geoForm.value.dimension === 'country' ? '请填写国家/地区代码' : '请填写 ASN'
+    return
+  }
+  if (geoForm.value.dimension === 'country' && !/^[A-Za-z]{2}$/.test(value)) {
+    geoError.value = '国家/地区代码必须是两位字母，例如 CN'
+    return
+  }
+  if (geoForm.value.dimension === 'asn' && !/^(AS)?\d{1,10}$/i.test(value)) {
+    geoError.value = 'ASN 必须是数字，例如 13335 或 AS13335'
+    return
+  }
+  saving.value = true
+  try {
+    const body = {
+      kind: `${geoForm.value.dimension}_${geoForm.value.action}`,
+      value,
+      note: geoForm.value.note,
+      enabled: geoForm.value.enabled,
+    }
+    if (editingGeo.value) {
+      await api.put(`/api/v1/waf/geo/${editingGeo.value.id}`, body)
+      toast.success('Geo/ASN 规则已更新')
+    } else {
+      await api.post(`/api/v1/domains/${domainId.value}/waf/geo`, body)
+      toast.success('Geo/ASN 规则已添加')
+    }
+    geoModalOpen.value = false
+    editingGeo.value = null
+    await loadGeo()
+  } catch (e: any) {
+    geoError.value = e?.data?.error || '保存失败，请检查国家代码或 ASN'
+  } finally {
+    saving.value = false
+  }
+}
+
+async function toggleGeo(rule: any) {
+  try {
+    await api.put(`/api/v1/waf/geo/${rule.id}`, {
+      kind: rule.kind,
+      value: rule.value,
+      note: rule.note || '',
+      enabled: !rule.enabled,
+    })
+    await loadGeo()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '更新失败')
+  }
+}
+
+async function removeGeo(rule: any) {
+  const ok = await ask({
+    title: '删除 Geo/ASN 规则',
+    message: `确认删除 ${geoKindLabel(rule.kind)} ${geoValueLabel(rule)}？`,
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!ok) return
+  try {
+    await api.del(`/api/v1/waf/geo/${rule.id}`)
+    toast.success('已删除')
+    await loadGeo()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '删除失败')
+  }
+}
+
 watch(domainId, async (id) => {
   if (!id) return
   loading.value = true
   try {
-    await Promise.all([loadSettings(), loadRules(), loadIps(), loadBans()])
+    await Promise.all([loadSettings(), loadRules(), loadIps(), loadGeo(), loadBans()])
     if (tab.value === 'events') await loadEvents()
     if (tab.value === 'overview') await loadStats()
   } finally {
@@ -2308,6 +2473,7 @@ onMounted(reload)
   border-top: 1px solid var(--divider);
   margin-top: 3px;
 }
+
 .dsl-cell {
   display: inline-flex;
   align-items: center;
@@ -2331,6 +2497,7 @@ onMounted(reload)
 }
 
 @media (max-width: 900px) {
+
   .managed-grid,
   .ruleset-grid {
     grid-template-columns: minmax(0, 1fr);

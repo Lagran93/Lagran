@@ -957,6 +957,7 @@ pub struct WafIpDto {
     pub kind: String,
     pub ip: String,
     pub note: String,
+    pub enabled: bool,
     pub created_at: String,
 }
 
@@ -968,6 +969,7 @@ impl From<repository::WafIpRow> for WafIpDto {
             kind: r.kind,
             ip: r.ip,
             note: r.note,
+            enabled: r.enabled,
             created_at: r.created_at.to_rfc3339(),
         }
     }
@@ -978,6 +980,7 @@ pub struct WafIpRequest {
     pub kind: String,
     pub ip: String,
     pub note: Option<String>,
+    pub enabled: Option<bool>,
 }
 
 pub async fn list_ips(
@@ -1044,6 +1047,61 @@ pub async fn create_ip(
     Ok((StatusCode::CREATED, Json(row.into())))
 }
 
+pub async fn update_ip(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+    Json(req): Json<WafIpRequest>,
+) -> Result<Json<WafIpDto>, (StatusCode, Json<ErrorBody>)> {
+    let ip_id = parse_uuid(&id)?;
+    let existing = repository::get_waf_ip(&state.pool, ip_id)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found("ip rule not found"))?;
+    if !actor.can_write_domain(&state, existing.domain_id).await {
+        return Err(forbidden());
+    }
+    let kind = req.kind.trim().to_ascii_lowercase();
+    if kind != "allow" && kind != "deny" {
+        return Err(bad_request("kind must be allow or deny".into()));
+    }
+    let ip = req.ip.trim();
+    if !valid_cidr(ip) {
+        return Err(bad_request("ip must be an IP or CIDR".into()));
+    }
+    let row = repository::update_waf_ip(
+        &state.pool,
+        ip_id,
+        &kind,
+        ip,
+        req.note.as_deref().unwrap_or(""),
+        req.enabled.unwrap_or(existing.enabled),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "update waf ip");
+        db_error()
+    })?
+    .ok_or_else(|| not_found("ip rule not found"))?;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "waf.ip.update",
+        &existing.domain_id.to_string(),
+        &format!("{} {} -> {kind} {ip}", existing.kind, existing.ip),
+    )
+    .await;
+    record_waf_version(
+        &state,
+        existing.domain_id,
+        &actor,
+        "waf.ip.update",
+        &format!("更新 WAF IP {kind} {ip}"),
+    )
+    .await;
+    Ok(Json(row.into()))
+}
+
 pub async fn delete_ip(
     State(state): State<AppState>,
     actor: Actor,
@@ -1074,6 +1132,275 @@ pub async fn delete_ip(
         &actor,
         "waf.ip.delete",
         &format!("删除 WAF IP {} {}", existing.kind, existing.ip),
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "success": true, "id": id })))
+}
+
+// ------------------------------------------------------------ Geo/ASN lists
+
+#[derive(Serialize)]
+pub struct WafGeoDto {
+    pub id: String,
+    pub domain_id: String,
+    pub kind: String,
+    pub value: String,
+    pub note: String,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+impl From<repository::WafGeoRow> for WafGeoDto {
+    fn from(r: repository::WafGeoRow) -> Self {
+        Self {
+            id: r.id.to_string(),
+            domain_id: r.domain_id.to_string(),
+            kind: r.kind,
+            value: r.value,
+            note: r.note,
+            enabled: r.enabled,
+            created_at: r.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct WafGeoRequest {
+    pub kind: String,
+    pub value: String,
+    pub note: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+const GEO_KINDS: [&str; 4] = ["country_allow", "country_deny", "asn_allow", "asn_deny"];
+
+fn normalize_country(input: &str) -> Option<String> {
+    let code = input.trim().to_ascii_uppercase();
+    if code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase()) {
+        Some(code)
+    } else {
+        None
+    }
+}
+
+/// Accept both `13335` and `AS13335`.
+fn normalize_asn(input: &str) -> Option<u32> {
+    let value = input.trim();
+    let digits = match value
+        .get(..2)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("as"))
+    {
+        Some(_) => &value[2..],
+        None => value,
+    };
+    match digits.trim().parse::<u32>() {
+        Ok(asn) if asn > 0 => Some(asn),
+        _ => None,
+    }
+}
+
+fn geo_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "country_allow" => "国家/地区白名单",
+        "country_deny" => "国家/地区黑名单",
+        "asn_allow" => "ASN 白名单",
+        _ => "ASN 黑名单",
+    }
+}
+
+pub async fn list_geo(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<WafGeoDto>>, (StatusCode, Json<ErrorBody>)> {
+    let domain_id = parse_uuid(&id)?;
+    if !actor.can_read_domain(&state, domain_id).await {
+        return Err(forbidden());
+    }
+    let rows = repository::list_waf_geo(&state.pool, domain_id)
+        .await
+        .map_err(|_| db_error())?;
+    Ok(Json(rows.into_iter().map(WafGeoDto::from).collect()))
+}
+
+pub async fn create_geo(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+    Json(req): Json<WafGeoRequest>,
+) -> Result<(StatusCode, Json<WafGeoDto>), (StatusCode, Json<ErrorBody>)> {
+    let domain_id = parse_uuid(&id)?;
+    if !actor.can_write_domain(&state, domain_id).await {
+        return Err(forbidden());
+    }
+    let kind = req.kind.trim().to_ascii_lowercase();
+    if !GEO_KINDS.contains(&kind.as_str()) {
+        return Err(bad_request(format!(
+            "kind must be one of {}",
+            GEO_KINDS.join(", ")
+        )));
+    }
+    let value = if kind.starts_with("country") {
+        let Some(code) = normalize_country(&req.value) else {
+            return Err(bad_request(
+                "value must be an ISO 3166-1 alpha-2 country code".into(),
+            ));
+        };
+        code
+    } else {
+        let Some(asn) = normalize_asn(&req.value) else {
+            return Err(bad_request(
+                "value must be an ASN such as 13335 or AS13335".into(),
+            ));
+        };
+        asn.to_string()
+    };
+    if repository::waf_geo_exists(&state.pool, domain_id, &kind, &value)
+        .await
+        .map_err(|_| db_error())?
+    {
+        return Err(bad_request("this entry already exists".into()));
+    }
+    let row = repository::create_waf_geo(
+        &state.pool,
+        domain_id,
+        &kind,
+        &value,
+        req.note.as_deref().unwrap_or(""),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "create waf geo rule");
+        db_error()
+    })?;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "waf.geo.create",
+        &domain_id.to_string(),
+        &format!("{kind} {value}"),
+    )
+    .await;
+    record_waf_version(
+        &state,
+        domain_id,
+        &actor,
+        "waf.geo.create",
+        &format!("新增 WAF {} {value}", geo_kind_label(&kind)),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(row.into())))
+}
+
+pub async fn update_geo(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+    Json(req): Json<WafGeoRequest>,
+) -> Result<Json<WafGeoDto>, (StatusCode, Json<ErrorBody>)> {
+    let geo_id = parse_uuid(&id)?;
+    let existing = repository::get_waf_geo(&state.pool, geo_id)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found("geo rule not found"))?;
+    if !actor.can_write_domain(&state, existing.domain_id).await {
+        return Err(forbidden());
+    }
+    let kind = req.kind.trim().to_ascii_lowercase();
+    if !GEO_KINDS.contains(&kind.as_str()) {
+        return Err(bad_request(format!(
+            "kind must be one of {}",
+            GEO_KINDS.join(", ")
+        )));
+    }
+    let value = if kind.starts_with("country") {
+        let Some(code) = normalize_country(&req.value) else {
+            return Err(bad_request(
+                "value must be an ISO 3166-1 alpha-2 country code".into(),
+            ));
+        };
+        code
+    } else {
+        let Some(asn) = normalize_asn(&req.value) else {
+            return Err(bad_request(
+                "value must be an ASN such as 13335 or AS13335".into(),
+            ));
+        };
+        asn.to_string()
+    };
+    if repository::waf_geo_exists_except(&state.pool, geo_id, existing.domain_id, &kind, &value)
+        .await
+        .map_err(|_| db_error())?
+    {
+        return Err(bad_request("this entry already exists".into()));
+    }
+    let row = repository::update_waf_geo(
+        &state.pool,
+        geo_id,
+        &kind,
+        &value,
+        req.note.as_deref().unwrap_or(""),
+        req.enabled.unwrap_or(existing.enabled),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "update waf geo rule");
+        db_error()
+    })?
+    .ok_or_else(|| not_found("geo rule not found"))?;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "waf.geo.update",
+        &existing.domain_id.to_string(),
+        &format!("{} {} -> {kind} {value}", existing.kind, existing.value),
+    )
+    .await;
+    record_waf_version(
+        &state,
+        existing.domain_id,
+        &actor,
+        "waf.geo.update",
+        &format!("更新 WAF {} {value}", geo_kind_label(&kind)),
+    )
+    .await;
+    Ok(Json(row.into()))
+}
+
+pub async fn delete_geo(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    let geo_id = parse_uuid(&id)?;
+    let existing = repository::get_waf_geo(&state.pool, geo_id)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found("geo rule not found"))?;
+    if !actor.can_write_domain(&state, existing.domain_id).await {
+        return Err(forbidden());
+    }
+    repository::delete_waf_geo(&state.pool, geo_id)
+        .await
+        .map_err(|_| db_error())?;
+    let _ = repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "waf.geo.delete",
+        &existing.domain_id.to_string(),
+        &format!("{} {}", existing.kind, existing.value),
+    )
+    .await;
+    record_waf_version(
+        &state,
+        existing.domain_id,
+        &actor,
+        "waf.geo.delete",
+        &format!(
+            "删除 WAF {} {}",
+            geo_kind_label(&existing.kind),
+            existing.value
+        ),
     )
     .await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
