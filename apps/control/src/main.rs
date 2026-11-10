@@ -49,6 +49,16 @@ async fn main() -> anyhow::Result<()> {
             "JWT_SECRET is the built-in default or too short — do not use this in production"
         );
     }
+    if control::waf_rulepack::signing_key(&config.waf_rulepack_secret).is_none() {
+        if config.require_secure_secrets {
+            anyhow::bail!(
+                "WAF_RULEPACK_SECRET is not set; signed WAF rulepacks cannot be trusted. Set WAF_RULEPACK_SECRET (and the same value on every edge) or disable REQUIRE_SECURE_SECRETS for local dev"
+            );
+        }
+        tracing::warn!(
+            "WAF_RULEPACK_SECRET is not set — edges reject unsigned rulepacks, so managed rulepack updates will not be applied; set it in production"
+        );
+    }
     if config.agent_token.is_empty() {
         tracing::warn!(
             "AGENT_TOKEN is empty; edge→control agent routes still require per-node tokens, but schedule/DNS global auth is weakened"
@@ -79,27 +89,27 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("migrations applied");
 
-    {
-        if config.waf_rulepack_secret.trim().is_empty() {
-            tracing::warn!(
-                "WAF_RULEPACK_SECRET is not set; using the built-in development rulepack key"
-            );
-        }
-        let secret = control::waf_rulepack::signing_key(
-            &config.waf_rulepack_secret,
-            &config.agent_token,
-        );
-        match control::waf_rulepack::ensure_seed(&pool, &secret).await {
+    match control::waf_rulepack::signing_key(&config.waf_rulepack_secret) {
+        Some(secret) => match control::waf_rulepack::ensure_seed(&pool, &secret).await {
             Ok(row) => tracing::info!(
                 version = %row.version,
                 slot = %row.slot,
                 "WAF rulepack ready"
             ),
             Err(e) => tracing::warn!(error = %e, "failed to seed WAF rulepack"),
-        }
+        },
+        None => tracing::warn!("skipping WAF rulepack seed: WAF_RULEPACK_SECRET is not set"),
     }
 
     if config.seed_demo {
+        // Refuse to create the well-known account when secure secrets are
+        // enforced: that combination is either a production host or a mistake.
+        if config.require_secure_secrets {
+            anyhow::bail!(
+                "SEED_DEMO=true is incompatible with REQUIRE_SECURE_SECRETS=true: the demo \
+                 account has a published password. Set SEED_DEMO=false"
+            );
+        }
         repository::ensure_demo_user(&pool).await?;
         repository::ensure_demo_domain(&pool).await?;
     } else {
@@ -208,7 +218,10 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("Control plane listening on http://{}", addr);
     if seed_demo {
-        tracing::info!("Demo login: demo@lagran.dev / demo123");
+        tracing::warn!(
+            "SEED_DEMO=true: a demo@lagran.dev account with a well-known password exists. \
+             Never enable this on a public deployment"
+        );
     }
 
     axum::serve(listener, app).await?;

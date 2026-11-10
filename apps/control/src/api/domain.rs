@@ -384,9 +384,15 @@ pub async fn create(
         }
     };
 
+    // Normalize before the uniqueness check so `CD.Example.COM.` and
+    // `cd.example.com` cannot both be registered: the edge would collapse them
+    // onto one registry key and the later write would silently take over.
+    let name = normalize_domain_name(&req.name)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+
     let row = repository::create_domain_with_project(
         &state.pool,
-        req.name.trim(),
+        &name,
         &origin_host,
         port,
         &proto,
@@ -854,6 +860,11 @@ pub struct SettingsDto {
     pub origin_auth_header: String,
     pub origin_auth_value: String,
     pub hotlink_signature_enabled: bool,
+    /// Whether a signed-URL secret is stored. The secret itself is masked, so
+    /// the UI needs this flag to render "已配置 / 未配置" instead of the value.
+    pub signed_url_secret_set: bool,
+    /// Whether an origin authorization value is stored (value is masked).
+    pub origin_auth_value_set: bool,
 }
 
 fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
@@ -885,13 +896,99 @@ fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
             s.signed_url_mode
         },
         signed_url_paths: s.signed_url_paths,
-        signed_url_secret: s.signed_url_secret,
-        signed_url_previous_secret: s.signed_url_previous_secret,
+        // Secrets are write-only over the API. Echoing them meant any project
+        // member with `domain:read` (a read-only observer) could lift the origin
+        // auth credentials and forge signed URLs, defeating both controls.
+        signed_url_secret: mask_secret(&s.signed_url_secret),
+        signed_url_previous_secret: mask_secret(&s.signed_url_previous_secret),
         signed_url_ttl_secs: s.signed_url_ttl_secs.max(0) as u32,
         origin_auth_header: s.origin_auth_header,
-        origin_auth_value: s.origin_auth_value,
+        origin_auth_value: mask_secret(&s.origin_auth_value),
         hotlink_signature_enabled: s.hotlink_signature_enabled,
+        signed_url_secret_set: !s.signed_url_secret.is_empty(),
+        origin_auth_value_set: !s.origin_auth_value.is_empty(),
     }
+}
+
+/// Placeholder returned in place of a stored secret.
+pub const SECRET_MASK: &str = "********";
+
+/// Mask a stored secret for API responses.
+///
+/// Callers cannot round-trip this value: writing it back is treated as
+/// "keep the stored secret" (see [`is_secret_mask`]), so a client that reads a
+/// settings document and PUTs it back unchanged never overwrites the secret with
+/// the mask itself.
+fn mask_secret(value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        SECRET_MASK.to_string()
+    }
+}
+
+/// True when a submitted value means "leave the stored secret alone".
+pub fn is_secret_mask(value: &str) -> bool {
+    let value = value.trim();
+    value == SECRET_MASK || value.eq_ignore_ascii_case(SECRET_MASK)
+}
+
+/// Resolve a secret submitted by a client, ignoring the mask placeholder.
+fn submitted_secret(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .filter(|v| !is_secret_mask(v))
+        .map(str::to_string)
+}
+
+/// Canonical domain name, validated.
+///
+/// The edge lowercases the `Host` header and strips a trailing root dot before
+/// looking a domain up, and the registry is keyed on that normalized form. If
+/// the control plane stored `CD.Example.COM.` as-is, two tenants could register
+/// spellings that collapse to the same edge key and the last write would win.
+///
+/// Returns the normalized name, or a message suitable for a 400 response.
+pub fn normalize_domain_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim().to_ascii_lowercase();
+    let name = name.trim_end_matches('.');
+    if name.is_empty() {
+        return Err("domain name is required".into());
+    }
+    if name.len() > 253 {
+        return Err("domain name is too long (max 253 characters)".into());
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return Err("use an origin IP instead of registering an IP as a domain name".into());
+    }
+    if name.contains('*') {
+        return Err("wildcard domains are not supported; register each hostname".into());
+    }
+    for label in name.split('.') {
+        if label.is_empty() {
+            return Err("domain name contains an empty label".into());
+        }
+        if label.len() > 63 {
+            return Err("a domain label exceeds 63 characters".into());
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return Err("each domain label must start and end with a letter or digit".into());
+        }
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            return Err(
+                "domain name may only contain letters, digits, hyphens and dots".into(),
+            );
+        }
+    }
+    if !name.contains('.') {
+        return Err("domain name must contain at least one dot".into());
+    }
+    Ok(name.to_string())
 }
 
 fn normalize_signed_path(path: &str) -> Result<String, ()> {
@@ -1157,9 +1254,12 @@ pub async fn rotate_signed_url(
         tracing::error!(error = %e, "rotate signed url secret");
         db_error()
     })?;
+    // Only the new key is returned. Handing back the previous one extended the
+    // window in which a leaked key stayed usable: edges keep accepting it until
+    // the next rotation.
     Ok(Json(SignedUrlRotateResponse {
         signed_url_secret: next,
-        signed_url_previous_secret: current,
+        signed_url_previous_secret: SECRET_MASK.to_string(),
     }))
 }
 
@@ -1325,12 +1425,10 @@ pub async fn put_settings(
         ));
     }
     if signed_requested {
-        let mut secret = req
-            .signed_url_secret
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string);
+        // `submitted_secret` drops the mask placeholder, so re-submitting an
+        // unchanged settings document keeps the stored secret instead of
+        // replacing it with "********".
+        let mut secret = submitted_secret(req.signed_url_secret.as_deref());
         let wanted_on = enabled_arg.unwrap_or(false);
         if wanted_on && secret.is_none() {
             let existing = repository::get_domain_settings(&state.pool, &domain_name)
@@ -1348,10 +1446,7 @@ pub async fn put_settings(
             requested_mode.as_deref(),
             requested_paths.as_deref(),
             secret.as_deref(),
-            req.signed_url_previous_secret
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty()),
+            submitted_secret(req.signed_url_previous_secret.as_deref()).as_deref(),
             req.signed_url_ttl_secs.map(|v| v as i32),
         )
         .await
@@ -1390,7 +1485,7 @@ pub async fn put_settings(
             &state.pool,
             uid,
             req.origin_auth_header.as_deref().map(str::trim),
-            req.origin_auth_value.as_deref().map(str::trim),
+            submitted_secret(req.origin_auth_value.as_deref()).as_deref(),
             req.hotlink_signature_enabled,
         )
         .await
@@ -1436,6 +1531,82 @@ pub async fn put_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The edge resolves a domain by the lowercased, root-dot-stripped `Host`.
+    /// Anything that normalizes to an existing name must be rejected rather
+    /// than stored as a second row that overwrites the first on the edge.
+    /// A project member with only `domain:read` must not be able to lift the
+    /// origin auth credentials or the signed-URL key from the settings API.
+    #[test]
+    fn secrets_are_masked_in_responses() {
+        assert_eq!(mask_secret("real-secret"), SECRET_MASK);
+        assert_eq!(mask_secret(""), "");
+        // The mask must be recognizable as "unchanged" by the write path.
+        assert!(is_secret_mask(SECRET_MASK));
+        assert!(is_secret_mask("  ********  "));
+        assert!(!is_secret_mask("real-secret"));
+        assert!(!is_secret_mask(""));
+    }
+
+    /// Round-tripping a settings document must not overwrite the stored secret
+    /// with the mask. This is the failure mode that masking would otherwise
+    /// introduce.
+    #[test]
+    fn masked_value_is_treated_as_unchanged() {
+        assert_eq!(submitted_secret(Some(SECRET_MASK)), None);
+        assert_eq!(submitted_secret(Some("   ")), None);
+        assert_eq!(submitted_secret(None), None);
+        assert_eq!(
+            submitted_secret(Some("  new-secret  ")).as_deref(),
+            Some("new-secret")
+        );
+    }
+
+    #[test]
+    fn domain_name_is_canonicalized() {
+        assert_eq!(normalize_domain_name("CD.Example.COM").unwrap(), "cd.example.com");
+        assert_eq!(normalize_domain_name("cdn.example.com.").unwrap(), "cdn.example.com");
+        assert_eq!(normalize_domain_name("  a.b.co  ").unwrap(), "a.b.co");
+    }
+
+    #[test]
+    fn equivalent_spellings_normalize_to_the_same_name() {
+        let forms = [
+            "cdn.example.com",
+            "CDN.Example.Com",
+            "cdn.example.com.",
+            "  cdn.example.com  ",
+        ];
+        let mut seen: Vec<String> = forms
+            .iter()
+            .map(|f| normalize_domain_name(f).unwrap())
+            .collect();
+        seen.dedup();
+        assert_eq!(seen.len(), 1, "all spellings must collapse to one name");
+    }
+
+    #[test]
+    fn invalid_domain_names_are_rejected() {
+        for bad in [
+            "",
+            "   ",
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "*.example.com",
+            "a..b.com",
+            "-bad.example.com",
+            "bad-.example.com",
+            "has space.com",
+            "has_underscore.com",
+            "exa mple.com",
+        ] {
+            assert!(
+                normalize_domain_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
 
     fn origin(host: &str, weight: u32, priority: i32) -> repository::DomainOrigin {
         repository::DomainOrigin {

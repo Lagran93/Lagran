@@ -801,21 +801,30 @@ pub async fn list_rules_for_domain(
     .await
 }
 
+/// Seed the local demo account, and only when explicitly asked for.
+///
+/// This used to unconditionally promote `demo@lagran.dev` (password `demo123`,
+/// printed to the startup log) to `admin`. On any deployment that forgot
+/// `SEED_DEMO=false` that is a remote root-equivalent account with a published
+/// password, so seeding now requires an explicit opt-in and the account is
+/// created as an ordinary user. An operator who wants an admin must promote it.
 pub async fn ensure_demo_user(pool: &PgPool) -> anyhow::Result<()> {
     let exists = find_user_by_email(pool, "demo@lagran.dev").await?;
     if exists.is_none() {
-        let hash = crate::utils::hash_password("demo123")
+        let hash = crate::utils::hash_password(DEMO_PASSWORD)
             .map_err(|e| anyhow::anyhow!("bcrypt error: {e}"))?;
         create_user(pool, "demo@lagran.dev", &hash, "Demo User").await?;
-        tracing::info!("seeded demo user demo@lagran.dev / demo123");
+        tracing::warn!(
+            email = "demo@lagran.dev",
+            "seeded demo account with the well-known demo password; it has no admin rights \
+             — change the password or delete the account"
+        );
     }
-    // Fresh databases seed the demo user *after* migrations ran, so the
-    // migration's admin promotion would miss it; enforce it here.
-    sqlx::query("UPDATE users SET role = 'admin' WHERE email = 'demo@lagran.dev'")
-        .execute(pool)
-        .await?;
     Ok(())
 }
+
+/// Password for the optionally seeded demo account.
+const DEMO_PASSWORD: &str = "demo123";
 
 pub async fn ensure_demo_domain(pool: &PgPool) -> sqlx::Result<()> {
     if get_domain_by_name(pool, "cdn.example.com").await?.is_none() {

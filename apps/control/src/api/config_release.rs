@@ -152,8 +152,54 @@ fn version_dto(v: ConfigVersionRow, with_snapshot: bool) -> VersionDto {
         actor: v.actor,
         message: v.message,
         created_at: v.created_at.to_rfc3339(),
-        diff: v.diff,
-        snapshot: with_snapshot.then_some(v.snapshot),
+        // Snapshots store the whole edge document, including the signed-URL
+        // secret and the origin authorization value. These rows are readable by
+        // any project member, so the secrets are redacted before they leave the
+        // API. The Edge still receives the real values from `/api/v1/config`.
+        diff: redact_secrets(v.diff),
+        snapshot: with_snapshot.then(|| redact_secrets(v.snapshot)),
+    }
+}
+
+/// Field names whose values must never be returned by the read APIs.
+const SECRET_FIELDS: [&str; 5] = [
+    "signed_url_secret",
+    "signed_url_previous_secret",
+    "origin_auth_value",
+    "password",
+    "password_hash",
+];
+
+/// Recursively replace secret values in a configuration document.
+///
+/// Walks objects, arrays and nested structures because a snapshot mixes the
+/// domain document with release metadata; redaction must not depend on where a
+/// field happens to sit.
+fn redact_secrets(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, val)| {
+                    if SECRET_FIELDS.iter().any(|f| key.eq_ignore_ascii_case(f)) {
+                        let redacted = match &val {
+                            serde_json::Value::String(s) if s.is_empty() => {
+                                serde_json::Value::String(String::new())
+                            }
+                            _ => serde_json::Value::String(
+                                crate::api::domain::SECRET_MASK.to_string(),
+                            ),
+                        };
+                        (key, redacted)
+                    } else {
+                        (key, redact_secrets(val))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_secrets).collect())
+        }
+        other => other,
     }
 }
 
@@ -683,4 +729,52 @@ pub fn versions_map(picks: &[VersionPick]) -> Value {
         map.insert(pick.domain.clone(), pick.version_id.clone());
     }
     serde_json::to_value(map).unwrap_or_else(|_| json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Snapshot rows contain the full edge document, secrets included, and are
+    /// readable by any project member. They must be redacted on the way out.
+    #[test]
+    fn redaction_covers_nested_secrets() {
+        let doc = json!({
+            "domain": "a.test",
+            "signed_url_secret": "real-secret",
+            "signed_url_previous_secret": "old-secret",
+            "origin_auth_value": "Bearer abc",
+            "origin_auth_header": "x-origin-auth",
+            "waf": { "enabled": true },
+            "domains": [
+                { "domain": "b.test", "origin_auth_value": "nested" }
+            ]
+        });
+        let out = redact_secrets(doc);
+
+        assert_eq!(out["signed_url_secret"], crate::api::domain::SECRET_MASK);
+        assert_eq!(
+            out["signed_url_previous_secret"],
+            crate::api::domain::SECRET_MASK
+        );
+        assert_eq!(out["origin_auth_value"], crate::api::domain::SECRET_MASK);
+        // Nested in an array must be redacted too.
+        assert_eq!(
+            out["domains"][0]["origin_auth_value"],
+            crate::api::domain::SECRET_MASK
+        );
+        // Non-secret fields survive.
+        assert_eq!(out["domain"], "a.test");
+        assert_eq!(out["origin_auth_header"], "x-origin-auth");
+        assert_eq!(out["waf"]["enabled"], true);
+    }
+
+    #[test]
+    fn redaction_preserves_empty_secrets() {
+        let doc = json!({ "signed_url_secret": "", "domain": "a.test" });
+        let out = redact_secrets(doc);
+        // An unset secret must not look like a configured one.
+        assert_eq!(out["signed_url_secret"], "");
+    }
 }

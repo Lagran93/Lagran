@@ -153,6 +153,11 @@ pub fn has_clearance(headers: &HeaderMap, host: &str, ttl_secs: u64, secret: &st
         .any(|value| clearance_valid(value, host, ttl_secs, secret))
 }
 
+/// Whether the client reached us over TLS.
+///
+/// The header is only meaningful because both data planes overwrite it with the
+/// value resolved by `security::trusted_proxy`; a client-supplied value never
+/// survives to this point.
 fn secure_request(req: &Request<Body>, headers: &HeaderMap) -> bool {
     if req.extensions().get::<TlsSni>().is_some() {
         return true;

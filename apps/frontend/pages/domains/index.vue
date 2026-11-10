@@ -371,7 +371,11 @@
           </div>
           <div class="field">
             <label class="field-label">回源鉴权值</label>
-            <input v-model="settings.origin_auth_value" class="input" type="password" placeholder="仅 Edge 与源站知道" />
+            <input v-model="settings.origin_auth_value" class="input" type="password"
+              :placeholder="secretsConfigured.origin_auth_value ? '已配置；留空表示保持不变' : '仅 Edge 与源站知道'" />
+            <span v-if="secretsConfigured.origin_auth_value" class="field-hint">
+              已保存的值不会回显。填写新值可替换，留空保持不变。
+            </span>
           </div>
         </div>
         <div class="field">
@@ -410,13 +414,17 @@
           </div>
           <div class="field">
             <label class="field-label">当前签名密钥</label>
-            <input v-model="settings.signed_url_secret" class="input" type="text" placeholder="开启后自动生成；可手动填写" />
+            <input v-model="settings.signed_url_secret" class="input" type="text"
+              :placeholder="secretsConfigured.signed_url_secret ? '已配置；留空表示保持不变' : '开启后自动生成；可手动填写'" />
+            <span v-if="secretsConfigured.signed_url_secret" class="field-hint">
+              已保存的密钥不会回显。建议使用「轮换」接口，避免手工换钥导致旧链接立即失效。
+            </span>
           </div>
         </div>
         <div class="field">
           <label class="field-label">上一个签名密钥（轮换兼容）</label>
           <input v-model="settings.signed_url_previous_secret" class="input" type="text"
-            placeholder="轮换后旧密钥保留一段时间，留空则立即失效" />
+            :placeholder="secretsConfigured.signed_url_secret ? '已配置；留空表示保持不变' : '轮换后旧密钥保留一段时间，留空则立即失效'" />
           <span class="field-hint">
             修改密钥后旧链接会立即失效；建议使用接口 /signed-url/rotate 自动轮换。
           </span>
@@ -556,6 +564,9 @@ const enabledOriginCount = computed(
 )
 
 const settingsOpen = ref(false)
+// Whether a secret is already stored server-side. Secrets are write-only over
+// the API, so the form shows an empty field plus a hint instead of the value.
+const secretsConfigured = ref({ signed_url_secret: false, origin_auth_value: false })
 const settingsDomain = ref<any>(null)
 const settings = ref({
   ignore_query_string: false,
@@ -863,14 +874,22 @@ async function openSettings(d: any) {
       signed_url_enabled: !!s.signed_url_enabled,
       signed_url_mode: s.signed_url_mode || (s.signed_url_enabled ? 'all' : 'off'),
       signed_url_paths: s.signed_url_paths || '',
-      signed_url_secret: s.signed_url_secret || '',
-      signed_url_previous_secret: s.signed_url_previous_secret || '',
+      // Secrets are write-only: the API returns "********" when one is stored.
+      // Leave the input empty so the mask is never mistaken for a real value,
+      // and remember whether something is configured so we can keep it.
+      signed_url_secret: '',
+      signed_url_previous_secret: '',
       signed_url_ttl_secs: s.signed_url_ttl_secs ?? 3600,
       origin_auth_header: s.origin_auth_header || '',
-      origin_auth_value: s.origin_auth_value || '',
+      origin_auth_value: '',
       hotlink_signature_enabled: !!s.hotlink_signature_enabled,
     }
+    secretsConfigured.value = {
+      signed_url_secret: !!s.signed_url_secret_set,
+      origin_auth_value: !!s.origin_auth_value_set,
+    }
   } catch {
+    secretsConfigured.value = { signed_url_secret: false, origin_auth_value: false }
     toast.error('读取高级设置失败，已使用默认值')
   }
   settingsOpen.value = true
@@ -881,6 +900,13 @@ async function saveSettings() {
   submitting.value = true
   try {
     const payload: any = { ...settings.value }
+    // An empty secret field means "leave the stored secret alone"; dropping it
+    // avoids relying on the backend's mask handling for a plain empty string.
+    if (!payload.signed_url_secret) delete payload.signed_url_secret
+    if (!payload.signed_url_previous_secret) delete payload.signed_url_previous_secret
+    if (!payload.origin_auth_value) delete payload.origin_auth_value
+    delete payload.signed_url_secret_set
+    delete payload.origin_auth_value_set
     payload.cache_key_ignore_headers = [
       payload.ignore_origin ? 'origin' : '',
       payload.ignore_accept_language ? 'accept-language' : '',

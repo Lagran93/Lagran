@@ -210,9 +210,16 @@ async fn main() -> anyhow::Result<()> {
         agent_token: config.agent_token.clone(),
         inflight: Inflight::default(),
         waf_log,
-        // Pingora overwrites X-Forwarded-For/Proto with the real downstream
-        // peer, and the engine is bound only to loopback.
+        // Pingora overwrites X-Forwarded-For/Proto before it forwards to this
+        // loopback-only engine, so the forwarded values are trusted exactly when
+        // the peer is loopback. Previously this was a blanket `true`, which the
+        // handler combined with a client header once the request arrived
+        // directly.
         trust_proxy_headers: true,
+        trusted_proxies: edge::security::trusted_proxy::TrustedProxies::parse(
+            "127.0.0.0/8, ::1",
+        )
+        .unwrap_or_default(),
         challenge_secret,
         geo: Arc::new(edge::waf::geo::GeoLookup::load(
             &config.geoip_country_db,

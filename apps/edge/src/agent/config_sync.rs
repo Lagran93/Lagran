@@ -421,11 +421,11 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
     let Some(cfg) = cfg else {
         return WafConfig::default();
     };
+    // An unset WAF_RULEPACK_SECRET must fail closed: skip the signed rulepack
+    // and fall back to the managed set already present in the config document
+    // rather than trusting a package nobody can authenticate.
     let package = cfg.rulepack.as_ref().and_then(|pack| {
-        let secret = crate::waf::rulepack::signing_key(
-            &config.waf_rulepack_secret,
-            &config.agent_token,
-        );
+        let secret = crate::waf::rulepack::signing_key(&config.waf_rulepack_secret)?;
         pack.verify_and_cache(&secret, &config.waf_rulepack_cache_dir)
     });
     let mut managed = ManagedRules {

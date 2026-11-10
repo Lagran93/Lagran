@@ -409,6 +409,54 @@ impl LargeCache {
             .ok();
     }
 
+    /// Headers that must never land in a cached entry.
+    ///
+    /// `Set-Cookie` is the important one: storing an origin response that sets a
+    /// session cookie and replaying it from cache hands the *origin's* session
+    /// to every later client that hits the same key. That is session fixation,
+    /// and it was reachable through this cache because the large-object writer
+    /// copied upstream headers verbatim while the small-object path filtered
+    /// them elsewhere.
+    pub(crate) fn cacheable_header(name: &str) -> bool {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "set-cookie"
+                | "set-cookie2"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "trailers"
+                | "upgrade"
+                | "age"
+                | "date"
+                | "x-lagran-cache-reason"
+                | "x-lagran-validator-source"
+        )
+    }
+
+    /// Drop uncacheable headers from a header list before it is persisted.
+    pub(crate) fn prune_uncacheable(headers: &[(String, String)]) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .filter(|(name, _)| Self::cacheable_header(name))
+            .cloned()
+            .collect()
+    }
+
+    /// Headers that may be replayed to a client from a stored entry.
+    ///
+    /// Entries written by an older build can still contain `Set-Cookie`, so the
+    /// replay side filters independently of the write side.
+    pub(crate) fn replayable_header(name: &str) -> bool {
+        !name.to_ascii_lowercase().starts_with("set-cookie")
+    }
+
     fn paths_for_key(&self, key: &str) -> (PathBuf, PathBuf) {
         let hash = stable_hash_str(key);
         let sub = format!("{:02x}", hash % 256);
@@ -466,17 +514,17 @@ impl LargeCache {
             return false;
         }
         for (name, value) in headers {
-            if name.eq_ignore_ascii_case("content-length")
-                || name.eq_ignore_ascii_case("transfer-encoding")
-                || name.eq_ignore_ascii_case("connection")
-                || name.eq_ignore_ascii_case("age")
-            {
+            // A 304 can still carry `Set-Cookie`; merging it here would attach
+            // fresh session headers to an old cached object.
+            if !Self::cacheable_header(name) {
                 continue;
             }
             meta.headers
                 .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
             meta.headers.push((name.clone(), value.clone()));
         }
+        // Also scrub anything already stored by an older build.
+        meta.headers.retain(|(name, _)| Self::cacheable_header(name));
         let now = now_unix();
         meta.fresh_until = now + fresh_secs.max(1);
         meta.stale_until = now + fresh_secs.max(1) + swr_secs;
@@ -529,6 +577,9 @@ impl LargeCache {
         if !self.accepts(content_length) {
             return None;
         }
+        // Defense in depth: callers are expected to filter already, but a single
+        // missed call site would otherwise cache a `Set-Cookie` response.
+        let headers = Self::prune_uncacheable(&headers);
         let (data_path, meta_path) = self.paths_for_key(key);
         let parent = data_path.parent()?;
         if fs::create_dir_all(parent).await.is_err() {
@@ -925,6 +976,45 @@ async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Storing an origin response that sets a session cookie and replaying it
+    /// from cache hands that session to every later client: session fixation.
+    #[test]
+    fn set_cookie_is_never_cached() {
+        let headers = vec![
+            ("content-type".to_string(), "text/html".to_string()),
+            ("set-cookie".to_string(), "sid=secret; Path=/".to_string()),
+            ("Set-Cookie2".to_string(), "legacy=1".to_string()),
+            ("age".to_string(), "42".to_string()),
+            ("cache-control".to_string(), "max-age=60".to_string()),
+        ];
+        let pruned = LargeCache::prune_uncacheable(&headers);
+
+        assert!(pruned.iter().any(|(n, _)| n == "content-type"));
+        assert!(pruned.iter().any(|(n, _)| n == "cache-control"));
+        for (name, _) in &pruned {
+            assert!(
+                !name.to_ascii_lowercase().starts_with("set-cookie"),
+                "{name} must not be cached"
+            );
+        }
+        assert!(!pruned.iter().any(|(n, _)| n == "age"));
+    }
+
+    /// Entries written by an older build can still contain `Set-Cookie`, so the
+    /// replay path filters independently.
+    #[test]
+    fn set_cookie_is_never_replayed() {
+        for name in ["set-cookie", "Set-Cookie", "SET-COOKIE", "set-cookie2"] {
+            assert!(
+                !LargeCache::replayable_header(name),
+                "{name} must not be replayed"
+            );
+        }
+        for name in ["content-type", "etag", "cache-control"] {
+            assert!(LargeCache::replayable_header(name));
+        }
+    }
 
     #[test]
     fn contiguous_segments_expose_splice_boundary() {

@@ -54,7 +54,8 @@ pub struct AppConfig {
     pub captcha_enabled: bool,
     /// When false, POST /auth/register is disabled (default: false).
     pub allow_register: bool,
-    /// Seed demo@lagran.dev on startup (default: true for local dev).
+    /// Seed demo@lagran.dev on startup (default: false). The account is a
+    /// normal user with a published password; never enable this in production.
     pub seed_demo: bool,
     /// Reject startup if JWT_SECRET is the built-in default (default: false).
     pub require_secure_secrets: bool,
@@ -137,7 +138,8 @@ impl Default for AppConfig {
             acme_contact_email: std::env::var("ACME_CONTACT_EMAIL").unwrap_or_default(),
             allow_register: env_bool("ALLOW_REGISTER", false),
             captcha_enabled: env_bool("CAPTCHA_ENABLED", true),
-            seed_demo: env_bool("SEED_DEMO", true),
+            // Off by default: the demo account ships with a published password.
+            seed_demo: env_bool("SEED_DEMO", false),
             require_secure_secrets: env_bool("REQUIRE_SECURE_SECRETS", false),
             log_retention_days: std::env::var("LOG_RETENTION_DAYS")
                 .ok()
@@ -236,6 +238,20 @@ mod tests {
     fn bind_parses_host_and_port() {
         // unit smoke: defaults construct without panic
         let _ = AppConfig::default();
+    }
+
+    /// The demo account ships with a published password, so seeding it must be
+    /// an explicit opt-in rather than the default.
+    #[test]
+    fn demo_seed_defaults_to_off() {
+        assert!(!env_bool("LAGRAN_TEST_UNSET_VAR_FOR_SEED_DEMO", false));
+        // The default passed at the call site is what matters; assert it directly
+        // so a future edit cannot quietly flip it back on.
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains("seed_demo: env_bool(\"SEED_DEMO\", false)"),
+            "SEED_DEMO must default to false"
+        );
     }
 
     #[test]

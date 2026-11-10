@@ -425,128 +425,15 @@ pub(crate) fn build(
         allow_ips: row.cc_allow_ips.clone(),
     };
 
-    let mut h = DefaultHasher::new();
-    rps.hash(&mut h);
-    burst.hash(&mut h);
-    for o in &origins {
-        o.host.hash(&mut h);
-        o.port.hash(&mut h);
-        o.protocol.hash(&mut h);
-        o.weight.hash(&mut h);
-        o.priority.hash(&mut h);
-        o.enabled.hash(&mut h);
-        o.sni.hash(&mut h);
-        o.host_header.hash(&mut h);
-    }
-    cc.enabled.hash(&mut h);
-    cc.rps.hash(&mut h);
-    cc.burst.hash(&mut h);
-    cc.ban_after.hash(&mut h);
-    cc.ban_seconds.hash(&mut h);
-    cc.mode.hash(&mut h);
-    cc.allow_ips.hash(&mut h);
-    row.ignore_query_string.hash(&mut h);
-    row.cache_key_ignore_headers.hash(&mut h);
-    row.cors_origins.hash(&mut h);
-    row.hotlink_allow_referers.hash(&mut h);
-    timeout.hash(&mut h);
-    row.custom_headers.hash(&mut h);
-    row.shield_url.hash(&mut h);
-    row.status.hash(&mut h);
-    row.ssl_enabled.hash(&mut h);
-    origin.host.hash(&mut h);
-    origin.port.hash(&mut h);
-    origin.protocol.hash(&mut h);
-    origin.sni.hash(&mut h);
-    origin.host_header.hash(&mut h);
-    if let Some(ref b) = backup {
-        b.host.hash(&mut h);
-        b.port.hash(&mut h);
-        b.protocol.hash(&mut h);
-        b.sni.hash(&mut h);
-        b.host_header.hash(&mut h);
-    }
-    for r in &rules {
-        r.path_pattern.hash(&mut h);
-        r.match_type.hash(&mut h);
-        r.ttl_seconds.hash(&mut h);
-        r.priority.hash(&mut h);
-        r.action.hash(&mut h);
-        r.swr_seconds.hash(&mut h);
-        r.enabled.hash(&mut h);
-        r.match_methods.hash(&mut h);
-        r.match_query.hash(&mut h);
-        r.browser_ttl_seconds.hash(&mut h);
-        r.ignore_query.hash(&mut h);
-        r.ignore_cookie.hash(&mut h);
-        r.ignore_key_headers.hash(&mut h);
-        r.match_content_type.hash(&mut h);
-    }
-    match &waf {
-        Some(w) => {
-            w.enabled.hash(&mut h);
-            w.mode.hash(&mut h);
-            w.managed.sqli.hash(&mut h);
-            w.managed.xss.hash(&mut h);
-            w.managed.traversal.hash(&mut h);
-            w.managed.scanners.hash(&mut h);
-            w.managed.rce.hash(&mut h);
-            w.managed.ssrf.hash(&mut h);
-            w.managed.xxe.hash(&mut h);
-            w.managed.log4shell.hash(&mut h);
-            w.managed.crlf.hash(&mut h);
-            w.managed.ssti.hash(&mut h);
-            w.managed.nosql.hash(&mut h);
-            w.managed.ldap.hash(&mut h);
-            w.managed.java.hash(&mut h);
-            w.managed.webshell.hash(&mut h);
-            w.managed.protocol.hash(&mut h);
-            w.security_level.hash(&mut h);
-            for r in &w.rules {
-                r.name.hash(&mut h);
-                r.field.hash(&mut h);
-                r.operator.hash(&mut h);
-                r.value.hash(&mut h);
-                r.action.hash(&mut h);
-                r.priority.hash(&mut h);
-                r.enabled.hash(&mut h);
-                r.expr.hash(&mut h);
-            }
-            for ip in &w.ip_allow {
-                ip.hash(&mut h);
-            }
-            for ip in &w.ip_deny {
-                ip.hash(&mut h);
-            }
-            // Geo/ASN policies participate in both the HTTP ETag and the
-            // Edge's version guard. Hash vectors separately (including lengths)
-            // so moving entries between allow and deny changes the version too.
-            w.country_allow.hash(&mut h);
-            w.country_deny.hash(&mut h);
-            w.asn_allow.hash(&mut h);
-            w.asn_deny.hash(&mut h);
-            w.challenge_difficulty.hash(&mut h);
-            w.challenge_ttl_secs.hash(&mut h);
-            w.rulepack_version.hash(&mut h);
-            if let Some(pack) = &w.rulepack {
-                pack.version.hash(&mut h);
-                pack.signature.hash(&mut h);
-                pack.checksum.hash(&mut h);
-            }
-        }
-        None => "waf-none".hash(&mut h),
-    }
-    row.signed_url_enabled.hash(&mut h);
-    row.signed_url_mode.hash(&mut h);
-    row.signed_url_paths.hash(&mut h);
-    row.signed_url_secret.hash(&mut h);
-    row.signed_url_previous_secret.hash(&mut h);
-    row.signed_url_ttl_secs.hash(&mut h);
-    row.origin_auth_header.hash(&mut h);
-    row.origin_auth_value.hash(&mut h);
-    row.hotlink_signature_enabled.hash(&mut h);
-
-    DomainConfigResponse {
+    // The version hash covers the entire document, not a hand-maintained list of
+    // fields. The previous per-field hashing silently omitted
+    // `waf.managed_rulesets`, so changing only the managed ruleset selection
+    // left both the HTTP ETag and the Edge's version guard unchanged: edges
+    // answered `304 Not Modified` and the new ruleset never took effect.
+    //
+    // The document is built first and hashed with `version` empty, so adding a
+    // field to `DomainConfigResponse` can never again escape the hash.
+    let mut out = DomainConfigResponse {
         domain: row.name.clone(),
         origin,
         rules,
@@ -578,8 +465,28 @@ pub(crate) fn build(
         origins,
         waf,
         cc,
-        version: format!("{}-{:x}", row.id, h.finish()),
+        version: String::new(),
+    };
+    out.version = String::new();
+    let digest = config_digest(&out);
+    out.version = format!("{}-{:x}", row.id, digest);
+    out
+}
+
+/// FNV-1a over the serialized configuration document.
+///
+/// A stable hash is required here: the version string is persisted in config
+/// snapshots and compared across control-plane restarts and replicas, so
+/// `std::collections::hash_map::DefaultHasher` (whose algorithm is explicitly
+/// unspecified and has changed between releases) must not be used.
+fn config_digest(config: &DomainConfigResponse) -> u64 {
+    let bytes = serde_json::to_vec(config).unwrap_or_default();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    hash
 }
 
 /// Build one domain's edge config snapshot. Used by version history/releases.
@@ -1198,6 +1105,110 @@ mod tests {
 
         assert_eq!(out.ip_allow, vec!["203.0.113.10".to_string()]);
         assert!(out.ip_deny.is_empty());
+    }
+
+    /// Every field of the WAF document must participate in the version, or an
+    /// Edge holding the old ETag answers 304 and the change never lands.
+    ///
+    /// This used to fail for `managed_rulesets`: the hash listed fields by hand
+    /// and that one was missing.
+    #[test]
+    fn version_changes_when_managed_rulesets_change() {
+        let base = waf_config_from(
+            "example.com",
+            settings(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        let mut selected = settings();
+        // Use catalog ids that actually exist: `parse_csv` drops unknown ones,
+        // which would make this test pass for the wrong reason.
+        selected.managed_rulesets = "owasp-core, injection-extended".into();
+        let with_rulesets = waf_config_from(
+            "example.com",
+            selected,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+
+        assert_eq!(base.managed_rulesets, Vec::<String>::new());
+        assert_eq!(
+            with_rulesets.managed_rulesets,
+            vec!["owasp-core".to_string(), "injection-extended".to_string()]
+        );
+
+        let a = build(&domain(), Vec::new(), Some(base));
+        let b = build(&domain(), Vec::new(), Some(with_rulesets));
+        assert_ne!(
+            a.version, b.version,
+            "changing managed_rulesets must change the config version"
+        );
+    }
+
+    /// Guards the property rather than a specific field: mutate the serialized
+    /// document in a few different places and require a different digest each
+    /// time. A hand-maintained field list cannot satisfy this.
+    #[test]
+    fn digest_reflects_the_whole_document() {
+        let base = build(
+            &domain(),
+            Vec::new(),
+            Some(waf_config_from(
+                "example.com",
+                settings(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &[],
+            )),
+        );
+        let baseline = config_digest(&base);
+
+        let mut changed = base.clone();
+        changed.hotlink_signature_enabled = !changed.hotlink_signature_enabled;
+        assert_ne!(config_digest(&changed), baseline, "top-level field");
+
+        let mut changed = base.clone();
+        if let Some(waf) = changed.waf.as_mut() {
+            waf.security_level = "high".into();
+        }
+        assert_ne!(config_digest(&changed), baseline, "nested waf field");
+
+        let mut changed = base.clone();
+        if let Some(waf) = changed.waf.as_mut() {
+            waf.managed.webshell = !waf.managed.webshell;
+        }
+        assert_ne!(config_digest(&changed), baseline, "nested managed flag");
+
+        // `version` is part of the document, so it participates in the digest.
+        // The builder always resets it before hashing, which is what keeps the
+        // digest stable across rebuilds.
+        let mut same = base.clone();
+        same.version = "different".into();
+        assert_ne!(config_digest(&same), baseline);
+    }
+
+    #[test]
+    fn version_is_stable_across_rebuilds() {
+        let make = || {
+            build(
+                &domain(),
+                Vec::new(),
+                Some(waf_config_from(
+                    "example.com",
+                    settings(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    &[],
+                )),
+            )
+        };
+        assert_eq!(make().version, make().version);
     }
 
     #[test]

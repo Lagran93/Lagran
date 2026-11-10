@@ -82,7 +82,7 @@ impl FromRequestParts<AppState> for Actor {
             .map_err(|_| ActorError::unauthorized("unauthorized"))?;
         let id = Uuid::parse_str(&user.0.sub)
             .map_err(|_| ActorError::unauthorized("invalid token subject"))?;
-        let session_key = format!("lagran:session:v2:{id}");
+        let session_key = crate::service::redis::session_key(id);
         let redis = state.redis.as_deref();
         let cached = if let Some(redis) = redis {
             redis.get_json::<CachedSession>(&session_key).await

@@ -938,14 +938,14 @@ fn normalize_vary_value(value: &str) -> String {
         .join(",")
 }
 
-/// Stable cache key: `METHOD:host:path[?query]` (host lowercased, port stripped).
+/// Stable cache key: `METHOD:host:path[?query]`.
+///
+/// The host goes through [`crate::config::registry::normalize_host`], the same
+/// function that keys the domain registry. Using a second, subtly different
+/// normalization here is what allowed one domain's objects to be stored under a
+/// key another domain could produce.
 pub fn cache_key_for(method: &Method, host: &str, path: &str) -> String {
-    let host = host.trim().to_ascii_lowercase();
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.split_once(']').map(|(ip, _)| ip))
-        .unwrap_or(&host);
-    let host = host.split(':').next().unwrap_or(host);
+    let host = crate::config::registry::normalize_host(host);
     format!("{}:{}:{}", method.as_str(), host, path)
 }
 
@@ -1666,6 +1666,31 @@ mod tests {
         assert_eq!(
             request_bypass_reason(&pragma, false),
             Some("request-pragma-no-cache")
+        );
+    }
+
+    /// The cache key and the domain registry must agree on host normalization:
+    /// any divergence stores one domain's objects under a key another domain
+    /// can produce.
+    #[test]
+    fn cache_key_host_matches_registry_normalization() {
+        use crate::config::registry::normalize_host;
+        let method = Method::GET;
+        for raw in [
+            "Example.COM:443",
+            "example.com.",
+            "[2001:db8::1]:8080",
+            "2001:db8::1",
+            "cdn.test:8080",
+        ] {
+            let key = cache_key_for(&method, raw, "/a");
+            let expected = format!("GET:{}:/a", normalize_host(raw));
+            assert_eq!(key, expected, "host {raw}");
+        }
+        // A non-port suffix must not collide with the bare host.
+        assert_ne!(
+            cache_key_for(&method, "example.com:evil", "/a"),
+            cache_key_for(&method, "example.com", "/a")
         );
     }
 

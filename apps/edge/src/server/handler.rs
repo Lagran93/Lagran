@@ -79,6 +79,8 @@ pub struct AppState {
     pub waf_log: WafLog,
     /// Trust X-Forwarded-For when determining the client IP (WAF ACLs).
     pub trust_proxy_headers: bool,
+    /// Networks whose `X-Forwarded-*` headers may be believed.
+    pub trusted_proxies: crate::security::trusted_proxy::TrustedProxies,
     /// HMAC secret for challenge nonces and clearance cookies.
     pub challenge_secret: String,
     /// MaxMind-backed country/ASN lookup for the WAF Geo/ASN lists.
@@ -254,18 +256,28 @@ async fn proxy_handler_inner(
         .unwrap_or_else(|| "/".to_string());
     let path_only = req.uri().path().to_string();
     let host = host_util::resolve_request_host(&req);
-    let peer_ip = req
+    let peer_addr = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|info| info.0.ip());
+        .map(|info| info.0);
     let mut headers = req.headers().clone();
-    let header_ip = header_ip_from_headers(&headers);
-    let client_ip_addr = if state.trust_proxy_headers {
-        header_ip.or(peer_ip)
-    } else {
-        peer_ip.or(header_ip)
-    };
-    let client_ip = client_ip_addr
+    // Client identity comes from the shared trusted-proxy resolver so this data
+    // plane and the Pingora one cannot disagree. Taking the leftmost
+    // `X-Forwarded-For` entry let any client choose its own source IP, which
+    // bypassed WAF IP deny lists and CC bans.
+    let identity = crate::security::trusted_proxy::resolve(
+        &state.trusted_proxies,
+        peer_addr,
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok()),
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok()),
+        req.extensions().get::<host_util::TlsSni>().is_some(),
+    );
+    let client_ip = identity
+        .ip
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "-".to_string());
     let user_agent = headers
@@ -338,15 +350,45 @@ async fn proxy_handler_inner(
 
     let domain_entry = state.domains.get(&host).await;
 
+    // Signed-URL enforcement for the in-process data plane.
+    //
+    // The Pingora request filter is not the only ingress: HEAD, Range,
+    // `Cache-Control: no-cache`, WebSocket and every request without a native
+    // plan fall back here. With the check only on the native path, adding a
+    // single request header was enough to bypass `signed_url_mode=all`, so the
+    // same verification has to run here. On success the signature parameters
+    // are removed so they never reach the cache key or the origin.
+    let req = match domain_entry.as_ref() {
+        Some(domain) => match signed_url_gate(domain, req, &host).await {
+            SignedUrlGate::Pass(req) | SignedUrlGate::Signed(req) => req,
+            SignedUrlGate::Reject => {
+                log_access(
+                    &state.access_log,
+                    &method,
+                    &host,
+                    &path_only,
+                    403,
+                    start,
+                    &client_ip,
+                    &user_agent,
+                    &referer,
+                    0,
+                    CacheStatus::Bypass.as_str(),
+                    &request_id,
+                )
+                .await;
+                return (StatusCode::FORBIDDEN, "invalid or expired signed url").into_response();
+            }
+        },
+        None => req,
+    };
+
     // Domain-level HTTPS enforcement: redirect plain HTTP before WAF/cache so
     // the browser continues over TLS (and secure challenge cookies stick).
-    let is_https = req.extensions().get::<host_util::TlsSni>().is_some()
-        || (state.trust_proxy_headers
-            && headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.eq_ignore_ascii_case("https"))
-                .unwrap_or(false));
+    // Scheme decided by the shared resolver: TLS we terminated ourselves, or an
+    // `X-Forwarded-Proto` from a peer in TRUSTED_PROXIES. Reading the header
+    // whenever `trust_proxy_headers` was on let a direct client assert HTTPS.
+    let is_https = identity.is_https;
 
     let registry_empty = state.domains.is_empty().await;
 
@@ -2200,7 +2242,9 @@ async fn store_large_response(
     if !large.accepts(len as u64) {
         return false;
     }
-    let mut headers = headers_vec(&resp.headers);
+    // `large.begin` filters again, but this path also feeds the validator and
+    // ETag computation below, which must not see a `Set-Cookie` either.
+    let mut headers = crate::cache::large::LargeCache::prune_uncacheable(&headers_vec(&resp.headers));
     let has_etag = headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("etag"));
@@ -2705,6 +2749,67 @@ fn url_query(path_and_query: &str) -> &str {
     path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("")
 }
 
+/// Result of checking a request against the domain's signed-URL policy.
+enum SignedUrlGate {
+    /// No signature required: forward the request unchanged.
+    Pass(Request<Body>),
+    /// Signature valid: forward with the signature parameters removed.
+    Signed(Request<Body>),
+    /// Signature required but missing, expired or wrong: answer 403.
+    Reject,
+}
+
+/// Verify the HMAC-signed URL for a domain that requires one.
+///
+/// This mirrors the check in the Pingora request filter. Both data planes must
+/// enforce it: requests fall back to the in-process handler for HEAD, Range,
+/// WebSocket, `Cache-Control: no-cache` and any request without a native plan,
+/// and those are exactly the requests an attacker would use to fetch protected
+/// content without a valid signature.
+async fn signed_url_gate(domain: &DomainEntry, req: Request<Body>, host: &str) -> SignedUrlGate {
+    use crate::security::signed_url;
+
+    if signed_url::effective_mode(domain) == "off" {
+        return SignedUrlGate::Pass(req);
+    }
+    let uri = req.uri().clone();
+    // An unparsable path is treated as protected so it cannot slip through.
+    let protected = signed_url::normalize_path(uri.path())
+        .map(|normalized| signed_url::path_protected(domain, &normalized))
+        .unwrap_or(true);
+    if !protected {
+        return SignedUrlGate::Pass(req);
+    }
+    let verified = match signed_url::verify(
+        domain,
+        req.method().as_str(),
+        host,
+        &uri,
+        signed_url::now_epoch_secs(),
+    ) {
+        Ok(verified) => verified,
+        Err(e) => {
+            tracing::debug!(reason = e.reason(), host, "signed url rejected (legacy path)");
+            return SignedUrlGate::Reject;
+        }
+    };
+    let mut parts = uri.into_parts();
+    parts.path_and_query = verified
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string())
+        .parse()
+        .ok();
+    let rewritten = match http::Uri::from_parts(parts) {
+        Ok(uri) => uri,
+        Err(_) => return SignedUrlGate::Reject,
+    };
+    let mut req = req;
+    *req.uri_mut() = rewritten;
+    SignedUrlGate::Signed(req)
+}
+
 pub(crate) fn hotlink_allowed(allowed_list: &str, referer: &str) -> bool {
     allowed_list
         .split(',')
@@ -2726,21 +2831,6 @@ pub(crate) fn challenge_accepts_html(method: &Method, headers: &HeaderMap) -> bo
         .unwrap_or(false)
 }
 
-fn header_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                return Some(ip);
-            }
-        }
-    }
-    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if let Ok(ip) = real.trim().parse::<IpAddr>() {
-            return Some(ip);
-        }
-    }
-    None
-}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn log_access(
@@ -3081,6 +3171,82 @@ mod tests {
         ));
         assert!(!hotlink_allowed("example.com", "https://evil.test/a"));
         assert!(!hotlink_allowed("example.com", ""));
+    }
+
+    fn signed_domain(mode: &str, secret: &str) -> DomainEntry {
+        DomainEntry {
+            domain: "cdn.test".into(),
+            signed_url_enabled: true,
+            signed_url_mode: mode.into(),
+            signed_url_secret: secret.into(),
+            signed_url_ttl_secs: 3600,
+            ..Default::default()
+        }
+    }
+
+    fn sign(secret: &str, method: &str, host: &str, path: &str, expires: &str) -> String {
+        use ring::hmac;
+        let canonical = format!("{method}\n{host}\n{path}\n\n{expires}");
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+        hmac::sign(&key, canonical.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The legacy data plane served protected objects whenever the Pingora
+    /// path did not handle the request. This is the regression that let a
+    /// single `Cache-Control: no-cache` header bypass `signed_url_mode=all`.
+    #[tokio::test]
+    async fn unsigned_request_is_rejected_on_the_legacy_path() {
+        let domain = signed_domain("all", "secret");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/paid/video.mp4")
+            .header(header::HOST, "cdn.test")
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(matches!(
+            signed_url_gate(&domain, req, "cdn.test").await,
+            SignedUrlGate::Reject
+        ));
+    }
+
+    #[tokio::test]
+    async fn signed_request_strips_signature_on_the_legacy_path() {
+        let domain = signed_domain("all", "secret");
+        let now = crate::security::signed_url::now_epoch_secs();
+        let expires = (now + 60).to_string();
+        let sig = sign("secret", "GET", "cdn.test", "/paid/video.mp4", &expires);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/paid/video.mp4?expires={expires}&sig={sig}"))
+            .header(header::HOST, "cdn.test")
+            .body(Body::empty())
+            .unwrap();
+
+        let SignedUrlGate::Signed(req) = signed_url_gate(&domain, req, "cdn.test").await else {
+            panic!("valid signature must pass the legacy gate");
+        };
+        // Signature must not reach the cache key or the origin.
+        assert_eq!(req.uri().to_string(), "/paid/video.mp4");
+    }
+
+    #[tokio::test]
+    async fn signature_is_not_required_when_policy_is_off() {
+        let domain = signed_domain("off", "secret");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/paid/video.mp4")
+            .header(header::HOST, "cdn.test")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            signed_url_gate(&domain, req, "cdn.test").await,
+            SignedUrlGate::Pass(_)
+        ));
     }
 
     #[test]

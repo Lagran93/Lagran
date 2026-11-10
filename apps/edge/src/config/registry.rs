@@ -164,22 +164,58 @@ impl DomainRegistry {
     }
 }
 
+/// Canonical form of a request or configuration host.
+///
+/// This is the single authority for host normalization on the edge. Registry
+/// lookups, cache keys and the challenge/clearance binding all route through it,
+/// so a given object can never be cached or resolved under two different keys
+/// depending on how the client spelled the `Host` header.
+///
+/// Rules applied, in order:
+/// * trim surrounding whitespace and lowercase;
+/// * strip a bracketed IPv6 literal's brackets, and nothing else, so
+///   `[2001:db8::1]:8080` becomes `2001:db8::1` while a bare `2001:db8::1`
+///   keeps all of its segments;
+/// * strip a trailing root dot (`example.com.` -> `example.com`);
+/// * strip a numeric port (`example.com:443` -> `example.com`).
+///
+/// A non-numeric suffix is *not* stripped: `example.com:evil` is not a valid
+/// authority and must stay distinct from `example.com` rather than silently
+/// aliasing onto it.
 pub fn normalize_host(host: &str) -> String {
-    let host = host.trim().to_lowercase();
+    let host = host.trim().to_ascii_lowercase();
     if host.is_empty() {
         return String::new();
     }
+
+    // Bracketed IPv6 literal, optionally with a port after the closing bracket.
     if let Some(rest) = host.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            return rest[..end].to_string();
-        }
+        return match rest.find(']') {
+            Some(end) => rest[..end].to_string(),
+            // Unterminated bracket: treat the whole value as opaque.
+            None => host,
+        };
     }
-    if let Some((name, port)) = host.rsplit_once(':') {
-        if !name.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
-            return name.to_string();
+
+    // A bare IPv6 literal contains several colons and no port; splitting on the
+    // last colon would truncate it to its first segment, which is exactly the
+    // bug that let `Host: 2001:db8::1` collide with `Host: 2001`.
+    let host = if host.matches(':').count() > 1 {
+        host
+    } else if let Some((name, port)) = host.rsplit_once(':') {
+        if !name.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            name.to_string()
+        } else {
+            host
         }
-    }
-    host
+    } else {
+        host
+    };
+
+    // Strip the root dot last so `example.com.:443` and `example.com.` both
+    // reduce to `example.com`. Doing this first left the port attached, and
+    // `strip_suffix('.').unwrap_or(&host)` silently kept the dot entirely.
+    host.trim_end_matches('.').to_string()
 }
 
 pub fn is_ip_host(host: &str) -> bool {
@@ -252,6 +288,18 @@ mod tests {
         assert_eq!(normalize_host("Ex.COM:443"), "ex.com");
         assert_eq!(normalize_host("[::1]:8080"), "::1");
         assert_eq!(normalize_host(" [::1] "), "::1");
+        // A bare IPv6 literal keeps every segment; splitting on the last colon
+        // used to truncate it to `2001`, aliasing unrelated hosts together.
+        assert_eq!(normalize_host("2001:db8::1"), "2001:db8::1");
+        assert_eq!(normalize_host("[2001:db8::1]:443"), "2001:db8::1");
+        // A trailing root dot is not a distinct host.
+        assert_eq!(normalize_host("example.com."), "example.com");
+        assert_eq!(normalize_host("example.com.:443"), "example.com");
+        // A non-numeric suffix is not a port and must not alias the bare host.
+        assert_eq!(normalize_host("example.com:evil"), "example.com:evil");
+        assert_ne!(normalize_host("example.com:evil"), normalize_host("example.com"));
+        assert_eq!(normalize_host(""), "");
+        assert_eq!(normalize_host("   "), "");
         assert!(is_ip_host("127.0.0.1"));
     }
 

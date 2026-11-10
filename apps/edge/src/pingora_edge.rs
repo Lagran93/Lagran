@@ -218,6 +218,7 @@ impl Default for ReqCtx {
 
 struct DataPlaneProxy {
     trust_proxy: bool,
+    trusted_proxies: crate::security::trusted_proxy::TrustedProxies,
     state: Arc<AppState>,
     native_cache: bool,
     storage: Option<&'static NativeStorage>,
@@ -237,17 +238,19 @@ impl ProxyHttp for DataPlaneProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        prepare_proxy_headers(session, self.trust_proxy)?;
+        prepare_proxy_headers(session, self.trust_proxy, &self.trusted_proxies)?;
 
         let req = session.req_header();
         ctx.host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
         ctx.path = req.uri.path().to_string();
         ctx.method = req.method.clone();
+        // `prepare_proxy_headers` already replaced X-Forwarded-For with the
+        // single address resolved from the trusted chain, so this header now
+        // holds exactly the client IP (or is absent).
         ctx.client_ip = req
             .headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
             .map(str::trim)
             .unwrap_or("")
             .to_string();
@@ -2013,6 +2016,7 @@ impl DataPlaneProxy {
                         || name.eq_ignore_ascii_case(META_HEADER)
                         || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
                         || is_hop_by_hop(name)
+                        || !crate::cache::large::LargeCache::replayable_header(name)
                     {
                         continue;
                     }
@@ -2045,6 +2049,7 @@ impl DataPlaneProxy {
                 || name.eq_ignore_ascii_case(META_HEADER)
                 || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
                 || is_hop_by_hop(name)
+                || !crate::cache::large::LargeCache::replayable_header(name)
             {
                 continue;
             }
@@ -2232,6 +2237,7 @@ impl DataPlaneProxy {
                 || name.eq_ignore_ascii_case("content-range")
                 || name.eq_ignore_ascii_case("cache-status")
                 || is_hop_by_hop(name)
+                || !crate::cache::large::LargeCache::replayable_header(name)
             {
                 continue;
             }
@@ -2472,6 +2478,7 @@ impl DataPlaneProxy {
                 || name.eq_ignore_ascii_case("content-range")
                 || name.eq_ignore_ascii_case("cache-status")
                 || is_hop_by_hop(name)
+                || !crate::cache::large::LargeCache::replayable_header(name)
             {
                 continue;
             }
@@ -3506,19 +3513,15 @@ fn range_is_small_bounded(headers: &HeaderMap) -> bool {
     end >= start && end - start < MAX_SLICE
 }
 
+/// Resolve the request host for registry lookups.
+///
+/// Delegates to [`crate::config::registry::normalize_host`] so the Pingora path,
+/// the in-process handler and the registry itself cannot disagree. The previous
+/// local implementation split on `:` and kept the brackets on IPv6 literals,
+/// which produced a different key than the one the registry was populated with.
 fn request_host(raw: Option<&str>) -> String {
-    let Some(raw) = raw else {
-        return String::new();
-    };
-    let raw = raw.trim();
-    if raw.starts_with('[') {
-        return raw
-            .split_once(']')
-            .map(|(h, _)| format!("{h}]"))
-            .unwrap_or_else(|| raw.to_string())
-            .to_ascii_lowercase();
-    }
-    raw.split(':').next().unwrap_or(raw).to_ascii_lowercase()
+    raw.map(crate::config::registry::normalize_host)
+        .unwrap_or_default()
 }
 
 fn parse_origin(url: &str) -> Option<(String, u16, bool)> {
@@ -3590,12 +3593,20 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-fn prepare_proxy_headers(session: &mut Session, trust_proxy: bool) -> Result<()> {
-    let client_ip = session
-        .client_addr()
-        .and_then(|addr| addr.as_inet())
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_default();
+/// Rewrite the forwarding headers before the request reaches cache/WAF/origin.
+///
+/// The client IP and scheme are decided by
+/// [`crate::security::trusted_proxy::resolve`], the same function the in-process
+/// handler uses. Previously this compared only "trust on/off": with trust
+/// enabled, a direct client could send `X-Forwarded-For: 1.2.3.4` and
+/// `X-Forwarded-Proto: https` and be believed, which defeated WAF IP deny lists,
+/// CC bans and the HTTPS redirect at once.
+fn prepare_proxy_headers(
+    session: &mut Session,
+    trust_proxy: bool,
+    trusted: &crate::security::trusted_proxy::TrustedProxies,
+) -> Result<()> {
+    let peer = session.client_addr().and_then(|addr| addr.as_inet());
     let is_https = session
         .digest()
         .and_then(|d| d.ssl_digest.as_ref())
@@ -3606,24 +3617,63 @@ fn prepare_proxy_headers(session: &mut Session, trust_proxy: bool) -> Result<()>
         .and_then(|d| d.extension.get::<Sni>())
         .map(|s| s.0.clone());
 
+    let req = session.req_header();
+    let xff = req
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    let xfp = req
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok());
+
+    // `trust_proxy_headers` is the legacy switch. When true but no CIDR list is
+    // configured, trust the immediate peer: that is only sane for the loopback
+    // hop, and it is what the header names always meant.
+    let effective_trusted;
+    let trusted = if trust_proxy && trusted.is_empty() {
+        effective_trusted = peer
+            .map(|addr| {
+                crate::security::trusted_proxy::TrustedProxies::parse(&addr.ip().to_string())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        &effective_trusted
+    } else if trust_proxy {
+        trusted
+    } else {
+        // Trust disabled: nothing is trusted, so forwarded headers are ignored.
+        effective_trusted = crate::security::trusted_proxy::TrustedProxies::default();
+        &effective_trusted
+    };
+
+    let identity =
+        crate::security::trusted_proxy::resolve(trusted, peer.copied(), xff, xfp, is_https);
+
+    let client_ip = identity
+        .ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
     let req = session.req_header_mut();
-    let has_xff = req.headers.contains_key("x-forwarded-for");
-    if !trust_proxy || !has_xff {
-        req.remove_header("x-forwarded-for");
-        if !client_ip.is_empty() {
-            req.insert_header("x-forwarded-for", client_ip.as_str())?;
-        }
+
+    // Always restate X-Forwarded-For with the resolved client address. Dropping
+    // the untrusted prefix means origin logs and any downstream trust decision
+    // see a value this edge vouches for.
+    req.remove_header("x-forwarded-for");
+    if !client_ip.is_empty() {
+        req.insert_header("x-forwarded-for", client_ip.as_str())?;
     }
-    if !trust_proxy {
-        req.remove_header("x-real-ip");
-    }
-    if !client_ip.is_empty() && !req.headers.contains_key("x-real-ip") {
+    req.remove_header("x-real-ip");
+    if !client_ip.is_empty() {
         req.insert_header("x-real-ip", client_ip.as_str())?;
     }
-    if !trust_proxy || !req.headers.contains_key("x-forwarded-proto") {
-        req.remove_header("x-forwarded-proto");
-        req.insert_header("x-forwarded-proto", if is_https { "https" } else { "http" })?;
-    }
+    // Same for the scheme: only a trusted hop may override what we observed.
+    req.remove_header("x-forwarded-proto");
+    req.insert_header(
+        "x-forwarded-proto",
+        if identity.is_https { "https" } else { "http" },
+    )?;
+
     if !req.headers.contains_key("host") {
         if let Some(sni) = sni {
             req.insert_header("host", sni.as_str())?;
@@ -3660,6 +3710,7 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
         Box::leak(CacheLock::new_boxed(Duration::from_secs(cache_lock_secs)));
     let proxy = DataPlaneProxy {
         trust_proxy: config.trust_proxy_headers,
+        trusted_proxies: config.trusted_proxies.clone(),
         state,
         native_cache: storage.is_some(),
         storage,

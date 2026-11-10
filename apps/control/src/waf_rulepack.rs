@@ -58,16 +58,19 @@ impl RulepackRow {
     }
 }
 
-pub fn signing_key(config_secret: &str, agent_token: &str) -> String {
+/// Resolve the HMAC key used to sign WAF rulepacks.
+///
+/// Returns `None` when `WAF_RULEPACK_SECRET` is unset. This used to fall back to
+/// a constant that is published in this source tree, so any caller holding an
+/// agent token could forge a signed rulepack and silently disable the managed
+/// signatures on every domain. Callers must treat `None` as "rulepacks
+/// unavailable" and must not start the control plane.
+pub fn signing_key(config_secret: &str) -> Option<String> {
     let secret = config_secret.trim();
-    if !secret.is_empty() {
-        return secret.to_string();
+    if secret.is_empty() {
+        return None;
     }
-    // Agent tokens are per-node on Edge and global on Control; they are not a
-    // shared rulepack key. Use the built-in development key when unset, and
-    // require WAF_RULEPACK_SECRET in production.
-    let _ = agent_token;
-    "lagran-dev-waf-rulepack-secret".to_string()
+    Some(secret.to_string())
 }
 
 pub fn build(version: &str) -> Rulepack {
@@ -421,6 +424,25 @@ pub fn gray_bucket(domain: &str, version: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_key_rejects_unset_secret() {
+        assert!(signing_key("").is_none());
+        assert!(signing_key("   ").is_none());
+    }
+
+    /// A published constant used to be substituted when the secret was unset,
+    /// which let anyone forge a rulepack that disables managed signatures.
+    #[test]
+    fn signing_key_never_returns_a_shared_default() {
+        for secret in ["", " ", "\t", "\n"] {
+            assert!(
+                signing_key(secret).is_none(),
+                "empty secret must not resolve to a built-in key"
+            );
+        }
+        assert_eq!(signing_key("  real-secret  ").as_deref(), Some("real-secret"));
+    }
 
     #[test]
     fn signature_is_stable_and_detects_tamper() {

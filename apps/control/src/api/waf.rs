@@ -326,10 +326,16 @@ pub async fn publish_rulepack(
             }
         }
     }
-    let secret = crate::waf_rulepack::signing_key(
-        &state.config.waf_rulepack_secret,
-        &state.config.agent_token,
-    );
+    let Some(secret) = crate::waf_rulepack::signing_key(&state.config.waf_rulepack_secret) else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: "WAF_RULEPACK_SECRET is not configured; refusing to publish an \
+                        unverifiable rulepack"
+                    .into(),
+            }),
+        ));
+    };
     let row = crate::waf_rulepack::publish_with_rulesets(
         &state.pool,
         &secret,

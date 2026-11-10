@@ -472,7 +472,10 @@ impl Storage for NativeStorage {
         if status == 200 {
             if let (Some(large), Some(len)) = (self.large.as_ref(), content_length) {
                 if large.accepts(len) {
-                    let mut stored_headers = headers.clone();
+                    // Strip `Set-Cookie` and friends before they are persisted;
+                    // `large.begin` filters too, but the validator logic below
+                    // reads this list.
+                    let mut stored_headers = crate::cache::large::LargeCache::prune_uncacheable(&headers);
                     stored_headers.push((META_HEADER.to_string(), encoded_meta.clone()));
                     stored_headers.retain(|(name, _)| {
                         !name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)

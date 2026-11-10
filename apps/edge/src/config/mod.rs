@@ -64,7 +64,15 @@ pub struct EdgeConfig {
     /// MaxMind GeoLite2-ASN database used by the WAF ASN rules.
     pub geoip_asn_db: String,
     /// Trust `X-Forwarded-For` for the client IP (only behind a trusted proxy).
+    ///
+    /// Retained for compatibility; it is only consulted when
+    /// [`EdgeConfig::trusted_proxies`] is empty. Prefer setting
+    /// `TRUSTED_PROXIES`, which bounds the trust to specific networks.
     pub trust_proxy_headers: bool,
+    /// Parsed `TRUSTED_PROXIES` CIDR list. Only requests whose socket peer is in
+    /// this set may influence the client IP or the request scheme.
+    #[serde(skip)]
+    pub trusted_proxies: crate::security::trusted_proxy::TrustedProxies,
     /// Ship WAF events to the control plane.
     pub waf_report: bool,
     pub waf_report_interval_secs: u64,
@@ -224,6 +232,8 @@ impl Default for EdgeConfig {
             geoip_asn_db: std::env::var("GEOIP_ASN_DB")
                 .unwrap_or_else(|_| "./data/maxmind/GeoLite2-ASN.mmdb".into()),
             trust_proxy_headers: bool_env("TRUST_PROXY_HEADERS", false),
+            // Parsed lazily below so a typo fails startup with a clear message.
+            trusted_proxies: crate::security::trusted_proxy::TrustedProxies::default(),
             waf_report: bool_env("WAF_REPORT", true),
             waf_report_interval_secs: std::env::var("WAF_REPORT_INTERVAL")
                 .ok()
@@ -319,15 +329,36 @@ fn env_nonempty(name: &str) -> Option<String> {
 }
 
 impl EdgeConfig {
+    /// Load configuration, failing fast on an unusable `TRUSTED_PROXIES`.
+    ///
+    /// A typo must not silently degrade to "trust nobody" (which breaks client
+    /// IP reporting) or, worse, to "trust everybody".
     pub fn load() -> Self {
+        Self::load_checked().unwrap_or_else(|e| panic!("invalid edge configuration: {e}"))
+    }
+
+    pub fn load_checked() -> Result<Self, String> {
         let _ = dotenvy::dotenv();
-        Self::default()
+        let mut config = Self::default();
+        let spec = std::env::var("TRUSTED_PROXIES").unwrap_or_default();
+        config.trusted_proxies = crate::security::trusted_proxy::TrustedProxies::parse(&spec)?;
+        Ok(config)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typo in TRUSTED_PROXIES must fail startup rather than silently
+    /// trusting nothing (breaking client IP reporting) or everything.
+    #[test]
+    fn invalid_trusted_proxies_is_rejected() {
+        assert!(crate::security::trusted_proxy::TrustedProxies::parse("10.0.0.0/8").is_ok());
+        assert!(crate::security::trusted_proxy::TrustedProxies::parse("10.0.0.0/33").is_err());
+        assert!(crate::security::trusted_proxy::TrustedProxies::parse("nonsense").is_err());
+        assert!(crate::security::trusted_proxy::TrustedProxies::parse("10.0.0.0/8, bad").is_err());
+    }
 
     #[test]
     fn control_url_is_normalized() {

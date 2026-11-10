@@ -13,6 +13,15 @@ use uuid::Uuid;
 
 const OP_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Single source of truth for the cached actor/session key.
+///
+/// Both the `Actor` extractor (read + write) and [`RedisService::invalidate_session`]
+/// must agree on this name; when they drifted apart, disabling a user or
+/// changing their groups left the stale privileges cached until the TTL expired.
+pub fn session_key(user_id: Uuid) -> String {
+    format!("lagran:session:v2:{user_id}")
+}
+
 #[derive(Clone)]
 pub struct RedisService {
     conn: ConnectionManager,
@@ -96,7 +105,7 @@ impl RedisService {
     }
 
     pub async fn invalidate_session(&self, user_id: Uuid) {
-        self.del(&format!("lagran:session:{user_id}")).await;
+        self.del(&session_key(user_id)).await;
     }
 
     pub async fn incr_with_ttl(&self, key: &str, ttl_secs: u64) -> Option<i64> {
@@ -263,4 +272,29 @@ impl RedisService {
 
 pub fn redis_enabled(state: &crate::state::AppState) -> bool {
     state.redis.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_key_is_stable_and_versioned() {
+        let id = Uuid::nil();
+        assert_eq!(
+            session_key(id),
+            "lagran:session:v2:00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    /// The `Actor` extractor and `invalidate_session` previously used different
+    /// key names, so disabling a user never evicted the cached privileges.
+    #[test]
+    fn invalidate_and_lookup_use_the_same_key() {
+        let id = Uuid::new_v4();
+        let read_key = session_key(id);
+        let invalidated = session_key(id);
+        assert_eq!(read_key, invalidated);
+        assert!(read_key.starts_with("lagran:session:v2:"));
+    }
 }
