@@ -10,6 +10,7 @@ pub use prefetch::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -171,6 +172,29 @@ pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<Use
     .bind(id)
     .fetch_optional(pool)
     .await
+}
+
+/// `(email, name)` for many users in one query.
+///
+/// Deliberately does not select `password_hash`: this is only used to decorate
+/// list responses.
+pub async fn user_identities(
+    pool: &PgPool,
+    user_ids: &[Uuid],
+) -> sqlx::Result<HashMap<Uuid, (String, String)>> {
+    let mut out: HashMap<Uuid, (String, String)> = HashMap::new();
+    if user_ids.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(Uuid, String, String)> =
+        sqlx::query_as("SELECT id, email, name FROM users WHERE id = ANY($1)")
+            .bind(user_ids)
+            .fetch_all(pool)
+            .await?;
+    for (id, email, name) in rows {
+        out.insert(id, (email, name));
+    }
+    Ok(out)
 }
 
 pub async fn create_user(
@@ -2060,6 +2084,7 @@ pub async fn update_domain_settings(
     Ok(r.rows_affected())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_domain_signed_url(
     pool: &PgPool,
     id: Uuid,
@@ -3679,6 +3704,30 @@ pub async fn group_member_ids(pool: &PgPool, group_id: Uuid) -> sqlx::Result<Vec
         .bind(group_id)
         .fetch_all(pool)
         .await
+}
+
+/// Member ids for many groups in one query.
+///
+/// The list endpoint previously issued one query per group (classic N+1).
+pub async fn group_member_ids_for(
+    pool: &PgPool,
+    group_ids: &[Uuid],
+) -> sqlx::Result<HashMap<Uuid, Vec<Uuid>>> {
+    let mut out: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    if group_ids.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT group_id, user_id FROM user_group_members \
+         WHERE group_id = ANY($1) ORDER BY group_id, user_id",
+    )
+    .bind(group_ids)
+    .fetch_all(pool)
+    .await?;
+    for (group_id, user_id) in rows {
+        out.entry(group_id).or_default().push(user_id);
+    }
+    Ok(out)
 }
 
 pub async fn set_group_members(

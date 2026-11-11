@@ -223,6 +223,8 @@ pub fn waf_blocked_page(host: &str, path: &str, rule: &str, category: &str) -> R
         "traversal" => "路径穿越",
         "scanners" => "恶意扫描",
         "ip_deny" => "IP 黑名单",
+        "geo_deny" => "Geo 黑名单",
+        "asn_deny" => "ASN 黑名单",
         _ => "自定义规则",
     };
     let body = format!(
@@ -259,12 +261,7 @@ pub fn waf_blocked_page(host: &str, path: &str, rule: &str, category: &str) -> R
 }
 
 /// Page returned when the edge rate limiter or CC protection rejects a request.
-pub fn rate_limited_page(
-    host: &str,
-    path: &str,
-    retry_after: u64,
-    banned: bool,
-) -> Response {
+pub fn rate_limited_page(host: &str, path: &str, retry_after: u64, banned: bool) -> Response {
     let host_esc = html_escape(host);
     let path_esc = html_escape(&truncate(path, 160));
     let reason = if banned {
@@ -507,7 +504,10 @@ mod tests {
         for response in pages {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let html = String::from_utf8_lossy(&body);
-            assert!(html.contains("https://t.me/lagranedge"), "missing Telegram URL");
+            assert!(
+                html.contains("https://t.me/lagranedge"),
+                "missing Telegram URL"
+            );
             assert!(html.contains("获取技术支持"), "missing support link text");
         }
     }

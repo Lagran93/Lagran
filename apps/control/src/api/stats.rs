@@ -198,7 +198,7 @@ pub async fn realtime(
             },
         )
         .collect();
-    domain_rows.sort_by(|a, b| b.requests.cmp(&a.requests));
+    domain_rows.sort_by_key(|row| std::cmp::Reverse(row.requests));
     let domain_count = domain_rows.len();
     domain_rows.truncate(20);
     Json(RealtimeStats {

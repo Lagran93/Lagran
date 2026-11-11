@@ -349,12 +349,9 @@ fn aia_urls(der: &[u8]) -> Vec<String> {
         // GeneralName URI is [6] IA5String: tag 0x86 + length. DER length bytes
         // are often ASCII digits (0x30 = '0'), so a naive scan would include
         // the next TLV's length byte in the URL.
-        if start >= 2 && der[start - 2] == 0x86 {
-            let len = der[start - 1] as usize;
-            if len > 0 && start + len <= der.len() {
-                end = start + len;
-            }
-        } else if start >= 3 && der[start - 3] == 0x86 && der[start - 2] == 0x81 {
+        let has_uri_length_prefix = (start >= 2 && der[start - 2] == 0x86)
+            || (start >= 3 && der[start - 3] == 0x86 && der[start - 2] == 0x81);
+        if has_uri_length_prefix {
             let len = der[start - 1] as usize;
             if len > 0 && start + len <= der.len() {
                 end = start + len;

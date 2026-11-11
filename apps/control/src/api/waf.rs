@@ -595,7 +595,7 @@ pub async fn put_settings(
 
     let managed_rulesets = match req.managed_rulesets.as_deref() {
         Some(ids) => crate::waf_rulesets::validate_ids(ids)
-            .map_err(|e| bad_request(e))?,
+            .map_err(bad_request)?,
         None => current.managed_rulesets.clone(),
     };
     let managed_csv = managed_rulesets.join(",");
@@ -608,7 +608,7 @@ pub async fn put_settings(
         .to_string();
     if !waf_rulepack_version.is_empty() {
         crate::waf_rulepack::validate_version(&waf_rulepack_version)
-            .map_err(|e| bad_request(e))?;
+            .map_err(bad_request)?;
         if crate::waf_rulepack::get(&state.pool, &waf_rulepack_version)
             .await
             .map_err(|_| db_error())?
@@ -1584,6 +1584,12 @@ const MAX_EVENT_PATH: usize = 2048;
 const MAX_EVENT_FIELD: usize = 256;
 const MAX_EVENT_NAME: usize = 128;
 
+// The event buffer relies on these caps; fail the build, not a test, if they
+// ever shrink below what the ingest path assumes.
+const _: () = assert!(MAX_EVENT_PATH >= 512);
+const _: () = assert!(MAX_EVENT_FIELD >= 64);
+const _: () = assert!(MAX_EVENT_NAME >= 32);
+
 /// Trim and truncate a field to at most `max` **characters**.
 ///
 /// Counts characters rather than bytes so a truncated value is always valid
@@ -1906,14 +1912,6 @@ mod tests {
         assert_eq!(cut, "中".repeat(10));
         assert_eq!(clamp_event("  spaced  ", 64), "spaced");
     }
-
-    #[test]
-    fn event_limits_are_sane() {
-        assert!(MAX_EVENT_PATH >= 512);
-        assert!(MAX_EVENT_FIELD >= 64);
-        assert!(MAX_EVENT_NAME >= 32);
-    }
-
 
     /// Without canonicalization `10.0.0.1`, `10.0.0.1/32` and a padded form are
     /// distinct strings, which is how duplicates piled up in the first place.

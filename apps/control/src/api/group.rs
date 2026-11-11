@@ -79,23 +79,24 @@ fn parse_uuid(id: &str) -> Result<Uuid, (StatusCode, Json<ErrorBody>)> {
     Uuid::parse_str(id).map_err(|_| bad_request("invalid id"))
 }
 
-async fn to_dto(state: &AppState, row: repository::UserGroupRow) -> GroupDto {
-    let member_ids = repository::group_member_ids(&state.pool, row.id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|id| id.to_string())
-        .collect();
+fn dto_from_row(row: repository::UserGroupRow, member_ids: Vec<Uuid>) -> GroupDto {
     GroupDto {
         id: row.id.to_string(),
         name: row.name,
         description: row.description,
         permissions: row.permissions,
         member_count: row.member_count,
-        member_ids,
+        member_ids: member_ids.into_iter().map(|id| id.to_string()).collect(),
         created_at: row.created_at.to_rfc3339(),
         updated_at: row.updated_at.to_rfc3339(),
     }
+}
+
+async fn to_dto(state: &AppState, row: repository::UserGroupRow) -> GroupDto {
+    let member_ids = repository::group_member_ids(&state.pool, row.id)
+        .await
+        .unwrap_or_default();
+    dto_from_row(row, member_ids)
 }
 
 fn normalize_permissions(
@@ -139,10 +140,18 @@ pub async fn list(
     let rows = repository::list_user_groups(&state.pool)
         .await
         .map_err(|_| db_error())?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(to_dto(&state, row).await);
-    }
+    // One query for all memberships instead of one per group.
+    let group_ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let mut members = repository::group_member_ids_for(&state.pool, &group_ids)
+        .await
+        .unwrap_or_default();
+    let out = rows
+        .into_iter()
+        .map(|row| {
+            let member_ids = members.remove(&row.id).unwrap_or_default();
+            dto_from_row(row, member_ids)
+        })
+        .collect();
     Ok(Json(out))
 }
 

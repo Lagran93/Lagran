@@ -158,6 +158,7 @@ pub async fn get_alert_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<Aler
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_alert_rule(
     pool: &PgPool,
     name: &str,
@@ -190,6 +191,7 @@ pub async fn create_alert_rule(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_alert_rule(
     pool: &PgPool,
     id: Uuid,

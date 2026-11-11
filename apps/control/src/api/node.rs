@@ -573,6 +573,8 @@ pub async fn create(
         &format!("region={region} agent_url={agent_url}"),
     )
     .await;
+    // A new node must be schedulable immediately, not after the snapshot TTL.
+    state.nodes.invalidate().await;
 
     let commands = install_commands(&base, name, &region, &row.public_ip, &agent_url, &token);
     Ok((
@@ -719,6 +721,7 @@ pub async fn update(
         ),
     )
     .await;
+    state.nodes.invalidate().await;
     Ok(Json(to_dto(row)))
 }
 
@@ -755,6 +758,8 @@ pub async fn set_status(
         "",
     )
     .await;
+    // Stop (or resume) scheduling this node immediately.
+    state.nodes.invalidate().await;
     Ok(Json(to_dto(row)))
 }
 
@@ -780,6 +785,7 @@ pub async fn delete(
         .await
         .map_err(|_| db_error())?;
     let _ = repository::insert_audit(&state.pool, &actor.email, "node.delete", &row.name, "").await;
+    state.nodes.invalidate().await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 

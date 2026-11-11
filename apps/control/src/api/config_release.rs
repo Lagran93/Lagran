@@ -329,25 +329,66 @@ fn release_domains(release: &ConfigReleaseRow) -> Vec<ReleaseDomainDto> {
     out
 }
 
+/// Build DTOs for many releases with two queries total (versions + reports).
+///
+/// Previously every release issued one query per domain version and one for its
+/// reports, so a 100-release list cost hundreds of round trips.
+async fn release_dtos(
+    state: &AppState,
+    rows: Vec<ConfigReleaseRow>,
+) -> Result<Vec<ReleaseDto>, sqlx::Error> {
+    let parsed: Vec<(ConfigReleaseRow, Vec<ReleaseDomainDto>)> = rows
+        .into_iter()
+        .map(|row| {
+            let domains = release_domains(&row);
+            (row, domains)
+        })
+        .collect();
+
+    let mut version_ids: Vec<Uuid> = parsed
+        .iter()
+        .flat_map(|(_, domains)| domains.iter())
+        .filter_map(|item| Uuid::parse_str(&item.version_id).ok())
+        .collect();
+    version_ids.sort_unstable();
+    version_ids.dedup();
+    let versions = repository::versions_by_ids(&state.pool, &version_ids).await?;
+
+    let release_ids: Vec<Uuid> = parsed.iter().map(|(row, _)| row.id).collect();
+    let mut reports = repository::reports_for_releases(&state.pool, &release_ids).await?;
+
+    Ok(parsed
+        .into_iter()
+        .map(|(row, mut domains)| {
+            for item in &mut domains {
+                item.version = Uuid::parse_str(&item.version_id)
+                    .ok()
+                    .and_then(|id| versions.get(&id))
+                    .map(|version| version.version);
+            }
+            let reports = reports.remove(&row.id).unwrap_or_default();
+            build_release_dto(row, domains, reports)
+        })
+        .collect())
+}
+
 async fn release_dto(
     state: &AppState,
     release: ConfigReleaseRow,
 ) -> Result<ReleaseDto, sqlx::Error> {
-    let mut domains = release_domains(&release);
-    for item in &mut domains {
-        if let Ok(Some(version)) = repository::get_version(
-            &state.pool,
-            Uuid::parse_str(&item.version_id).unwrap_or_default(),
-        )
-        .await
-        {
-            item.version = Some(version.version);
-        }
-    }
-    let reports = repository::reports(&state.pool, release.id)
-        .await
-        .unwrap_or_default();
-    Ok(ReleaseDto {
+    release_dtos(state, vec![release])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(sqlx::Error::RowNotFound)
+}
+
+fn build_release_dto(
+    release: ConfigReleaseRow,
+    domains: Vec<ReleaseDomainDto>,
+    reports: Vec<(String, bool, String)>,
+) -> ReleaseDto {
+    ReleaseDto {
         id: release.id.to_string(),
         status: release.status,
         domains,
@@ -370,7 +411,7 @@ async fn release_dto(
                 reported_at: String::new(),
             })
             .collect(),
-    })
+    }
 }
 
 pub async fn list_releases(
@@ -383,10 +424,7 @@ pub async fn list_releases(
     let rows = repository::list_releases(&state.pool, 100)
         .await
         .map_err(|_| db_error())?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(release_dto(&state, row).await.map_err(|_| db_error())?);
-    }
+    let out = release_dtos(&state, rows).await.map_err(|_| db_error())?;
     Ok(Json(out))
 }
 
@@ -731,7 +769,7 @@ pub async fn apply_report(
         }
     }
     let release_id = parse_uuid(&req.release_id, "release id")?;
-    release_service::report(&state, release_id, &node_id, req.success, req.error.trim())
+    release_service::report(&state, release_id, node_id, req.success, req.error.trim())
         .await
         .map_err(|_| db_error())?;
     clear_config_cache(&state, Some(release_id)).await;

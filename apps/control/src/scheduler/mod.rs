@@ -11,8 +11,67 @@ use crate::repository;
 use crate::state::AppState;
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Short-lived snapshot of the `edge_nodes` table used by GeoDNS scheduling.
+///
+/// Every DNS cache miss asks for a scheduling decision; without a snapshot each
+/// one issued a full `SELECT ... FROM edge_nodes`. The table only changes on
+/// heartbeat and admin actions, and the DNS answer itself is cached for
+/// `schedule_ttl`, so a few seconds of staleness is harmless.
+pub struct NodeSnapshotCache {
+    ttl: Duration,
+    inner: AsyncMutex<Option<(Instant, Arc<Vec<repository::NodeRow>>)>>,
+}
+
+impl NodeSnapshotCache {
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            ttl: Duration::from_secs(ttl_secs),
+            inner: AsyncMutex::new(None),
+        }
+    }
+
+    pub async fn snapshot(
+        &self,
+        pool: &sqlx::PgPool,
+    ) -> sqlx::Result<Arc<Vec<repository::NodeRow>>> {
+        self.snapshot_with(|| repository::list_nodes(pool)).await
+    }
+
+    /// Cache-aware load. Split out from [`Self::snapshot`] so the reuse and
+    /// expiry behaviour can be tested without a database.
+    async fn snapshot_with<F, Fut>(&self, load: F) -> sqlx::Result<Arc<Vec<repository::NodeRow>>>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = sqlx::Result<Vec<repository::NodeRow>>>,
+    {
+        if self.ttl.is_zero() {
+            return Ok(Arc::new(load().await?));
+        }
+        // Holding the lock across the refresh keeps a burst of DNS misses from
+        // all issuing the same query; readers wait at most one table read per
+        // TTL.
+        let mut guard = self.inner.lock().await;
+        if let Some((expires, rows)) = guard.as_ref() {
+            if *expires > Instant::now() {
+                return Ok(rows.clone());
+            }
+        }
+        let rows = Arc::new(load().await?);
+        *guard = Some((Instant::now() + self.ttl, rows.clone()));
+        Ok(rows)
+    }
+
+    /// Drop the snapshot so the next lookup re-reads the table.
+    pub async fn invalidate(&self) {
+        *self.inner.lock().await = None;
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GeoInfo {
@@ -604,23 +663,21 @@ pub async fn resolve(state: &AppState, req: ScheduleRequest) -> ScheduleResponse
     let ttl = state.schedule_ttl;
     let domain = req.domain.clone().unwrap_or_default();
 
-    let nodes = repository::list_nodes(&state.pool)
-        .await
-        .unwrap_or_default();
+    let nodes = state.nodes.snapshot(&state.pool).await.unwrap_or_default();
     let mut candidates: Vec<(i32, Candidate)> = nodes
-        .into_iter()
+        .iter()
         .filter(|n| n.status == "online" && !n.public_ip.trim().is_empty())
         .map(|n| {
-            let (score, reason) = score_node(&n, &client);
+            let (score, reason) = score_node(n, &client);
             (
                 score,
                 Candidate {
-                    name: n.name,
-                    public_ip: n.public_ip,
-                    region: n.region,
-                    province: n.province,
-                    city: n.city,
-                    isp: n.isp,
+                    name: n.name.clone(),
+                    public_ip: n.public_ip.clone(),
+                    region: n.region.clone(),
+                    province: n.province.clone(),
+                    city: n.city.clone(),
+                    isp: n.isp.clone(),
                     weight: n.weight,
                     score,
                     reason,
@@ -806,5 +863,46 @@ mod tests {
             "CN"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn node_snapshot_reuses_within_ttl_and_after_invalidate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = NodeSnapshotCache::new(60);
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+        let load = move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, sqlx::Error>(Vec::new())
+            }
+        };
+
+        cache.snapshot_with(load.clone()).await.unwrap();
+        cache.snapshot_with(load.clone()).await.unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "second call must hit the snapshot");
+
+        cache.invalidate().await;
+        cache.snapshot_with(load.clone()).await.unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 2, "invalidate must force a reload");
+    }
+
+    #[tokio::test]
+    async fn node_snapshot_disabled_always_loads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = NodeSnapshotCache::new(0);
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+        let load = move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, sqlx::Error>(Vec::new())
+            }
+        };
+        cache.snapshot_with(load.clone()).await.unwrap();
+        cache.snapshot_with(load.clone()).await.unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
 }

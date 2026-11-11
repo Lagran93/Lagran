@@ -371,7 +371,7 @@ mod tests {
         put_u16(&mut raw, 18, 4);
 
         // Vector bucket for 1.2.x.x
-        let vector = HEADER_LEN + (1 * 256 + 2) * 8;
+        let vector = HEADER_LEN + (256 + 2) * 8;
         put_u32(&mut raw, vector, segment_start as u32);
         put_u32(&mut raw, vector + 4, segment_start as u32);
 

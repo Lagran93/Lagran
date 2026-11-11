@@ -85,6 +85,7 @@ impl RedisService {
 
     /// Same as `getdel`, but distinguishes an absent key (`Ok(None)`) from a
     /// Redis error (`Err`). Used where Redis must remain authoritative.
+    #[allow(clippy::result_unit_err)] // `Err(())` = "Redis unavailable", callers fall back
     pub async fn getdel_checked(&self, key: &str) -> Result<Option<String>, ()> {
         let mut conn = self.conn().await;
         let result = tokio::time::timeout(
@@ -143,6 +144,7 @@ impl RedisService {
     /// SET NX PX. Returns a token only when the caller acquired the lock.
     /// `Ok(None)` means another replica holds the lock; `Err(())` means Redis
     /// is unavailable and the caller should run its normal fallback path.
+    #[allow(clippy::result_unit_err)] // `Err(())` = "Redis unavailable", callers fall back
     pub async fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<LockToken>, ()> {
         let token = Uuid::new_v4().to_string();
         let mut conn = self.conn().await;

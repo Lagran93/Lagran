@@ -142,7 +142,7 @@ pub async fn get(
     let user = repository::find_user_by_id(&state.pool, uid)
         .await
         .map_err(|_| db_error())?
-        .ok_or_else(|| not_found())?;
+        .ok_or_else(not_found)?;
     Ok(Json(to_dto(user)))
 }
 
@@ -224,7 +224,7 @@ pub async fn update(
     let current = repository::find_user_by_id(&state.pool, uid)
         .await
         .map_err(|_| db_error())?
-        .ok_or_else(|| not_found())?;
+        .ok_or_else(not_found)?;
 
     let name = req
         .name
@@ -284,7 +284,7 @@ pub async fn update(
     )
     .await
     .map_err(|_| db_error())?
-    .ok_or_else(|| not_found())?;
+    .ok_or_else(not_found)?;
     if let Some(redis) = state.redis.as_deref() {
         redis.invalidate_session(uid).await;
     }
@@ -354,7 +354,7 @@ pub async fn delete(
     let current = repository::find_user_by_id(&state.pool, uid)
         .await
         .map_err(|_| db_error())?
-        .ok_or_else(|| not_found())?;
+        .ok_or_else(not_found)?;
     if current.role == "admin" && current.is_active {
         let admins = repository::count_active_admins(&state.pool)
             .await

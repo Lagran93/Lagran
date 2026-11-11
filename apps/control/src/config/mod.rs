@@ -42,6 +42,8 @@ pub struct AppConfig {
     pub geoip_ipv6_path: String,
     /// TTL returned by the scheduling API (seconds).
     pub schedule_ttl: u64,
+    /// How long the scheduler caches the node table (seconds). 0 disables it.
+    pub schedule_node_cache_secs: u64,
     /// DNS server used by the console "DNS test" endpoint (host:port).
     pub dns_test_server: String,
     /// ACME directory for Let's Encrypt production.
@@ -135,6 +137,11 @@ impl Default for AppConfig {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(30)
                 .clamp(5, 3600),
+            schedule_node_cache_secs: std::env::var("SCHEDULE_NODE_CACHE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5)
+                .clamp(0, 300),
             dns_test_server: std::env::var("DNS_TEST_SERVER")
                 .unwrap_or_else(|_| "127.0.0.1:53".into()),
             acme_directory_url: std::env::var("ACME_DIRECTORY_URL")

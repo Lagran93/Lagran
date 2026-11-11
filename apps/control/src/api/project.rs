@@ -52,20 +52,27 @@ pub struct UpdateMemberRequest {
     pub role: String,
 }
 
-async fn to_dto(state: &AppState, r: repository::ProjectRow) -> ProjectDto {
-    let owner = repository::find_user_by_id(&state.pool, r.owner_id)
-        .await
-        .ok()
-        .flatten();
+fn dto_from_row(
+    r: repository::ProjectRow,
+    owner: Option<&(String, String)>,
+) -> ProjectDto {
     ProjectDto {
         id: r.id.to_string(),
         name: r.name,
         owner_id: r.owner_id.to_string(),
-        owner_email: owner.as_ref().map(|u| u.email.clone()).unwrap_or_default(),
-        owner_name: owner.as_ref().map(|u| u.name.clone()).unwrap_or_default(),
+        owner_email: owner.map(|(email, _)| email.clone()).unwrap_or_default(),
+        owner_name: owner.map(|(_, name)| name.clone()).unwrap_or_default(),
         domain_count: r.domain_count.unwrap_or(0),
         created_at: r.created_at.to_rfc3339(),
     }
+}
+
+async fn to_dto(state: &AppState, r: repository::ProjectRow) -> ProjectDto {
+    let owner = repository::user_identities(&state.pool, &[r.owner_id])
+        .await
+        .ok()
+        .and_then(|mut owners| owners.remove(&r.owner_id));
+    dto_from_row(r, owner.as_ref())
 }
 
 fn parse_uuid(id: &str) -> Result<Uuid, (StatusCode, Json<ErrorBody>)> {
@@ -110,10 +117,18 @@ pub async fn list(
         tracing::error!(error = %e, "list projects");
         db_error()
     })?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(to_dto(&state, row).await);
-    }
+    // One query for every owner instead of one per project.
+    let owner_ids: Vec<Uuid> = rows.iter().map(|row| row.owner_id).collect();
+    let owners = repository::user_identities(&state.pool, &owner_ids)
+        .await
+        .unwrap_or_default();
+    let out = rows
+        .into_iter()
+        .map(|row| {
+            let owner = owners.get(&row.owner_id);
+            dto_from_row(row, owner)
+        })
+        .collect();
     Ok(Json(out))
 }
 

@@ -13,19 +13,16 @@ pub async fn backfill_missing(pool: &PgPool) {
         Err(_) => return,
     };
     for domain in domains {
-        match crate::repository::latest_version(pool, domain.id).await {
-            Ok(None) => {
-                let _ = record_domain(
-                    pool,
-                    domain.id,
-                    &domain.name,
-                    "system",
-                    "initial.baseline",
-                    "升级后初始化版本",
-                )
-                .await;
-            }
-            _ => {}
+        if let Ok(None) = crate::repository::latest_version(pool, domain.id).await {
+            let _ = record_domain(
+                pool,
+                domain.id,
+                &domain.name,
+                "system",
+                "initial.baseline",
+                "升级后初始化版本",
+            )
+            .await;
         }
     }
 }

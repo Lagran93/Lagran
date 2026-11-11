@@ -189,7 +189,7 @@ pub fn catalog_fingerprint(rulesets: &[RulesetEntry]) -> String {
 
 pub fn sign(payload: &str, secret: &str) -> (String, String) {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
-    let signature = hex(&ring::hmac::sign(&key, payload.as_bytes()).as_ref().to_vec());
+    let signature = hex(ring::hmac::sign(&key, payload.as_bytes()).as_ref());
     let checksum = hex(ring::digest::digest(&ring::digest::SHA256, payload.as_bytes()).as_ref());
     (signature, checksum)
 }
@@ -288,12 +288,12 @@ pub fn verify(row: &RulepackRow, secret: &str) -> bool {
 }
 
 fn hex_decode(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(value.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         let hi = (chunk[0] as char).to_digit(16)?;
         let lo = (chunk[1] as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);

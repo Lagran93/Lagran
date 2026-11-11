@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -56,6 +57,7 @@ pub async fn latest_version(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_version(
     pool: &PgPool,
     domain_id: Uuid,
@@ -134,6 +136,34 @@ pub async fn get_version(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<ConfigV
     .bind(id)
     .fetch_optional(pool)
     .await
+}
+
+/// Many versions in one query, keyed by id.
+///
+/// The release list used to fetch each release's domain versions one by one.
+pub async fn versions_by_ids(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> sqlx::Result<HashMap<Uuid, ConfigVersionRow>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let rows = sqlx::query_as::<_, ConfigVersionRow>(
+        r#"
+        SELECT id, domain_id, domain_name, version, snapshot, diff,
+               action, actor, message, created_at
+        FROM config_versions
+        WHERE id = ANY($1)
+        "#,
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        out.insert(row.id, row);
+    }
+    Ok(out)
 }
 
 pub async fn set_published_version(
@@ -317,6 +347,30 @@ pub async fn reports(pool: &PgPool, release_id: Uuid) -> sqlx::Result<Vec<(Strin
     .bind(release_id)
     .fetch_all(pool)
     .await
+}
+
+/// Reports for many releases in one query, keyed by release id.
+pub async fn reports_for_releases(
+    pool: &PgPool,
+    release_ids: &[Uuid],
+) -> sqlx::Result<HashMap<Uuid, Vec<(String, bool, String)>>> {
+    let mut out: HashMap<Uuid, Vec<(String, bool, String)>> = HashMap::new();
+    if release_ids.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(Uuid, String, bool, String)> = sqlx::query_as(
+        "SELECT release_id, node_id, success, error \
+         FROM config_release_reports WHERE release_id = ANY($1)",
+    )
+    .bind(release_ids)
+    .fetch_all(pool)
+    .await?;
+    for (release_id, node, success, error) in rows {
+        out.entry(release_id)
+            .or_default()
+            .push((node, success, error));
+    }
+    Ok(out)
 }
 
 pub async fn publishing_exists(pool: &PgPool, exclude: Uuid) -> sqlx::Result<bool> {

@@ -1624,16 +1624,16 @@ pub async fn put_settings(
         // replacing it with "********".
         let mut secret = submitted_secret(req.signed_url_secret.as_deref());
         let wanted_on = enabled_arg.unwrap_or(false);
-        if wanted_on && secret.is_none() {
-            if stored_settings
+        if wanted_on
+            && secret.is_none()
+            && stored_settings
                 .as_ref()
                 .map(|s| s.signed_url_secret.is_empty())
                 .unwrap_or(true)
-            {
-                // Enabling signed URLs without supplying a key creates one.
-                sensitive.signed_url_secret_generated = true;
-                secret = Some(generate_secret());
-            }
+        {
+            // Enabling signed URLs without supplying a key creates one.
+            sensitive.signed_url_secret_generated = true;
+            secret = Some(generate_secret());
         }
         repository::update_domain_signed_url(
             &state.pool,
@@ -1808,9 +1808,11 @@ mod tests {
     #[test]
     fn audit_detail_never_contains_secret_values() {
         let value = "super-secret-origin-token";
-        let mut changes = SensitiveChanges::default();
-        changes.origin_auth_value = true;
-        changes.signed_url_secret = true;
+        let changes = SensitiveChanges {
+            origin_auth_value: true,
+            signed_url_secret: true,
+            ..SensitiveChanges::default()
+        };
         let detail = changes.audit_detail();
         assert!(!detail.contains(value));
         assert!(!detail.contains(SECRET_MASK));
