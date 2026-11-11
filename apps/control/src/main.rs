@@ -31,39 +31,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = AppConfig::load();
-    if !config.public_url.is_empty() && !is_http_url(&config.public_url) {
-        anyhow::bail!(
-            "CONTROL_PUBLIC_URL must start with http:// or https:// (got {:?})",
-            config.public_url
-        );
-    }
+    // Share one validation path with `check-config`, so the pre-flight gate and
+    // the server can never disagree about which configuration is acceptable.
+    check_config(&config)?;
     let tracer_provider = init_tracing(&config);
-    const DEFAULT_JWT: &str = "lagran-dev-secret-change-me";
-    if config.jwt_secret == DEFAULT_JWT || config.jwt_secret.len() < 16 {
-        if config.require_secure_secrets {
-            anyhow::bail!(
-                "JWT_SECRET is missing or uses the insecure default; set a strong secret or disable REQUIRE_SECURE_SECRETS for local dev"
-            );
-        }
-        tracing::warn!(
-            "JWT_SECRET is the built-in default or too short — do not use this in production"
-        );
-    }
-    if control::waf_rulepack::signing_key(&config.waf_rulepack_secret).is_none() {
-        if config.require_secure_secrets {
-            anyhow::bail!(
-                "WAF_RULEPACK_SECRET is not set; signed WAF rulepacks cannot be trusted. Set WAF_RULEPACK_SECRET (and the same value on every edge) or disable REQUIRE_SECURE_SECRETS for local dev"
-            );
-        }
-        tracing::warn!(
-            "WAF_RULEPACK_SECRET is not set — edges reject unsigned rulepacks, so managed rulepack updates will not be applied; set it in production"
-        );
-    }
-    if config.agent_token.is_empty() {
-        tracing::warn!(
-            "AGENT_TOKEN is empty; edge→control agent routes still require per-node tokens, but schedule/DNS global auth is weakened"
-        );
-    }
     if !config.cors_allowed_origins.is_empty() {
         tracing::info!(
             origins = %config.cors_allowed_origins.join(","),
@@ -303,7 +274,28 @@ fn check_config(config: &AppConfig) -> anyhow::Result<()> {
     if config.agent_token.is_empty() {
         eprintln!("warning: AGENT_TOKEN is empty; agent endpoints are weaker");
     }
-    println!("config: ok");
+    // Signed WAF rulepacks are rejected outright when this is unset, and edges
+    // then fall back to the managed flags in the config document. `check-config`
+    // is the pre-flight gate operators run before shipping, so it must fail here
+    // for the same reason `serve` fails at startup.
+    if control::waf_rulepack::signing_key(&config.waf_rulepack_secret).is_none() {
+        if config.require_secure_secrets {
+            anyhow::bail!(
+                "WAF_RULEPACK_SECRET is not set; signed WAF rulepacks cannot be trusted. Set WAF_RULEPACK_SECRET (and the same value on every edge) or disable REQUIRE_SECURE_SECRETS for local dev"
+            );
+        }
+        eprintln!(
+            "warning: WAF_RULEPACK_SECRET is not set; edges will reject signed rulepacks"
+        );
+    }
+    // Only the CLI subcommands are interactive; `serve` logs through tracing, so
+    // emitting "config: ok" there would be noise in the service journal.
+    if !matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("serve") | None
+    ) {
+        println!("config: ok");
+    }
     println!("bind: {}", config.bind_addr());
     println!("public_url: {}", if config.public_url.is_empty() { "(derive from request)".to_string() } else { config.public_url.clone() });
     println!("database: configured");

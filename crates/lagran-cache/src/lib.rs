@@ -252,11 +252,34 @@ impl MemoryCache {
     }
 
     /// Evict least-recently-used entries until the cache fits its capacity.
+    /// Subtract `bytes` from the running total without wrapping.
+    ///
+    /// `fetch_sub` on a `u64` wraps to a huge value if two threads account for
+    /// the same removal, and the wrap makes `over_limit()` permanently true: the
+    /// cache then evicts every entry it holds, on every insert. A saturating
+    /// update keeps the counter meaningful even if bookkeeping ever drifts.
+    fn release_bytes(&self, bytes: u64) {
+        self.used_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(bytes))
+            })
+            .ok();
+    }
+
+    /// Sum of `memory_size()` over the entries currently held.
+    ///
+    /// O(n) in the entry count; only used on `clear` and by tests.
+    fn accounted_bytes(&self) -> u64 {
+        self.inner
+            .iter()
+            .map(|e| e.entry.memory_size())
+            .fold(0u64, |acc, size| acc.saturating_add(size))
+    }
+
     fn remove_key(&self, key: &str) -> Option<TimedEntry> {
         let removed = self.inner.remove(key).map(|(_, entry)| entry);
         if let Some(entry) = &removed {
-            self.used_bytes
-                .fetch_sub(entry.entry.memory_size(), Ordering::Relaxed);
+            self.release_bytes(entry.entry.memory_size());
         }
         if let Ok(mut lru) = self.lru.lock() {
             lru.remove(key);
@@ -266,8 +289,7 @@ impl MemoryCache {
 
     fn over_limit(&self) -> bool {
         (self.capacity > 0 && self.inner.len() > self.capacity)
-            || (self.max_bytes > 0
-                && self.used_bytes.load(Ordering::Relaxed) > self.max_bytes)
+            || (self.max_bytes > 0 && self.used_bytes.load(Ordering::Relaxed) > self.max_bytes)
     }
 
     /// Evict least-recently-used entries until count and byte limits fit.
@@ -342,20 +364,32 @@ impl CacheBackend for MemoryCache {
         entry.fresh_until_epoch_secs = now_epoch + fresh_secs;
         entry.stale_until_epoch_secs = now_epoch + fresh_secs + swr_secs;
         entry.stored_at_epoch_secs = now_epoch;
-        let size = entry.memory_size();
-        let old = self.inner.insert(
-            key.to_string(),
-            TimedEntry {
-                entry,
-                fresh_until: now + fresh,
-                stale_until: now + fresh + swr,
-            },
-        );
-        if let Some(old) = old {
-            self.used_bytes
-                .fetch_sub(old.entry.memory_size(), Ordering::Relaxed);
-        }
-        self.used_bytes.fetch_add(size, Ordering::Relaxed);
+        // Account for the replacement atomically per key.
+        //
+        // The previous code added the new size and subtracted the old one as two
+        // independent operations on a shared counter. Two concurrent writers to
+        // the same key can both observe their own `insert` return value while
+        // another thread's value is the one actually replaced, so the total
+        // drifts; repeated drift wraps the `u64` and triggers a full eviction
+        // storm. Pairing the sizes and applying the delta in one update keeps the
+        // counter consistent regardless of interleaving.
+        let new_entry = TimedEntry {
+            entry,
+            fresh_until: now + fresh,
+            stale_until: now + fresh + swr,
+        };
+        let size = new_entry.entry.memory_size();
+        // `DashMap::insert` returns the replaced value under the shard lock, so
+        // the delta is exact even with concurrent writers on the same key. A
+        // separate `get` before the insert leaves a window where two writers
+        // both read the same old size and both subtract it.
+        let old = self.inner.insert(key.to_string(), new_entry);
+        let old_size = old.map(|e| e.entry.memory_size()).unwrap_or(0);
+        self.used_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(old_size).saturating_add(size))
+            })
+            .ok();
         self.touch(key);
         self.evict_overflow();
     }
@@ -366,7 +400,12 @@ impl CacheBackend for MemoryCache {
 
     async fn clear(&self) {
         self.inner.clear();
-        self.used_bytes.store(0, Ordering::Relaxed);
+        // Recompute rather than zero: an `insert` that raced with `clear` may
+        // already have added its bytes, and storing 0 would then under-count
+        // them permanently. Recomputing from the live map is always correct and
+        // also heals any earlier drift.
+        self.used_bytes
+            .store(self.accounted_bytes(), Ordering::Relaxed);
         if let Ok(mut lru) = self.lru.lock() {
             lru.pos.clear();
             lru.order.clear();
@@ -492,6 +531,94 @@ mod tests {
         c.set("c", big, 60).await;
         assert!(c.used_bytes() <= 650);
         assert!(c.len().await <= 2);
+    }
+
+    /// A wrapped counter makes `over_limit()` permanently true, so the cache
+    /// evicts everything on every insert.
+    ///
+    /// This exercises `release_bytes` directly: driving the wrap through
+    /// concurrent `set` calls is timing-dependent and did not reproduce it
+    /// reliably, so the arithmetic is what gets asserted.
+    #[tokio::test]
+    async fn release_bytes_never_wraps() {
+        let c = MemoryCache::with_max_bytes(1000, 100_000);
+        c.set("a", entry("a"), 60).await;
+        let before = c.used_bytes();
+        assert!(before > 0);
+
+        // Releasing more than is accounted must clamp at zero, not wrap.
+        c.release_bytes(before + 1);
+        assert_eq!(
+            c.used_bytes(),
+            0,
+            "over-release must saturate at zero, not wrap to u64::MAX"
+        );
+
+        // Over-releasing desynchronises the counter from the live map: the
+        // entry is still there but uncounted. That is exactly why `clear`
+        // recomputes instead of trusting the running total, and it is why the
+        // real code paths never release bytes they did not add. Verify the
+        // recovery mechanism works rather than asserting a state the cache is
+        // not supposed to reach.
+        assert_ne!(c.used_bytes(), c.accounted_bytes());
+        c.clear().await;
+        assert_eq!(
+            c.used_bytes(),
+            c.accounted_bytes(),
+            "clear must resynchronise the counter with reality"
+        );
+    }
+
+    /// Overwriting the same key repeatedly must keep the total exact.
+    #[tokio::test]
+    async fn repeated_overwrite_keeps_total_exact() {
+        let c = MemoryCache::with_max_bytes(1000, 100_000);
+        for _ in 0..500 {
+            c.set("same-key", entry("a"), 60).await;
+        }
+        assert_eq!(c.len().await, 1);
+        assert_eq!(
+            c.used_bytes(),
+            c.accounted_bytes(),
+            "total must equal the single live entry"
+        );
+    }
+
+    /// Two writers on the same key must not both subtract the same old size.
+    #[tokio::test]
+    async fn concurrent_overwrite_keeps_accounting_consistent() {
+        let c = std::sync::Arc::new(MemoryCache::with_max_bytes(1000, 100_000));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = c.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..200 {
+                    cache.set("hot", entry("x"), 60).await;
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(c.len().await, 1, "single key must stay single");
+        let one = c.accounted_bytes();
+        assert_eq!(
+            c.used_bytes(),
+            one,
+            "accounted total must match the actual entry"
+        );
+    }
+
+    /// `clear` recomputes instead of zeroing, so a racing insert is not lost.
+    #[tokio::test]
+    async fn clear_recomputes_instead_of_zeroing() {
+        let c = MemoryCache::new(100);
+        c.set("a", entry("a"), 60).await;
+        c.set("b", entry("b"), 60).await;
+        c.clear().await;
+        assert_eq!(c.len().await, 0);
+        assert_eq!(c.used_bytes(), 0);
+        assert_eq!(c.used_bytes(), c.accounted_bytes());
     }
 
     #[tokio::test]

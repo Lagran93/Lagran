@@ -115,10 +115,13 @@ impl CertStore {
             if let Err(e) = std::fs::write(&crt, cert_pem) {
                 tracing::warn!(error = %e, path = %crt.display(), "write cert failed");
             }
-            if let Err(e) = std::fs::write(&key, key_pem) {
-                tracing::warn!(error = %e, path = %key.display(), "write key failed");
-            } else {
-                tracing::debug!(server_name = %n, "cert persisted to disk");
+            // The private key must never be world-readable. `fs::write` creates
+            // with 0666 minus the process umask, and the packaged systemd unit
+            // did not set one, so these files landed as 0644: any local user
+            // could read the TLS key for every domain this node serves.
+            match write_private(&key, key_pem) {
+                Ok(()) => tracing::debug!(server_name = %n, "cert persisted to disk"),
+                Err(e) => tracing::warn!(error = %e, path = %key.display(), "write key failed"),
             }
         }
     }
@@ -233,4 +236,30 @@ impl Default for CertStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Write a file readable only by its owner (0600), replacing any existing mode.
+///
+/// Uses `OpenOptions::mode` on Unix so the permissions apply at creation time:
+/// writing first and chmod-ing afterwards leaves a window where the private key
+/// is world-readable.
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    // `mode` is ignored when the file already exists, so normalise it.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }

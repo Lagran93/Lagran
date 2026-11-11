@@ -504,25 +504,18 @@ pub async fn snapshot_domain(
     let Some(row) = repository::get_domain_full_by_name(pool, name).await? else {
         return Ok(None);
     };
-    let rules = repository::list_rules_for_domain(pool, row.id)
-        .await
-        .unwrap_or_default();
-    let rulepacks = crate::waf_rulepack::list(pool).await.unwrap_or_default();
-    let waf = match repository::get_waf_settings(pool, row.id)
-        .await
-        .ok()
-        .flatten()
-    {
+    // Every query on the config path must propagate its error. Coercing a
+    // failure into an empty collection turns "the database blipped" into "this
+    // domain has no WAF rules and no Geo allow-list", which silently disables
+    // protection (or, for a Geo allow-list, blocks all traffic). A 5xx makes the
+    // edge keep its current config instead.
+    let rules = repository::list_rules_for_domain(pool, row.id).await?;
+    let rulepacks = crate::waf_rulepack::list(pool).await?;
+    let waf = match repository::get_waf_settings(pool, row.id).await? {
         Some(settings) => {
-            let waf_rules = repository::list_waf_rules(pool, row.id)
-                .await
-                .unwrap_or_default();
-            let waf_ips = repository::list_waf_ips(pool, row.id)
-                .await
-                .unwrap_or_default();
-            let waf_geo = repository::list_waf_geo(pool, row.id)
-                .await
-                .unwrap_or_default();
+            let waf_rules = repository::list_waf_rules(pool, row.id).await?;
+            let waf_ips = repository::list_waf_ips(pool, row.id).await?;
+            let waf_geo = repository::list_waf_geo(pool, row.id).await?;
             Some(waf_config_from(
                 &row.name,
                 settings,
@@ -547,27 +540,46 @@ pub async fn get_domain_config(
         .await
         .map_err(|_| db_error())?
         .ok_or_else(not_found)?;
+    // Same rule as `snapshot_domain`: a failed query must not degrade into an
+    // empty rule set, or the edge would serve this domain with protection off.
     let rules = repository::list_rules_for_domain(&state.pool, row.id)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            tracing::error!(error = %e, domain = %row.name, "load cache rules for config");
+            db_error()
+        })?;
     let rulepacks = crate::waf_rulepack::list(&state.pool)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            tracing::error!(error = %e, "load rulepacks for config");
+            db_error()
+        })?;
     let waf = match repository::get_waf_settings(&state.pool, row.id)
         .await
-        .ok()
-        .flatten()
+        .map_err(|e| {
+            tracing::error!(error = %e, domain = %row.name, "load waf settings for config");
+            db_error()
+        })?
     {
         Some(settings) => {
             let waf_rules = repository::list_waf_rules(&state.pool, row.id)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| {
+                    tracing::error!(error = %e, domain = %row.name, "load waf rules for config");
+                    db_error()
+                })?;
             let waf_ips = repository::list_waf_ips(&state.pool, row.id)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| {
+                    tracing::error!(error = %e, domain = %row.name, "load waf ips for config");
+                    db_error()
+                })?;
             let waf_geo = repository::list_waf_geo(&state.pool, row.id)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| {
+                    tracing::error!(error = %e, domain = %row.name, "load waf geo for config");
+                    db_error()
+                })?;
             Some(waf_config_from(
                 &row.name,
                 settings,
@@ -680,7 +692,10 @@ pub async fn list_all_configs(
 
     let rulepacks = crate::waf_rulepack::list(&state.pool)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            tracing::error!(error = %e, "list rulepacks for config");
+            db_error()
+        })?;
     let mut waf_settings_by: HashMap<Uuid, repository::WafSettingsRow> =
         waf_settings.into_iter().map(|s| (s.domain_id, s)).collect();
     let mut waf_rules_by: HashMap<Uuid, Vec<repository::WafRuleRow>> = HashMap::new();

@@ -39,6 +39,39 @@ status() {
   chmod 0644 "${STATUS}" 2>/dev/null || true
 }
 
+# Extract a release tarball, rejecting entries that would escape the target.
+#
+# `tar -xzf` honours absolute paths and `../` components, so a tampered archive
+# can overwrite arbitrary files as root even when its checksum matches (a bundle
+# built by a compromised CI runner sums correctly too). Only plain relative paths
+# are accepted, and any link member is refused: a release bundle needs neither.
+safe_extract() {
+  local archive="$1" dest="$2" names verbose line found_link=0
+  names="$(tar -tzf "${archive}" 2>/dev/null)" || { die "cannot list archive ${archive}"; return 1; }
+  case "${names}" in
+    /*) die "archive contains an absolute path; refusing to extract ${archive}"; return 1 ;;
+  esac
+  if grep -qE '(^|/)[.][.](/|$)' <<< "${names}"; then
+    die "archive contains an entry that escapes its destination"
+    return 1
+  fi
+  verbose="$(tar -tvzf "${archive}" 2>/dev/null)" || { die "cannot inspect archive ${archive}"; return 1; }
+  # The first character of each verbose line is the member type: `-` file,
+  # `d` directory, `l` symlink, `h` hardlink. Reject the link kinds. `die` only
+  # exits the process in production, but return explicitly so the extract below
+  # can never run after a rejection.
+  while IFS= read -r line; do
+    case "${line}" in
+      l*|h*) found_link=1; break ;;
+    esac
+  done <<< "${verbose}"
+  if [[ "${found_link}" -eq 1 ]]; then
+    die "archive contains link entries; refusing to extract ${archive}"
+    return 1
+  fi
+  tar --no-same-owner --no-same-permissions -xzf "${archive}" -C "${dest}"
+}
+
 fail() {
   status "failed" "${TAG:-}" "$1"
   rm -f "${REQUEST}"
@@ -81,7 +114,7 @@ curl -fsSL --retry 3 --connect-timeout 15 "${BASE}/SHA256SUMS" \
 ) || fail "checksum verification failed"
 
 mkdir -p "${WORK}/stage"
-tar -xzf "${WORK}/${ASSET}" -C "${WORK}/stage" || fail "extract release failed"
+safe_extract "${WORK}/${ASSET}" "${WORK}/stage" || fail "extract release failed"
 STAGE_ROOT="${WORK}/stage"
 # Older bundles may wrap everything in a top-level directory. Resolve the real
 # stage root before looking for binaries.

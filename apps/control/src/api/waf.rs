@@ -757,13 +757,35 @@ struct ValidRule {
     expr: String,
 }
 
+/// Upper bounds for a stored custom rule.
+///
+/// `WafRuleOut` is serialised into the config document that every edge holds in
+/// memory, so an unbounded `value` is a cross-tenant memory and bandwidth
+/// amplifier: one tenant can park megabytes on every node. The limits match the
+/// DSL crate's own constants so a value that passes here also fits the parser.
+const MAX_RULE_NAME: usize = 128;
+const MAX_RULE_VALUE: usize = 512;
+const MAX_RULE_EXPR: usize = 1024;
+
 fn validate_rule(req: &WafRuleRequest) -> Result<ValidRule, (StatusCode, Json<ErrorBody>)> {
     let name = req.name.trim();
     if name.is_empty() {
         return Err(bad_request("name required".into()));
     }
+    // Count characters, not bytes: a CJK rule name is legitimate and must not be
+    // rejected for being multi-byte.
+    if name.chars().count() > MAX_RULE_NAME {
+        return Err(bad_request(format!(
+            "name must be at most {MAX_RULE_NAME} characters"
+        )));
+    }
     let expr = req.expr.as_deref().unwrap_or("").trim().to_string();
     if !expr.is_empty() {
+        if expr.chars().count() > MAX_RULE_EXPR {
+            return Err(bad_request(format!(
+                "expr must be at most {MAX_RULE_EXPR} characters"
+            )));
+        }
         lagran_waf_dsl::validate(&expr).map_err(|e| {
             bad_request(format!("invalid DSL at position {}: {}", e.position, e.message))
         })?;
@@ -796,6 +818,11 @@ fn validate_rule(req: &WafRuleRequest) -> Result<ValidRule, (StatusCode, Json<Er
         if value.is_empty() {
             return Err(bad_request("value required".into()));
         }
+        if value.chars().count() > MAX_RULE_VALUE {
+            return Err(bad_request(format!(
+                "value must be at most {MAX_RULE_VALUE} characters"
+            )));
+        }
     } else {
         // The DSL supersedes the legacy condition. Keep harmless defaults for
         // old Edge binaries and for the table's NOT NULL columns.
@@ -827,7 +854,9 @@ fn validate_rule(req: &WafRuleRequest) -> Result<ValidRule, (StatusCode, Json<Er
         operator,
         value: value.to_string(),
         action,
-        priority: req.priority.unwrap_or(0),
+        // Clamped rather than rejected: priority only orders rules, and an
+        // out-of-range value carries no useful meaning.
+        priority: req.priority.unwrap_or(0).clamp(-1000, 1000),
         enabled: req.enabled.unwrap_or(true),
         expr,
     })
@@ -898,6 +927,16 @@ pub async fn create_rule(
     Ok((StatusCode::CREATED, Json(row.into())))
 }
 
+/// Whether a submitted string should replace the stored value.
+///
+/// The wire format uses empty strings for "field omitted", so empty always means
+/// "keep what is stored". Getting this wrong made a partial update rewrite the
+/// stored rule: `validate_rule` substitutes defaults for empty fields, and in DSL
+/// mode it copies the whole expression into `value`.
+fn keep_existing(submitted: &str) -> bool {
+    submitted.trim().is_empty()
+}
+
 pub async fn update_rule(
     State(state): State<AppState>,
     actor: Actor,
@@ -912,10 +951,41 @@ pub async fn update_rule(
     if !actor.can_write_domain(&state, existing.domain_id).await {
         return Err(forbidden());
     }
-    // Partial updates (for example the enable/disable toggle) must not
-    // silently clear an existing DSL expression.
+    // A partial update (the enable/disable toggle, a rename) must preserve every
+    // field the caller did not send. Only back-filling `expr` was not enough:
+    // when the request carried an `expr` but no `field`/`operator`/`value`,
+    // `validate_rule` filled the legacy columns with defaults and silently
+    // rewrote the stored rule (`value` became the whole expression).
     if req.expr.is_none() {
         req.expr = Some(existing.expr.clone());
+    }
+    // `name`/`field`/`operator`/`value` are required strings in the wire format,
+    // so "not supplied" arrives as an empty string. Treat empty as unchanged
+    // rather than letting `validate_rule` substitute defaults and rewrite the
+    // stored rule.
+    if keep_existing(&req.name) {
+        req.name = existing.name.clone();
+    }
+    if keep_existing(&req.field) {
+        req.field = existing.field.clone();
+    }
+    if keep_existing(&req.operator) {
+        req.operator = existing.operator.clone();
+    }
+    if keep_existing(&req.value) {
+        // Covers both "caller omitted value" and "caller sent only an expr":
+        // `validate_rule` would otherwise replace `value` with the whole
+        // expression and destroy the legacy condition columns.
+        req.value = existing.value.clone();
+    }
+    if req.action.is_none() {
+        req.action = Some(existing.action.clone());
+    }
+    if req.priority.is_none() {
+        req.priority = Some(existing.priority);
+    }
+    if req.enabled.is_none() {
+        req.enabled = Some(existing.enabled);
     }
     let rule = validate_rule(&req)?;
     let row = repository::update_waf_rule(
@@ -1505,28 +1575,73 @@ pub struct ReportAck {
     pub accepted: usize,
 }
 
+/// Per-field limits for an uploaded event.
+///
+/// These columns are `TEXT` with no length check, so an agent could store
+/// multi-megabyte values and then have them grouped by the stats queries. They
+/// also feed dashboards, so a bound keeps the display sane.
+const MAX_EVENT_PATH: usize = 2048;
+const MAX_EVENT_FIELD: usize = 256;
+const MAX_EVENT_NAME: usize = 128;
+
+/// Trim and truncate a field to at most `max` **characters**.
+///
+/// Counts characters rather than bytes so a truncated value is always valid
+/// UTF-8 and never splits a multi-byte sequence.
+fn clamp_event(value: &str, max: usize) -> String {
+    value.trim().chars().take(max).collect()
+}
+
 /// Edge → control batch upload.
+///
+/// Events are attributed to a domain by name, so an agent could previously write
+/// into any domain's history, including domains it does not serve. The domain is
+/// now required to exist, and every free-form field is bounded.
 pub async fn report_events(
     State(state): State<AppState>,
     _agent: AgentAuth,
     Json(body): Json<EventsBody>,
 ) -> Json<ReportAck> {
+    // Resolve the set of known domains once per batch instead of per event.
+    let known: std::collections::HashSet<String> = repository::list_domains(&state.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|d| d.name.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut inputs = Vec::with_capacity(body.events.len().min(1000));
+    let mut rejected_domain = 0usize;
     for e in body.events.into_iter().take(1000) {
-        if e.domain.trim().is_empty() {
+        let domain = clamp_event(&e.domain, MAX_EVENT_FIELD);
+        if domain.is_empty() {
+            continue;
+        }
+        if !known.contains(&domain.to_ascii_lowercase()) {
+            // Unknown or foreign domain: drop the event instead of polluting
+            // another tenant's history and stats.
+            rejected_domain += 1;
             continue;
         }
         inputs.push(repository::WafEventInput {
-            domain: e.domain.trim().to_string(),
-            node_id: e.node_id.unwrap_or_default(),
-            client_ip: e.client_ip.unwrap_or_default(),
-            method: e.method.unwrap_or_default(),
-            path: e.path.unwrap_or_default(),
-            action: e.action,
-            category: e.category.unwrap_or_default(),
-            rule_name: e.rule_name.unwrap_or_default(),
-            mode: e.mode.unwrap_or_else(|| "block".into()),
+            domain,
+            node_id: clamp_event(&e.node_id.unwrap_or_default(), MAX_EVENT_FIELD),
+            client_ip: clamp_event(&e.client_ip.unwrap_or_default(), 64),
+            method: clamp_event(&e.method.unwrap_or_default(), 16),
+            path: clamp_event(&e.path.unwrap_or_default(), MAX_EVENT_PATH),
+            action: clamp_event(&e.action, 32),
+            category: clamp_event(&e.category.unwrap_or_default(), MAX_EVENT_NAME),
+            rule_name: clamp_event(&e.rule_name.unwrap_or_default(), MAX_EVENT_NAME),
+            mode: clamp_event(&e.mode.unwrap_or_else(|| "block".into()), 32),
         });
+    }
+    if rejected_domain > 0 {
+        tracing::warn!(
+            rejected = rejected_domain,
+            "dropped WAF events for unknown domains"
+        );
     }
     let accepted = inputs.len();
     if let Err(e) = repository::insert_waf_events_batch(&state.pool, &inputs).await {
@@ -1704,6 +1819,101 @@ pub async fn list_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rule_request(name: &str, value: &str) -> WafRuleRequest {
+        WafRuleRequest {
+            name: name.into(),
+            field: "path".into(),
+            operator: "contains".into(),
+            value: value.into(),
+            action: Some("block".into()),
+            priority: None,
+            enabled: None,
+            expr: None,
+        }
+    }
+
+    /// `value` is shipped to every edge in the config document, so it must be
+    /// bounded; one tenant could otherwise park megabytes on every node.
+    #[test]
+    fn oversized_rule_value_is_rejected() {
+        let ok = rule_request("r", &"a".repeat(MAX_RULE_VALUE));
+        assert!(validate_rule(&ok).is_ok());
+
+        let too_long = rule_request("r", &"a".repeat(MAX_RULE_VALUE + 1));
+        assert!(validate_rule(&too_long).is_err());
+    }
+
+    /// Multi-byte values are measured in characters, not bytes.
+    #[test]
+    fn rule_value_limit_counts_characters() {
+        let cjk = rule_request("r", &"中".repeat(MAX_RULE_VALUE));
+        assert!(
+            validate_rule(&cjk).is_ok(),
+            "{} characters must be accepted",
+            MAX_RULE_VALUE
+        );
+    }
+
+    #[test]
+    fn oversized_rule_name_is_rejected() {
+        let long_name = rule_request(&"n".repeat(MAX_RULE_NAME + 1), "/admin");
+        assert!(validate_rule(&long_name).is_err());
+        let ok = rule_request(&"n".repeat(MAX_RULE_NAME), "/admin");
+        assert!(validate_rule(&ok).is_ok());
+    }
+
+    #[test]
+    fn oversized_expr_is_rejected() {
+        let mut req = rule_request("r", "/admin");
+        req.expr = Some(format!("path contains \"{}\"", "a".repeat(MAX_RULE_EXPR)));
+        assert!(validate_rule(&req).is_err());
+    }
+
+    /// Priority only orders rules; an absurd value is clamped, not rejected.
+    #[test]
+    fn priority_is_clamped() {
+        let mut req = rule_request("r", "/admin");
+        req.priority = Some(i32::MAX);
+        let high = validate_rule(&req).ok().map(|r| r.priority);
+        assert_eq!(high, Some(1000));
+        req.priority = Some(i32::MIN);
+        let low = validate_rule(&req).ok().map(|r| r.priority);
+        assert_eq!(low, Some(-1000));
+    }
+
+    /// Empty means "field omitted" in the wire format. Treating it as a value
+    /// made a partial update rewrite the stored rule via `validate_rule`'s
+    /// defaults (and, in DSL mode, copy the expression into `value`).
+    #[test]
+    fn keep_existing_preserves_omitted_fields() {
+        assert!(keep_existing(""));
+        assert!(keep_existing("   "));
+        assert!(!keep_existing("/admin"));
+        assert!(!keep_existing(" example.com "));
+    }
+
+    /// Event fields are bounded so an agent cannot store unbounded text that the
+    /// stats queries then group over.
+    #[test]
+    fn clamp_event_bounds_utf8_safely() {
+        let long = "a".repeat(5000);
+        assert_eq!(clamp_event(&long, MAX_EVENT_PATH).chars().count(), MAX_EVENT_PATH);
+        // Multi-byte input is cut on a character boundary, never mid-sequence.
+        let cjk = "中".repeat(1000);
+        let cut = clamp_event(&cjk, 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert_eq!(cut, "中".repeat(10));
+        assert_eq!(clamp_event("  spaced  ", 64), "spaced");
+    }
+
+    #[test]
+    fn event_limits_are_sane() {
+        assert!(MAX_EVENT_PATH >= 512);
+        assert!(MAX_EVENT_FIELD >= 64);
+        assert!(MAX_EVENT_NAME >= 32);
+    }
+
 
     /// Without canonicalization `10.0.0.1`, `10.0.0.1/32` and a padded form are
     /// distinct strings, which is how duplicates piled up in the first place.

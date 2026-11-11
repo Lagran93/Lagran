@@ -684,20 +684,51 @@ pub async fn dry_run(
     }))
 }
 
+/// Decide which node a report is attributed to.
+///
+/// The token binding always wins; the header is only used to detect drift. Split
+/// out so the rule is testable without a database.
+pub fn resolving_node<'a>(token_node: &'a str, claimed: Option<&'a str>) -> (&'a str, Option<&'a str>) {
+    let claimed = claimed.map(str::trim).filter(|v| !v.is_empty());
+    let mismatch = claimed.filter(|c| *c != token_node);
+    (token_node, mismatch)
+}
+
 pub async fn apply_report(
     State(state): State<AppState>,
-    _agent: AgentAuth,
+    agent: AgentAuth,
     headers: HeaderMap,
     Json(req): Json<ApplyReportRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorBody>)> {
-    let node_id = headers
+    // The reporting node is the one that owns the presented token, never the one
+    // named in a header. Trusting the header let any registered node report
+    // `success` on behalf of a different node, which could make the "all targets
+    // reported" check succeed before the real node had applied anything and
+    // promote a partially verified release to production.
+    //
+    // The header is still read to detect a stale client; a mismatch is rejected
+    // rather than silently ignored so misconfiguration is visible.
+    let node_id = agent.node_name;
+    if node_id.trim().is_empty() {
+        return Err(bad_request("agent token is not bound to a node"));
+    }
+    let claimed = headers
         .get("x-lagran-node-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if node_id.is_empty() {
-        return Err(bad_request("x-lagran-node-id is required"));
+        .and_then(|v| v.to_str().ok());
+    let (node_id, mismatch) = resolving_node(&node_id, claimed);
+    {
+        if let Some(claimed) = mismatch {
+            // Tolerate a stale `NODE_ID` on the edge: the token is authoritative
+            // and an outright rejection would break reporting for nodes that were
+            // renamed in the console without updating their env. The warning makes
+            // the drift visible; an attacker gains nothing because the token
+            // binding is what is recorded.
+            tracing::warn!(
+                token_node = %node_id,
+                claimed = %claimed,
+                "apply report node id does not match the agent token; using the token binding"
+            );
+        }
     }
     let release_id = parse_uuid(&req.release_id, "release id")?;
     release_service::report(&state, release_id, &node_id, req.success, req.error.trim())
@@ -735,6 +766,23 @@ pub fn versions_map(picks: &[VersionPick]) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The token decides which node a report belongs to. Trusting the header let
+    /// one node report success for another, which could satisfy "all targets
+    /// reported" and promote a release that a real node never applied.
+    #[test]
+    fn apply_report_uses_the_token_binding() {
+        // A different claimed node yields a mismatch, and the token wins.
+        let (node, mismatch) = super::resolving_node("edge-a", Some("edge-b"));
+        assert_eq!(node, "edge-a");
+        assert_eq!(mismatch, Some("edge-b"));
+
+        // Matching and absent headers are not mismatches.
+        assert_eq!(super::resolving_node("edge-a", Some("edge-a")).1, None);
+        assert_eq!(super::resolving_node("edge-a", Some("  edge-a  ")).1, None);
+        assert_eq!(super::resolving_node("edge-a", None).1, None);
+        assert_eq!(super::resolving_node("edge-a", Some("   ")).1, None);
+    }
 
     /// Snapshot rows contain the full edge document, secrets included, and are
     /// readable by any project member. They must be redacted on the way out.

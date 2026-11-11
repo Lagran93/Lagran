@@ -84,6 +84,39 @@ Environment:
 EOF
 }
 
+# Extract a release tarball, rejecting entries that would escape the target.
+#
+# `tar -xzf` honours absolute paths and `../` components, so a tampered archive
+# can overwrite arbitrary files as root even when its checksum matches (a bundle
+# built by a compromised CI runner sums correctly too). Only plain relative paths
+# are accepted, and any link member is refused: a release bundle needs neither.
+safe_extract() {
+  local archive="$1" dest="$2" names verbose line found_link=0
+  names="$(tar -tzf "${archive}" 2>/dev/null)" || { die "cannot list archive ${archive}"; return 1; }
+  case "${names}" in
+    /*) die "archive contains an absolute path; refusing to extract ${archive}"; return 1 ;;
+  esac
+  if grep -qE '(^|/)[.][.](/|$)' <<< "${names}"; then
+    die "archive contains an entry that escapes its destination"
+    return 1
+  fi
+  verbose="$(tar -tvzf "${archive}" 2>/dev/null)" || { die "cannot inspect archive ${archive}"; return 1; }
+  # The first character of each verbose line is the member type: `-` file,
+  # `d` directory, `l` symlink, `h` hardlink. Reject the link kinds. `die` only
+  # exits the process in production, but return explicitly so the extract below
+  # can never run after a rejection.
+  while IFS= read -r line; do
+    case "${line}" in
+      l*|h*) found_link=1; break ;;
+    esac
+  done <<< "${verbose}"
+  if [[ "${found_link}" -eq 1 ]]; then
+    die "archive contains link entries; refusing to extract ${archive}"
+    return 1
+  fi
+  tar --no-same-owner --no-same-permissions -xzf "${archive}" -C "${dest}"
+}
+
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 log() { printf '\n==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -213,14 +246,18 @@ resolve_release() {
   TMP="$(mktemp -d)"
   trap 'rm -rf "${TMP:-}"' EXIT
   curl -fL --retry 3 --retry-delay 2 "$base/$asset" -o "$TMP/$asset"
-  if curl -fsSL "$base/SHA256SUMS" -o "$TMP/SHA256SUMS"; then
-    (cd "$TMP" && grep "  ${asset}\$" SHA256SUMS | sha256sum -c -)
-  else
-    warn "SHA256SUMS not found; continuing without checksum verification"
+  # Refuse to install an unverified release. The previous fallback turned a
+  # missing or tampered SHA256SUMS into a silent downgrade to "install whatever
+  # the network gave us", executed as root.
+  if ! curl -fsSL "$base/SHA256SUMS" -o "$TMP/SHA256SUMS"; then
+    die "SHA256SUMS unavailable for ${VERSION}; refusing to install an unverified release"
+  fi
+  if ! (cd "$TMP" && grep -F "  ${asset}" SHA256SUMS | sha256sum -c - >/dev/null 2>&1); then
+    die "checksum verification failed for ${asset}"
   fi
   STAGE="$TMP/stage"
   mkdir -p "$STAGE"
-  tar -xzf "$TMP/$asset" -C "$STAGE"
+  safe_extract "$TMP/$asset" "$STAGE"
   # Some old bundles wrap everything in a top-level directory.
   if [[ ! -d "$STAGE/bin" && ! -f "$STAGE/lagran-control" ]]; then
     local nested
@@ -457,6 +494,14 @@ RestartSec=3
 LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Hardening shared with the control unit. UMask matters most here: the edge
+# writes TLS private keys to disk, and without it they land as 0644.
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${DATA_DIR} ${LOG_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -513,6 +558,12 @@ RestartSec=3
 LimitNOFILE=65535
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${DATA_DIR} ${LOG_DIR}
 
 [Install]
 WantedBy=multi-user.target
