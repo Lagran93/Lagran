@@ -808,7 +808,7 @@ async fn proxy_handler_inner(
                     let status = resp.status;
                     let body_len = resp.body.len() as u64;
                     let etag = entry_etag(&resp);
-                    state.metrics.record_hit(&host, body_len).await;
+                    state.metrics.record_hit(&host, body_len);
                     log_access(
                         &state.access_log,
                         &method,
@@ -852,9 +852,9 @@ async fn proxy_handler_inner(
                     );
                     let response_bypass = response_policy.action != RuleAction::Cache;
                     if !response_bypass && (200..300).contains(&status.as_u16()) {
-                        state.metrics.record_miss(&host, body_len).await;
+                        state.metrics.record_miss(&host, body_len);
                     } else {
-                        state.metrics.record_bypass(&host, body_len).await;
+                        state.metrics.record_bypass(&host, body_len);
                     }
                     let label = if response_bypass {
                         CacheStatus::Bypass
@@ -1098,7 +1098,7 @@ async fn bypass_to_origin(
                 }
             }
             let out = pass_through_response(resp, label.as_str(), &eff.cors, &eff.custom_headers);
-            state.metrics.record_bypass(host, body_len).await;
+            state.metrics.record_bypass(host, body_len);
             log_access(
                 &state.access_log,
                 method,
@@ -1310,7 +1310,7 @@ async fn bypass_to_origin_streaming(
                 }
             };
 
-            state.metrics.record_bypass(host, content_length).await;
+            state.metrics.record_bypass(host, content_length);
             log_access(
                 &state.access_log,
                 method,
@@ -1806,7 +1806,7 @@ async fn revalidate_cached_entry(
                     }
                 }
             }
-            state.metrics.record_miss(host, body_len).await;
+            state.metrics.record_miss(host, body_len);
             log_access(
                 &state.access_log,
                 method,
@@ -2048,7 +2048,7 @@ async fn serve_range_entry(
     ));
     entry.headers.push(("accept-ranges".into(), "bytes".into()));
 
-    state.metrics.record_hit(host, body_len).await;
+    state.metrics.record_hit(host, body_len);
     log_access(
         &state.access_log,
         method,
@@ -2097,7 +2097,7 @@ async fn serve_cached(
 
     if let Some(inm) = if_none_match {
         if etag_matches(inm, &etag) {
-            state.metrics.record_hit(host, 0).await;
+            state.metrics.record_hit(host, 0);
             log_access(
                 &state.access_log,
                 method,
@@ -2118,7 +2118,7 @@ async fn serve_cached(
     }
 
     let bytes = entry.body.len() as u64;
-    state.metrics.record_hit(host, bytes).await;
+    state.metrics.record_hit(host, bytes);
     log_access(
         &state.access_log,
         method,

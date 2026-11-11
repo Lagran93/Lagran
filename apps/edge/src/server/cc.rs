@@ -7,12 +7,12 @@
 //! rotating addresses inside one allocation cannot bypass the limit.
 
 use crate::waf::IpNet;
-use std::collections::{HashMap, HashSet};
+use dashmap::DashMap;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
 
 const WINDOW: Duration = Duration::from_secs(1);
 const STATE_TTL: Duration = Duration::from_secs(600);
@@ -357,15 +357,21 @@ struct GlobalState {
 
 #[derive(Clone, Default)]
 pub struct CcProtector {
-    inner: Arc<Mutex<HashMap<String, ClientState>>>,
+    /// Sharded client state: a request only contends with its own shard
+    /// instead of a process-wide mutex.
+    inner: Arc<DashMap<String, ClientState>>,
     /// Domain-wide counters used to trigger automatic attack mode.
-    global: Arc<Mutex<HashMap<String, GlobalState>>>,
+    global: Arc<DashMap<String, GlobalState>>,
     /// Domains currently in automatic attack mode.
-    attack_until: Arc<Mutex<HashMap<String, Instant>>>,
+    attack_until: Arc<DashMap<String, Instant>>,
     /// Bans pulled from the control plane, keyed by aggregated client group.
-    shared: Arc<RwLock<HashMap<String, Instant>>>,
-    /// CIDR bans pulled from the control plane.
-    shared_nets: Arc<RwLock<Vec<(String, IpNet, Instant)>>>,
+    shared: Arc<DashMap<String, Instant>>,
+    /// CIDR bans pulled from the control plane. Replaced rarely and read per
+    /// request, so a std lock is enough and avoids an async await.
+    shared_nets: Arc<StdRwLock<Vec<(String, IpNet, Instant)>>>,
+    /// Runs table maintenance every N requests; `DashMap::len()` is O(shards)
+    /// and must not sit on the hot path.
+    maintenance_tick: Arc<AtomicU64>,
     /// Optional shared sliding-window counters.
     redis: Option<RedisCc>,
 }
@@ -387,9 +393,9 @@ impl CcProtector {
     /// group used by request accounting.
     pub async fn replace_shared(&self, bans: Vec<(String, u64)>) {
         let now = Instant::now();
-        let mut map = HashMap::with_capacity(bans.len());
         let mut nets = Vec::new();
         let mut active = HashSet::with_capacity(bans.len());
+        self.shared.clear();
         for (key, secs) in bans {
             if secs == 0 {
                 continue;
@@ -406,18 +412,18 @@ impl CcProtector {
             } else if let Ok(ip) = target.parse::<IpAddr>() {
                 let normalized = format!("{host}|{}", client_group(ip));
                 active.insert(normalized.clone());
-                map.insert(normalized, until);
+                self.shared.insert(normalized, until);
             }
         }
-        *self.shared.write().await = map;
-        *self.shared_nets.write().await = nets;
+        *self.nets_mut() = nets;
 
         // A reported local ban that disappeared from the control plane was
         // manually removed (or expired): clear it locally as well. Bans that
         // failed to report stay on their local timer.
-        let mut local = self.inner.lock().await;
-        for (key, state) in local.iter_mut() {
-            if state.reported && !active.contains(group_key_of(key)) {
+        for mut entry in self.inner.iter_mut() {
+            let stale = entry.value().reported && !active.contains(group_key_of(entry.key()));
+            if stale {
+                let state = entry.value_mut();
                 state.banned_until = None;
                 state.violations = 0;
                 state.reported = false;
@@ -430,17 +436,53 @@ impl CcProtector {
     pub async fn mark_reported(&self, host: &str, ip: IpAddr) {
         let group = client_key(host, ip);
         let prefix = format!("{group}|");
-        let mut local = self.inner.lock().await;
-        for (key, state) in local.iter_mut() {
-            if key == &group || key.starts_with(&prefix) {
-                state.reported = true;
+        for mut entry in self.inner.iter_mut() {
+            let matches = {
+                let key = entry.key();
+                key == &group || key.starts_with(&prefix)
+            };
+            if matches {
+                entry.value_mut().reported = true;
             }
         }
     }
 
     #[cfg(test)]
     async fn shared_len(&self) -> usize {
-        self.shared.read().await.len()
+        self.shared.len()
+    }
+
+    /// Run table maintenance occasionally instead of on every request.
+    fn maybe_maintain(&self, now: Instant) {
+        if !self
+            .maintenance_tick
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(256)
+        {
+            return;
+        }
+        if self.inner.len() > 50_000 {
+            self.inner.retain(|_, state| {
+                state.last_seen.elapsed() < STATE_TTL
+                    && state.banned_until.map(|until| until > now).unwrap_or(true)
+            });
+        }
+        if self.global.len() > 10_000 {
+            self.global
+                .retain(|_, state| now.duration_since(state.window_start) < STATE_TTL);
+        }
+    }
+
+    fn nets(&self) -> std::sync::RwLockReadGuard<'_, Vec<(String, IpNet, Instant)>> {
+        self.shared_nets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn nets_mut(&self) -> std::sync::RwLockWriteGuard<'_, Vec<(String, IpNet, Instant)>> {
+        self.shared_nets
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Consume one slot from the domain-wide budget. Shared through Redis when
@@ -455,37 +497,28 @@ impl CcProtector {
             }
         }
         let now = Instant::now();
-        let mut map = self.global.lock().await;
-        if map.len() > 10_000 {
-            map.retain(|_, state| now.duration_since(state.window_start) < STATE_TTL);
+        self.maybe_maintain(now);
+        if let Some(mut state) = self.global.get_mut(host) {
+            return bump_global(&mut state, now) > limit;
         }
-        let state = map.entry(host.to_string()).or_insert(GlobalState {
+        let mut state = self.global.entry(host.to_string()).or_insert(GlobalState {
             window_start: now,
             count: 0,
         });
-        if now.duration_since(state.window_start) >= WINDOW {
-            state.window_start = now;
-            state.count = 0;
-        }
-        state.count = state.count.saturating_add(1);
-        state.count > limit
+        bump_global(&mut state, now) > limit
     }
 
-    async fn mark_attack(&self, host: &str) {
+    fn mark_attack(&self, host: &str) {
         let until = Instant::now() + Duration::from_secs(60);
-        self.attack_until
-            .lock()
-            .await
-            .insert(host.to_string(), until);
+        self.attack_until.insert(host.to_string(), until);
     }
 
-    async fn in_attack(&self, host: &str) -> bool {
+    fn in_attack(&self, host: &str) -> bool {
         let now = Instant::now();
-        let mut map = self.attack_until.lock().await;
-        match map.get(host).copied() {
+        match self.attack_until.get(host).map(|entry| *entry.value()) {
             Some(until) if until > now => true,
             Some(_) => {
-                map.remove(host);
+                self.attack_until.remove(host);
                 false
             }
             None => false,
@@ -514,7 +547,7 @@ impl CcProtector {
         let class = classify_path(path);
         let key = format!("{group_key}|{}", class.as_str());
         let now = Instant::now();
-        if let Some(until) = self.shared.read().await.get(&group_key).copied() {
+        if let Some(until) = self.shared.get(&group_key).map(|entry| *entry.value()) {
             if until > now {
                 return CcDecision::Banned {
                     retry_after: remaining(until, now),
@@ -523,7 +556,7 @@ impl CcProtector {
             }
         }
         let net_until = {
-            let nets = self.shared_nets.read().await;
+            let nets = self.nets();
             nets.iter()
                 .find(|(net_host, net, until)| net_host == host && *until > now && net.contains(ip))
                 .map(|(_, _, until)| *until)
@@ -534,11 +567,11 @@ impl CcProtector {
                 newly_banned: false,
             };
         }
-        let mut in_attack = self.in_attack(host).await;
+        let mut in_attack = self.in_attack(host);
         let global_limit = cfg.global_rps.saturating_add(cfg.global_burst);
         if global_limit > 0 && self.global_over(host, global_limit).await {
             in_attack = true;
-            self.mark_attack(host).await;
+            self.mark_attack(host);
             // A clearance cookie lets an interactive browser continue
             // through attack mode, subject to the halved per-client limit.
             if !cleared {
@@ -571,15 +604,8 @@ impl CcProtector {
             }
         }
 
-        let mut map = self.inner.lock().await;
-        if map.len() > 50_000 {
-            map.retain(|_, s| {
-                s.last_seen.elapsed() < STATE_TTL
-                    && s.banned_until.map(|until| until > now).unwrap_or(true)
-            });
-        }
-
-        let state = map.entry(key.clone()).or_insert_with(|| ClientState {
+        self.maybe_maintain(now);
+        let mut entry = self.inner.entry(key).or_insert_with(|| ClientState {
             window_start: now,
             count: 0,
             window_over: false,
@@ -588,79 +614,82 @@ impl CcProtector {
             last_seen: now,
             reported: false,
         });
-        state.last_seen = now;
+        let mut ban_until = None;
+        let decision = {
+            let state = entry.value_mut();
+            state.last_seen = now;
 
-        if let Some(until) = state.banned_until {
-            if until > now {
-                return CcDecision::Banned {
-                    retry_after: remaining(until, now),
-                    newly_banned: false,
-                };
+            if let Some(until) = state.banned_until {
+                if until > now {
+                    return CcDecision::Banned {
+                        retry_after: remaining(until, now),
+                        newly_banned: false,
+                    };
+                }
+                state.banned_until = None;
+                state.window_start = now;
+                state.count = 0;
+                state.violations = 0;
+                state.window_over = false;
             }
-            state.banned_until = None;
-            state.window_start = now;
-            state.count = 0;
-            state.violations = 0;
-            state.window_over = false;
-        }
 
-        if now.duration_since(state.window_start) >= WINDOW {
-            if !state.window_over {
-                // One clean window forgives one earlier violation.
-                state.violations = state.violations.saturating_sub(1);
+            if now.duration_since(state.window_start) >= WINDOW {
+                if !state.window_over {
+                    // One clean window forgives one earlier violation.
+                    state.violations = state.violations.saturating_sub(1);
+                }
+                state.window_start = now;
+                state.count = 0;
+                state.window_over = false;
             }
-            state.window_start = now;
-            state.count = 0;
-            state.window_over = false;
-        }
-        state.count = state.count.saturating_add(1);
+            state.count = state.count.saturating_add(1);
 
-        if state.count <= limit {
-            return CcDecision::Allow;
-        }
-
-        // Count one violation per overloaded window, not per request. A burst
-        // of 100 requests in one second must not consume 100 ban strikes.
-        if state.window_over {
-            return CcDecision::Limit {
-                retry_after: remaining(state.window_start + WINDOW, now),
-            };
-        }
-        state.window_over = true;
-        state.violations = state.violations.saturating_add(1);
-        if cfg.ban_after > 0 && cfg.ban_seconds > 0 && state.violations >= cfg.ban_after {
-            let until = now + Duration::from_secs(cfg.ban_seconds);
-            state.banned_until = Some(until);
-            state.violations = 0;
-            state.window_over = false;
-            state.reported = false;
+            if state.count <= limit {
+                CcDecision::Allow
+            } else if state.window_over {
+                // Count one violation per overloaded window, not per request. A
+                // burst of 100 requests must not consume 100 ban strikes.
+                CcDecision::Limit {
+                    retry_after: remaining(state.window_start + WINDOW, now),
+                }
+            } else {
+                state.window_over = true;
+                state.violations = state.violations.saturating_add(1);
+                if cfg.ban_after > 0
+                    && cfg.ban_seconds > 0
+                    && state.violations >= cfg.ban_after
+                {
+                    let until = now + Duration::from_secs(cfg.ban_seconds);
+                    state.banned_until = Some(until);
+                    state.violations = 0;
+                    state.window_over = false;
+                    state.reported = false;
+                    ban_until = Some(until);
+                    CcDecision::Banned {
+                        retry_after: cfg.ban_seconds,
+                        newly_banned: true,
+                    }
+                } else {
+                    CcDecision::Limit {
+                        retry_after: remaining(state.window_start + WINDOW, now),
+                    }
+                }
+            }
+        };
+        if let Some(until) = ban_until {
+            // Publish the ban so every request class of this client is blocked.
             self.shared
-                .write()
-                .await
-                .insert(group_key_of(&key).to_string(), until);
-            return CcDecision::Banned {
-                retry_after: cfg.ban_seconds,
-                newly_banned: true,
-            };
+                .insert(group_key_of(entry.key()).to_string(), until);
         }
-
-        CcDecision::Limit {
-            retry_after: remaining(state.window_start + WINDOW, now),
-        }
+        decision
     }
 
     /// Record one overloaded window when the Redis counter already decided the
     /// request is over the limit. Local state only tracks ban strikes, not the
     /// request count.
     async fn note_over_limit(&self, key: &str, cfg: &CcConfig, now: Instant) -> CcDecision {
-        let mut map = self.inner.lock().await;
-        if map.len() > 50_000 {
-            map.retain(|_, s| {
-                s.last_seen.elapsed() < STATE_TTL
-                    && s.banned_until.map(|until| until > now).unwrap_or(true)
-            });
-        }
-        let state = map.entry(key.to_string()).or_insert_with(|| ClientState {
+        self.maybe_maintain(now);
+        let mut entry = self.inner.entry(key.to_string()).or_insert_with(|| ClientState {
             window_start: now,
             count: 0,
             window_over: false,
@@ -669,52 +698,72 @@ impl CcProtector {
             last_seen: now,
             reported: false,
         });
-        state.last_seen = now;
-        if let Some(until) = state.banned_until {
-            if until > now {
-                return CcDecision::Banned {
-                    retry_after: remaining(until, now),
-                    newly_banned: false,
-                };
+        let mut ban_until = None;
+        let decision = {
+            let state = entry.value_mut();
+            state.last_seen = now;
+            if let Some(until) = state.banned_until {
+                if until > now {
+                    return CcDecision::Banned {
+                        retry_after: remaining(until, now),
+                        newly_banned: false,
+                    };
+                }
+                state.banned_until = None;
+                state.window_start = now;
+                state.violations = 0;
+                state.window_over = false;
             }
-            state.banned_until = None;
-            state.window_start = now;
-            state.violations = 0;
-            state.window_over = false;
-        }
-        if now.duration_since(state.window_start) >= WINDOW {
-            if !state.window_over {
-                state.violations = state.violations.saturating_sub(1);
+            if now.duration_since(state.window_start) >= WINDOW {
+                if !state.window_over {
+                    state.violations = state.violations.saturating_sub(1);
+                }
+                state.window_start = now;
+                state.window_over = false;
             }
-            state.window_start = now;
-            state.window_over = false;
+            if state.window_over {
+                CcDecision::Limit {
+                    retry_after: remaining(state.window_start + WINDOW, now),
+                }
+            } else {
+                state.window_over = true;
+                state.violations = state.violations.saturating_add(1);
+                if cfg.ban_after > 0
+                    && cfg.ban_seconds > 0
+                    && state.violations >= cfg.ban_after
+                {
+                    let until = now + Duration::from_secs(cfg.ban_seconds);
+                    state.banned_until = Some(until);
+                    state.violations = 0;
+                    state.window_over = false;
+                    state.reported = false;
+                    ban_until = Some(until);
+                    CcDecision::Banned {
+                        retry_after: cfg.ban_seconds,
+                        newly_banned: true,
+                    }
+                } else {
+                    CcDecision::Limit {
+                        retry_after: remaining(state.window_start + WINDOW, now),
+                    }
+                }
+            }
+        };
+        if let Some(until) = ban_until {
+            self.shared.insert(group_key_of(key).to_string(), until);
         }
-        if state.window_over {
-            return CcDecision::Limit {
-                retry_after: remaining(state.window_start + WINDOW, now),
-            };
-        }
-        state.window_over = true;
-        state.violations = state.violations.saturating_add(1);
-        if cfg.ban_after > 0 && cfg.ban_seconds > 0 && state.violations >= cfg.ban_after {
-            let until = now + Duration::from_secs(cfg.ban_seconds);
-            state.banned_until = Some(until);
-            state.violations = 0;
-            state.window_over = false;
-            state.reported = false;
-            self.shared
-                .write()
-                .await
-                .insert(group_key_of(&key).to_string(), until);
-            return CcDecision::Banned {
-                retry_after: cfg.ban_seconds,
-                newly_banned: true,
-            };
-        }
-        CcDecision::Limit {
-            retry_after: remaining(state.window_start + WINDOW, now),
-        }
+        decision
     }
+}
+
+/// Advance a domain-wide fixed window and return the new request count.
+fn bump_global(state: &mut GlobalState, now: Instant) -> u32 {
+    if now.duration_since(state.window_start) >= WINDOW {
+        state.window_start = now;
+        state.count = 0;
+    }
+    state.count = state.count.saturating_add(1);
+    state.count
 }
 
 fn remaining(until: Instant, now: Instant) -> u64 {

@@ -5,18 +5,19 @@
 //! edge nodes share one budget per domain. The Redis script uses Redis `TIME`
 //! as the clock, avoiding skew between edge hosts.
 
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 
 const REDIS_TIMEOUT: Duration = Duration::from_millis(10);
 const REDIS_FAILURE_COOLDOWN_MS: u64 = 5_000;
 
 #[derive(Clone, Default)]
 pub struct RateLimiter {
-    inner: Arc<Mutex<HashMap<String, Bucket>>>,
+    /// Sharded: one lock per bucket shard instead of a process-wide lock on
+    /// every request.
+    inner: Arc<DashMap<String, Bucket>>,
     /// Global default RPS (0 = off)
     default_rps: u32,
     default_burst: u32,
@@ -137,7 +138,7 @@ impl RedisRateLimiter {
 impl RateLimiter {
     pub fn new(default_rps: u32, default_burst: u32) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(DashMap::new()),
             default_rps,
             default_burst,
             redis: None,
@@ -182,27 +183,33 @@ impl RateLimiter {
             // the whole edge offline.
         }
 
-        let mut map = self.inner.lock().await;
         let now = Instant::now();
-        let b = map.entry(key.to_string()).or_insert_with(|| Bucket {
+        // Hot path: an existing bucket is borrowed without allocating a key.
+        if let Some(mut bucket) = self.inner.get_mut(key) {
+            return take_token(&mut bucket, now, rps, burst);
+        }
+        let mut bucket = self.inner.entry(key.to_string()).or_insert_with(|| Bucket {
             tokens: burst as f64,
             last: now,
             rps: rps as f64,
             burst: burst as f64,
         });
-        // update config if changed
-        b.rps = rps as f64;
-        b.burst = burst as f64;
+        take_token(&mut bucket, now, rps, burst)
+    }
+}
 
-        let elapsed = now.duration_since(b.last).as_secs_f64();
-        b.last = now;
-        b.tokens = (b.tokens + elapsed * b.rps).min(b.burst);
-        if b.tokens >= 1.0 {
-            b.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+/// Refill and consume one token from a local bucket.
+fn take_token(bucket: &mut Bucket, now: Instant, rps: u32, burst: u32) -> bool {
+    bucket.rps = rps as f64;
+    bucket.burst = burst as f64;
+    let elapsed = now.duration_since(bucket.last).as_secs_f64();
+    bucket.last = now;
+    bucket.tokens = (bucket.tokens + elapsed * bucket.rps).min(bucket.burst);
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        true
+    } else {
+        false
     }
 }
 

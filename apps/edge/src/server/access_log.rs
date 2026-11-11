@@ -87,17 +87,37 @@ impl AccessLog {
                     tokio::select! {
                         maybe = rx.recv() => {
                             let Some(rec) = maybe else { break };
-                            if let Some(f) = file.as_mut() {
+                            // Format once, only when someone consumes the text
+                            // (a file, or the tracing target is enabled).
+                            let want_trace =
+                                tracing::enabled!(target: "access", tracing::Level::INFO);
+                            if file.is_some() || want_trace {
                                 let payload = if json_lines {
                                     serde_json::to_string(&rec)
                                         .unwrap_or_else(|_| combined_line(&rec))
                                 } else {
                                     combined_line(&rec)
                                 };
-                                if let Err(e) = f.write_all(payload.as_bytes()).await {
-                                    tracing::warn!(error = %e, "access log write failed");
-                                } else if let Err(e) = f.write_all(b"\n").await {
-                                    tracing::warn!(error = %e, "access log write failed");
+                                if want_trace {
+                                    tracing::info!(
+                                        target: "access",
+                                        client_ip = %rec.client_ip,
+                                        method = %rec.method,
+                                        host = %rec.host,
+                                        path = %rec.path,
+                                        status = rec.status,
+                                        bytes = rec.bytes,
+                                        latency_ms = rec.latency_ms,
+                                        cache = %rec.cache_status,
+                                        "{}", payload
+                                    );
+                                }
+                                if let Some(f) = file.as_mut() {
+                                    if let Err(e) = f.write_all(payload.as_bytes()).await {
+                                        tracing::warn!(error = %e, "access log write failed");
+                                    } else if let Err(e) = f.write_all(b"\n").await {
+                                        tracing::warn!(error = %e, "access log write failed");
+                                    }
                                 }
                             }
                             let mut buf = buffer.lock().await;
@@ -178,20 +198,12 @@ impl AccessLog {
         }
     }
 
-    /// Enqueue a record; returns immediately. The writer task owns the file.
+    /// Enqueue a record; returns as soon as the writer accepts it.
+    ///
+    /// All formatting (and the `tracing` event) happens in the writer task. The
+    /// request path used to format the line here and the writer formatted it
+    /// again, doubling the cost on the hottest path in the process.
     pub async fn write(&self, rec: AccessRecord) {
-        tracing::info!(
-            target: "access",
-            client_ip = %rec.client_ip,
-            method = %rec.method,
-            host = %rec.host,
-            path = %rec.path,
-            status = rec.status,
-            bytes = rec.bytes,
-            latency_ms = rec.latency_ms,
-            cache = %rec.cache_status,
-            "{}", combined_line(&rec)
-        );
         // Backpressure instead of dropping: a bounded queue keeps memory safe,
         // and the request waits for the writer when the disk falls behind. This
         // gives zero-loss access logging while the process is alive.

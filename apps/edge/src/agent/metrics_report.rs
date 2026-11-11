@@ -17,7 +17,7 @@ pub fn spawn_metrics_report(config: EdgeConfig, control: ControlClient, metrics:
 
         loop {
             tokio::time::sleep(interval).await;
-            let snaps = metrics.take_snapshots().await;
+            let snaps = metrics.take_snapshots();
             if snaps.is_empty() {
                 continue;
             }

@@ -171,7 +171,7 @@ async fn update_authed(
 }
 
 async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let snaps = state.metrics.take_snapshots_peek().await;
+    let snaps = state.metrics.take_snapshots_peek();
     let mut out = String::from(
         "# HELP lagran_edge_up Edge process up\n# TYPE lagran_edge_up gauge\nlagran_edge_up 1\n\
          # HELP lagran_edge_domains Domains with traffic counters\n# TYPE lagran_edge_domains gauge\n\

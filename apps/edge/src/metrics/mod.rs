@@ -1,9 +1,8 @@
 //! Per-domain edge request counters
 
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 #[derive(Default)]
 struct Counters {
@@ -15,7 +14,9 @@ struct Counters {
 
 #[derive(Default)]
 pub struct EdgeMetrics {
-    by_domain: Mutex<HashMap<String, Arc<Counters>>>,
+    /// Sharded: every request updates a counter, so a single process-wide lock
+    /// would serialise the whole edge on its hottest path.
+    by_domain: DashMap<String, Arc<Counters>>,
     origin_timeouts: AtomicU64,
     origin_errors: AtomicU64,
     stream_requests: AtomicU64,
@@ -50,34 +51,42 @@ impl EdgeMetrics {
         Arc::new(Self::default())
     }
 
-    async fn bucket(&self, domain: &str) -> Arc<Counters> {
+    /// Find or create the counters for one domain.
+    ///
+    /// Hosts reach this code already normalized to lower case by both data
+    /// planes, so the common path is a borrowed lookup with no allocation.
+    fn bucket(&self, domain: &str) -> Arc<Counters> {
         let key = if domain.is_empty() {
-            "(unknown)".to_string()
+            "(unknown)"
         } else {
-            domain.to_lowercase()
+            domain
         };
-        let mut map = self.by_domain.lock().await;
-        map.entry(key)
+        if let Some(counters) = self.by_domain.get(key) {
+            return counters.value().clone();
+        }
+        self.by_domain
+            .entry(key.to_lowercase())
             .or_insert_with(|| Arc::new(Counters::default()))
+            .value()
             .clone()
     }
 
-    pub async fn record_hit(&self, domain: &str, bytes: u64) {
-        let c = self.bucket(domain).await;
+    pub fn record_hit(&self, domain: &str, bytes: u64) {
+        let c = self.bucket(domain);
         c.requests.fetch_add(1, Ordering::Relaxed);
         c.cache_hits.fetch_add(1, Ordering::Relaxed);
         c.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub async fn record_miss(&self, domain: &str, bytes: u64) {
-        let c = self.bucket(domain).await;
+    pub fn record_miss(&self, domain: &str, bytes: u64) {
+        let c = self.bucket(domain);
         c.requests.fetch_add(1, Ordering::Relaxed);
         c.cache_misses.fetch_add(1, Ordering::Relaxed);
         c.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub async fn record_bypass(&self, domain: &str, bytes: u64) {
-        let c = self.bucket(domain).await;
+    pub fn record_bypass(&self, domain: &str, bytes: u64) {
+        let c = self.bucket(domain);
         c.requests.fetch_add(1, Ordering::Relaxed);
         c.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -122,35 +131,35 @@ impl EdgeMetrics {
         }
     }
 
-    /// Snapshot and reset all domain counters for reporting
-
     /// Read counters without resetting (for Prometheus scrape).
-    pub async fn take_snapshots_peek(&self) -> Vec<DomainSnapshot> {
-        let map = self.by_domain.lock().await;
-        let mut out = Vec::new();
-        for (domain, c) in map.iter() {
-            out.push(DomainSnapshot {
-                domain: domain.clone(),
-                requests: c.requests.load(Ordering::Relaxed),
-                cache_hits: c.cache_hits.load(Ordering::Relaxed),
-                cache_misses: c.cache_misses.load(Ordering::Relaxed),
-                bytes_sent: c.bytes_sent.load(Ordering::Relaxed),
-            });
-        }
-        out
+    pub fn take_snapshots_peek(&self) -> Vec<DomainSnapshot> {
+        self.by_domain
+            .iter()
+            .map(|entry| {
+                let counters = entry.value();
+                DomainSnapshot {
+                    domain: entry.key().clone(),
+                    requests: counters.requests.load(Ordering::Relaxed),
+                    cache_hits: counters.cache_hits.load(Ordering::Relaxed),
+                    cache_misses: counters.cache_misses.load(Ordering::Relaxed),
+                    bytes_sent: counters.bytes_sent.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
     }
 
-    pub async fn take_snapshots(&self) -> Vec<DomainSnapshot> {
-        let mut map = self.by_domain.lock().await;
+    /// Snapshot and reset all domain counters for reporting.
+    pub fn take_snapshots(&self) -> Vec<DomainSnapshot> {
         let mut out = Vec::new();
-        for (domain, c) in map.iter() {
-            let requests = c.requests.swap(0, Ordering::Relaxed);
-            let hits = c.cache_hits.swap(0, Ordering::Relaxed);
-            let misses = c.cache_misses.swap(0, Ordering::Relaxed);
-            let bytes = c.bytes_sent.swap(0, Ordering::Relaxed);
+        for entry in self.by_domain.iter() {
+            let counters = entry.value();
+            let requests = counters.requests.swap(0, Ordering::Relaxed);
+            let hits = counters.cache_hits.swap(0, Ordering::Relaxed);
+            let misses = counters.cache_misses.swap(0, Ordering::Relaxed);
+            let bytes = counters.bytes_sent.swap(0, Ordering::Relaxed);
             if requests > 0 || hits > 0 || misses > 0 || bytes > 0 {
                 out.push(DomainSnapshot {
-                    domain: domain.clone(),
+                    domain: entry.key().clone(),
                     requests,
                     cache_hits: hits,
                     cache_misses: misses,
@@ -158,12 +167,51 @@ impl EdgeMetrics {
                 });
             }
         }
-        // drop empty buckets to avoid unbounded growth
-        map.retain(|_, c| {
-            c.requests.load(Ordering::Relaxed) > 0
-                || c.cache_hits.load(Ordering::Relaxed) > 0
-                || c.cache_misses.load(Ordering::Relaxed) > 0
+        // Drop empty buckets to bound growth.
+        self.by_domain.retain(|_, counters| {
+            counters.requests.load(Ordering::Relaxed) > 0
+                || counters.cache_hits.load(Ordering::Relaxed) > 0
+                || counters.cache_misses.load(Ordering::Relaxed) > 0
         });
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_accumulate_and_snapshots_reset() {
+        let metrics = EdgeMetrics::default();
+        metrics.record_hit("a.test", 100);
+        metrics.record_hit("a.test", 50);
+        metrics.record_miss("b.test", 10);
+        metrics.record_bypass("a.test", 5);
+
+        let mut snaps = metrics.take_snapshots();
+        snaps.sort_by(|a, b| a.domain.cmp(&b.domain));
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].domain, "a.test");
+        assert_eq!(snaps[0].requests, 3);
+        assert_eq!(snaps[0].cache_hits, 2);
+        assert_eq!(snaps[0].bytes_sent, 155);
+        assert_eq!(snaps[1].domain, "b.test");
+        assert_eq!(snaps[1].cache_misses, 1);
+
+        // The second read must be empty: `take_snapshots` resets counters.
+        assert!(metrics.take_snapshots().is_empty());
+    }
+
+    #[test]
+    fn domain_lookup_is_case_insensitive() {
+        let metrics = EdgeMetrics::default();
+        metrics.record_hit("Example.COM", 1);
+        metrics.record_hit("example.com", 1);
+
+        let snaps = metrics.take_snapshots_peek();
+        assert_eq!(snaps.len(), 1, "both spellings must share one bucket");
+        assert_eq!(snaps[0].domain, "example.com");
+        assert_eq!(snaps[0].requests, 2);
     }
 }

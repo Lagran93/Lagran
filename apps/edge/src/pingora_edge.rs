@@ -1527,9 +1527,9 @@ impl ProxyHttp for DataPlaneProxy {
         )
         .await;
         match label {
-            "HIT" | "STALE" => self.state.metrics.record_hit(&ctx.host, bytes).await,
-            "MISS" | "REVALIDATED" => self.state.metrics.record_miss(&ctx.host, bytes).await,
-            _ => self.state.metrics.record_bypass(&ctx.host, bytes).await,
+            "HIT" | "STALE" => self.state.metrics.record_hit(&ctx.host, bytes),
+            "MISS" | "REVALIDATED" => self.state.metrics.record_miss(&ctx.host, bytes),
+            _ => self.state.metrics.record_bypass(&ctx.host, bytes),
         }
     }
 
@@ -2995,7 +2995,7 @@ impl DataPlaneProxy {
                 .await;
             }
             ("GET", "/__lagran/metrics") => {
-                let snaps = self.state.metrics.take_snapshots_peek().await;
+                let snaps = self.state.metrics.take_snapshots_peek();
                 let mut body = String::from(
                     "# HELP lagran_edge_requests_total Requests handled by this edge\n\
                      # TYPE lagran_edge_requests_total counter\n\
@@ -3158,9 +3158,9 @@ impl DataPlaneProxy {
         )
         .await;
         if cache_label == "HIT" {
-            self.state.metrics.record_hit(&ctx.host, 0).await;
+            self.state.metrics.record_hit(&ctx.host, 0);
         } else {
-            self.state.metrics.record_miss(&ctx.host, 0).await;
+            self.state.metrics.record_miss(&ctx.host, 0);
         }
         true
     }
