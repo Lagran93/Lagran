@@ -346,7 +346,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{header, Request};
-    use tower::ServiceExt;
+    use tower::util::ServiceExt;
 
     async fn cors_headers(allowed: Vec<String>, origin: &str) -> Option<String> {
         // A minimal router: the CORS layer is what is under test, not the API.
