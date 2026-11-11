@@ -7,7 +7,7 @@
 //! bypass/dynamic traffic, disk/hybrid cache, control endpoints and
 //! WebSocket) are handed to the in-process handler.
 
-use crate::cache::CacheSource;
+use crate::cache::{CacheBackend, CacheSource};
 use crate::origin_dns::OriginDnsCache;
 use crate::cache::policy::{
     apply_key_ignore_default, compute_etag, decide_storage_reason, request_bypass_reason_headers,
@@ -18,7 +18,7 @@ use crate::config::registry::{DomainEntry, OriginTarget};
 use crate::config::EdgeConfig;
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
-use crate::server::compression::{should_compress, CompressionConfig, GzipEncoder};
+use crate::server::compression::{replay_chunk, should_compress, CompressionConfig, GzipEncoder};
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::handler::{
     apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed,
@@ -181,6 +181,12 @@ struct ReqCtx {
     range_sink: Option<RangeSink>,
     /// Active gzip encoder for this response; set in `response_filter`.
     gzip: Option<GzipEncoder>,
+    /// Pre-compressed body to replay instead of re-gzipping this response.
+    gzip_replay: Option<Bytes>,
+    /// Accumulates gzip output on the first request so it can be reused later.
+    gzip_store: Option<(String, BytesMut)>,
+    /// Remaining lifetime of the identity entry, reused as the variant TTL.
+    identity_ttl_secs: Option<u64>,
     flight_guard: Option<crate::cache::flight::FlightGuard>,
     /// Set when the in-process handler already wrote its own access log.
     skip_logging: bool,
@@ -216,6 +222,9 @@ impl Default for ReqCtx {
             range_fill: None,
             range_sink: None,
             gzip: None,
+            gzip_replay: None,
+            gzip_store: None,
+            identity_ttl_secs: None,
             flight_guard: None,
             skip_logging: false,
         }
@@ -726,6 +735,12 @@ impl ProxyHttp for DataPlaneProxy {
         if response_policy.action != RuleAction::Cache {
             return Ok(Some(ForcedFreshness::ForceMiss));
         }
+        // How long the identity object can still be served; a pre-compressed
+        // variant outliving it would only waste memory.
+        let lifespan = meta
+            .fresh_sec()
+            .saturating_add(u64::from(meta.stale_while_revalidate_sec()));
+        ctx.identity_ttl_secs = Some(lifespan.saturating_sub(meta.age().as_secs()).max(1));
         Ok(None)
     }
 
@@ -997,6 +1012,12 @@ impl ProxyHttp for DataPlaneProxy {
                 )));
             }
         };
+        ctx.identity_ttl_secs = Some(
+            decision
+                .ttl_secs
+                .saturating_add(decision.swr_secs)
+                .max(1),
+        );
         let now = SystemTime::now();
         let meta = CacheMeta::new(
             now + Duration::from_secs(decision.ttl_secs),
@@ -1128,28 +1149,63 @@ impl ProxyHttp for DataPlaneProxy {
         }
         // Compress here, not upstream: the cache has already stored the
         // identity body, so one object serves every Accept-Encoding.
-        if !plan.is_head && !plan.is_websocket {
-            let req = session.req_header();
-            if should_compress(
-                &self.compression,
-                req.version,
-                &req.method,
-                response.status.as_u16(),
-                &response.headers,
-                &req.headers,
-            ) && ctx.gzip.is_none()
-            {
+        if !plan.is_head && !plan.is_websocket && ctx.gzip.is_none() && ctx.gzip_replay.is_none() {
+            let (compress, request_version) = {
+                let req = session.req_header();
+                (
+                    should_compress(
+                        &self.compression,
+                        req.version,
+                        &req.method,
+                        response.status.as_u16(),
+                        &response.headers,
+                        &req.headers,
+                    ),
+                    req.version,
+                )
+            };
+            if compress {
+                // Key variants by the validator so a changed object can never
+                // be served from a stale compressed copy.
+                let etag = response
+                    .headers
+                    .get(header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let variant_key = if plan.cacheable && ctx.identity_ttl_secs.is_some() {
+                    etag.as_deref()
+                        .map(|etag| compressed_variant_key(&plan.key, etag))
+                } else {
+                    None
+                };
+                if let Some(key) = variant_key.as_deref() {
+                    if let Some(cached) = self.state.compressed.get(key).await {
+                        if !cached.body.is_empty() {
+                            ctx.gzip_replay = Some(cached.body);
+                        }
+                    }
+                }
+
                 response.insert_header(header::CONTENT_ENCODING, "gzip")?;
                 // The compressed length is not known up front.
                 response.remove_header(&header::CONTENT_LENGTH);
                 vary_on_accept_encoding(response)?;
                 // H1 needs explicit framing once Content-Length is gone; H2
                 // must not carry Transfer-Encoding at all.
-                if req.version == Version::HTTP_11 {
+                if request_version == Version::HTTP_11 {
                     response.insert_header(header::TRANSFER_ENCODING, "chunked")?;
                 }
                 weaken_etag(response)?;
-                ctx.gzip = Some(GzipEncoder::new(self.compression.level));
+
+                if ctx.gzip_replay.is_none() {
+                    ctx.gzip = Some(GzipEncoder::new(self.compression.level));
+                    if let Some(key) = variant_key {
+                        if self.compression.variant_max_object_bytes > 0 {
+                            ctx.gzip_store = Some((key, BytesMut::new()));
+                        }
+                    }
+                }
             }
         }
         if plan.is_head {
@@ -1290,7 +1346,20 @@ impl ProxyHttp for DataPlaneProxy {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
-        if ctx.gzip.is_some() {
+        if ctx.gzip_replay.is_some() || ctx.gzip.is_some() {
+            // Replay path: the compressed copy is already in memory. The
+            // identity body is still streamed by the cache layer, so it is
+            // dropped here instead of being re-compressed.
+            if let Some(replay) = ctx.gzip_replay.as_mut() {
+                let input_len = body.as_ref().map(|chunk| chunk.len()).unwrap_or(0);
+                let out = replay_chunk(replay, input_len, end_of_stream);
+                *body = if out.is_empty() { None } else { Some(out) };
+                if end_of_stream {
+                    ctx.gzip_replay = None;
+                }
+                return Ok(None);
+            }
+
             let mut encoded = BytesMut::new();
             if let Some(chunk) = body.as_ref() {
                 if let Some(encoder) = ctx.gzip.as_mut() {
@@ -1300,6 +1369,30 @@ impl ProxyHttp for DataPlaneProxy {
             if end_of_stream {
                 if let Some(encoder) = ctx.gzip.take() {
                     encoded.extend_from_slice(&encoder.finish());
+                }
+            }
+            if let Some((_, buffer)) = ctx.gzip_store.as_mut() {
+                if buffer.len() + encoded.len() <= self.compression.variant_max_object_bytes {
+                    buffer.extend_from_slice(&encoded);
+                } else {
+                    // Too large to retain; keep streaming without the store.
+                    ctx.gzip_store = None;
+                }
+            }
+            if end_of_stream {
+                if let Some((key, buffer)) = ctx.gzip_store.take() {
+                    let ttl = ctx
+                        .identity_ttl_secs
+                        .unwrap_or(self.compression.variant_ttl_secs)
+                        .max(1);
+                    let entry =
+                        crate::cache::CacheEntry::new(200, Vec::new(), buffer.freeze());
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        let store = self.state.compressed.clone();
+                        handle.spawn(async move {
+                            store.set_with_swr(&key, entry, ttl, 0).await;
+                        });
+                    }
                 }
             }
             *body = if encoded.is_empty() {
@@ -3657,6 +3750,15 @@ pub(crate) fn effective_connect_timeout_ms(domain_override_ms: u32, global_ms: u
     }
 }
 
+/// Cache key for the pre-compressed variant of one object.
+///
+/// Embedding the validator means a changed object can never be served from a
+/// stale compressed copy: the key changes with the ETag and the old variant
+/// simply ages out.
+fn compressed_variant_key(cache_key: &str, etag: &str) -> String {
+    format!("{cache_key}\u{0}gzip\u{0}{etag}")
+}
+
 /// Add `Accept-Encoding` to `Vary` without discarding existing values.
 fn vary_on_accept_encoding(response: &mut ResponseHeader) -> Result<()> {
     let already_present = response
@@ -3892,6 +3994,15 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
             enabled: config.compression_enabled,
             min_bytes: config.compression_min_bytes,
             level: config.compression_level,
+            // Reuse is only possible when the variant store has room.
+            variant_max_object_bytes: if config.compressed_cache_bytes == 0
+                || config.compressed_cache_entries == 0
+            {
+                0
+            } else {
+                config.compressed_cache_max_object_bytes
+            },
+            variant_ttl_secs: 300,
         },
     };
     match std::net::TcpListener::bind(&config.listen_addr) {
@@ -3934,9 +4045,9 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_connect_timeout_ms, fill_window, head_content_length_for_protocol,
-        parse_single_range, range_fill_is_candidate, valid_release_tag,
-        vary_on_accept_encoding, weaken_etag,
+        compressed_variant_key, effective_connect_timeout_ms, fill_window,
+        head_content_length_for_protocol, parse_single_range, range_fill_is_candidate,
+        valid_release_tag, vary_on_accept_encoding, weaken_etag,
     };
     use pingora::http::ResponseHeader;
 
@@ -3987,6 +4098,19 @@ mod tests {
         let mut none = ResponseHeader::build(200, None).unwrap();
         weaken_etag(&mut none).unwrap();
         assert!(header_values(&none, "etag").is_empty());
+    }
+
+    /// Variants are keyed by the identity key plus the validator: a changed
+    /// object (new ETag) must never hit a stale compressed copy.
+    #[test]
+    fn compressed_variant_key_tracks_the_validator() {
+        let a = compressed_variant_key("GET:a.test/x", "\"v1\"");
+        let b = compressed_variant_key("GET:a.test/x", "\"v2\"");
+        let other = compressed_variant_key("GET:b.test/x", "\"v1\"");
+        assert_ne!(a, b, "a new ETag must produce a new variant key");
+        assert_ne!(a, other, "different objects must not share a variant");
+        assert!(a.starts_with("GET:a.test/x"));
+        assert_eq!(a, compressed_variant_key("GET:a.test/x", "\"v1\""));
     }
 
     /// A per-domain value of 0 must inherit the cluster default; any positive

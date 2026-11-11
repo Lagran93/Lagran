@@ -23,6 +23,11 @@ pub struct CompressionConfig {
     pub min_bytes: usize,
     /// gzip level, 1 (fastest) to 9 (smallest).
     pub level: u32,
+    /// Largest object retained as a pre-compressed variant. 0 disables reuse.
+    pub variant_max_object_bytes: usize,
+    /// Variant lifetime used when the identity entry's remaining TTL is
+    /// unknown.
+    pub variant_ttl_secs: u64,
 }
 
 impl Default for CompressionConfig {
@@ -31,6 +36,8 @@ impl Default for CompressionConfig {
             enabled: true,
             min_bytes: 1024,
             level: 4,
+            variant_max_object_bytes: 4 * 1024 * 1024,
+            variant_ttl_secs: 300,
         }
     }
 }
@@ -179,6 +186,26 @@ fn response_accepts_gzip(request: &HeaderMap) -> bool {
         Some(value) => accepts_gzip(value),
         // No Accept-Encoding header at all: the client asked for identity.
         None => false,
+    }
+}
+
+/// Take the next slice of a pre-compressed body.
+///
+/// Emission is bounded so a large cached variant is never written downstream as
+/// one unbounded chunk, while `end_of_stream` always drains the remainder. The
+/// returned `Bytes` shares the buffer (no copy).
+pub fn replay_chunk(replay: &mut Bytes, input_len: usize, end_of_stream: bool) -> Bytes {
+    const MIN_EMIT: usize = 16 * 1024;
+    const MAX_EMIT: usize = 256 * 1024;
+    let take = if end_of_stream {
+        replay.len()
+    } else {
+        input_len.clamp(MIN_EMIT, MAX_EMIT).min(replay.len())
+    };
+    if take == 0 {
+        Bytes::new()
+    } else {
+        replay.split_to(take)
     }
 }
 
@@ -364,6 +391,37 @@ mod tests {
             &ok,
             &identity
         ));
+    }
+
+    /// A cached variant is replayed instead of being re-compressed, so every
+    /// byte must be emitted exactly once across arbitrary chunk boundaries.
+    #[test]
+    fn replayed_variant_emits_every_byte_once() {
+        let original: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+        let mut replay = Bytes::from(original.clone());
+        let mut out = Vec::new();
+
+        // A cache hit delivers one large chunk and then end-of-stream. The
+        // first emission is bounded; end-of-stream drains the rest.
+        let first = replay_chunk(&mut replay, original.len(), false);
+        assert!(
+            first.len() <= 256 * 1024,
+            "emission must be bounded, got {}",
+            first.len()
+        );
+        out.extend_from_slice(&first);
+        assert!(!replay.is_empty());
+
+        loop {
+            let chunk = replay_chunk(&mut replay, 0, true);
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(out, original);
+        assert!(replay.is_empty());
     }
 
     /// The streaming encoder must produce a valid gzip stream across arbitrary

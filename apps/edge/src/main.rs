@@ -237,6 +237,10 @@ async fn main() -> anyhow::Result<()> {
         node_control,
         https_redirect_port: config.https_redirect_port,
         max_cacheable_body: config.max_cacheable_body,
+        compressed: Arc::new(edge::cache::MemoryCache::with_max_bytes(
+            config.compressed_cache_entries,
+            config.compressed_cache_bytes,
+        )),
         cache_key_ignore_headers: config.cache_key_ignore_headers.clone(),
         origin_read_timeout_ms: config.origin_read_timeout_ms,
         origin_stream_read_timeout_ms: config.origin_stream_read_timeout_ms,

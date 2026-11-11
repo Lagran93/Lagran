@@ -110,6 +110,12 @@ pub struct EdgeConfig {
     pub compression_min_bytes: usize,
     /// gzip level, 1 (fastest) to 9 (smallest).
     pub compression_level: u32,
+    /// Memory cap for pre-compressed response variants. 0 disables reuse.
+    pub compressed_cache_bytes: u64,
+    /// Maximum number of pre-compressed variants retained.
+    pub compressed_cache_entries: u64,
+    /// Objects larger than this are compressed per request but never retained.
+    pub compressed_cache_max_object_bytes: usize,
     /// Idle timeout while waiting for origin response bytes. This is separate
     /// from the per-domain connect/header timeout so media streams are not
     /// aborted just because the whole object takes longer than 10s.
@@ -306,6 +312,21 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4)
                 .clamp(1, 9),
+            compressed_cache_bytes: std::env::var("EDGE_COMPRESSED_CACHE_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64 * 1024 * 1024)
+                .clamp(0, 4 * 1024 * 1024 * 1024),
+            compressed_cache_entries: std::env::var("EDGE_COMPRESSED_CACHE_ENTRIES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000)
+                .clamp(0, 1_000_000),
+            compressed_cache_max_object_bytes: std::env::var("EDGE_COMPRESSED_CACHE_MAX_OBJECT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4 * 1024 * 1024)
+                .clamp(0, 64 * 1024 * 1024),
             origin_read_timeout_ms: std::env::var("ORIGIN_READ_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())

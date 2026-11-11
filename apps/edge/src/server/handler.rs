@@ -92,6 +92,9 @@ pub struct AppState {
     pub https_redirect_port: Option<u16>,
     /// Responses larger than this are proxied but not stored in cache.
     pub max_cacheable_body: usize,
+    /// Pre-compressed response variants, keyed by identity cache key + ETag.
+    /// Keeps gzip out of the per-request path for repeat hits.
+    pub compressed: Arc<lagran_cache::MemoryCache>,
     /// Header names intentionally excluded from the shared-cache key.
     pub cache_key_ignore_headers: Vec<String>,
     /// Idle origin read timeout; separate from per-domain connect timeout.
