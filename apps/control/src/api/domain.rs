@@ -124,10 +124,7 @@ pub(crate) fn effective_origins(r: &repository::DomainRow) -> Vec<repository::Do
     out
 }
 
-fn normalize_origin_meta(
-    value: Option<String>,
-    field: &str,
-) -> Result<Option<String>, String> {
+fn normalize_origin_meta(value: Option<String>, field: &str) -> Result<Option<String>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -334,8 +331,9 @@ pub async fn create(
     if normalized_origins.is_none() {
         let sni = normalize_origin_meta(req.origin_sni.clone(), "origin SNI")
             .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
-        let host_header = normalize_origin_meta(req.origin_host_header.clone(), "origin Host header")
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        let host_header =
+            normalize_origin_meta(req.origin_host_header.clone(), "origin Host header")
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
         if sni.is_some() || host_header.is_some() {
             normalized_origins = Some(
                 normalize_origins(vec![repository::DomainOrigin {
@@ -409,14 +407,16 @@ pub async fn create(
             tracing::error!(error = %msg, "create domain");
         }
         let (status, error) = if duplicate {
-            (
-                StatusCode::CONFLICT,
-                "域名已存在，请勿重复添加",
-            )
+            (StatusCode::CONFLICT, "域名已存在，请勿重复添加")
         } else {
             (StatusCode::BAD_REQUEST, "数据库错误，请稍后重试")
         };
-        (status, Json(ErrorBody { error: error.into() }))
+        (
+            status,
+            Json(ErrorBody {
+                error: error.into(),
+            }),
+        )
     })?;
 
     if let Some(ref origins) = normalized_origins {
@@ -612,8 +612,9 @@ pub async fn update(
     if normalized_origins.is_none() {
         let sni = normalize_origin_meta(req.origin_sni.clone(), "origin SNI")
             .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
-        let host_header = normalize_origin_meta(req.origin_host_header.clone(), "origin Host header")
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+        let host_header =
+            normalize_origin_meta(req.origin_host_header.clone(), "origin Host header")
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
         if req.origin_sni.is_some() || req.origin_host_header.is_some() {
             let mut pool = if before.origins.0.is_empty() {
                 vec![repository::DomainOrigin {
@@ -863,6 +864,12 @@ pub struct SettingsDto {
     /// Whether a signed-URL secret is stored. The secret itself is masked, so
     /// the UI needs this flag to render "已配置 / 未配置" instead of the value.
     pub signed_url_secret_set: bool,
+    /// Whether the previous-key slot holds a value.
+    ///
+    /// The edge accepts both the current and the previous key, so the console
+    /// needs this to tell the operator whether links signed with the old key
+    /// still work after a rotation.
+    pub signed_url_previous_secret_set: bool,
     /// Whether an origin authorization value is stored (value is masked).
     pub origin_auth_value_set: bool,
 }
@@ -891,7 +898,11 @@ fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
         shield_url: s.shield_url,
         signed_url_enabled: s.signed_url_enabled,
         signed_url_mode: if s.signed_url_mode.is_empty() {
-            if s.signed_url_enabled { "all".into() } else { "off".into() }
+            if s.signed_url_enabled {
+                "all".into()
+            } else {
+                "off".into()
+            }
         } else {
             s.signed_url_mode
         },
@@ -906,6 +917,7 @@ fn settings_dto(s: repository::DomainSettingsRow) -> SettingsDto {
         origin_auth_value: mask_secret(&s.origin_auth_value),
         hotlink_signature_enabled: s.hotlink_signature_enabled,
         signed_url_secret_set: !s.signed_url_secret.is_empty(),
+        signed_url_previous_secret_set: !s.signed_url_previous_secret.is_empty(),
         origin_auth_value_set: !s.origin_auth_value.is_empty(),
     }
 }
@@ -988,7 +1000,9 @@ pub fn validate_hotlink_referers(raw: &str) -> Result<String, String> {
                         .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
             });
         if !valid {
-            return Err(format!("hotlink referer {entry:?} is not a valid host name"));
+            return Err(format!(
+                "hotlink referer {entry:?} is not a valid host name"
+            ));
         }
         out.push(if entry.starts_with("*.") {
             format!("*.{host}")
@@ -1100,9 +1114,7 @@ pub fn normalize_domain_name(raw: &str) -> Result<String, String> {
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
         {
-            return Err(
-                "domain name may only contain letters, digits, hyphens and dots".into(),
-            );
+            return Err("domain name may only contain letters, digits, hyphens and dots".into());
         }
     }
     if !name.contains('.') {
@@ -1148,13 +1160,17 @@ fn normalize_signed_path(path: &str) -> Result<String, ()> {
 fn signed_path_protected(mode: &str, patterns: &str, path: &str) -> bool {
     match mode {
         "all" => true,
-        "paths" => patterns.lines().map(str::trim).filter(|p| !p.is_empty()).any(|p| {
-            if let Some(prefix) = p.strip_suffix('*') {
-                path.starts_with(prefix)
-            } else {
-                path == p
-            }
-        }),
+        "paths" => patterns
+            .lines()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .any(|p| {
+                if let Some(prefix) = p.strip_suffix('*') {
+                    path.starts_with(prefix)
+                } else {
+                    path == p
+                }
+            }),
         _ => false,
     }
 }
@@ -1213,13 +1229,7 @@ pub struct SignedUrlRotateResponse {
     pub signed_url_previous_secret: String,
 }
 
-fn signed_canonical(
-    method: &str,
-    host: &str,
-    path: &str,
-    query: &str,
-    expires: &str,
-) -> String {
+fn signed_canonical(method: &str, host: &str, path: &str, query: &str, expires: &str) -> String {
     let mut pairs: Vec<String> = query
         .split('&')
         .filter(|part| {
@@ -1259,7 +1269,9 @@ fn sign_path(
     let tag = ring::hmac::sign(&key, canonical.as_bytes());
     let signature: String = tag.as_ref().iter().map(|b| format!("{b:02x}")).collect();
     let sep = if query.is_empty() { "?" } else { "&" };
-    Ok(format!("{path_and_query}{sep}expires={expires}&sig={signature}"))
+    Ok(format!(
+        "{path_and_query}{sep}expires={expires}&sig={signature}"
+    ))
 }
 
 /// POST /api/v1/domains/{id}/signed-url
@@ -1307,12 +1319,18 @@ pub async fn create_signed_url(
         )
     })?;
     let mode = if settings.signed_url_mode.is_empty() {
-        if settings.signed_url_enabled { "all" } else { "off" }
+        if settings.signed_url_enabled {
+            "all"
+        } else {
+            "off"
+        }
     } else {
         settings.signed_url_mode.as_str()
     };
     let hotlink_only = settings.hotlink_signature_enabled;
-    if !hotlink_only && (mode == "off" || !signed_path_protected(mode, &settings.signed_url_paths, &path)) {
+    if !hotlink_only
+        && (mode == "off" || !signed_path_protected(mode, &settings.signed_url_paths, &path))
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
@@ -1335,6 +1353,20 @@ pub async fn create_signed_url(
 }
 
 /// POST /api/v1/domains/{id}/signed-url/rotate
+/// Decide which key (if any) should land in the previous-key slot after a
+/// rotation.
+///
+/// Only a key that was actually stored can be a compatibility key. Generating a
+/// throwaway value for the empty case would record a key no client ever signed
+/// with, and the console would then claim old links still work.
+pub fn previous_key_after_rotate(stored: &str) -> Option<String> {
+    if stored.trim().is_empty() {
+        None
+    } else {
+        Some(stored.to_string())
+    }
+}
+
 pub async fn rotate_signed_url(
     State(state): State<AppState>,
     actor: Actor,
@@ -1348,25 +1380,23 @@ pub async fn rotate_signed_url(
         .await
         .map_err(|_| db_error())?
         .ok_or_else(|| not_found(&id))?;
-    let current = if settings.signed_url_secret.is_empty() {
-        generate_secret()
-    } else {
-        settings.signed_url_secret
-    };
+    let previous = previous_key_after_rotate(&settings.signed_url_secret);
     let next = generate_secret();
     let mode = if settings.signed_url_mode.is_empty() {
         "all".to_string()
     } else {
         settings.signed_url_mode.clone()
     };
+    // Rotating must not flip protection on by itself: leave `enabled` untouched
+    // so a key can be provisioned ahead of enabling the feature.
     repository::update_domain_signed_url(
         &state.pool,
         domain.id,
-        Some(true),
+        None,
         Some(&mode),
         Some(&settings.signed_url_paths),
         Some(&next),
-        Some(&current),
+        previous.as_deref(),
         Some(settings.signed_url_ttl_secs),
     )
     .await
@@ -1450,10 +1480,9 @@ pub async fn put_settings(
     // The header *name* is not a secret, so compare against the stored value
     // instead of just checking for non-empty: clearing it, renaming it and
     // re-sending the current one are three different events.
-    if let (Some(header), Some(current)) = (
-        req.origin_auth_header.as_deref(),
-        stored_settings.as_ref(),
-    ) {
+    if let (Some(header), Some(current)) =
+        (req.origin_auth_header.as_deref(), stored_settings.as_ref())
+    {
         if header.trim() != current.origin_auth_header.trim() {
             sensitive.origin_auth_header = true;
         }
@@ -1494,10 +1523,7 @@ pub async fn put_settings(
         Some(value) => match normalize_cache_key_ignore_headers(value) {
             Ok(value) => Some(value),
             Err(error) => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorBody { error }),
-                ));
+                return Err((StatusCode::BAD_REQUEST, Json(ErrorBody { error })));
             }
         },
         None => None,
@@ -1558,9 +1584,14 @@ pub async fn put_settings(
             .signed_url_enabled
             .map(|enabled| if enabled { "all" } else { "off" }.to_string())
             .or_else(|| {
-                req.signed_url_paths
-                    .as_ref()
-                    .map(|paths| if paths.trim().is_empty() { "off" } else { "paths" }.to_string())
+                req.signed_url_paths.as_ref().map(|paths| {
+                    if paths.trim().is_empty() {
+                        "off"
+                    } else {
+                        "paths"
+                    }
+                    .to_string()
+                })
             }),
     };
     let enabled_arg = requested_mode
@@ -1624,9 +1655,7 @@ pub async fn put_settings(
         || req.hotlink_signature_enabled.is_some();
     if security_requested {
         if req.hotlink_signature_enabled == Some(true) {
-            let settings = stored_settings
-                .as_ref()
-                .ok_or_else(|| not_found(&id))?;
+            let settings = stored_settings.as_ref().ok_or_else(|| not_found(&id))?;
             if settings.signed_url_secret.is_empty() {
                 // Enabling hotlink signing creates a signing key implicitly.
                 sensitive.signed_url_secret_generated = true;
@@ -1733,6 +1762,19 @@ mod tests {
         assert!(err.contains("bare host"), "unexpected message: {err}");
     }
 
+    /// Generating a key for a domain that never had one must not invent a
+    /// "previous" key: no client ever signed with it, and the console would
+    /// wrongly report that old links still work.
+    #[test]
+    fn rotate_does_not_invent_a_previous_key() {
+        assert_eq!(super::previous_key_after_rotate(""), None);
+        assert_eq!(super::previous_key_after_rotate("   "), None);
+        assert_eq!(
+            super::previous_key_after_rotate("existing-key").as_deref(),
+            Some("existing-key")
+        );
+    }
+
     /// The audit entry must name which credentials changed. It used to read
     /// only "updated", so a review could not distinguish an origin credential
     /// rotation from a cosmetic change.
@@ -1811,8 +1853,14 @@ mod tests {
 
     #[test]
     fn domain_name_is_canonicalized() {
-        assert_eq!(normalize_domain_name("CD.Example.COM").unwrap(), "cd.example.com");
-        assert_eq!(normalize_domain_name("cdn.example.com.").unwrap(), "cdn.example.com");
+        assert_eq!(
+            normalize_domain_name("CD.Example.COM").unwrap(),
+            "cd.example.com"
+        );
+        assert_eq!(
+            normalize_domain_name("cdn.example.com.").unwrap(),
+            "cdn.example.com"
+        );
         assert_eq!(normalize_domain_name("  a.b.co  ").unwrap(), "a.b.co");
     }
 

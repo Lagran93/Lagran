@@ -318,7 +318,7 @@
     <!-- 高级设置 -->
     <BaseDrawer v-model="settingsOpen" :title="`高级设置 · ${settingsDomain?.name || ''}`" :loading="submitting"
       :close-on-overlay="true" @confirm="saveSettings">
-      <div class="form-col">
+      <div class="form-col settings-form">
         <div class="alert alert-info">
           <AppIcon name="info" :size="16" class="icon" />
           <span>保存后边缘节点约 15 秒内自动同步，无需停用或重启。</span>
@@ -329,132 +329,189 @@
           <span>该域名已启用配置发布：保存后不会立即下发，请在「配置发布」创建并审批发布单后才会切换边缘版本。</span>
         </div>
 
-        <label class="switch" :class="{ on: settings.ignore_query_string }">
-          <span class="switch-track" />
-          <input v-model="settings.ignore_query_string" type="checkbox" style="display: none" />
-          忽略 URL 查询串（缓存键不含 ?query）
-        </label>
+        <!-- 缓存 -->
+        <section class="settings-group">
+          <h4 class="settings-group-title">缓存</h4>
+          <label class="switch" :class="{ on: settings.ignore_query_string }">
+            <span class="switch-track" />
+            <input v-model="settings.ignore_query_string" type="checkbox" style="display: none" />
+            忽略 URL 查询串（缓存键不含 ?query）
+          </label>
 
-        <div class="field">
-          <label class="field-label">Cache Key 忽略请求头</label>
-          <div class="flex gap-16" style="flex-wrap: wrap">
-            <label class="check">
-              <input v-model="settings.ignore_origin" type="checkbox" />
-              Origin
-            </label>
-            <label class="check">
-              <input v-model="settings.ignore_accept_language" type="checkbox" />
-              Accept-Language
-            </label>
+          <div class="field">
+            <label class="field-label">Cache Key 忽略请求头</label>
+            <div class="check-row">
+              <label class="check">
+                <input v-model="settings.ignore_origin" type="checkbox" />
+                Origin
+              </label>
+              <label class="check">
+                <input v-model="settings.ignore_accept_language" type="checkbox" />
+                Accept-Language
+              </label>
+            </div>
+            <span class="field-hint">
+              仅当响应内容不随该请求头变化时使用。忽略 Origin 前须确认 Access-Control-Allow-Origin 固定；
+              忽略 Accept-Language 前须确认站点不按语言返回不同内容。规则可覆盖此设置。
+            </span>
           </div>
-          <span class="field-hint">
-            仅当响应内容不随该请求头变化时使用。忽略 Origin 前必须确认 Access-Control-Allow-Origin 固定；
-            忽略 Accept-Language 前必须确认站点不按语言返回不同内容。规则可覆盖此设置。
-          </span>
-        </div>
+        </section>
 
-        <div class="field">
-          <label class="field-label">CORS 允许源</label>
-          <input v-model="settings.cors_origins" class="input" placeholder="* 或 https://a.com,https://b.com" />
-        </div>
+        <!-- 访问控制 -->
+        <section class="settings-group">
+          <h4 class="settings-group-title">访问控制</h4>
+          <div class="form-grid">
+            <div class="field">
+              <label class="field-label">CORS 允许源</label>
+              <input v-model="settings.cors_origins" class="input" placeholder="* 或 https://a.com" />
+            </div>
+            <div class="field">
+              <label class="field-label">防盗链 Referer 白名单</label>
+              <input v-model="settings.hotlink_allow_referers" class="input"
+                placeholder="example.com,*.example.com（留空关闭）" />
+            </div>
+          </div>
+        </section>
 
-        <div class="field">
-          <label class="field-label">防盗链 Referer 白名单</label>
-          <input v-model="settings.hotlink_allow_referers" class="input"
-            placeholder="example.com,*.example.com（留空关闭）" />
-        </div>
-
-        <div class="form-grid">
+        <!-- 回源 -->
+        <section class="settings-group">
+          <h4 class="settings-group-title">回源</h4>
           <div class="field">
             <label class="field-label">回源鉴权 Header</label>
             <input v-model="settings.origin_auth_header" class="input" placeholder="例如 x-origin-token" />
           </div>
           <div class="field">
             <label class="field-label">回源鉴权值</label>
-            <input v-model="settings.origin_auth_value" class="input" type="password"
-              :placeholder="secretsConfigured.origin_auth_value ? '已配置；留空表示保持不变' : '仅 Edge 与源站知道'" />
-            <span v-if="secretsConfigured.origin_auth_value" class="field-hint">
-              已保存的值不会回显。填写新值可替换，留空保持不变。
-            </span>
+            <div class="secret-row">
+              <StatusTag :tone="secretsConfigured.origin_auth_value ? 'success' : 'neutral'" dot>
+                {{ secretsConfigured.origin_auth_value ? '已配置' : '未配置' }}
+              </StatusTag>
+              <span class="text-muted secret-note">
+                {{ secretsConfigured.origin_auth_value
+                  ? '值不在页面回显。留空保存即保持原值。'
+                  : '填写后 Edge 会把它注入到回源请求的上面这个 Header。' }}
+              </span>
+              <span class="spacer" />
+              <button class="btn btn-text btn-sm" type="button" @click="toggleOriginAuthInput">
+                {{ showOriginAuthInput ? '取消' : (secretsConfigured.origin_auth_value ? '替换' : '填写') }}
+              </button>
+            </div>
+            <input v-if="showOriginAuthInput" v-model="settings.origin_auth_value" class="input"
+              type="password" autocomplete="off" :placeholder="secretsConfigured.origin_auth_value ? '输入新值以替换' : '仅 Edge 与源站知道'" />
           </div>
-        </div>
-        <div class="field">
-          <label class="field-label">防盗链签名</label>
-          <label class="switch" :class="{ on: settings.hotlink_signature_enabled }">
-            <span class="switch-track" />
-            <input v-model="settings.hotlink_signature_enabled" type="checkbox" style="display: none" />
-            使用签名 URL 密钥绕过 Referer 防盗链
-          </label>
-          <span class="field-hint">开启后，Referer 不在白名单时必须携带同一套 expires+sig；公开资源不受影响。</span>
-        </div>
+          <div class="form-grid">
+            <div class="field">
+              <label class="field-label">回源连接超时（毫秒）</label>
+              <input v-model.number="settings.origin_timeout_ms" class="input" type="number" />
+            </div>
+            <div class="field">
+              <label class="field-label">Origin Shield 地址</label>
+              <input v-model="settings.shield_url" class="input" placeholder="留空关闭" />
+            </div>
+          </div>
+          <span class="field-hint">
+            配置 Shield 后边缘优先向它回源并保留当前域名 Host；Shield 不可用时自动回退到普通源站。
+          </span>
+        </section>
 
-        <div class="field">
-          <label class="field-label">签名 URL 防护</label>
-          <select v-model="settings.signed_url_mode" class="select">
-            <option value="off">关闭</option>
-            <option value="all">整个域名都要求签名</option>
-            <option value="paths">仅指定路径要求签名</option>
-          </select>
+        <!-- 签名 URL -->
+        <section class="settings-group">
+          <h4 class="settings-group-title">签名 URL 防护</h4>
+          <div class="form-grid">
+            <div class="field">
+              <label class="field-label">保护范围</label>
+              <select v-model="settings.signed_url_mode" class="select">
+                <option value="off">关闭</option>
+                <option value="all">整个域名都要求签名</option>
+                <option value="paths">仅指定路径要求签名</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field-label">签名有效期上限（秒）</label>
+              <input v-model.number="settings.signed_url_ttl_secs" class="input" type="number" min="1" />
+            </div>
+          </div>
           <span class="field-hint">
             选择「仅指定路径」后，只需保护 /private/*、/downloads/* 等私有目录，公开页面和静态资源不受影响。
           </span>
-        </div>
 
-        <div v-if="settings.signed_url_mode === 'paths'" class="field">
-          <label class="field-label">需要签名的路径</label>
-          <textarea v-model="settings.signed_url_paths" class="textarea" rows="4"
-            placeholder="/private/*&#10;/downloads/*&#10;/vip/exact-file.mp4" />
-          <span class="field-hint">每行一个规则，支持精确路径或 /prefix/*；不支持 .. 和正则。</span>
-        </div>
-
-        <div class="form-grid">
-          <div class="field">
-            <label class="field-label">签名有效期上限（秒）</label>
-            <input v-model.number="settings.signed_url_ttl_secs" class="input" type="number" min="1" />
+          <div v-if="settings.signed_url_mode === 'paths'" class="field">
+            <label class="field-label">需要签名的路径</label>
+            <textarea v-model="settings.signed_url_paths" class="textarea" rows="3"
+              placeholder="/private/*&#10;/downloads/*&#10;/vip/exact-file.mp4" />
+            <span class="field-hint">每行一个规则，支持精确路径或 /prefix/*；不支持 .. 和正则。</span>
           </div>
+
+          <div class="field">
+            <label class="field-label">防盗链签名</label>
+            <label class="switch" :class="{ on: settings.hotlink_signature_enabled }">
+              <span class="switch-track" />
+              <input v-model="settings.hotlink_signature_enabled" type="checkbox" style="display: none" />
+              使用签名 URL 密钥绕过 Referer 防盗链
+            </label>
+            <span class="field-hint">开启后，Referer 不在白名单时必须携带同一套 expires+sig；公开资源不受影响。</span>
+          </div>
+
+          <!-- Key state, not a value field: the secret is write-only over the API,
+               so the console shows status and offers an explicit rotation. -->
           <div class="field">
             <label class="field-label">当前签名密钥</label>
-            <input v-model="settings.signed_url_secret" class="input" type="text"
-              :placeholder="secretsConfigured.signed_url_secret ? '已配置；留空表示保持不变' : '开启后自动生成；可手动填写'" />
-            <span v-if="secretsConfigured.signed_url_secret" class="field-hint">
-              已保存的密钥不会回显。建议使用「轮换」接口，避免手工换钥导致旧链接立即失效。
-            </span>
+            <div class="secret-row">
+              <StatusTag :tone="secretsConfigured.signed_url_secret ? 'success' : 'neutral'" dot>
+                {{ secretsConfigured.signed_url_secret ? '已配置' : '未配置' }}
+              </StatusTag>
+              <span class="text-muted secret-note">
+                {{ secretsConfigured.signed_url_secret
+                  ? '密钥不在页面回显。轮换后旧密钥会作为「上一个密钥」继续被接受。'
+                  : '尚未生成密钥。可点右侧「生成密钥」，开启防护时也会自动创建。' }}
+              </span>
+              <span class="spacer" />
+              <button class="btn btn-secondary btn-sm" type="button"
+                :disabled="rotatingSecret"
+                @click="rotateSignedUrlSecret">
+                {{ rotatingSecret
+                  ? '处理中…'
+                  : (secretsConfigured.signed_url_secret ? '轮换密钥' : '生成密钥') }}
+              </button>
+            </div>
           </div>
-        </div>
-        <div class="field">
-          <label class="field-label">上一个签名密钥（轮换兼容）</label>
-          <input v-model="settings.signed_url_previous_secret" class="input" type="text"
-            :placeholder="secretsConfigured.signed_url_secret ? '已配置；留空表示保持不变' : '轮换后旧密钥保留一段时间，留空则立即失效'" />
-          <span class="field-hint">
-            修改密钥后旧链接会立即失效；建议使用接口 /signed-url/rotate 自动轮换。
-          </span>
-        </div>
 
-        <div class="form-grid">
           <div class="field">
-            <label class="field-label">回源连接超时（毫秒）</label>
-            <input v-model.number="settings.origin_timeout_ms" class="input" type="number" />
+            <label class="field-label">上一个签名密钥（轮换兼容）</label>
+            <div class="secret-row">
+              <StatusTag :tone="secretsConfigured.signed_url_previous_secret ? 'warning' : 'neutral'" dot>
+                {{ secretsConfigured.signed_url_previous_secret ? '生效中' : '无' }}
+              </StatusTag>
+              <span class="text-muted secret-note">
+                {{ secretsConfigured.signed_url_previous_secret
+                  ? '使用旧密钥签发的链接仍然可用；再次轮换后旧密钥将被替换。'
+                  : '当前没有兼容密钥，旧链接已失效。' }}
+              </span>
+            </div>
           </div>
-          <div class="field">
-            <label class="field-label">全局限流 RPS（0 = 不限）</label>
-            <input v-model.number="settings.rate_limit_rps" class="input" type="number" />
-          </div>
-          <div class="field">
-            <label class="field-label">全局限流突发</label>
-            <input v-model.number="settings.rate_limit_burst" class="input" type="number" />
-          </div>
-        </div>
 
-        <div class="field">
-          <label class="field-label">Origin Shield 地址</label>
-          <input v-model="settings.shield_url" class="input" placeholder="https://shield.example.com（留空关闭）" />
-          <span class="field-hint">
-            可选。配置后边缘优先向 Shield 回源，并保留当前域名 Host；Shield 不可用时自动回退到普通源站。
-          </span>
-        </div>
+          <details class="advanced-secret">
+            <summary>高级：手动指定密钥</summary>
+            <p class="text-muted" style="font-size: 12px; margin: 6px 0 10px">
+              仅在你需要把同一把密钥同步到多个域名时使用。手工覆盖密钥会让此前签发的链接<strong>立即失效</strong>；
+              日常轮换请使用上面的「轮换密钥」按钮。
+            </p>
+            <div class="form-grid">
+              <div class="field">
+                <label class="field-label">当前密钥（留空保持不变）</label>
+                <input v-model="settings.signed_url_secret" class="input" type="text" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label class="field-label">上一个密钥（留空保持不变）</label>
+                <input v-model="settings.signed_url_previous_secret" class="input" type="text" autocomplete="off" />
+              </div>
+            </div>
+          </details>
+        </section>
 
-        <div class="field-label" style="margin-top: 24px; font-size: 15px">CC 防御</div>
-        <div class="field">
+        <!-- CC 防御 -->
+        <section class="settings-group">
+          <h4 class="settings-group-title">CC 防御</h4>
           <label class="check">
             <input v-model="settings.cc_enabled" type="checkbox" />
             启用 CC 防御（按客户端聚合组限速，超限自动挑战/封禁）
@@ -463,46 +520,77 @@
             全局限流 RPS 是域名总阈值：超过后自动进入 60 秒攻击模式，客户端限额减半；HTML 浏览器首次超限
             进入 PoW 挑战，验证通过后获得临时 2x 预算，持续超限才封禁。
           </span>
-        </div>
-        <div class="form-grid">
-          <div class="field">
-            <label class="field-label">每 IP 每秒请求数</label>
-            <input v-model.number="settings.cc_rps" class="input" type="number" min="1" />
-          </div>
-          <div class="field">
-            <label class="field-label">突发额度</label>
-            <input v-model.number="settings.cc_burst" class="input" type="number" min="0" />
-          </div>
-          <div class="field">
-            <label class="field-label">连续超限次数后封禁</label>
-            <input v-model.number="settings.cc_ban_after" class="input" type="number" min="1" />
-          </div>
-          <div class="field">
-            <label class="field-label">封禁时长（秒）</label>
-            <input v-model.number="settings.cc_ban_seconds" class="input" type="number" min="1" max="86400" />
-          </div>
-          <div class="field">
-            <label class="field-label">模式</label>
-            <select v-model="settings.cc_mode" class="select">
-              <option value="block">拦截（429）</option>
-              <option value="monitor">观察（只记录）</option>
-            </select>
-          </div>
-        </div>
-        <div class="field">
-          <label class="field-label">IP 白名单</label>
-          <input v-model="settings.cc_allow_ips" class="input" placeholder="10.0.0.0/8, 203.0.113.7" />
-          <span class="field-hint">逗号分隔，支持 IPv4/IPv6 与 CIDR；白名单 IP 不受 CC 限制。</span>
-        </div>
 
-        <div class="field">
-          <label class="field-label">自定义响应头</label>
-          <textarea v-model="settings.custom_headers" class="textarea" rows="4"
+          <div class="form-grid">
+            <div class="field">
+              <label class="field-label">全局限流 RPS（0 = 不限）</label>
+              <input v-model.number="settings.rate_limit_rps" class="input" type="number" />
+            </div>
+            <div class="field">
+              <label class="field-label">全局限流突发</label>
+              <input v-model.number="settings.rate_limit_burst" class="input" type="number" />
+            </div>
+            <div class="field">
+              <label class="field-label">每 IP 每秒请求数</label>
+              <input v-model.number="settings.cc_rps" class="input" type="number" min="1" />
+            </div>
+            <div class="field">
+              <label class="field-label">突发额度</label>
+              <input v-model.number="settings.cc_burst" class="input" type="number" min="0" />
+            </div>
+            <div class="field">
+              <label class="field-label">连续超限次数后封禁</label>
+              <input v-model.number="settings.cc_ban_after" class="input" type="number" min="1" />
+            </div>
+            <div class="field">
+              <label class="field-label">封禁时长（秒）</label>
+              <input v-model.number="settings.cc_ban_seconds" class="input" type="number" min="1" max="86400" />
+            </div>
+            <div class="field">
+              <label class="field-label">模式</label>
+              <select v-model="settings.cc_mode" class="select">
+                <option value="block">拦截（429）</option>
+                <option value="monitor">观察（只记录）</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field-label">IP 白名单</label>
+              <input v-model="settings.cc_allow_ips" class="input" placeholder="10.0.0.0/8, 203.0.113.7" />
+            </div>
+          </div>
+          <span class="field-hint">白名单逗号分隔，支持 IPv4/IPv6 与 CIDR；白名单 IP 不受 CC 限制。</span>
+        </section>
+
+        <!-- 响应头 -->
+        <section class="settings-group">
+          <h4 class="settings-group-title">自定义响应头</h4>
+          <textarea v-model="settings.custom_headers" class="textarea mono" rows="3"
             placeholder="X-CDN: lagran&#10;X-Frame-Options: DENY" />
           <span class="field-hint">每行一个，格式 Name: Value。</span>
-        </div>
+        </section>
       </div>
     </BaseDrawer>
+
+    <!-- One-time reveal: the API never returns a secret again, so this is the
+         only chance for the operator to copy it. -->
+    <BaseModal v-model="rotatedSecretOpen" title="新的签名密钥" confirm-text="我已保存"
+      @confirm="closeRotatedSecret" @close="closeRotatedSecret">
+      <div class="form-col">
+        <div class="alert alert-warning" role="alert">
+          <AppIcon name="alert" :size="16" class="icon" />
+          <span>该密钥只显示这一次，关闭后无法再次查看。请立即复制并妥善保存。</span>
+        </div>
+        <div class="field">
+          <label class="field-label">签名密钥</label>
+          <div class="secret-row">
+            <input class="input mono" :value="rotatedSecret" readonly />
+            <button class="btn btn-secondary btn-sm" type="button" @click="copyRotatedSecret">
+              复制
+            </button>
+          </div>
+        </div>
+      </div>
+    </BaseModal>
   </div>
 </template>
 
@@ -565,8 +653,20 @@ const enabledOriginCount = computed(
 
 const settingsOpen = ref(false)
 // Whether a secret is already stored server-side. Secrets are write-only over
-// the API, so the form shows an empty field plus a hint instead of the value.
-const secretsConfigured = ref({ signed_url_secret: false, origin_auth_value: false })
+// the API, so the form shows status badges plus an explicit rotate action
+// instead of the value itself.
+const secretsConfigured = ref({
+  signed_url_secret: false,
+  signed_url_previous_secret: false,
+  origin_auth_value: false,
+})
+const rotatingSecret = ref(false)
+// The origin auth value is write-only too: the input is hidden until the
+// operator explicitly chooses to set or replace it.
+const showOriginAuthInput = ref(false)
+// Holds the freshly rotated key for the one-time reveal dialog.
+const rotatedSecret = ref('')
+const rotatedSecretOpen = ref(false)
 const settingsDomain = ref<any>(null)
 const settings = ref({
   ignore_query_string: false,
@@ -886,13 +986,85 @@ async function openSettings(d: any) {
     }
     secretsConfigured.value = {
       signed_url_secret: !!s.signed_url_secret_set,
+      signed_url_previous_secret: !!s.signed_url_previous_secret_set,
       origin_auth_value: !!s.origin_auth_value_set,
     }
+    showOriginAuthInput.value = false
   } catch {
-    secretsConfigured.value = { signed_url_secret: false, origin_auth_value: false }
+    secretsConfigured.value = {
+      signed_url_secret: false,
+      signed_url_previous_secret: false,
+      origin_auth_value: false,
+    }
     toast.error('读取高级设置失败，已使用默认值')
   }
   settingsOpen.value = true
+}
+
+/// Toggle the write-only origin auth input.
+///
+/// Cancelling also clears whatever was typed, so a half-entered value is not
+/// submitted with the rest of the form.
+function toggleOriginAuthInput() {
+  showOriginAuthInput.value = !showOriginAuthInput.value
+  if (!showOriginAuthInput.value) {
+    settings.value.origin_auth_value = ''
+  }
+}
+
+/// Rotate the signed-URL key via the API.
+///
+/// When a key already exists, it becomes the "previous" key so links signed
+/// before the rotation keep working. When none exists this simply provisions
+/// one; either way the feature toggle is left alone, so generating a key never
+/// turns protection on by itself. The new key is shown exactly once: the API
+/// never returns it again, so this dialog is the only chance to copy it.
+async function rotateSignedUrlSecret() {
+  if (!settingsDomain.value) return
+  const hasKey = secretsConfigured.value.signed_url_secret
+  const ok = await ask({
+    title: hasKey ? '轮换签名密钥' : '生成签名密钥',
+    message: hasKey
+      ? '将生成新的签名密钥，当前密钥会作为「上一个密钥」继续被接受一段时间。新密钥只显示一次，请准备好复制。'
+      : '将为该域名生成一把签名密钥。生成后「签名 URL 防护」仍是关闭状态，需要你手动开启才生效。新密钥只显示一次。',
+    confirmText: hasKey ? '轮换' : '生成',
+  })
+  if (!ok) return
+  rotatingSecret.value = true
+  try {
+    const res: any = await api.post(
+      `/api/v1/domains/${settingsDomain.value.id}/signed-url/rotate`,
+      {},
+    )
+    rotatedSecret.value = res?.signed_url_secret || ''
+    rotatedSecretOpen.value = true
+    secretsConfigured.value = {
+      ...secretsConfigured.value,
+      signed_url_secret: true,
+      // A freshly generated key has no predecessor; only a real rotation moves
+      // the old key into the compatibility slot.
+      signed_url_previous_secret: hasKey,
+    }
+  } catch (e: any) {
+    toast.error(e?.data?.error || '轮换失败')
+  } finally {
+    rotatingSecret.value = false
+  }
+}
+
+async function copyRotatedSecret() {
+  if (!rotatedSecret.value) return
+  try {
+    await navigator.clipboard.writeText(rotatedSecret.value)
+    toast.success('已复制到剪贴板')
+  } catch {
+    toast.error('复制失败，请手动选择文本')
+  }
+}
+
+function closeRotatedSecret() {
+  rotatedSecretOpen.value = false
+  rotatedSecret.value = ''
 }
 
 async function saveSettings() {
@@ -1634,5 +1806,113 @@ onMounted(load)
     width: 28px;
     height: 28px;
   }
+}
+
+/* Status row for write-only secrets: badge + explanation + action. */
+.secret-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.secret-row .input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Manual key entry is an escape hatch, not the normal path. */
+.advanced-secret {
+  margin: 4px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle, transparent);
+}
+.advanced-secret summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.advanced-secret[open] summary {
+  margin-bottom: 4px;
+}
+
+/* Grouped settings: each section is a visual unit so a long drawer can be
+   scanned instead of read top to bottom. */
+.settings-form {
+  gap: 18px;
+}
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg, 10px);
+  background: var(--card);
+}
+.settings-group-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+/* A short rule under the title separates it from the first field without
+   adding height. */
+.settings-group-title::after {
+  content: "";
+  display: block;
+  margin-top: 8px;
+  height: 1px;
+  background: var(--border);
+}
+.settings-group .form-grid {
+  gap: 12px 14px;
+}
+.settings-group .field-hint {
+  margin-top: -4px;
+}
+
+/* Inline row of checkboxes, used for cache-key headers. */
+.check-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+}
+
+/* Status row for write-only secrets: badge + explanation + action. */
+.secret-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-height: 28px;
+}
+.secret-row .input {
+  flex: 1;
+  min-width: 0;
+}
+.secret-note {
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+/* Manual key entry is an escape hatch, not the normal path. */
+.advanced-secret {
+  padding: 10px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: transparent;
+}
+.advanced-secret summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-2);
+  user-select: none;
+}
+.advanced-secret[open] summary {
+  margin-bottom: 2px;
 }
 </style>
