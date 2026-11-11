@@ -396,22 +396,26 @@
                 {{ showOriginAuthInput ? '取消' : (secretsConfigured.origin_auth_value ? '替换' : '填写') }}
               </button>
             </div>
-            <input v-if="showOriginAuthInput" v-model="settings.origin_auth_value" class="input"
-              type="password" autocomplete="off" :placeholder="secretsConfigured.origin_auth_value ? '输入新值以替换' : '仅 Edge 与源站知道'" />
+            <input v-if="showOriginAuthInput" v-model="settings.origin_auth_value" class="input" type="password"
+              autocomplete="off" :placeholder="secretsConfigured.origin_auth_value ? '输入新值以替换' : '仅 Edge 与源站知道'" />
           </div>
           <div class="form-grid">
             <div class="field">
               <label class="field-label">回源连接超时（毫秒）</label>
-              <input v-model.number="settings.origin_timeout_ms" class="input" type="number" />
+              <input v-model.number="settings.origin_timeout_ms" class="input" type="number" min="0"
+                placeholder="0 = 使用全局默认" />
+              <span class="field-hint">
+                0 表示继承 Edge 全局默认。
+              </span>
             </div>
             <div class="field">
               <label class="field-label">Origin Shield 地址</label>
               <input v-model="settings.shield_url" class="input" placeholder="留空关闭" />
+              <span class="field-hint">
+                配置 Shield 后边缘优先向它回源并保留当前域名 Host；Shield 不可用时自动回退到普通源站。
+              </span>
             </div>
           </div>
-          <span class="field-hint">
-            配置 Shield 后边缘优先向它回源并保留当前域名 Host；Shield 不可用时自动回退到普通源站。
-          </span>
         </section>
 
         <!-- 签名 URL -->
@@ -466,8 +470,7 @@
                   : '尚未生成密钥。可点右侧「生成密钥」，开启防护时也会自动创建。' }}
               </span>
               <span class="spacer" />
-              <button class="btn btn-secondary btn-sm" type="button"
-                :disabled="rotatingSecret"
+              <button class="btn btn-secondary btn-sm" type="button" :disabled="rotatingSecret"
                 @click="rotateSignedUrlSecret">
                 {{ rotatingSecret
                   ? '处理中…'
@@ -573,8 +576,8 @@
 
     <!-- One-time reveal: the API never returns a secret again, so this is the
          only chance for the operator to copy it. -->
-    <BaseModal v-model="rotatedSecretOpen" title="新的签名密钥" confirm-text="我已保存"
-      @confirm="closeRotatedSecret" @close="closeRotatedSecret">
+    <BaseModal v-model="rotatedSecretOpen" title="新的签名密钥" confirm-text="我已保存" @confirm="closeRotatedSecret"
+      @close="closeRotatedSecret">
       <div class="form-col">
         <div class="alert alert-warning" role="alert">
           <AppIcon name="alert" :size="16" class="icon" />
@@ -674,7 +677,7 @@ const settings = ref({
   ignore_accept_language: false,
   cors_origins: '',
   hotlink_allow_referers: '',
-  origin_timeout_ms: 10000,
+  origin_timeout_ms: 0,
   custom_headers: '',
   shield_url: '',
   rate_limit_rps: 0,
@@ -959,7 +962,9 @@ async function openSettings(d: any) {
       ignore_accept_language: cachedHeaders.includes('accept-language'),
       cors_origins: s.cors_origins || '',
       hotlink_allow_referers: s.hotlink_allow_referers || '',
-      origin_timeout_ms: s.origin_timeout_ms || 10000,
+      // 0 means "inherit the edge-wide default" and must be preserved, so do
+      // not fall back to a truthy default here.
+      origin_timeout_ms: s.origin_timeout_ms ?? 0,
       custom_headers: s.custom_headers || '',
       shield_url: s.shield_url || '',
       rate_limit_rps: s.rate_limit_rps || 0,
@@ -1815,6 +1820,7 @@ onMounted(load)
   gap: 10px;
   flex-wrap: wrap;
 }
+
 .secret-row .input {
   flex: 1;
   min-width: 0;
@@ -1828,12 +1834,14 @@ onMounted(load)
   border-radius: var(--radius);
   background: var(--bg-subtle, transparent);
 }
+
 .advanced-secret summary {
   cursor: pointer;
   font-size: 13px;
   font-weight: 500;
   color: var(--text-2);
 }
+
 .advanced-secret[open] summary {
   margin-bottom: 4px;
 }
@@ -1843,6 +1851,7 @@ onMounted(load)
 .settings-form {
   gap: 18px;
 }
+
 .settings-group {
   display: flex;
   flex-direction: column;
@@ -1852,6 +1861,7 @@ onMounted(load)
   border-radius: var(--radius-lg, 10px);
   background: var(--card);
 }
+
 .settings-group-title {
   margin: 0;
   font-size: 13px;
@@ -1859,6 +1869,7 @@ onMounted(load)
   color: var(--text);
   letter-spacing: 0.02em;
 }
+
 /* A short rule under the title separates it from the first field without
    adding height. */
 .settings-group-title::after {
@@ -1868,9 +1879,11 @@ onMounted(load)
   height: 1px;
   background: var(--border);
 }
+
 .settings-group .form-grid {
   gap: 12px 14px;
 }
+
 .settings-group .field-hint {
   margin-top: -4px;
 }
@@ -1890,10 +1903,12 @@ onMounted(load)
   flex-wrap: wrap;
   min-height: 28px;
 }
+
 .secret-row .input {
   flex: 1;
   min-width: 0;
 }
+
 .secret-note {
   font-size: 12.5px;
   line-height: 1.4;
@@ -1906,12 +1921,14 @@ onMounted(load)
   border-radius: var(--radius);
   background: transparent;
 }
+
 .advanced-secret summary {
   cursor: pointer;
   font-size: 12.5px;
   color: var(--text-2);
   user-select: none;
 }
+
 .advanced-secret[open] summary {
   margin-bottom: 2px;
 }

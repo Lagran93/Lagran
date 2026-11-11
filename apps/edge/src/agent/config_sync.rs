@@ -268,11 +268,10 @@ impl DomainCfg {
             cache_key_ignore_headers: self.cache_key_ignore_headers,
             cors_origins: self.cors_origins,
             hotlink_allow_referers: self.hotlink_allow_referers,
-            origin_timeout_ms: if self.origin_timeout_ms == 0 {
-                10_000
-            } else {
-                self.origin_timeout_ms
-            },
+            // 0 means "inherit the edge-wide ORIGIN_CONNECT_TIMEOUT_MS".
+            // A non-zero value overrides the TCP connect timeout for this
+            // domain only.
+            origin_timeout_ms: self.origin_timeout_ms,
             custom_headers: self.custom_headers,
             backup_origin_url,
             ssl_enabled: self.ssl_enabled,
@@ -521,7 +520,7 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
         })
         .collect();
 
-    WafConfig {
+    let mut waf = WafConfig {
         enabled: cfg.enabled,
         mode: if cfg.mode.eq_ignore_ascii_case("monitor") {
             WafMode::Monitor
@@ -539,7 +538,11 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
         challenge_difficulty: cfg.challenge_difficulty.clamp(1, 6),
         challenge_ttl_secs: cfg.challenge_ttl_secs.clamp(60, 86_400),
         security_level: SecurityLevel::parse(&cfg.security_level),
-    }
+    };
+    // Sort and filter the custom rules once here so the request path never
+    // builds or sorts a temporary rule list.
+    waf.finalize();
+    waf
 }
 
 fn parse_nets(entries: Vec<String>) -> Vec<IpNet> {

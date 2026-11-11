@@ -12,6 +12,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+/// jemalloc instead of the system allocator: the data plane allocates on every
+/// request (header vectors, access-log records, WAF decoding), and glibc's
+/// per-arena contention is visible once the process is thread-heavy.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn is_http_url(value: &str) -> bool {
     (value.starts_with("http://") || value.starts_with("https://"))
         && !value.chars().any(char::is_whitespace)
@@ -57,7 +63,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let origin = OriginClient::new(config.origin_url.clone());
+    let origin = OriginClient::with_connect_timeout(
+        config.origin_url.clone(),
+        std::time::Duration::from_millis(config.origin_connect_timeout_ms),
+    );
     let rules = RuleSet::new();
     let metrics = EdgeMetrics::new();
     let cert_store = Arc::new(edge::server::cert_store::CertStore::with_persist_dir(

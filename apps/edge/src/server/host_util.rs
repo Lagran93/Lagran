@@ -7,6 +7,23 @@ use axum::http::Request;
 #[derive(Clone, Debug)]
 pub struct TlsSni(pub String);
 
+/// Marker for an in-process request whose downstream TLS was terminated by the
+/// Pingora listener.
+///
+/// When Pingora hands a request to the legacy handler it does not carry a TLS
+/// extension and the socket peer is the real client (not a trusted proxy), so
+/// `X-Forwarded-Proto` is deliberately ignored. Without this marker the handler
+/// would classify an HTTPS request as plaintext and answer it with an HTTPS
+/// redirect to the URL that was already served over TLS.
+#[derive(Clone, Copy, Debug)]
+pub struct TlsTerminated;
+
+/// Whether this request arrived over TLS, from either data plane.
+pub fn request_is_tls<B>(req: &Request<B>) -> bool {
+    req.extensions().get::<TlsSni>().is_some()
+        || req.extensions().get::<TlsTerminated>().is_some()
+}
+
 /// Best-effort host for domain registry lookup.
 pub fn resolve_request_host<B>(req: &Request<B>) -> String {
     // 1) Host header
@@ -53,4 +70,34 @@ pub fn resolve_request_host<B>(req: &Request<B>) -> String {
     }
 
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    fn request() -> Request<Body> {
+        Request::builder()
+            .uri("https://example.com/a.js")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn tls_is_detected_from_either_data_plane() {
+        let mut plain = request();
+        assert!(!request_is_tls(&plain));
+
+        // Axum TLS listener.
+        plain.extensions_mut().insert(TlsSni("example.com".into()));
+        assert!(request_is_tls(&plain));
+
+        // Pingora in-process handoff: no SNI extension is available, but the
+        // connection was TLS. Losing this flag made the HTTPS redirect fire on
+        // requests that already arrived over HTTPS.
+        let mut in_process = request();
+        in_process.extensions_mut().insert(TlsTerminated);
+        assert!(request_is_tls(&in_process));
+    }
 }

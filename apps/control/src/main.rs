@@ -11,6 +11,11 @@ use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+/// jemalloc for the same reason as the edge: a long-running, multi-threaded
+/// server whose hot paths allocate small objects continuously.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn is_http_url(value: &str) -> bool {
     (value.starts_with("http://") || value.starts_with("https://"))
         && !value.chars().any(char::is_whitespace)

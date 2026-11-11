@@ -18,6 +18,7 @@ use crate::config::registry::{DomainEntry, OriginTarget};
 use crate::config::EdgeConfig;
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
+use crate::server::compression::{should_compress, CompressionConfig, GzipEncoder};
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::handler::{
     apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed,
@@ -32,7 +33,7 @@ use crate::security::signed_url;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version};
 use axum::Json;
 use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
@@ -115,7 +116,9 @@ struct NativePlan {
     origin_host: String,
     origins: Vec<OriginTarget>,
     backup_url: String,
-    timeout_ms: u64,
+    /// TCP connect timeout. Kept separate so an unreachable origin fails over
+    /// quickly instead of consuming the response budget.
+    connect_timeout_ms: u64,
     read_timeout_ms: u64,
     cache_reason: Option<&'static str>,
     policy: ResolvedPolicy,
@@ -176,6 +179,8 @@ struct ReqCtx {
     head_status: u16,
     range_fill: Option<RangeFill>,
     range_sink: Option<RangeSink>,
+    /// Active gzip encoder for this response; set in `response_filter`.
+    gzip: Option<GzipEncoder>,
     flight_guard: Option<crate::cache::flight::FlightGuard>,
     /// Set when the in-process handler already wrote its own access log.
     skip_logging: bool,
@@ -210,6 +215,7 @@ impl Default for ReqCtx {
             head_status: 0,
             range_fill: None,
             range_sink: None,
+            gzip: None,
             flight_guard: None,
             skip_logging: false,
         }
@@ -227,6 +233,8 @@ struct DataPlaneProxy {
     /// Weighted round-robin seed for origin selection.
     origin_counter: std::sync::atomic::AtomicU64,
     dns_cache: OriginDnsCache,
+    /// Downstream compression policy (cache stores identity).
+    compression: CompressionConfig,
 }
 
 #[async_trait]
@@ -785,7 +793,7 @@ impl ProxyHttp for DataPlaneProxy {
                     addr,
                     &host,
                     tls,
-                    plan.timeout_ms,
+                    plan.connect_timeout_ms,
                     if session.req_header().headers.contains_key("range") {
                         self.state.origin_stream_read_timeout_ms
                     } else {
@@ -825,6 +833,34 @@ impl ProxyHttp for DataPlaneProxy {
             | pingora::ErrorType::TLSHandshakeTimedout
             | pingora::ErrorType::ReadTimedout => self.state.metrics.record_origin_timeout(),
             _ => self.state.metrics.record_origin_error(),
+        }
+        // Hard connectivity failures fail over immediately instead of waiting
+        // for the scheduled prober's hysteresis. Without this, a dead origin
+        // keeps being selected and every fetch pays the connect timeout.
+        let hard_failure = matches!(
+            e.etype(),
+            pingora::ErrorType::ConnectError
+                | pingora::ErrorType::ConnectRefused
+                | pingora::ErrorType::ConnectNoRoute
+                | pingora::ErrorType::ConnectTimedout
+                | pingora::ErrorType::ConnectProxyFailure
+                | pingora::ErrorType::TLSHandshakeFailure
+                | pingora::ErrorType::TLSHandshakeTimedout
+                | pingora::ErrorType::ReadTimedout
+        );
+        if hard_failure && !ctx.current_origin.is_empty() {
+            // `error_while_proxy` is synchronous, so the health write is
+            // handed to the runtime. It only runs on failures, never on the
+            // success path.
+            let health = self.state.origin_health.clone();
+            let host = ctx.host.clone();
+            let origin = ctx.current_origin.clone();
+            let reason = e.to_string();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    health.record_origin_failure(&host, &origin, &reason).await;
+                });
+            }
         }
         let idempotent = session.req_header().method.is_idempotent();
         let safe_to_retry = ctx
@@ -1090,6 +1126,32 @@ impl ProxyHttp for DataPlaneProxy {
         for (name, value) in headers.iter() {
             response.insert_header(name.clone(), value.clone())?;
         }
+        // Compress here, not upstream: the cache has already stored the
+        // identity body, so one object serves every Accept-Encoding.
+        if !plan.is_head && !plan.is_websocket {
+            let req = session.req_header();
+            if should_compress(
+                &self.compression,
+                req.version,
+                &req.method,
+                response.status.as_u16(),
+                &response.headers,
+                &req.headers,
+            ) && ctx.gzip.is_none()
+            {
+                response.insert_header(header::CONTENT_ENCODING, "gzip")?;
+                // The compressed length is not known up front.
+                response.remove_header(&header::CONTENT_LENGTH);
+                vary_on_accept_encoding(response)?;
+                // H1 needs explicit framing once Content-Length is gone; H2
+                // must not carry Transfer-Encoding at all.
+                if req.version == Version::HTTP_11 {
+                    response.insert_header(header::TRANSFER_ENCODING, "chunked")?;
+                }
+                weaken_etag(response)?;
+                ctx.gzip = Some(GzipEncoder::new(self.compression.level));
+            }
+        }
         if plan.is_head {
             // HEAD carries no downstream body. Keeping the origin GET's
             // Content-Length makes Pingora's H1 encoder wait for bytes that
@@ -1228,6 +1290,25 @@ impl ProxyHttp for DataPlaneProxy {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        if ctx.gzip.is_some() {
+            let mut encoded = BytesMut::new();
+            if let Some(chunk) = body.as_ref() {
+                if let Some(encoder) = ctx.gzip.as_mut() {
+                    encoded.extend_from_slice(&encoder.write(chunk));
+                }
+            }
+            if end_of_stream {
+                if let Some(encoder) = ctx.gzip.take() {
+                    encoded.extend_from_slice(&encoder.finish());
+                }
+            }
+            *body = if encoded.is_empty() {
+                None
+            } else {
+                Some(encoded.freeze())
+            };
+            return Ok(None);
+        }
         if let Some(sink) = ctx.range_sink.as_mut() {
             let mut reached_fill_end = false;
             if let Some(chunk) = body.as_ref() {
@@ -1676,7 +1757,7 @@ impl DataPlaneProxy {
         }
 
         let conditional = match tokio::time::timeout(
-            Duration::from_millis(plan.timeout_ms),
+            Duration::from_millis(plan.read_timeout_ms),
             self.state.origin.request_with_sni(
                 &target.url,
                 &Method::GET,
@@ -2193,11 +2274,10 @@ impl DataPlaneProxy {
             origin_host,
             origins: domain.origins.clone(),
             backup_url: domain.backup_origin_url.clone(),
-            timeout_ms: u64::from(if domain.origin_timeout_ms == 0 {
-                10_000
-            } else {
-                domain.origin_timeout_ms
-            }),
+            connect_timeout_ms: effective_connect_timeout_ms(
+                domain.origin_timeout_ms,
+                self.state.origin.connect_timeout_ms(),
+            ),
             read_timeout_ms: self.state.origin_read_timeout_ms,
             cache_reason: request_reason,
             policy,
@@ -3080,14 +3160,14 @@ impl DataPlaneProxy {
         addr: SocketAddr,
         host: &str,
         tls: bool,
-        timeout_ms: u64,
+        connect_timeout_ms: u64,
         read_timeout_ms: u64,
         sni: Option<&str>,
     ) -> Result<Box<HttpPeer>> {
         // Pass a resolved address to avoid Pingora's panicking DNS path.
         let server_name = sni.filter(|s| !s.is_empty()).unwrap_or(host);
         let mut peer = HttpPeer::new(addr, tls, server_name.to_string());
-        peer.options.connection_timeout = Some(Duration::from_millis(timeout_ms));
+        peer.options.connection_timeout = Some(Duration::from_millis(connect_timeout_ms));
         peer.options.read_timeout = Some(Duration::from_millis(read_timeout_ms));
         Ok(Box::new(peer))
     }
@@ -3130,6 +3210,18 @@ impl DataPlaneProxy {
         };
         if let Some(peer) = session.client_addr().and_then(|a| a.as_inet()).copied() {
             axum_req.extensions_mut().insert(ConnectInfo(peer));
+        }
+        // The legacy handler cannot see this session, so forward the fact that
+        // the downstream connection was TLS. Without it the HTTPS redirect
+        // fires for requests that already arrived over HTTPS (HEAD, no-cache
+        // revalidation and other in-process fallbacks).
+        let downstream_tls = session
+            .digest()
+            .is_some_and(|digest| digest.ssl_digest.is_some());
+        if downstream_tls {
+            axum_req
+                .extensions_mut()
+                .insert(crate::server::host_util::TlsTerminated);
         }
 
         let resp = proxy_handler(State(self.state.clone()), axum_req).await;
@@ -3552,6 +3644,72 @@ fn header_vec(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Resolve the connect timeout for one domain.
+///
+/// `domain_override_ms` is the operator's per-domain setting; 0 means "inherit
+/// the edge-wide default". This is the only place the two settings meet, so the
+/// precedence is identical for every origin of a request.
+pub(crate) fn effective_connect_timeout_ms(domain_override_ms: u32, global_ms: u64) -> u64 {
+    if domain_override_ms > 0 {
+        u64::from(domain_override_ms)
+    } else {
+        global_ms
+    }
+}
+
+/// Add `Accept-Encoding` to `Vary` without discarding existing values.
+fn vary_on_accept_encoding(response: &mut ResponseHeader) -> Result<()> {
+    let already_present = response
+        .headers
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            value
+                .split(',')
+                .any(|field| field.trim().eq_ignore_ascii_case("accept-encoding"))
+        });
+    if already_present {
+        return Ok(());
+    }
+    let existing = response
+        .headers
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let value = if existing.is_empty() {
+        "Accept-Encoding".to_string()
+    } else {
+        format!("{existing}, Accept-Encoding")
+    };
+    response.insert_header(header::VARY, value)?;
+    Ok(())
+}
+
+/// A compressed representation is different representation data, so a strong
+/// validator must not be reused verbatim. `If-None-Match` uses weak comparison
+/// (RFC 9110 §13.1.2), so `W/` keeps 304 revalidation working.
+fn weaken_etag(response: &mut ResponseHeader) -> Result<()> {
+    let Some(etag) = response
+        .headers
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+    else {
+        return Ok(());
+    };
+    if etag.trim_start().starts_with("W/") {
+        return Ok(());
+    }
+    if let Ok(value) = HeaderValue::from_str(&format!("W/{etag}")) {
+        response.insert_header(header::ETAG, value)?;
+    }
+    Ok(())
+}
+
 fn cache_label(phase: CachePhase) -> &'static str {
     match phase {
         CachePhase::Hit => "HIT",
@@ -3697,7 +3855,19 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
     } else {
         pingora::server::configuration::Opt::parse_args()
     };
-    let mut server = Server::new(Some(opt))?;
+    // Pingora's own default is a single worker thread. With one thread, every
+    // downstream TLS handshake, WAF scan and upstream TLS handshake runs on the
+    // same core, so origin fetches queue behind each other. Size the service
+    // runtime from configuration (default: available CPUs).
+    let mut conf = pingora::server::configuration::ServerConf::new()
+        .ok_or_else(|| anyhow::anyhow!("cannot load default Pingora configuration"))?;
+    conf.threads = config.worker_threads.max(1);
+    tracing::info!(
+        threads = conf.threads,
+        listener_tasks_per_fd = conf.listener_tasks_per_fd,
+        "Pingora data plane runtime"
+    );
+    let mut server = Server::new_with_opt_and_conf(Some(opt), conf);
     server.bootstrap();
 
     let storage = Some(leak_storage_with_large(
@@ -3718,6 +3888,11 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
         management_on_data: config.admin_listen_addr.is_none(),
         origin_counter: std::sync::atomic::AtomicU64::new(0),
         dns_cache: OriginDnsCache::new(),
+        compression: CompressionConfig {
+            enabled: config.compression_enabled,
+            min_bytes: config.compression_min_bytes,
+            level: config.compression_level,
+        },
     };
     match std::net::TcpListener::bind(&config.listen_addr) {
         Ok(probe) => drop(probe),
@@ -3759,9 +3934,73 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 #[cfg(test)]
 mod tests {
     use super::{
-        fill_window, head_content_length_for_protocol, parse_single_range,
-        range_fill_is_candidate, valid_release_tag,
+        effective_connect_timeout_ms, fill_window, head_content_length_for_protocol,
+        parse_single_range, range_fill_is_candidate, valid_release_tag,
+        vary_on_accept_encoding, weaken_etag,
     };
+    use pingora::http::ResponseHeader;
+
+    fn header_values(response: &ResponseHeader, name: &str) -> Vec<String> {
+        response
+            .headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn vary_appends_accept_encoding_without_dropping_existing_values() {
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response.insert_header("vary", "Origin").unwrap();
+        vary_on_accept_encoding(&mut response).unwrap();
+        assert_eq!(
+            header_values(&response, "vary").join(", "),
+            "Origin, Accept-Encoding"
+        );
+
+        // Idempotent: a second pass must not duplicate the field.
+        vary_on_accept_encoding(&mut response).unwrap();
+        assert_eq!(
+            header_values(&response, "vary").join(", "),
+            "Origin, Accept-Encoding"
+        );
+
+        let mut bare = ResponseHeader::build(200, None).unwrap();
+        vary_on_accept_encoding(&mut bare).unwrap();
+        assert_eq!(header_values(&bare, "vary").join(", "), "Accept-Encoding");
+    }
+
+    #[test]
+    fn etag_is_weakened_once() {
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response.insert_header("etag", "\"abc\"").unwrap();
+        weaken_etag(&mut response).unwrap();
+        assert_eq!(header_values(&response, "etag"), vec!["W/\"abc\""]);
+
+        // Already weak: leave it untouched.
+        weaken_etag(&mut response).unwrap();
+        assert_eq!(header_values(&response, "etag"), vec!["W/\"abc\""]);
+
+        // No ETag: no header is synthesised.
+        let mut none = ResponseHeader::build(200, None).unwrap();
+        weaken_etag(&mut none).unwrap();
+        assert!(header_values(&none, "etag").is_empty());
+    }
+
+    /// A per-domain value of 0 must inherit the cluster default; any positive
+    /// value overrides it. This is the whole precedence rule between the two
+    /// settings, so it is worth pinning down.
+    #[test]
+    fn domain_connect_timeout_zero_inherits_global() {
+        assert_eq!(effective_connect_timeout_ms(0, 3_000), 3_000);
+        assert_eq!(effective_connect_timeout_ms(800, 3_000), 800);
+        assert_eq!(effective_connect_timeout_ms(15_000, 3_000), 15_000);
+        // A global of 0 is "unset" from configuration's point of view; the edge
+        // clamps it to >= 500 before it ever reaches here.
+        assert_eq!(effective_connect_timeout_ms(0, 500), 500);
+    }
 
     #[test]
     fn address_failure_retries_same_origin_before_failing_over() {

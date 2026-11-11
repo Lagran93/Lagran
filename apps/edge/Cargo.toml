@@ -55,3 +55,4 @@ flate2 = { workspace = true }
 httpdate = { workspace = true }
 ring = { workspace = true }
 webpki-roots = { workspace = true }
+tikv-jemallocator = { workspace = true }

@@ -3,6 +3,7 @@ pub mod acme_challenge;
 pub mod agent_auth;
 pub mod cache_diag;
 pub mod cc;
+pub mod compression;
 pub mod cert_store;
 pub mod challenge;
 pub mod bot_guard;

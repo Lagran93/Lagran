@@ -18,6 +18,29 @@ use tokio::sync::Mutex;
 
 use super::policy::stable_hash_str;
 
+/// How many directory entries one eviction pass may examine.
+///
+/// Eviction runs on the write path, so its cost must not scale with cache size.
+/// The previous implementation walked the whole tree, stat'ed every file and
+/// sorted all of them while holding `evict_lock`, which stalled every
+/// concurrent writer once the cache was full. A pass now walks shard
+/// directories from a rotating cursor and stops after this many entries; a
+/// cache that is still over budget is finished by the next write.
+///
+/// Sized against [`EVICT_VICTIM_BUDGET`]: a sample this large reliably yields
+/// enough old entries to fill the victim budget, while staying inside a single
+/// millisecond on local storage.
+const EVICT_ENTRY_BUDGET: usize = 256;
+
+/// How many entries one eviction pass may delete.
+///
+/// Each victim costs two `unlink` calls. Deleting a thousand entries in one
+/// pass turned a single `set` into a ~100 ms stall on overlay/tmpfs, because
+/// the write path waits for eviction to finish. Capping the victims keeps the
+/// per-write cost predictable; a cache that is still over budget is trimmed by
+/// the following writes.
+const EVICT_VICTIM_BUDGET: usize = 64;
+
 #[derive(Serialize, Deserialize)]
 struct DiskMeta {
     /// Cache key this entry belongs to (used by purge). Absent on legacy files.
@@ -40,6 +63,9 @@ pub struct DiskCache {
     entries: AtomicUsize,
     /// Serialises eviction scans only; normal writes do not take this lock.
     evict_lock: Mutex<()>,
+    /// Shard index the next eviction pass starts from, so successive passes
+    /// cover the whole tree without any single pass walking all of it.
+    evict_cursor: AtomicUsize,
 }
 
 impl DiskCache {
@@ -54,6 +80,7 @@ impl DiskCache {
             used_bytes: AtomicU64::new(used),
             entries: AtomicUsize::new(count),
             evict_lock: Mutex::new(()),
+            evict_cursor: AtomicUsize::new(0),
         })
     }
 
@@ -120,16 +147,34 @@ impl DiskCache {
             freed += m.len();
         }
         if fs::remove_file(meta_path).await.is_ok() || fs::remove_file(bin_path).await.is_ok() {
-            self.used_bytes.fetch_sub(
-                freed.min(self.used_bytes.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
-            self.entries.fetch_sub(1, Ordering::Relaxed);
+            // Saturating updates: `fetch_sub` wraps to `u64::MAX` when two
+            // concurrent removals account for the same bytes, which would make
+            // `used_bytes` permanently over budget and `len()` report nonsense.
+            self.used_bytes
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    Some(used.saturating_sub(freed))
+                })
+                .ok();
+            self.entries
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .ok();
         }
         let _ = fs::remove_file(bin_path).await;
     }
 
-    /// Drop oldest files (by mtime) until usage is back under 90% of the cap.
+    /// Evict least-recently-used entries until usage is back under 90% of the
+    /// cap, examining at most [`EVICT_ENTRY_BUDGET`] directory entries per pass.
+    ///
+    /// The pass walks shard directories starting at a rotating cursor, so it
+    /// samples the cache instead of rescanning it: memory and latency stay
+    /// bounded no matter how many files are on disk. If the cache is still over
+    /// budget afterwards, the next write continues where this one stopped.
+    ///
+    /// Entries are removed as a `(meta, bin)` pair. Deleting the two files
+    /// independently (as the previous version did) could leave an orphaned
+    /// body or sidecar behind and drift `entries` below the real file count.
     async fn evict_overflow(&self) {
         if self.max_bytes == 0 || self.used_bytes.load(Ordering::Relaxed) <= self.max_bytes {
             return;
@@ -141,21 +186,39 @@ impl DiskCache {
             return;
         }
         let target = self.max_bytes / 10 * 9;
-        let mut files = Vec::new();
-        let mut stack = vec![self.root.clone()];
-        while let Some(dir) = stack.pop() {
-            let mut rd = match fs::read_dir(&dir).await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let Ok(ft) = ent.file_type().await else {
+
+        let shards = 256usize;
+        let start = self.evict_cursor.load(Ordering::Relaxed) % shards;
+        // Collect the sample on a blocking thread. Each candidate needs a
+        // `read_dir` entry plus one `stat` for its body; awaiting those one at
+        // a time on the runtime turned a 2048-entry sample into ~100 ms of
+        // sequential syscalls. `spawn_blocking` runs them back-to-back without
+        // involving the async scheduler, and keeps the shard walk off the
+        // request threads.
+        let root = self.root.clone();
+        let sample = tokio::task::spawn_blocking(move || {
+            let mut candidates: Vec<(u64, u64, PathBuf, PathBuf)> = Vec::new();
+            let mut examined = 0usize;
+            let mut cursor = start;
+            'scan: for offset in 0..shards {
+                let shard = (start + offset) % shards;
+                cursor = shard;
+                let dir = root.join(format!("{shard:02x}"));
+                let Ok(rd) = std::fs::read_dir(&dir) else {
                     continue;
                 };
-                if ft.is_dir() {
-                    stack.push(ent.path());
-                } else if ft.is_file() {
-                    let Ok(meta) = ent.metadata().await else {
+                for ent in rd.flatten() {
+                    if examined >= EVICT_ENTRY_BUDGET {
+                        break 'scan;
+                    }
+                    examined += 1;
+                    let path = ent.path();
+                    // Only sidecars are considered; the body path is derived
+                    // from it so a victim is always a complete pair.
+                    if path.extension().is_none_or(|e| e != "meta") {
+                        continue;
+                    }
+                    let Ok(meta) = ent.metadata() else {
                         continue;
                     };
                     let mtime = meta
@@ -164,25 +227,54 @@ impl DiskCache {
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    files.push((mtime, meta.len(), ent.path()));
+                    let bin = path.with_extension("bin");
+                    let bin_len = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+                    candidates.push((mtime, bin_len + meta.len(), path, bin));
                 }
             }
-        }
-        files.sort_by_key(|(mtime, _, _)| *mtime);
+            (candidates, examined, cursor)
+        })
+        .await
+        .unwrap_or_default();
+        let (mut candidates, examined, cursor) = sample;
+        self.evict_cursor
+            .store((cursor + 1) % shards, Ordering::Relaxed);
+        // The sampled entries are evicted oldest-first; that approximates LRU
+        // across the sample without needing a full sort of the cache.
+        candidates.sort_unstable_by_key(|(mtime, _, _, _)| *mtime);
+
         let mut freed = 0u64;
         let mut victims = 0usize;
-        for (_, len, path) in files {
-            if used.saturating_sub(freed) <= target {
+        for (_, size, meta_path, bin_path) in candidates {
+            if used.saturating_sub(freed) <= target || victims >= EVICT_VICTIM_BUDGET {
                 break;
             }
-            if fs::remove_file(&path).await.is_ok() {
-                freed += len;
+            let meta_removed = fs::remove_file(&meta_path).await.is_ok();
+            let bin_removed = fs::remove_file(&bin_path).await.is_ok();
+            if meta_removed || bin_removed {
+                freed += size;
                 victims += 1;
             }
         }
-        self.used_bytes.fetch_sub(freed, Ordering::Relaxed);
-        self.entries.fetch_sub(victims, Ordering::Relaxed);
-        tracing::warn!(freed, victims, "disk cache evicted oldest entries");
+        self.used_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                Some(u.saturating_sub(freed))
+            })
+            .ok();
+        self.entries
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(victims))
+            })
+            .ok();
+        if victims > 0 {
+            tracing::warn!(
+                freed,
+                victims,
+                examined,
+                remaining = self.used_bytes.load(Ordering::Relaxed),
+                "disk cache evicted oldest sampled entries"
+            );
+        }
     }
 }
 
@@ -571,6 +663,68 @@ mod tests {
         }
         assert!(cache.len().await >= 2, "cache should retain recent entries");
         assert!(cache.used_bytes.load(Ordering::Relaxed) <= 4096 + 4096 / 4);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Incremental eviction must still converge: after enough writes the cache
+    /// has to be back under the cap, not stuck just above it because each pass
+    /// only sampled a slice of the tree.
+    #[tokio::test]
+    async fn incremental_eviction_converges_under_cap() {
+        let dir = std::env::temp_dir().join(format!("lagran-disk-converge-{}", std::process::id()));
+        let cap = 64 * 1024;
+        let cache = DiskCache::new(&dir, cap).await.unwrap();
+        let body = Bytes::from(vec![7u8; 4096]);
+        // Many more objects than fit, so eviction has to run repeatedly.
+        for i in 0..400 {
+            let e = CacheEntry::new(200, vec![], body.clone());
+            cache.set(&format!("GET:c.test/{i}"), e, 60).await;
+        }
+        assert!(
+            cache.used_bytes.load(Ordering::Relaxed) <= cap,
+            "usage must settle at or below the cap, got {}",
+            cache.used_bytes.load(Ordering::Relaxed)
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Eviction removes a `.meta`/`.bin` pair, so no orphaned half-entries are
+    /// left behind and the entry count matches the files on disk.
+    #[tokio::test]
+    async fn eviction_leaves_no_orphan_files() {
+        let dir = std::env::temp_dir().join(format!("lagran-disk-orphan-{}", std::process::id()));
+        let cache = DiskCache::new(&dir, 32 * 1024).await.unwrap();
+        let body = Bytes::from(vec![1u8; 2048]);
+        for i in 0..120 {
+            let e = CacheEntry::new(200, vec![], body.clone());
+            cache.set(&format!("GET:o.test/{i}"), e, 60).await;
+        }
+
+        let mut meta_files = 0usize;
+        let mut bin_files = 0usize;
+        let mut stack = vec![dir.clone()];
+        while let Some(current) = stack.pop() {
+            let mut rd = tokio::fs::read_dir(&current).await.unwrap();
+            while let Some(ent) = rd.next_entry().await.unwrap() {
+                let ft = ent.file_type().await.unwrap();
+                if ft.is_dir() {
+                    stack.push(ent.path());
+                } else if ent.path().extension().is_some_and(|e| e == "meta") {
+                    meta_files += 1;
+                } else if ent.path().extension().is_some_and(|e| e == "bin") {
+                    bin_files += 1;
+                }
+            }
+        }
+        assert_eq!(
+            meta_files, bin_files,
+            "every sidecar must have a body and vice versa"
+        );
+        assert_eq!(
+            meta_files,
+            cache.len().await,
+            "entry count must match the number of sidecars"
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

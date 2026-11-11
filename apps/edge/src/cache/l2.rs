@@ -335,10 +335,10 @@ impl CacheBackend for RedisL2Cache {
     }
 
     async fn has_local(&self, key: &str) -> bool {
-        matches!(
-            self.local.get_result(key).await,
-            CacheGetResult::Hit(_) | CacheGetResult::Stale(_)
-        )
+        // Delegate to the local backend's non-promoting probe. Falling back to
+        // `get_result` here would take the L1 LRU lock and refresh recency for
+        // a read that only asks "is a lock needed?".
+        self.local.has_local(key).await
     }
 
     async fn set(&self, key: &str, entry: CacheEntry, ttl_secs: u64) {

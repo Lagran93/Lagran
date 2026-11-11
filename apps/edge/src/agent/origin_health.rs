@@ -127,6 +127,35 @@ impl OriginHealthMap {
         state.healthy
     }
 
+    /// Mark an origin unhealthy immediately after a hard connectivity failure
+    /// observed on the request path (connect error, connect timeout, TLS
+    /// handshake timeout).
+    ///
+    /// [`OriginHealthMap::record`] deliberately applies hysteresis because it
+    /// is fed by scheduled probes. On the request path that hysteresis is
+    /// expensive: a dead origin keeps being selected and every fetch waits out
+    /// the connect timeout. Flipping the flag now routes subsequent requests to
+    /// the next origin; the periodic prober still restores the state after
+    /// `recover_threshold` successes, and `origin_order` falls back to the full
+    /// pool when nothing is healthy, so capacity is never lost.
+    pub async fn record_origin_failure(&self, domain: &str, origin_url: &str, err: &str) {
+        let key = origin_key(domain, origin_url);
+        let mut map = self.inner.write().await;
+        let state = map.entry(key).or_default();
+        state.consecutive_fail = self.fail_threshold.max(1);
+        state.consecutive_ok = 0;
+        state.last_error = err.to_string();
+        if state.healthy {
+            state.healthy = false;
+            tracing::warn!(
+                domain,
+                origin = origin_url,
+                error = %err,
+                "origin marked unhealthy after a request-path failure"
+            );
+        }
+    }
+
     /// Force state (e.g. admin override).
     pub async fn set(&self, domain: &str, healthy: bool) {
         let mut map = self.inner.write().await;
@@ -293,10 +322,38 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::run_limited;
+    use super::{run_limited, OriginHealthMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A request-path connectivity failure must bypass probe hysteresis: one
+    /// dead origin otherwise keeps being selected and every fetch waits out the
+    /// connect timeout. The scheduled prober still has to restore it.
+    #[tokio::test]
+    async fn request_path_failure_flips_origin_immediately() {
+        let map = OriginHealthMap::with_thresholds(3, 2);
+        let domain = "a.test";
+        let origin = "https://origin.test";
+        assert!(map.is_origin_healthy(domain, origin).await);
+
+        map.record_origin_failure(domain, origin, "connect timeout")
+            .await;
+        assert!(
+            !map.is_origin_healthy(domain, origin).await,
+            "a hard failure must mark the origin unhealthy at once"
+        );
+        assert!(
+            map.is_origin_healthy(domain, "https://backup.test").await,
+            "other origins of the same domain must be unaffected"
+        );
+
+        // Recovery still needs `recover_threshold` probe successes.
+        map.record_origin(domain, origin, true, 1, "").await;
+        assert!(!map.is_origin_healthy(domain, origin).await);
+        map.record_origin(domain, origin, true, 1, "").await;
+        assert!(map.is_origin_healthy(domain, origin).await);
+    }
 
     #[tokio::test]
     async fn probe_tasks_run_concurrently_with_a_fixed_limit() {

@@ -411,11 +411,10 @@ pub(crate) fn build(
     let origin = origin_config(row);
     let backup = backup_config(row);
     let origins = origin_pool(row);
-    let timeout = if row.origin_timeout_ms <= 0 {
-        10_000
-    } else {
-        row.origin_timeout_ms as u32
-    };
+    // 0 means "inherit the edge-wide ORIGIN_CONNECT_TIMEOUT_MS"; the edge
+    // resolves the actual value. Do not substitute a default here, otherwise
+    // the per-domain override would always win over the cluster default.
+    let timeout = row.origin_timeout_ms.max(0) as u32;
     let rps = row.rate_limit_rps.max(0) as u32;
     let burst = row.rate_limit_burst.max(0) as u32;
     let cc = CcConfigOut {

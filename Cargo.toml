@@ -64,4 +64,17 @@ regex = "1"
 ring = "0.17"
 webpki-roots = "1"
 
+# Global allocator for the long-running servers. glibc malloc's per-arena
+# contention shows up on the multi-threaded edge data plane, which allocates
+# constantly (header vectors, access-log records, WAF decoding).
+tikv-jemallocator = "0.6"
+
 lagran-cache = { path = "crates/lagran-cache" }
+
+# The edge data plane is a hot loop over Pingora/hyper generics, so cross-crate
+# inlining is worth the longer build. `panic = "abort"` is deliberately NOT set:
+# tokio isolates a panicking task with unwinding, and aborting would turn one
+# bad request into a full node outage.
+[profile.release]
+lto = "thin"
+codegen-units = 1

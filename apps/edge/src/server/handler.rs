@@ -274,7 +274,7 @@ async fn proxy_handler_inner(
         headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok()),
-        req.extensions().get::<host_util::TlsSni>().is_some(),
+        host_util::request_is_tls(&req),
     );
     let client_ip = identity
         .ip
@@ -442,11 +442,10 @@ async fn proxy_handler_inner(
                 custom_headers: e.custom_headers.clone(),
                 origin_auth_header: e.origin_auth_header.clone(),
                 origin_auth_value: e.origin_auth_value.clone(),
-                timeout_ms: u64::from(if e.origin_timeout_ms == 0 {
-                    10_000
-                } else {
-                    e.origin_timeout_ms
-                }),
+                // Budget for the whole legacy request (WebSocket handshake,
+                // conditional revalidation, pass-through). The per-domain
+                // `origin_timeout_ms` is a TCP connect override, not this.
+                timeout_ms: state.origin_read_timeout_ms,
             }
         }
         None => {
@@ -473,7 +472,7 @@ async fn proxy_handler_inner(
                 custom_headers: String::new(),
                 origin_auth_header: String::new(),
                 origin_auth_value: String::new(),
-                timeout_ms: 10_000,
+                timeout_ms: state.origin_read_timeout_ms,
             }
         }
     };
@@ -1519,6 +1518,19 @@ async fn fetch_origin(
         result = attempt(target.clone()).await;
         if result.is_ok() {
             break;
+        }
+        if matches!(result, Err(FetchError::Timeout) | Err(FetchError::Failed(_))) {
+            // Fail over immediately: without this, a dead origin keeps being
+            // selected until the scheduled prober flips it, and every fetch
+            // waits out the full timeout.
+            let reason = match &result {
+                Err(e) => e.to_string(),
+                Ok(_) => String::new(),
+            };
+            state
+                .origin_health
+                .record_origin_failure(host, &target.url, &reason)
+                .await;
         }
         tracing::warn!(origin = %target.url, "origin failed, trying next origin");
     }

@@ -1541,7 +1541,9 @@ pub async fn put_settings(
         req.ignore_query_string,
         req.cors_origins.as_deref(),
         hotlink_referers.as_deref(),
-        req.origin_timeout_ms.map(|v| v as i32),
+        // 0 = inherit the edge-wide default; clamp to the same upper bound the
+        // edge accepts for the global setting.
+        req.origin_timeout_ms.map(|v| v.min(60_000) as i32),
         req.custom_headers.as_deref(),
         req.rate_limit_rps.map(|v| v as i32),
         req.rate_limit_burst.map(|v| v as i32),

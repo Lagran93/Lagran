@@ -19,6 +19,12 @@ pub struct EdgeConfig {
     /// Optional isolated listener for control-plane management endpoints.
     /// When unset, management stays on `listen_addr` for compatibility.
     pub admin_listen_addr: Option<String>,
+    /// Worker threads for the Pingora data plane.
+    ///
+    /// Pingora's own default is a single thread, which serialises downstream
+    /// TLS, WAF scanning and upstream TLS handshakes. Every origin fetch then
+    /// queues behind the handshake of the previous one.
+    pub worker_threads: usize,
     pub https_listen_addr: Option<String>,
     pub origin_url: String,
     pub default_ttl_secs: u64,
@@ -88,6 +94,22 @@ pub struct EdgeConfig {
     /// headers that do not vary the response body, such as Accept-Language on
     /// a single-language site, so prefetch and browsers share one object.
     pub cache_key_ignore_headers: Vec<String>,
+    /// TCP connect timeout to an origin.
+    ///
+    /// Deliberately separate from `origin_read_timeout_ms` and from the
+    /// per-domain request timeout: a dead origin must fail over in seconds,
+    /// not stall every fetch for the whole request budget.
+    pub origin_connect_timeout_ms: u64,
+    /// Gzip responses to clients when the origin returned identity.
+    ///
+    /// Origin fetches always request identity so the shared cache stores one
+    /// reusable representation; compression is applied per client on the way
+    /// out.
+    pub compression_enabled: bool,
+    /// Bodies smaller than this are not compressed.
+    pub compression_min_bytes: usize,
+    /// gzip level, 1 (fastest) to 9 (smallest).
+    pub compression_level: u32,
     /// Idle timeout while waiting for origin response bytes. This is separate
     /// from the per-domain connect/header timeout so media streams are not
     /// aborted just because the whole object takes longer than 10s.
@@ -152,6 +174,15 @@ impl Default for EdgeConfig {
         Self {
             listen_addr: listen,
             admin_listen_addr,
+            worker_threads: std::env::var("EDGE_WORKER_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                })
+                .clamp(1, 256),
             https_listen_addr,
             origin_url: std::env::var("ORIGIN_URL")
                 .unwrap_or_else(|_| "https://example.com".into()),
@@ -252,6 +283,29 @@ impl Default for EdgeConfig {
                 .map(|name| name.trim().to_ascii_lowercase())
                 .filter(|name| !name.is_empty())
                 .collect(),
+            origin_connect_timeout_ms: std::env::var("ORIGIN_CONNECT_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3_000)
+                .clamp(500, 60_000),
+            compression_enabled: std::env::var("EDGE_COMPRESSION")
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no" | "disabled"
+                    )
+                })
+                .unwrap_or(true),
+            compression_min_bytes: std::env::var("EDGE_COMPRESSION_MIN_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024)
+                .clamp(0, 1024 * 1024),
+            compression_level: std::env::var("EDGE_COMPRESSION_LEVEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4)
+                .clamp(1, 9),
             origin_read_timeout_ms: std::env::var("ORIGIN_READ_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())

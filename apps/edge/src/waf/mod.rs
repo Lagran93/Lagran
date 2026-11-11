@@ -14,6 +14,7 @@ pub mod geo;
 pub mod rulepack;
 
 use axum::http::HeaderMap;
+use std::borrow::Cow;
 use std::net::IpAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -304,6 +305,28 @@ impl WafConfig {
     /// True when a Geo/ASN allow-list gate is active.
     pub fn has_geo_allow(&self) -> bool {
         !self.country_allow.is_empty() || !self.asn_allow.is_empty()
+    }
+
+    /// Sort the rule list once at configuration time.
+    ///
+    /// The evaluator used to filter and sort a fresh `Vec` on every request.
+    /// Config construction is the right place for that work: rules are static
+    /// between config syncs.
+    pub fn finalize(&mut self) {
+        self.rules.retain(|rule| rule.enabled);
+        // Highest priority first; ties keep declaration order (stable sort).
+        self.rules
+            .sort_by_key(|rule| std::cmp::Reverse(rule.priority));
+    }
+
+    /// Whether [`WafConfig::finalize`] already prepared `rules` for the hot
+    /// path (sorted by descending priority, no disabled entries).
+    fn rules_are_finalized(&self) -> bool {
+        self.rules.iter().all(|rule| rule.enabled)
+            && self
+                .rules
+                .windows(2)
+                .all(|pair| pair[0].priority >= pair[1].priority)
     }
 }
 
@@ -631,6 +654,7 @@ fn header_value(headers: &HeaderMap, name: &str) -> String {
         .and_then(|v| v.to_str().ok())
         .map(decode_lower)
         .unwrap_or_default()
+        .into_owned()
 }
 
 fn level_verdict(
@@ -669,11 +693,23 @@ fn level_verdict(
 }
 
 /// Percent-decode then lower-case (ASCII). Invalid escapes are kept verbatim.
-pub fn decode_lower(input: &str) -> String {
+pub fn decode_lower(input: &str) -> Cow<'_, str> {
     decode_lower_once(input)
 }
 
-fn decode_lower_once(input: &str) -> String {
+/// Whether a single pass of [`decode_lower_once`] would change the input.
+///
+/// Paths, queries and header values are overwhelmingly already lower-case and
+/// escape-free, so the common case can borrow instead of allocating. The check
+/// and the transform are fused into one scan to avoid reading the input twice.
+fn needs_decode_lower(input: &str) -> bool {
+    input.bytes().any(|b| b == b'%' || b.is_ascii_uppercase())
+}
+
+fn decode_lower_once(input: &str) -> Cow<'_, str> {
+    if !needs_decode_lower(input) {
+        return Cow::Borrowed(input);
+    }
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -690,16 +726,17 @@ fn decode_lower_once(input: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).to_ascii_lowercase()
+    Cow::Owned(String::from_utf8_lossy(&out).to_ascii_lowercase())
 }
 
 /// Decode twice so `%2527`/`%253Cscript%253E` cannot hide behind one layer of
 /// encoding. Only decode a second time when the first pass still contains `%`,
 /// keeping normal requests cheap.
-fn decode_lower_twice(input: &str) -> String {
+fn decode_lower_twice(input: &str) -> Cow<'_, str> {
     let once = decode_lower_once(input);
     if once.contains('%') {
-        decode_lower_once(&once)
+        // The second pass may borrow from `once`, which is local: own it.
+        Cow::Owned(decode_lower_once(&once).into_owned())
     } else {
         once
     }
@@ -709,27 +746,97 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
 
-/// Evaluate the WAF for one request. Returns the first matching verdict.
-fn eval_dsl(
-    expr: &lagran_waf_dsl::Expr,
-    req: &WafRequest,
-    path: &str,
-    query: &str,
-    ua: &str,
-    referer: &str,
-    method: &str,
-    ip_text: &str,
-) -> bool {
-    match expr {
-        lagran_waf_dsl::Expr::And(parts) => parts.iter().all(|part| {
-            eval_dsl(part, req, path, query, ua, referer, method, ip_text)
-        }),
-        lagran_waf_dsl::Expr::Or(parts) => parts.iter().any(|part| {
-            eval_dsl(part, req, path, query, ua, referer, method, ip_text)
-        }),
-        lagran_waf_dsl::Expr::Not(inner) => {
-            !eval_dsl(inner, req, path, query, ua, referer, method, ip_text)
+/// Exactly equivalent to `contains` on `parts.join(separators)`, without
+/// building the joined string.
+///
+/// The evaluator used to materialise `format!("{path}?{query} {ua} {referer}")`
+/// on every request. Signatures such as `"union select"` contain the separator
+/// themselves, so simply scanning each component separately would drop
+/// boundary-spanning matches and weaken detection. This keeps the original
+/// semantics: a cheap per-component scan first (which covers virtually every
+/// real match), then a boundary scan only for needles that actually contain a
+/// separator.
+fn contains_joined(parts: &[&str], separators: &[char], needle: &str) -> bool {
+    if parts.iter().any(|part| part.contains(needle)) {
+        return true;
+    }
+    if !needle.chars().any(|c| separators.contains(&c)) {
+        return false;
+    }
+    if separators.len() + 1 != parts.len() {
+        return false;
+    }
+    let needle = needle.as_bytes();
+    for (index, part) in parts.iter().enumerate() {
+        if index + 1 == parts.len() {
+            break;
         }
+        // A boundary-spanning match must start within the last `len - 1` bytes
+        // of this part, so the scan stays proportional to the needle length
+        // instead of the component length.
+        let earliest = part.len().saturating_sub(needle.len().saturating_sub(1));
+        for start in earliest..=part.len() {
+            if matches_joined_at(parts, separators, index, start, needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Try to match `needle` starting at byte `offset` of `parts[part_index]`,
+/// continuing across the separators between components.
+fn matches_joined_at(
+    parts: &[&str],
+    separators: &[char],
+    mut part_index: usize,
+    mut offset: usize,
+    needle: &[u8],
+) -> bool {
+    let mut matched = 0usize;
+    loop {
+        if matched == needle.len() {
+            return true;
+        }
+        let part = parts[part_index].as_bytes();
+        if offset < part.len() {
+            if part[offset] != needle[matched] {
+                return false;
+            }
+            offset += 1;
+            matched += 1;
+            continue;
+        }
+        if part_index + 1 >= parts.len() {
+            return false;
+        }
+        let mut buffer = [0_u8; 4];
+        for byte in separators[part_index].encode_utf8(&mut buffer).bytes() {
+            if matched == needle.len() {
+                return true;
+            }
+            if byte != needle[matched] {
+                return false;
+            }
+            matched += 1;
+        }
+        part_index += 1;
+        offset = 0;
+    }
+}
+
+fn contains_any_joined(parts: &[&str], separators: &[char], needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| contains_joined(parts, separators, needle))
+}
+
+/// Evaluate a parsed DSL expression against the decoded request fields.
+fn eval_dsl(expr: &lagran_waf_dsl::Expr, fields: &RuleFields<'_, '_>) -> bool {
+    match expr {
+        lagran_waf_dsl::Expr::And(parts) => parts.iter().all(|part| eval_dsl(part, fields)),
+        lagran_waf_dsl::Expr::Or(parts) => parts.iter().any(|part| eval_dsl(part, fields)),
+        lagran_waf_dsl::Expr::Not(inner) => !eval_dsl(inner, fields),
         lagran_waf_dsl::Expr::Condition { field, op, value } => {
             let op = match op {
                 lagran_waf_dsl::Op::Contains => WafOp::Contains,
@@ -739,7 +846,7 @@ fn eval_dsl(
                 lagran_waf_dsl::Op::In => WafOp::In,
             };
             if op == WafOp::In {
-                let Ok(ip) = ip_text.parse::<IpAddr>() else {
+                let Ok(ip) = fields.ip_text.parse::<IpAddr>() else {
                     return false;
                 };
                 return value.split(',').any(|part| {
@@ -749,15 +856,15 @@ fn eval_dsl(
                 });
             }
             if let lagran_waf_dsl::Field::Header(name) = field {
-                return op.matches(&header_value(req.headers, name), value);
+                return op.matches(&header_value(fields.req.headers, name), value);
             }
             let haystack = match field {
-                lagran_waf_dsl::Field::Path => path,
-                lagran_waf_dsl::Field::Query => query,
-                lagran_waf_dsl::Field::UserAgent => ua,
-                lagran_waf_dsl::Field::Referer => referer,
-                lagran_waf_dsl::Field::Method => method,
-                lagran_waf_dsl::Field::Ip => ip_text,
+                lagran_waf_dsl::Field::Path => fields.path,
+                lagran_waf_dsl::Field::Query => fields.query,
+                lagran_waf_dsl::Field::UserAgent => fields.ua,
+                lagran_waf_dsl::Field::Referer => fields.referer,
+                lagran_waf_dsl::Field::Method => fields.method,
+                lagran_waf_dsl::Field::Ip => fields.ip_text,
                 lagran_waf_dsl::Field::Header(_) => unreachable!(),
             };
             op.matches(haystack, value)
@@ -790,9 +897,14 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     // Deny always wins over allow. When the MaxMind databases are unavailable
     // the lookup yields nothing: deny rules cannot match, while an active
     // allow-list gate fails closed (traffic is blocked) until data is loaded.
-    let country = req.country.map(str::to_ascii_uppercase);
-    if let Some(code) = country.as_deref() {
-        if cfg.country_deny.iter().any(|item| item == code) {
+    // Country codes are stored uppercase by `parse_countries`; compare without
+    // allocating a new String per request.
+    let country = req.country;
+    let country_matches = |list: &[String]| {
+        country.is_some_and(|code| list.iter().any(|item| item.eq_ignore_ascii_case(code)))
+    };
+    if let Some(code) = country {
+        if country_matches(&cfg.country_deny) {
             return Some(WafVerdict {
                 action: WafAction::Block,
                 rule_name: format!("国家/地区黑名单 ({code})"),
@@ -810,9 +922,7 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
         }
     }
     if cfg.has_geo_allow() {
-        let country_ok = country
-            .as_deref()
-            .is_some_and(|code| cfg.country_allow.iter().any(|item| item == code));
+        let country_ok = country_matches(&cfg.country_allow);
         let asn_ok = req.asn.is_some_and(|asn| cfg.asn_allow.contains(&asn));
         if !country_ok && !asn_ok {
             return Some(WafVerdict {
@@ -827,15 +937,22 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     let query = decode_lower_twice(req.query);
     let ua = decode_lower_twice(req.user_agent);
     let referer = decode_lower_twice(req.referer);
-    let haystack = format!("{path}?{query} {ua} {referer}");
 
-    if cfg.managed.sqli && contains_any(&haystack, SQLI) {
+    // The managed signatures run over "path?query ua referer". Concatenating
+    // that into one String allocated and copied every component on every
+    // request. `contains_any_joined` walks the same logical text without
+    // materialising it, including matches that straddle a separator.
+    let parts: [&str; 4] = [path.as_ref(), query.as_ref(), ua.as_ref(), referer.as_ref()];
+    const FULL_SEPS: [char; 3] = ['?', ' ', ' '];
+    const URL_SEPS: [char; 1] = ['?'];
+
+    if cfg.managed.sqli && contains_any_joined(&parts, &FULL_SEPS, SQLI) {
         return Some(verdict("SQL 注入", "sqli"));
     }
-    if cfg.managed.xss && contains_any(&haystack, XSS) {
+    if cfg.managed.xss && contains_any_joined(&parts, &FULL_SEPS, XSS) {
         return Some(verdict("XSS 跨站脚本", "xss"));
     }
-    if cfg.managed.traversal && contains_any(&haystack, TRAVERSAL) {
+    if cfg.managed.traversal && contains_any_joined(&parts, &FULL_SEPS, TRAVERSAL) {
         return Some(verdict("路径穿越", "traversal"));
     }
     if cfg.managed.scanners {
@@ -846,17 +963,16 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
             return Some(verdict("敏感路径探测", "scanners"));
         }
     }
-    let url_part = format!("{path}?{query}");
-    if cfg.managed.rce && contains_any(&haystack, RCE) {
+    if cfg.managed.rce && contains_any_joined(&parts, &FULL_SEPS, RCE) {
         return Some(verdict("命令执行", "rce"));
     }
-    if cfg.managed.log4shell && contains_any(&haystack, LOG4SHELL) {
+    if cfg.managed.log4shell && contains_any_joined(&parts, &FULL_SEPS, LOG4SHELL) {
         return Some(verdict("Log4Shell", "log4shell"));
     }
-    if cfg.managed.ssrf && contains_any(&url_part, SSRF) {
+    if cfg.managed.ssrf && contains_any_joined(&parts[..2], &URL_SEPS, SSRF) {
         return Some(verdict("SSRF / 云元数据", "ssrf"));
     }
-    if cfg.managed.xxe && contains_any(&haystack, XXE) {
+    if cfg.managed.xxe && contains_any_joined(&parts, &FULL_SEPS, XXE) {
         return Some(verdict("XXE 外部实体", "xxe"));
     }
     if cfg.managed.crlf
@@ -867,19 +983,19 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     {
         return Some(verdict("CRLF / 头注入", "crlf"));
     }
-    if cfg.managed.ssti && contains_any(&haystack, SSTI) {
+    if cfg.managed.ssti && contains_any_joined(&parts, &FULL_SEPS, SSTI) {
         return Some(verdict("模板注入 SSTI", "ssti"));
     }
-    if cfg.managed.nosql && contains_any(&url_part, NOSQL) {
+    if cfg.managed.nosql && contains_any_joined(&parts[..2], &URL_SEPS, NOSQL) {
         return Some(verdict("NoSQL 注入", "nosql"));
     }
-    if cfg.managed.ldap && contains_any(&haystack, LDAP) {
+    if cfg.managed.ldap && contains_any_joined(&parts, &FULL_SEPS, LDAP) {
         return Some(verdict("LDAP 注入", "ldap"));
     }
-    if cfg.managed.java && contains_any(&haystack, JAVA) {
+    if cfg.managed.java && contains_any_joined(&parts, &FULL_SEPS, JAVA) {
         return Some(verdict("Java 反序列化 / OGNL", "java"));
     }
-    if cfg.managed.webshell && contains_any(&haystack, WEBSHELL) {
+    if cfg.managed.webshell && contains_any_joined(&parts, &FULL_SEPS, WEBSHELL) {
         return Some(verdict("WebShell / PHP 注入", "webshell"));
     }
     if cfg.managed.protocol {
@@ -900,36 +1016,87 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
         }
     }
 
-    // Custom rules: highest priority first, first match wins.
-    let mut rules: Vec<&WafRule> = cfg.rules.iter().filter(|r| r.enabled).collect();
-    rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
-    let method = req.method.to_ascii_lowercase();
-    let ip_text = req.ip.map(|i| i.to_string()).unwrap_or_default();
-    for rule in rules {
-        let matched = if let Some(expr) = &rule.expr {
-            eval_dsl(expr, req, &path, &query, &ua, &referer, &method, &ip_text)
-        } else {
-            let value: String = match &rule.field {
-                WafField::Path => path.clone(),
-                WafField::Query => query.clone(),
-                WafField::UserAgent => ua.clone(),
-                WafField::Referer => referer.clone(),
-                WafField::Method => method.clone(),
-                WafField::Ip => ip_text.clone(),
-                WafField::Header(name) => header_value(req.headers, name),
-            };
-            rule.op.matches(&value, &rule.value)
-        };
-        if matched {
-            return Some(WafVerdict {
-                action: rule.action,
-                rule_name: rule.name.clone(),
-                category: "custom".into(),
-            });
+    // Custom rules: highest priority first, first match wins. `finalize`
+    // pre-sorts and filters the list during config construction, so the normal
+    // path iterates a slice instead of building and sorting a Vec per request.
+    let method = decode_lower(req.method);
+    let ip_text = match req.ip {
+        Some(ip) => Cow::Owned(ip.to_string()),
+        None => Cow::Borrowed(""),
+    };
+    let mut fields = RuleFields {
+        req,
+        path: path.as_ref(),
+        query: query.as_ref(),
+        ua: ua.as_ref(),
+        referer: referer.as_ref(),
+        method: method.as_ref(),
+        ip_text: ip_text.as_ref(),
+    };
+    if cfg.rules_are_finalized() {
+        for rule in cfg.rules.iter() {
+            if let Some(verdict) = rule_verdict(rule, &mut fields) {
+                return Some(verdict);
+            }
+        }
+    } else {
+        // Configs built outside `finalize` (tests, direct callers): order them
+        // here. This is the cold path and allocates, which is why `finalize`
+        // exists.
+        let mut rules: Vec<&WafRule> = cfg.rules.iter().filter(|r| r.enabled).collect();
+        rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
+        for rule in rules {
+            if let Some(verdict) = rule_verdict(rule, &mut fields) {
+                return Some(verdict);
+            }
         }
     }
 
     level_verdict(cfg.security_level, req.method, &path, &ua, req.headers)
+}
+
+/// Decoded request components a custom rule can be evaluated against.
+///
+/// Held by reference so a rule evaluation borrows the already-decoded values
+/// instead of cloning one `String` per rule, per request.
+struct RuleFields<'a, 'r> {
+    req: &'a WafRequest<'r>,
+    path: &'a str,
+    query: &'a str,
+    ua: &'a str,
+    referer: &'a str,
+    method: &'a str,
+    ip_text: &'a str,
+}
+
+impl RuleFields<'_, '_> {
+    fn value_for(&self, field: &WafField) -> Cow<'_, str> {
+        match field {
+            WafField::Path => Cow::Borrowed(self.path),
+            WafField::Query => Cow::Borrowed(self.query),
+            WafField::UserAgent => Cow::Borrowed(self.ua),
+            WafField::Referer => Cow::Borrowed(self.referer),
+            WafField::Method => Cow::Borrowed(self.method),
+            WafField::Ip => Cow::Borrowed(self.ip_text),
+            // Header lookups are rare and already decoded on demand.
+            WafField::Header(name) => Cow::Owned(header_value(self.req.headers, name)),
+        }
+    }
+}
+
+/// Evaluate one custom rule; `None` means it did not match.
+fn rule_verdict(rule: &WafRule, fields: &mut RuleFields<'_, '_>) -> Option<WafVerdict> {
+    let matched = if let Some(expr) = &rule.expr {
+        eval_dsl(expr, fields)
+    } else {
+        let value = fields.value_for(&rule.field);
+        rule.op.matches(&value, &rule.value)
+    };
+    matched.then(|| WafVerdict {
+        action: rule.action,
+        rule_name: rule.name.clone(),
+        category: "custom".into(),
+    })
 }
 
 fn verdict(name: &str, category: &str) -> WafVerdict {
@@ -1010,6 +1177,204 @@ mod tests {
             "traversal"
         );
         assert!(evaluate(&c, &req(&h, "/", "", "curl")).is_none());
+    }
+
+    /// The joined scan must agree exactly with the previous
+    /// `format!("{path}?{query} {ua} {referer}").contains(needle)` behaviour,
+    /// including needles that straddle a separator. This guards the security
+    /// property the refactor was not allowed to change.
+    #[test]
+    fn joined_scan_matches_concatenated_semantics() {
+        const SEPS: [char; 3] = ['?', ' ', ' '];
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("/a", "q=1", "curl", ""),
+            ("/search", "q=union select", "curl", ""),
+            ("/a", "", "wget http://x", ""),
+            ("/a", "x=1", "", "ref"),
+            ("", "", "", ""),
+            ("/a?", "b", "c", "d"),
+            ("/a", "b ", "c", "d"),
+            ("/a", "b", "c ", "d"),
+            ("/end", "", "", ""),
+        ];
+        // Needles chosen to exercise per-part matches, boundary matches and
+        // non-matches around every separator position.
+        let needles = [
+            "union select",
+            ";wget ",
+            ";curl ",
+            "?b",
+            "b ",
+            " c",
+            "?",
+            " ",
+            "a?b",
+            "a b",
+            "d",
+            "zzz",
+            "b c",
+            "c d",
+        ];
+        for (path, query, ua, referer) in cases {
+            let joined = format!("{path}?{query} {ua} {referer}");
+            let parts: [&str; 4] = [path, query, ua, referer];
+            for needle in needles {
+                assert_eq!(
+                    contains_joined(&parts, &SEPS, needle),
+                    joined.contains(needle),
+                    "mismatch for joined={joined:?} needle={needle:?}"
+                );
+            }
+        }
+    }
+
+    /// Same check for the two-component URL form used by SSRF/NoSQL.
+    #[test]
+    fn joined_scan_matches_url_semantics() {
+        const SEPS: [char; 1] = ['?'];
+        let cases: &[(&str, &str)] = &[
+            ("/proxy", "url=http://169.254.169.254/x"),
+            ("/a", ""),
+            ("/a?", ""),
+            ("/a", "?b"),
+            ("", ""),
+        ];
+        let needles = [
+            "169.254.169.254",
+            "file://",
+            "?url",
+            "a?b",
+            "?",
+            "zzz",
+            "$ne",
+        ];
+        for (path, query) in cases {
+            let joined = format!("{path}?{query}");
+            let parts: [&str; 2] = [path, query];
+            for needle in needles {
+                assert_eq!(
+                    contains_joined(&parts, &SEPS, needle),
+                    joined.contains(needle),
+                    "mismatch for joined={joined:?} needle={needle:?}"
+                );
+            }
+        }
+    }
+
+    /// `finalize` must preserve "highest priority wins, first match wins".
+    #[test]
+    fn finalize_sorts_and_drops_disabled_rules() {
+        let mut c = cfg();
+        c.rules = vec![
+            WafRule {
+                name: "low".into(),
+                field: WafField::Path,
+                op: WafOp::Prefix,
+                value: "/admin".into(),
+                action: WafAction::Log,
+                priority: 1,
+                enabled: true,
+                expr: None,
+            },
+            WafRule {
+                name: "disabled-high".into(),
+                field: WafField::Path,
+                op: WafOp::Prefix,
+                value: "/admin".into(),
+                action: WafAction::Block,
+                priority: 99,
+                enabled: false,
+                expr: None,
+            },
+            WafRule {
+                name: "high".into(),
+                field: WafField::Path,
+                op: WafOp::Prefix,
+                value: "/admin".into(),
+                action: WafAction::Block,
+                priority: 10,
+                enabled: true,
+                expr: None,
+            },
+        ];
+        c.finalize();
+        assert_eq!(c.rules.len(), 2, "disabled rule must be dropped");
+        assert_eq!(c.rules[0].name, "high");
+        assert_eq!(c.rules[1].name, "low");
+        assert!(c.rules_are_finalized());
+        let h = HeaderMap::new();
+        assert_eq!(
+            evaluate(&c, &req(&h, "/admin/x", "", "curl"))
+                .unwrap()
+                .rule_name,
+            "high"
+        );
+    }
+
+    /// An un-finalized config must still evaluate in priority order, because
+    /// tests and direct callers build `WafConfig` by hand.
+    #[test]
+    fn unsorted_rules_still_respect_priority() {
+        let mut c = cfg();
+        c.managed = ManagedRules {
+            sqli: false,
+            xss: false,
+            traversal: false,
+            scanners: false,
+            rce: false,
+            ssrf: false,
+            xxe: false,
+            log4shell: false,
+            crlf: false,
+            ssti: false,
+            nosql: false,
+            ldap: false,
+            java: false,
+            webshell: false,
+            protocol: false,
+        };
+        c.rules = vec![
+            WafRule {
+                name: "low".into(),
+                field: WafField::Path,
+                op: WafOp::Prefix,
+                value: "/admin".into(),
+                action: WafAction::Log,
+                priority: 1,
+                enabled: true,
+                expr: None,
+            },
+            WafRule {
+                name: "high".into(),
+                field: WafField::Path,
+                op: WafOp::Prefix,
+                value: "/admin".into(),
+                action: WafAction::Block,
+                priority: 10,
+                enabled: true,
+                expr: None,
+            },
+        ];
+        assert!(!c.rules_are_finalized());
+        let h = HeaderMap::new();
+        assert_eq!(
+            evaluate(&c, &req(&h, "/admin/x", "", "curl"))
+                .unwrap()
+                .rule_name,
+            "high"
+        );
+    }
+
+    /// `decode_lower` must borrow when nothing changes, and still decode and
+    /// lower-case otherwise (including double-encoded payloads).
+    #[test]
+    fn decode_lower_borrows_when_unchanged() {
+        assert!(matches!(decode_lower("/already/lower"), Cow::Borrowed(_)));
+        assert_eq!(decode_lower("/MiXeD"), "/mixed");
+        assert_eq!(decode_lower("%2F"), "/");
+        assert_eq!(decode_lower_twice("%2527"), "'");
+        // Invalid escapes stay verbatim rather than being dropped.
+        assert_eq!(decode_lower("%zz"), "%zz");
     }
 
     #[test]

@@ -19,6 +19,22 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::policy::stable_hash_str;
 
+/// How many directory entries one eviction pass may examine.
+///
+/// Eviction runs on the commit path, so its cost must not scale with the number
+/// of cached objects. A pass samples shard directories from a rotating cursor
+/// and stops here; any remaining overflow is handled by the next commit.
+/// Sized against [`EVICT_VICTIM_BUDGET`]: large enough that a sample reliably
+/// yields old victims, small enough to stay sub-millisecond.
+const EVICT_ENTRY_BUDGET: usize = 256;
+
+/// How many objects one eviction pass may delete.
+///
+/// Each victim costs two `unlink` calls plus a sidecar read. Capping the count
+/// keeps the commit path's tail latency predictable; any remaining overflow is
+/// trimmed by subsequent commits.
+const EVICT_VICTIM_BUDGET: usize = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LargeMeta {
     pub key: String,
@@ -336,6 +352,8 @@ pub struct LargeCache {
     used_bytes: AtomicU64,
     entries: AtomicUsize,
     evict_lock: Mutex<()>,
+    /// Shard index the next eviction pass starts from.
+    evict_cursor: AtomicUsize,
     /// One active range writer per object. A second request on the same key
     /// streams from origin normally instead of racing the sparse file/meta.
     range_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -375,6 +393,7 @@ impl LargeCache {
             used_bytes: AtomicU64::new(used),
             entries: AtomicUsize::new(count),
             evict_lock: Mutex::new(()),
+            evict_cursor: AtomicUsize::new(0),
             range_locks: Mutex::new(HashMap::new()),
         }))
     }
@@ -801,6 +820,16 @@ impl LargeCache {
         self.entries.load(Ordering::Relaxed)
     }
 
+    /// Evict least-recently-used objects until usage is back under 90% of the
+    /// cap, examining at most [`EVICT_ENTRY_BUDGET`] directory entries.
+    ///
+    /// Large-object eviction runs on the write path, right after an object
+    /// commits. The previous version recursively walked the whole tree,
+    /// stat'ed and re-read every sidecar, then sorted every path while holding
+    /// `evict_lock` — with a full cache of large files that is a multi-second
+    /// stall that also blocks every other writer. This pass samples shard
+    /// directories from a rotating cursor and finishes any remaining overflow
+    /// on the next commit.
     pub async fn evict_overflow(&self) {
         if self.max_bytes == 0 || self.used_bytes.load(Ordering::Relaxed) <= self.max_bytes {
             return;
@@ -811,54 +840,82 @@ impl LargeCache {
             return;
         }
         let target = self.max_bytes / 10 * 9;
-        let mut files = Vec::new();
-        let mut stack = vec![self.root.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(mut rd) = fs::read_dir(&dir).await else {
-                continue;
-            };
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let Ok(ft) = ent.file_type().await else {
+
+        let shards = 256usize;
+        let start = self.evict_cursor.load(Ordering::Relaxed) % shards;
+        // Sample on a blocking thread: every candidate needs a `stat` and a
+        // sidecar read, and awaiting those individually on the runtime made a
+        // single pass cost ~100 ms of sequential syscalls.
+        let root = self.root.clone();
+        let sample = tokio::task::spawn_blocking(move || {
+            // (mtime, accounted bytes, data path, meta path)
+            let mut candidates: Vec<(u64, u64, PathBuf, PathBuf)> = Vec::new();
+            let mut examined = 0usize;
+            let mut cursor = start;
+            'scan: for offset in 0..shards {
+                let shard = (start + offset) % shards;
+                cursor = shard;
+                let dir = root.join(format!("{shard:02x}"));
+                let Ok(rd) = std::fs::read_dir(&dir) else {
                     continue;
                 };
-                let path = ent.path();
-                if ft.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "data") {
-                    let Ok(meta) = ent.metadata().await else {
+                for ent in rd.flatten() {
+                    if examined >= EVICT_ENTRY_BUDGET {
+                        break 'scan;
+                    }
+                    examined += 1;
+                    let path = ent.path();
+                    if !path.to_string_lossy().ends_with(".meta.json") {
+                        continue;
+                    }
+                    let Ok(meta_stat) = ent.metadata() else {
                         continue;
                     };
-                    let mtime = meta
+                    let mtime = meta_stat
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    files.push((mtime, path));
+                    let base = path
+                        .to_string_lossy()
+                        .trim_end_matches(".meta.json")
+                        .to_string();
+                    let data = PathBuf::from(format!("{base}.data"));
+                    // `stored_bytes()` is the resident size of a sparse file,
+                    // which can be far smaller than the logical length. Reading
+                    // the sidecar keeps accounting honest.
+                    let stored = std::fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<LargeMeta>(&bytes).ok())
+                        .map(|row| row.stored_bytes())
+                        .unwrap_or_else(|| {
+                            std::fs::metadata(&data).map(|m| m.len()).unwrap_or(0)
+                        });
+                    candidates.push((mtime, stored + meta_stat.len(), data, path));
                 }
             }
-        }
-        files.sort_by_key(|(mtime, _)| *mtime);
+            (candidates, examined, cursor)
+        })
+        .await
+        .unwrap_or_default();
+        let (mut candidates, examined, cursor) = sample;
+        self.evict_cursor
+            .store((cursor + 1) % shards, Ordering::Relaxed);
+        candidates.sort_unstable_by_key(|(mtime, _, _, _)| *mtime);
+
         let mut freed = 0u64;
         let mut victims = 0usize;
-        for (_, data) in files {
-            if used.saturating_sub(freed) <= target {
+        for (_, size, data, meta) in candidates {
+            if used.saturating_sub(freed) <= target || victims >= EVICT_VICTIM_BUDGET {
                 break;
             }
-            let meta = data.with_extension("meta.json");
-            let data_len = fs::metadata(&data).await.map(|m| m.len()).unwrap_or(0);
-            let meta_len = fs::metadata(&meta).await.map(|m| m.len()).unwrap_or(0);
-            let stored = fs::read(&meta)
-                .await
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<LargeMeta>(&bytes).ok())
-                .map(|row| row.stored_bytes())
-                .unwrap_or(data_len);
-            if fs::remove_file(&data).await.is_ok() {
-                freed += stored + meta_len;
+            let data_removed = fs::remove_file(&data).await.is_ok();
+            let meta_removed = fs::remove_file(&meta).await.is_ok();
+            if data_removed || meta_removed {
+                freed += size;
                 victims += 1;
             }
-            let _ = fs::remove_file(&meta).await;
         }
         self.release_bytes(freed);
         self.entries
@@ -867,7 +924,13 @@ impl LargeCache {
             })
             .ok();
         if victims > 0 {
-            tracing::warn!(freed, victims, "large object cache evicted oldest entries");
+            tracing::warn!(
+                freed,
+                victims,
+                examined,
+                remaining = self.used_bytes.load(Ordering::Relaxed),
+                "large object cache evicted oldest sampled entries"
+            );
         }
     }
 }
@@ -1225,6 +1288,86 @@ mod tests {
         assert_eq!(entry.meta.segments, vec![(0, total - 1)]);
         let chunk = entry.read_at(2048, 16).await.unwrap().unwrap();
         assert_eq!(&chunk[..], &[3_u8; 16]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Incremental eviction must converge: after enough commits the large
+    /// cache has to be back under its cap rather than hovering just above it.
+    #[tokio::test]
+    async fn incremental_eviction_converges_under_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-large-converge-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let min = 1024 * 1024;
+        let cap = 8 * min;
+        let cache = LargeCache::open(&dir, min, 4 * min, cap).await.unwrap();
+        let body = vec![9_u8; min as usize];
+        for i in 0..24 {
+            let key = format!("GET:big.test:/obj{i}.bin");
+            let mut writer = cache
+                .begin(&key, 200, Vec::new(), min, 60, 0)
+                .await
+                .expect("writer");
+            writer.write_all(&body).await;
+            assert!(writer.commit().await);
+        }
+        assert!(
+            cache.used_bytes.load(Ordering::Relaxed) <= cap,
+            "usage must settle at or below the cap, got {}",
+            cache.used_bytes.load(Ordering::Relaxed)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A victim is removed as a `.data`/`.meta.json` pair, so eviction never
+    /// leaves a body without metadata (or vice versa) and the entry count
+    /// matches the sidecars on disk.
+    #[tokio::test]
+    async fn eviction_leaves_no_orphan_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-large-orphan-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let min = 1024 * 1024;
+        let cache = LargeCache::open(&dir, min, 2 * min, 6 * min).await.unwrap();
+        let body = vec![4_u8; min as usize];
+        for i in 0..16 {
+            let key = format!("GET:orph.test:/o{i}.bin");
+            let mut writer = cache
+                .begin(&key, 200, Vec::new(), min, 60, 0)
+                .await
+                .expect("writer");
+            writer.write_all(&body).await;
+            assert!(writer.commit().await);
+        }
+
+        let mut data_files = 0usize;
+        let mut meta_files = 0usize;
+        let mut stack = vec![dir.clone()];
+        while let Some(current) = stack.pop() {
+            let mut rd = tokio::fs::read_dir(&current).await.unwrap();
+            while let Some(ent) = rd.next_entry().await.unwrap() {
+                let ft = ent.file_type().await.unwrap();
+                let path = ent.path();
+                if ft.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path.to_string_lossy();
+                if name.ends_with(".meta.json") {
+                    meta_files += 1;
+                } else if name.ends_with(".data") {
+                    data_files += 1;
+                }
+            }
+        }
+        assert_eq!(data_files, meta_files, "no orphaned data or sidecar files");
+        assert_eq!(meta_files, cache.len(), "entry count must match sidecars");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

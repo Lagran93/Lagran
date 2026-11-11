@@ -158,22 +158,35 @@ struct TimedEntry {
     stale_until: Instant,
 }
 
-/// Approximate-LRU bookkeeping: a monotonic tick per access plus an ordered
-/// queue of (key, tick). Stale queue records are skipped lazily and the queue
-/// is compacted once it grows past twice the live key count.
+/// Sharded LRU bookkeeping.
+///
+/// A single process-wide `Mutex<LruState>` made every L1 hit serialize on one
+/// lock and allocate the key twice. Both costs scaled with core count, so the
+/// cache became slower the more threads it served. The recency index is now
+/// split into power-of-two shards selected by a hash of the key: a hit only
+/// contends with keys that land in the same shard.
+///
+/// The global tick is a single atomic, so ordering across shards stays
+/// comparable. Eviction still picks the globally oldest entry (the minimum of
+/// each shard's oldest live record), which keeps exact-LRU victim selection
+/// rather than degrading to per-shard LRU.
 #[derive(Default)]
-struct LruState {
-    tick: u64,
-    pos: HashMap<String, u64>,
-    order: VecDeque<(String, u64)>,
+struct LruShard {
+    pos: HashMap<Arc<str>, u64>,
+    order: VecDeque<(Arc<str>, u64)>,
 }
 
-impl LruState {
-    fn touch(&mut self, key: &str) {
-        self.tick = self.tick.wrapping_add(1);
-        let t = self.tick;
-        self.pos.insert(key.to_string(), t);
-        self.order.push_back((key.to_string(), t));
+impl LruShard {
+    /// Record an access. Reuses the key's existing `Arc` when the entry is
+    /// already tracked, so a repeated hit allocates nothing.
+    fn touch(&mut self, key: &str, tick: u64) {
+        let arc: Arc<str> = self
+            .pos
+            .get_key_value(key)
+            .map(|(existing, _)| existing.clone())
+            .unwrap_or_else(|| Arc::from(key));
+        self.pos.insert(arc.clone(), tick);
+        self.order.push_back((arc, tick));
         let limit = self.pos.len().saturating_mul(2).saturating_add(64);
         if self.order.len() > limit {
             self.compact();
@@ -190,21 +203,63 @@ impl LruState {
         self.pos.remove(key);
     }
 
-    fn pop_victim(&mut self) -> Option<String> {
-        while let Some((k, t)) = self.order.pop_front() {
-            if self.pos.get(&k).is_some_and(|cur| *cur == t) {
-                self.pos.remove(&k);
-                return Some(k);
+    /// Oldest live record, discarding superseded queue entries on the way.
+    /// Does not remove the entry, so the caller can compare shards first.
+    fn peek_victim(&mut self) -> Option<(u64, Arc<str>)> {
+        loop {
+            let (key, tick) = match self.order.front() {
+                Some((key, tick)) => (key.clone(), *tick),
+                None => return None,
+            };
+            if self.pos.get(&key).is_some_and(|cur| *cur == tick) {
+                return Some((tick, key));
+            }
+            self.order.pop_front();
+        }
+    }
+
+    fn pop_victim(&mut self) -> Option<Arc<str>> {
+        while let Some((key, tick)) = self.order.pop_front() {
+            if self.pos.get(&key).is_some_and(|cur| *cur == tick) {
+                self.pos.remove(&key);
+                return Some(key);
             }
         }
         None
     }
+
+    fn clear(&mut self) {
+        self.pos.clear();
+        self.order.clear();
+    }
+}
+
+fn shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .next_power_of_two()
+        .clamp(8, 64)
+}
+
+fn shard_hash(key: &str) -> usize {
+    // FNV-1a: cheap, no dependency, and only used to pick a shard.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash as usize
 }
 
 #[derive(Clone)]
 pub struct MemoryCache {
     inner: Arc<DashMap<String, TimedEntry>>,
-    lru: Arc<Mutex<LruState>>,
+    /// Recency index, sharded to keep L1 hits off a process-wide lock.
+    lru: Arc<[Mutex<LruShard>]>,
+    /// Monotonic access counter shared by all shards so cross-shard age is
+    /// comparable when eviction picks a victim.
+    tick: Arc<AtomicU64>,
     /// Maximum number of entries; 0 means unbounded.
     capacity: usize,
     /// Maximum approximate bytes; 0 means unbounded.
@@ -224,9 +279,13 @@ impl MemoryCache {
     }
 
     pub fn with_max_bytes(max_capacity: u64, max_bytes: u64) -> Self {
+        let shards: Vec<Mutex<LruShard>> = (0..shard_count())
+            .map(|_| Mutex::new(LruShard::default()))
+            .collect();
         Self {
             inner: Arc::new(DashMap::new()),
-            lru: Arc::new(Mutex::new(LruState::default())),
+            lru: Arc::from(shards),
+            tick: Arc::new(AtomicU64::new(0)),
             capacity: usize::try_from(max_capacity).unwrap_or(usize::MAX),
             max_bytes,
             used_bytes: Arc::new(AtomicU64::new(0)),
@@ -245,9 +304,15 @@ impl MemoryCache {
         self.used_bytes.load(Ordering::Relaxed)
     }
 
+    fn shard(&self, key: &str) -> &Mutex<LruShard> {
+        // `lru` is never empty and its length is a power of two.
+        &self.lru[shard_hash(key) % self.lru.len()]
+    }
+
     fn touch(&self, key: &str) {
-        if let Ok(mut lru) = self.lru.lock() {
-            lru.touch(key);
+        let tick = self.tick.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut shard) = self.shard(key).lock() {
+            shard.touch(key, tick);
         }
     }
 
@@ -281,8 +346,8 @@ impl MemoryCache {
         if let Some(entry) = &removed {
             self.release_bytes(entry.entry.memory_size());
         }
-        if let Ok(mut lru) = self.lru.lock() {
-            lru.remove(key);
+        if let Ok(mut shard) = self.shard(key).lock() {
+            shard.remove(key);
         }
         removed
     }
@@ -295,19 +360,15 @@ impl MemoryCache {
     /// Evict least-recently-used entries until count and byte limits fit.
     fn evict_overflow(&self) {
         while self.over_limit() {
-            let victim = match self.lru.lock() {
-                Ok(mut lru) => lru.pop_victim(),
-                Err(_) => None,
-            };
-            match victim {
+            match self.next_victim() {
                 Some(key) => {
                     self.remove_key(&key);
                 }
                 None => {
-                    // LRU bookkeeping out of sync (entries inserted elsewhere):
-                    // fall back to dropping an arbitrary entry so memory stays bounded.
-                    let any = self.inner.iter().next().map(|e| e.key().clone());
-                    match any {
+                    // Recency bookkeeping out of sync (entries inserted
+                    // elsewhere): drop an arbitrary entry so the byte/count
+                    // ceiling still holds.
+                    match self.inner.iter().next().map(|e| e.key().clone()) {
                         Some(key) => {
                             self.remove_key(&key);
                         }
@@ -316,6 +377,34 @@ impl MemoryCache {
                 }
             }
         }
+    }
+
+    /// Globally oldest tracked key: the shard with the smallest head tick wins,
+    /// so sharding does not weaken LRU quality.
+    fn next_victim(&self) -> Option<String> {
+        // Retry a few times: between peeking and claiming, a concurrent hit may
+        // promote the entry we selected, leaving that shard with no victim.
+        for _ in 0..4 {
+            let mut best: Option<(u64, usize)> = None;
+            for (index, shard) in self.lru.iter().enumerate() {
+                let Ok(mut guard) = shard.lock() else {
+                    continue;
+                };
+                let Some((tick, _)) = guard.peek_victim() else {
+                    continue;
+                };
+                if best.is_none_or(|(best_tick, _)| tick < best_tick) {
+                    best = Some((tick, index));
+                }
+            }
+            let (_, index) = best?;
+            if let Ok(mut guard) = self.lru[index].lock() {
+                if let Some(claimed) = guard.pop_victim() {
+                    return Some(claimed.to_string());
+                }
+            }
+        }
+        None
     }
 }
 
@@ -349,6 +438,20 @@ impl CacheBackend for MemoryCache {
         drop(item);
         self.remove_key(key);
         CacheGetResult::Expired
+    }
+
+    /// Local presence probe that never touches the recency index.
+    ///
+    /// Callers use this to decide whether a cross-node single-flight lock is
+    /// needed. Routing it through `get_result` promoted the entry and took the
+    /// LRU lock on every cacheable request, which is exactly the cost this
+    /// probe is supposed to avoid.
+    async fn has_local(&self, key: &str) -> bool {
+        let Some(item) = self.inner.get(key) else {
+            return false;
+        };
+        let now = Instant::now();
+        now <= item.stale_until
     }
 
     async fn set(&self, key: &str, entry: CacheEntry, ttl_secs: u64) {
@@ -406,9 +509,10 @@ impl CacheBackend for MemoryCache {
         // also heals any earlier drift.
         self.used_bytes
             .store(self.accounted_bytes(), Ordering::Relaxed);
-        if let Ok(mut lru) = self.lru.lock() {
-            lru.pos.clear();
-            lru.order.clear();
+        for shard in self.lru.iter() {
+            if let Ok(mut guard) = shard.lock() {
+                guard.clear();
+            }
         }
     }
 
@@ -637,5 +741,61 @@ mod tests {
             c.set(&format!("k{i}"), entry("x"), 60).await;
         }
         assert_eq!(c.len().await, 100);
+    }
+
+    /// Sharding the recency index must not change which entry is evicted: the
+    /// victim is still the globally oldest access, even when keys land in
+    /// different shards.
+    #[tokio::test]
+    async fn sharded_lru_still_evicts_globally_oldest() {
+        let c = MemoryCache::new(3);
+        // Spread keys across shards by construction; the hash decides placement.
+        c.set("a", entry("a"), 60).await;
+        c.set("b", entry("b"), 60).await;
+        c.set("c", entry("c"), 60).await;
+        // Touch b and c so `a` is the global LRU regardless of its shard.
+        let _ = c.get_result("b").await;
+        let _ = c.get_result("c").await;
+        c.set("d", entry("d"), 60).await;
+        assert_eq!(c.len().await, 3);
+        assert!(
+            matches!(c.get_result("a").await, CacheGetResult::Miss),
+            "globally oldest entry must be the eviction victim"
+        );
+        for key in ["b", "c", "d"] {
+            assert!(
+                matches!(c.get_result(key).await, CacheGetResult::Hit(_)),
+                "recently used entry {key} must survive"
+            );
+        }
+    }
+
+    /// `has_local` exists to avoid promoting an entry: it must not refresh
+    /// recency, or the probe would silently defeat LRU ordering.
+    #[tokio::test]
+    async fn has_local_does_not_promote() {
+        let c = MemoryCache::new(2);
+        c.set("a", entry("a"), 60).await;
+        c.set("b", entry("b"), 60).await;
+        // `a` is the oldest; probing it must not make it younger than `b`.
+        assert!(c.has_local("a").await);
+        c.set("c", entry("c"), 60).await;
+        assert!(
+            matches!(c.get_result("a").await, CacheGetResult::Miss),
+            "has_local must not refresh recency"
+        );
+        assert!(matches!(c.get_result("b").await, CacheGetResult::Hit(_)));
+        assert!(matches!(c.get_result("c").await, CacheGetResult::Hit(_)));
+    }
+
+    #[tokio::test]
+    async fn has_local_reports_presence_and_expiry() {
+        let c = MemoryCache::new(10);
+        assert!(!c.has_local("missing").await);
+        c.set_with_swr("k", entry("a"), 1, 1).await;
+        assert!(c.has_local("k").await, "fresh entry must be present");
+        // Past fresh+stale the entry is no longer usable without a refetch.
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert!(!c.has_local("k").await);
     }
 }

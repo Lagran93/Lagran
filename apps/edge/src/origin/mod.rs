@@ -118,6 +118,8 @@ pub struct OriginClient {
     sni_clients: Arc<RwLock<HashMap<String, Arc<SniHttpsClient>>>>,
     /// Fallback default origin (legacy single-origin)
     base_url: Arc<RwLock<String>>,
+    /// TCP connect timeout applied to every connector this client builds.
+    connect_timeout: Duration,
 }
 
 /// Headers worth replaying to the origin for a cacheable GET/HEAD.
@@ -159,11 +161,11 @@ fn is_hop_by_hop(name: &str) -> bool {
 }
 
 #[allow(deprecated)]
-fn build_client() -> DefaultHttpsClient {
+fn build_client(connect_timeout: Duration) -> DefaultHttpsClient {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_nodelay(true);
-    http.set_connect_timeout(Some(Duration::from_secs(5)));
+    http.set_connect_timeout(Some(connect_timeout));
 
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
@@ -178,11 +180,11 @@ fn build_client() -> DefaultHttpsClient {
 }
 
 #[allow(deprecated)]
-fn build_sni_client(addr: SocketAddr) -> SniHttpsClient {
+fn build_sni_client(addr: SocketAddr, connect_timeout: Duration) -> SniHttpsClient {
     let mut http = HttpConnector::new_with_resolver(FixedResolver { addr });
     http.enforce_http(false);
     http.set_nodelay(true);
-    http.set_connect_timeout(Some(Duration::from_secs(5)));
+    http.set_connect_timeout(Some(connect_timeout));
 
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
@@ -198,13 +200,27 @@ fn build_sni_client(addr: SocketAddr) -> SniHttpsClient {
 
 impl OriginClient {
     pub fn new(base_url: String) -> Self {
+        Self::with_connect_timeout(base_url, Duration::from_secs(5))
+    }
+
+    /// Build a client with an explicit TCP connect timeout.
+    ///
+    /// The connect timeout is independent of how long the origin may take to
+    /// send the response: a dead or unreachable origin should fail over in
+    /// seconds instead of consuming the per-domain request budget.
+    pub fn with_connect_timeout(base_url: String, connect_timeout: Duration) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = build_client();
+        let client = build_client(connect_timeout);
         Self {
             client: Arc::new(client),
             sni_clients: Arc::new(RwLock::new(HashMap::new())),
             base_url: Arc::new(RwLock::new(base_url)),
+            connect_timeout,
         }
+    }
+
+    pub fn connect_timeout_ms(&self) -> u64 {
+        self.connect_timeout.as_millis().min(u128::from(u64::MAX)) as u64
     }
 
     async fn client_for(&self, sni: Option<&str>, addr: Option<SocketAddr>) -> Arc<SniHttpsClient> {
@@ -220,6 +236,7 @@ impl OriginClient {
         }
         let client = Arc::new(build_sni_client(
             addr.parse().expect("fixed resolver address"),
+            self.connect_timeout,
         ));
         self.sni_clients.write().await.insert(key, client.clone());
         client
@@ -621,5 +638,14 @@ mod tests {
         assert!(is_hop_by_hop("transfer-encoding"));
         assert!(!is_hop_by_hop("content-type"));
         assert!(!is_hop_by_hop("set-cookie"));
+    }
+
+    #[test]
+    fn connect_timeout_is_configurable_and_reported() {
+        let client = OriginClient::with_connect_timeout(
+            "https://origin.test".into(),
+            Duration::from_millis(2_500),
+        );
+        assert_eq!(client.connect_timeout_ms(), 2_500);
     }
 }
