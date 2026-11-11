@@ -338,12 +338,26 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
     if cfg.tcp_enabled {
         let tcp_service = service.clone();
         let listen = cfg.listen.clone();
+        // One thread per connection: without a cap a client can exhaust threads
+        // and file descriptors just by opening sockets.
+        let max_conns = cfg.max_tcp_connections;
+        let active = Arc::new(AtomicU64::new(0));
         std::thread::spawn(move || match TcpListener::bind(&listen) {
             Ok(listener) => {
-                tracing::info!(listen, "DNS TCP listener started");
+                tracing::info!(listen, max_conns, "DNS TCP listener started");
                 for stream in listener.incoming().flatten() {
+                    if active.load(Ordering::Relaxed) >= max_conns as u64 {
+                        // Dropping the stream closes the connection immediately.
+                        tracing::debug!("TCP connection limit reached, dropping");
+                        continue;
+                    }
                     let svc = tcp_service.clone();
-                    std::thread::spawn(move || handle_tcp(stream, svc));
+                    let active = active.clone();
+                    active.fetch_add(1, Ordering::Relaxed);
+                    std::thread::spawn(move || {
+                        handle_tcp(stream, svc);
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    });
                 }
             }
             Err(e) => tracing::error!(error = %e, "DNS TCP bind failed"),
@@ -373,12 +387,23 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
         tracing::info!(hits, misses, cache = size, "dns stats");
     });
 
+    // Rate limit at the receive edge so a flood never reaches the worker pool.
+    // Loopback is exempt and a zero `per_source` disables the limiter.
+    let mut limiter = crate::ratelimit::RateLimiter::new(cfg.rate_limit);
+    let mut last_report = Instant::now();
     let mut buf = [0u8; 4096];
     loop {
         match udp.recv_from(&mut buf) {
             Ok((n, peer)) => {
-                if n >= 12 {
+                if n >= 12 && limiter.allow(peer.ip(), Instant::now()) {
                     queue.push((buf[..n].to_vec(), peer));
+                }
+                if last_report.elapsed() >= Duration::from_secs(30) {
+                    let rejected = limiter.rejected();
+                    if rejected > 0 {
+                        tracing::warn!(rejected, "dropped rate-limited DNS queries");
+                    }
+                    last_report = Instant::now();
                 }
             }
             Err(e) => {

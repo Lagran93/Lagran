@@ -73,19 +73,40 @@ fn parse_uuid(id: &str) -> Result<Uuid, (StatusCode, Json<ErrorBody>)> {
     Uuid::parse_str(id.trim()).map_err(|_| bad_request(format!("invalid uuid: {id}")))
 }
 
-fn valid_cidr(input: &str) -> bool {
+/// Canonical text form of an IP or CIDR.
+///
+/// Without this, `10.0.0.1`, `10.0.0.1/32` and `010.0.0.1/32` are three distinct
+/// strings in the database even though the edge evaluates them identically. That
+/// let one tenant pile up unlimited duplicate entries, each of which the edge
+/// scans linearly on every request.
+///
+/// A bare address is stored as a bare address and an explicit prefix is
+/// preserved, so `10.0.0.0/8` keeps its meaning while `10.0.0.1/32` collapses to
+/// `10.0.0.1`.
+pub fn normalize_cidr(input: &str) -> Option<String> {
     let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
     let (addr, prefix) = match input.split_once('/') {
-        Some((a, p)) => (a, Some(p)),
+        Some((a, p)) => (a.trim(), Some(p.trim())),
         None => (input, None),
     };
-    let Ok(addr) = addr.parse::<IpAddr>() else {
-        return false;
-    };
+    let addr: IpAddr = addr.parse().ok()?;
     let max = if addr.is_ipv4() { 32 } else { 128 };
     match prefix {
-        None => true,
-        Some(p) => p.trim().parse::<u8>().map(|p| p <= max).unwrap_or(false),
+        None => Some(addr.to_string()),
+        Some(p) => {
+            let prefix: u8 = p.parse().ok()?;
+            if prefix > max {
+                return None;
+            }
+            if prefix == max {
+                // `x/32` and `x/128` name a single host; store the bare address.
+                return Some(addr.to_string());
+            }
+            Some(format!("{addr}/{prefix}"))
+        }
     }
 }
 
@@ -367,7 +388,19 @@ pub async fn rollback_rulepack(
     if !actor.is_admin {
         return Err(forbidden());
     }
-    let row = crate::waf_rulepack::rollback(&state.pool, &version)
+    // Promote only if the target can actually be signed: a version that the
+    // edges cannot verify is not a usable rollback target.
+    let Some(secret) = crate::waf_rulepack::signing_key(&state.config.waf_rulepack_secret)
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: "WAF_RULEPACK_SECRET is not configured; cannot re-sign the rulepack"
+                    .into(),
+            }),
+        ));
+    };
+    let row = crate::waf_rulepack::rollback(&state.pool, &secret, &version)
         .await
         .map_err(|_| db_error())?
         .ok_or_else(|| not_found("rulepack version not found"))?;
@@ -1018,15 +1051,24 @@ pub async fn create_ip(
     if kind != "allow" && kind != "deny" {
         return Err(bad_request("kind must be allow or deny".into()));
     }
-    let ip = req.ip.trim();
-    if !valid_cidr(ip) {
+    let Some(ip) = normalize_cidr(&req.ip) else {
         return Err(bad_request("ip must be an IP or CIDR".into()));
+    };
+    // Reject duplicates before insert: each extra entry is scanned linearly by
+    // every edge on every request, so unbounded duplicates are a cross-tenant
+    // amplification vector. The unique index enforces the same rule in the
+    // database for concurrent writers.
+    if repository::waf_ip_exists(&state.pool, domain_id, &kind, &ip)
+        .await
+        .map_err(|_| db_error())?
+    {
+        return Err(bad_request("this IP entry already exists".into()));
     }
     let row = repository::create_waf_ip(
         &state.pool,
         domain_id,
         &kind,
-        ip,
+        &ip,
         req.note.as_deref().unwrap_or(""),
     )
     .await
@@ -1071,15 +1113,26 @@ pub async fn update_ip(
     if kind != "allow" && kind != "deny" {
         return Err(bad_request("kind must be allow or deny".into()));
     }
-    let ip = req.ip.trim();
-    if !valid_cidr(ip) {
+    let Some(ip) = normalize_cidr(&req.ip) else {
         return Err(bad_request("ip must be an IP or CIDR".into()));
+    };
+    if repository::waf_ip_exists_except(
+        &state.pool,
+        ip_id,
+        existing.domain_id,
+        &kind,
+        &ip,
+    )
+    .await
+    .map_err(|_| db_error())?
+    {
+        return Err(bad_request("this IP entry already exists".into()));
     }
     let row = repository::update_waf_ip(
         &state.pool,
         ip_id,
         &kind,
-        ip,
+        &ip,
         req.note.as_deref().unwrap_or(""),
         req.enabled.unwrap_or(existing.enabled),
     )
@@ -1646,4 +1699,39 @@ pub async fn list_events(
             })
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without canonicalization `10.0.0.1`, `10.0.0.1/32` and a padded form are
+    /// distinct strings, which is how duplicates piled up in the first place.
+    #[test]
+    fn normalize_cidr_collapses_equivalent_forms() {
+        for input in ["10.0.0.1", "10.0.0.1/32", " 10.0.0.1 ", "10.0.0.1/32 "] {
+            assert_eq!(
+                normalize_cidr(input).as_deref(),
+                Some("10.0.0.1"),
+                "input {input:?}"
+            );
+        }
+        assert_eq!(
+            normalize_cidr("2001:db8::1/128").as_deref(),
+            Some("2001:db8::1")
+        );
+        // A real prefix keeps its meaning.
+        assert_eq!(normalize_cidr("10.0.0.0/8").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(
+            normalize_cidr("2001:db8::/32").as_deref(),
+            Some("2001:db8::/32")
+        );
+    }
+
+    #[test]
+    fn normalize_cidr_rejects_invalid_input() {
+        for bad in ["", "  ", "not-an-ip", "10.0.0.1/33", "::1/129", "10.0.0.1/x"] {
+            assert!(normalize_cidr(bad).is_none(), "{bad:?} must be rejected");
+        }
+    }
 }

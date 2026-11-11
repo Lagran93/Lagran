@@ -312,15 +312,22 @@ fn waf_config_from(
         checksum: p.checksum.clone(),
     });
     let rulepack_version = selected.map(|p| p.version.clone()).unwrap_or_default();
+    // De-duplicate on the way out. The unique index prevents new duplicates, but
+    // rows written before it existed may still contain them, and the edge matches
+    // these lists linearly on every request.
     let mut ip_allow = Vec::new();
     let mut ip_deny = Vec::new();
+    let mut seen_allow = std::collections::HashSet::new();
+    let mut seen_deny = std::collections::HashSet::new();
     for ip in ips {
         if !ip.enabled {
             continue;
         }
         if ip.kind == "allow" {
-            ip_allow.push(ip.ip);
-        } else {
+            if seen_allow.insert(ip.ip.clone()) {
+                ip_allow.push(ip.ip);
+            }
+        } else if seen_deny.insert(ip.ip.clone()) {
             ip_deny.push(ip.ip);
         }
     }
@@ -1090,6 +1097,40 @@ mod tests {
         assert_eq!(waf.country_allow, vec!["CN".to_string()]);
         assert!(waf.country_deny.is_empty());
         assert!(waf.asn_deny.is_empty());
+    }
+
+    /// Historical duplicate rows must not be shipped to the edge even after the
+    /// unique index is in place, because the index does not retroactively prove
+    /// the config generator is duplicate-safe.
+    #[test]
+    fn duplicate_ip_entries_are_collapsed_in_config() {
+        use uuid::Uuid;
+        let row = |ip: &str| repository::WafIpRow {
+            id: Uuid::new_v4(),
+            domain_id: Uuid::nil(),
+            kind: "deny".into(),
+            ip: ip.into(),
+            note: String::new(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        };
+        let out = waf_config_from(
+            "example.com",
+            settings(),
+            Vec::new(),
+            vec![
+                row("198.51.100.10"),
+                row("198.51.100.10"),
+                row("198.51.100.11"),
+                row("198.51.100.10"),
+            ],
+            Vec::new(),
+            &[],
+        );
+        assert_eq!(
+            out.ip_deny,
+            vec!["198.51.100.10".to_string(), "198.51.100.11".to_string()]
+        );
     }
 
     #[test]

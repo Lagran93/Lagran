@@ -3128,6 +3128,40 @@ pub async fn get_waf_geo(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<WafGeoR
     .await
 }
 
+pub async fn waf_ip_exists(
+    pool: &PgPool,
+    domain_id: Uuid,
+    kind: &str,
+    ip: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM waf_ip_rules WHERE domain_id = $1 AND kind = $2 AND ip = $3)",
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(ip)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn waf_ip_exists_except(
+    pool: &PgPool,
+    id: Uuid,
+    domain_id: Uuid,
+    kind: &str,
+    ip: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM waf_ip_rules WHERE domain_id = $1 AND kind = $2 AND ip = $3 AND id <> $4)",
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(ip)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}
+
 pub async fn waf_geo_exists(
     pool: &PgPool,
     domain_id: Uuid,

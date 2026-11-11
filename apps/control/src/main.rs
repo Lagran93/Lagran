@@ -64,6 +64,12 @@ async fn main() -> anyhow::Result<()> {
             "AGENT_TOKEN is empty; edge→control agent routes still require per-node tokens, but schedule/DNS global auth is weakened"
         );
     }
+    if !config.cors_allowed_origins.is_empty() {
+        tracing::info!(
+            origins = %config.cors_allowed_origins.join(","),
+            "CORS restricted to the configured origins"
+        );
+    }
     if config.allow_register {
         tracing::warn!("ALLOW_REGISTER=true — open self-registration is enabled");
     }
@@ -90,14 +96,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("migrations applied");
 
     match control::waf_rulepack::signing_key(&config.waf_rulepack_secret) {
-        Some(secret) => match control::waf_rulepack::ensure_seed(&pool, &secret).await {
-            Ok(row) => tracing::info!(
-                version = %row.version,
-                slot = %row.slot,
-                "WAF rulepack ready"
-            ),
-            Err(e) => tracing::warn!(error = %e, "failed to seed WAF rulepack"),
-        },
+        Some(secret) => {
+            match control::waf_rulepack::ensure_seed(&pool, &secret).await {
+                Ok(row) => tracing::info!(
+                    version = %row.version,
+                    slot = %row.slot,
+                    "WAF rulepack ready"
+                ),
+                Err(e) => tracing::warn!(error = %e, "failed to seed WAF rulepack"),
+            }
+            // The previous slot is deliverable too (pinned domains, grey
+            // rollout), so it must also verify with the current key.
+            if let Err(e) = control::waf_rulepack::ensure_all_signed(&pool, &secret).await {
+                tracing::warn!(error = %e, "failed to re-sign WAF rulepacks");
+            }
+        }
         None => tracing::warn!("skipping WAF rulepack seed: WAF_RULEPACK_SECRET is not set"),
     }
 

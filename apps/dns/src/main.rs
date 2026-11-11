@@ -2,6 +2,7 @@
 
 mod config;
 mod control;
+mod ratelimit;
 mod server;
 mod wire;
 

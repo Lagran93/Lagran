@@ -44,10 +44,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 use tracing::Instrument;
 
 pub fn create_router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = build_cors(&state.config.cors_allowed_origins);
 
     Router::new()
         .route("/health", get(health::health))
@@ -272,6 +269,42 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Build the CORS layer.
+///
+/// The console authenticates with a bearer token rather than a cookie, so a
+/// browser never attaches credentials implicitly and classic CSRF does not apply.
+/// `Any` is therefore not an exploitable hole, but it does let any web page talk
+/// to this API if it ever learns a token, and it hides the origin policy from
+/// reviewers. Deployments that serve the console from the API origin do not use
+/// CORS at all, so an empty list keeps working: it preserves the previous
+/// behaviour and lets operators tighten it with `CORS_ALLOWED_ORIGINS`.
+fn build_cors(allowed: &[String]) -> CorsLayer {
+    let base = CorsLayer::new()
+        .allow_methods(Any)
+        .allow_headers(Any);
+    if allowed.is_empty() {
+        return base.allow_origin(Any);
+    }
+    let origins: Vec<axum::http::HeaderValue> = allowed
+        .iter()
+        // `HeaderValue::from_str` rejects CR/LF and other non-ASCII bytes, so a
+        // malformed entry can never be used for header injection.
+        .filter_map(|origin| match axum::http::HeaderValue::from_str(origin.trim()) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                tracing::warn!(origin = %origin, "ignoring invalid CORS_ALLOWED_ORIGINS entry");
+                None
+            }
+        })
+        .collect();
+    if origins.is_empty() {
+        // Every entry was invalid: fail closed rather than silently opening up.
+        tracing::error!("CORS_ALLOWED_ORIGINS contains no valid origin; cross-origin requests are denied");
+        return base.allow_origin(Vec::<axum::http::HeaderValue>::new());
+    }
+    base.allow_origin(origins)
+}
+
 async fn trace_http_request(request: Request<Body>, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
@@ -306,4 +339,85 @@ async fn not_found(req: Request<Body>) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Request};
+    use tower::ServiceExt;
+
+    async fn cors_headers(allowed: Vec<String>, origin: &str) -> Option<String> {
+        // A minimal router: the CORS layer is what is under test, not the API.
+        let app = Router::new()
+            .route("/ping", get(|| async { "pong" }))
+            .layer(build_cors(&allowed));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ping")
+            .header(header::ORIGIN, origin)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// An empty list keeps the previous behaviour: the response echoes the
+    /// request origin, so existing deployments are unaffected.
+    #[tokio::test]
+    async fn empty_allowlist_preserves_open_default() {
+        let allow = cors_headers(vec![], "https://anything.test").await;
+        assert_eq!(allow.as_deref(), Some("*"));
+    }
+
+    /// A configured allowlist echoes only the configured origin.
+    #[tokio::test]
+    async fn configured_origin_is_allowed() {
+        let allow = cors_headers(
+            vec!["https://console.example.com".to_string()],
+            "https://console.example.com",
+        )
+        .await;
+        assert_eq!(allow.as_deref(), Some("https://console.example.com"));
+    }
+
+    /// A non-configured origin must not be granted access.
+    #[tokio::test]
+    async fn unlisted_origin_is_not_allowed() {
+        let allow = cors_headers(
+            vec!["https://console.example.com".to_string()],
+            "https://evil.test",
+        )
+        .await;
+        assert!(
+            allow.is_none() || allow.as_deref() != Some("https://evil.test"),
+            "unlisted origin must not be echoed back"
+        );
+    }
+
+    /// An entry that is not a valid header value is dropped rather than injected.
+    #[tokio::test]
+    async fn invalid_origin_entries_are_dropped() {
+        let allow = cors_headers(
+            vec![
+                "https://ok.example.com".to_string(),
+                "bad\r\nX-Injected: 1".to_string(),
+            ],
+            "https://ok.example.com",
+        )
+        .await;
+        assert_eq!(allow.as_deref(), Some("https://ok.example.com"));
+    }
+
+    /// If every entry is invalid, fail closed instead of widening access.
+    #[tokio::test]
+    async fn all_invalid_entries_fail_closed() {
+        let allow = cors_headers(vec!["not an origin".to_string()], "https://evil.test").await;
+        assert!(allow.is_none(), "must not grant any origin: {allow:?}");
+    }
 }

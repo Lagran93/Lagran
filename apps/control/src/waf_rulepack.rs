@@ -271,11 +271,131 @@ pub async fn publish_with_rulesets(
         .ok_or_else(|| sqlx::Error::RowNotFound)
 }
 
-pub async fn ensure_seed(pool: &PgPool, secret: &str) -> sqlx::Result<RulepackRow> {
-    if let Some(row) = active(pool).await? {
-        return Ok(row);
+/// Verify a stored rulepack against `secret`.
+///
+/// True when the signature matches the payload under the given key. Returns
+/// false on any mismatch, including a payload that no longer hashes to the
+/// recorded checksum, so callers treat a corrupt row the same as a stale key.
+pub fn verify(row: &RulepackRow, secret: &str) -> bool {
+    let (_signature, expected_checksum) = sign(&row.payload, secret);
+    let checksum_ok = expected_checksum == row.checksum;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let sig_bytes: Option<Vec<u8>> = hex_decode(&row.signature);
+    let sig_ok = sig_bytes
+        .as_deref()
+        .is_some_and(|sig| ring::hmac::verify(&key, row.payload.as_bytes(), sig).is_ok());
+    checksum_ok && sig_ok
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
     }
-    publish(pool, secret, "2026.11", "system").await
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(value.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+/// Outcome of deciding whether a stored row needs re-signing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SignAction {
+    /// Signature already matches the current key: leave the row alone.
+    Keep,
+    /// Signature does not match: rewrite `signature` and `checksum`.
+    Resign {
+        signature: String,
+        checksum: String,
+    },
+}
+
+/// Decide what to do with a stored row under the current key.
+///
+/// Split out from [`ensure_signed`] so the decision is testable without a
+/// database, and so both the startup path and the slot-switch path provably make
+/// the same decision.
+pub fn sign_action(row: &RulepackRow, secret: &str) -> SignAction {
+    if verify(row, secret) {
+        return SignAction::Keep;
+    }
+    let (signature, checksum) = sign(&row.payload, secret);
+    SignAction::Resign {
+        signature,
+        checksum,
+    }
+}
+
+/// Re-sign one stored row in place when it does not verify with `secret`.
+///
+/// The payload is kept byte-for-byte: the catalog on disk may have moved on since
+/// this version was published, and quietly swapping the ruleset contents during
+/// what is only a key rotation would be a surprise. Only `signature` and
+/// `checksum` change.
+pub async fn ensure_signed(
+    pool: &PgPool,
+    secret: &str,
+    row: RulepackRow,
+) -> sqlx::Result<RulepackRow> {
+    let (signature, checksum) = match sign_action(&row, secret) {
+        SignAction::Keep => return Ok(row),
+        SignAction::Resign {
+            signature,
+            checksum,
+        } => (signature, checksum),
+    };
+    tracing::warn!(
+        version = %row.version,
+        slot = %row.slot,
+        "WAF rulepack does not verify with the configured WAF_RULEPACK_SECRET; re-signing in place (was the secret rotated?)"
+    );
+    sqlx::query(
+        r#"
+        UPDATE waf_rulepack_versions
+           SET signature = $2, checksum = $3, created_by = 'system:resign'
+         WHERE version = $1
+        "#,
+    )
+    .bind(&row.version)
+    .bind(&signature)
+    .bind(&checksum)
+    .execute(pool)
+    .await?;
+    get(pool, &row.version)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)
+}
+
+/// Ensure every slot that can be served to an edge verifies with `secret`.
+///
+/// Both `active` and `previous` are deliverable: a domain pinned to a specific
+/// version, or a grey rollout, can hand out the previous package. Re-signing only
+/// the active row left the other one permanently unverifiable, which is exactly
+/// what produced `HMAC verification failed` after switching slots.
+pub async fn ensure_all_signed(pool: &PgPool, secret: &str) -> sqlx::Result<()> {
+    if let Some(row) = active(pool).await? {
+        ensure_signed(pool, secret, row).await?;
+    }
+    if let Some(row) = previous(pool).await? {
+        ensure_signed(pool, secret, row).await?;
+    }
+    Ok(())
+}
+
+/// Ensure an active rulepack exists and is signed with the current key.
+///
+/// Rotating `WAF_RULEPACK_SECRET` used to leave the previously signed rows in
+/// place, so every edge rejected the package with "HMAC verification failed"
+/// until an operator republished by hand. Rows are now re-signed in place, which
+/// makes key rotation self-healing.
+pub async fn ensure_seed(pool: &PgPool, secret: &str) -> sqlx::Result<RulepackRow> {
+    match active(pool).await? {
+        Some(row) => ensure_signed(pool, secret, row).await,
+        None => publish(pool, secret, "2026.11", "system").await,
+    }
 }
 
 pub async fn active(pool: &PgPool) -> sqlx::Result<Option<RulepackRow>> {
@@ -315,10 +435,25 @@ pub async fn list(pool: &PgPool) -> sqlx::Result<Vec<RulepackRow>> {
     .await
 }
 
-pub async fn rollback(pool: &PgPool, version: &str) -> sqlx::Result<Option<RulepackRow>> {
-    if get(pool, version).await?.is_none() {
+/// Promote `version` to active, re-signing it with `secret` first.
+///
+/// Switching slots used to leave the target row signed with whatever key was
+/// current when it was first published. If the secret had since been rotated the
+/// promotion produced a version every edge rejected, and the warning repeated on
+/// every config sync with no way to recover short of restarting the control
+/// plane. Signing happens before the switch so the promoted row is always
+/// deliverable.
+pub async fn rollback(
+    pool: &PgPool,
+    secret: &str,
+    version: &str,
+) -> sqlx::Result<Option<RulepackRow>> {
+    let Some(target) = get(pool, version).await? else {
         return Ok(None);
-    }
+    };
+    // Re-sign before promoting so the row is deliverable the moment it becomes
+    // active; `ensure_signed` is a no-op when the signature already matches.
+    ensure_signed(pool, secret, target).await?;
     let mut tx = pool.begin().await?;
     sqlx::query("UPDATE waf_rulepack_versions SET slot = 'retired' WHERE version = $1")
         .bind(version)
@@ -424,6 +559,102 @@ pub fn gray_bucket(domain: &str, version: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_signed_with(payload: &str, secret: &str) -> RulepackRow {
+        let (signature, checksum) = sign(payload, secret);
+        RulepackRow {
+            version: "2026.11.07-163951".into(),
+            payload: payload.to_string(),
+            signature,
+            checksum,
+            slot: "active".into(),
+            created_at: chrono::Utc::now(),
+            created_by: "system".into(),
+        }
+    }
+
+    /// The slot-switch path must reach the same decision as the startup path;
+    /// switching to a row signed with an old key used to leave it unverifiable
+    /// forever, which is the warning the user observed after "set as active".
+    #[test]
+    fn sign_action_resigns_rows_signed_with_an_old_key() {
+        let stale = row_signed_with("{\"version\":\"1\"}", "old-secret");
+        match sign_action(&stale, "new-secret") {
+            SignAction::Resign {
+                signature,
+                checksum,
+            } => {
+                let mut fixed = stale.clone();
+                fixed.signature = signature;
+                fixed.checksum = checksum;
+                assert!(verify(&fixed, "new-secret"), "re-signed row must verify");
+                assert_eq!(fixed.payload, stale.payload, "payload must not change");
+            }
+            SignAction::Keep => panic!("stale signature must be re-signed"),
+        }
+    }
+
+    #[test]
+    fn sign_action_keeps_rows_that_already_verify() {
+        let row = row_signed_with("{}", "secret");
+        assert_eq!(sign_action(&row, "secret"), SignAction::Keep);
+    }
+
+    /// Re-signing must be idempotent: running it twice leaves the row valid and
+    /// produces the same signature the second time.
+    #[test]
+    fn resign_is_idempotent() {
+        let stale = row_signed_with("{\"a\":1}", "old-secret");
+        let once = sign(&stale.payload, "new-secret");
+        let mut row = stale.clone();
+        row.signature = once.0.clone();
+        row.checksum = once.1.clone();
+        assert!(verify(&row, "new-secret"));
+        assert_eq!(sign_action(&row, "new-secret"), SignAction::Keep);
+        assert_eq!(sign(&row.payload, "new-secret"), once);
+    }
+
+    #[test]
+    fn verify_accepts_matching_secret() {
+        let row = row_signed_with("{\"version\":\"1\"}", "secret-a");
+        assert!(verify(&row, "secret-a"));
+    }
+
+    /// Rotating the key must be detected, otherwise the stale row is served to
+    /// every edge and they all reject it with "HMAC verification failed".
+    #[test]
+    fn verify_rejects_rotated_secret() {
+        let row = row_signed_with("{\"version\":\"1\"}", "old-secret");
+        assert!(!verify(&row, "new-secret"));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_payload() {
+        let mut row = row_signed_with("{\"version\":\"1\"}", "secret");
+        row.payload = "{\"version\":\"2\"}".into();
+        assert!(!verify(&row, "secret"));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_checksum() {
+        let mut row = row_signed_with("{}", "secret");
+        row.checksum = "00".repeat(32);
+        assert!(!verify(&row, "secret"));
+    }
+
+    /// Re-signing after a rotation must produce a row that verifies under the
+    /// new key, which is what makes startup self-healing.
+    #[test]
+    fn resign_after_rotation_verifies() {
+        let mut row = row_signed_with("{\"version\":\"1\"}", "old-secret");
+        assert!(!verify(&row, "new-secret"));
+        let (signature, checksum) = sign(&row.payload, "new-secret");
+        row.signature = signature;
+        row.checksum = checksum;
+        assert!(verify(&row, "new-secret"));
+        // The payload itself is untouched: re-signing must not rewrite rules.
+        assert_eq!(row.payload, "{\"version\":\"1\"}");
+    }
 
     #[test]
     fn signing_key_rejects_unset_secret() {

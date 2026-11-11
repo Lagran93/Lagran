@@ -52,6 +52,13 @@ pub struct AppConfig {
     pub acme_contact_email: String,
     /// Require image CAPTCHA on login and registration (default: true).
     pub captcha_enabled: bool,
+    /// Origins allowed to call the API from a browser (CORS).
+    ///
+    /// Empty keeps the previous wide-open behaviour so existing single-origin
+    /// deployments upgrade without a config change, but the console and the API
+    /// are normally served from the same origin, in which case CORS is not
+    /// involved at all and setting this list only tightens things.
+    pub cors_allowed_origins: Vec<String>,
     /// When false, POST /auth/register is disabled (default: false).
     pub allow_register: bool,
     /// Seed demo@lagran.dev on startup (default: false). The account is a
@@ -138,6 +145,7 @@ impl Default for AppConfig {
             acme_contact_email: std::env::var("ACME_CONTACT_EMAIL").unwrap_or_default(),
             allow_register: env_bool("ALLOW_REGISTER", false),
             captcha_enabled: env_bool("CAPTCHA_ENABLED", true),
+            cors_allowed_origins: env_list("CORS_ALLOWED_ORIGINS"),
             // Off by default: the demo account ships with a published password.
             seed_demo: env_bool("SEED_DEMO", false),
             require_secure_secrets: env_bool("REQUIRE_SECURE_SECRETS", false),
@@ -172,6 +180,20 @@ fn env_bool(name: &str, default: bool) -> bool {
         }
         Err(_) => default,
     }
+}
+
+/// Parse a comma-separated list, dropping empty entries.
+///
+/// Used for `CORS_ALLOWED_ORIGINS`; surrounding whitespace is trimmed so
+/// `https://a.test, https://b.test` works as typed.
+fn env_list(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn env_nonempty(name: &str) -> Option<String> {

@@ -2810,12 +2810,88 @@ async fn signed_url_gate(domain: &DomainEntry, req: Request<Body>, host: &str) -
     SignedUrlGate::Signed(req)
 }
 
+/// Parse the host out of a `Referer` header value.
+///
+/// Returns `None` when there is no usable host: an empty value, a non-http(s)
+/// scheme, or a value that is not a URL at all. `about:blank`, `file://` and
+/// `data:` referers never grant access.
+fn referer_host(referer: &str) -> Option<String> {
+    let referer = referer.trim();
+    if referer.is_empty() {
+        return None;
+    }
+    // Only absolute http(s) URLs name a site. Bare strings such as
+    // `example.com/page` have no scheme and are treated as unusable rather than
+    // guessed at.
+    let rest = referer
+        .strip_prefix("https://")
+        .or_else(|| referer.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip userinfo so `https://example.com@evil.test/` cannot pass as
+    // `example.com`: the real host is what follows the last `@`.
+    let authority = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+    if authority.is_empty() {
+        return None;
+    }
+    let host = crate::config::registry::normalize_host(authority);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host)
+}
+
+/// True when `host` equals `pattern` or is one of its subdomains.
+///
+/// `example.com` matches `example.com` and `www.example.com` but never
+/// `evil-example.com` or `example.com.evil.test`. A leading `*.` is accepted and
+/// means subdomains only (`*.example.com` matches `a.example.com`).
+fn host_matches(pattern: &str, host: &str) -> bool {
+    // The operator may type `Example.COM` in the console; the referer host is
+    // always lowercase after normalization, so normalize the pattern too.
+    let pattern: String = pattern
+        .trim()
+        .trim_start_matches("*.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let pattern = pattern.as_str();
+    if pattern.is_empty() {
+        return false;
+    }
+    if host == pattern {
+        return !pattern.is_empty();
+    }
+    // Boundary must be a real label separator, not any substring.
+    host.len() > pattern.len()
+        && host.ends_with(pattern)
+        && host.as_bytes()[host.len() - pattern.len() - 1] == b'.'
+}
+
+/// Decide whether a request from `referer` may hotlink.
+///
+/// The previous implementation used `referer.contains(pattern)`, so a page at
+/// `https://evil.test/?ref=https://example.com` was granted access to a domain
+/// that only whitelisted `example.com`. Matching is now done on the parsed host
+/// with label boundaries.
 pub(crate) fn hotlink_allowed(allowed_list: &str, referer: &str) -> bool {
-    allowed_list
+    let patterns: Vec<&str> = allowed_list
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .any(|pat| pat == "*" || (!referer.is_empty() && referer.contains(pat)))
+        .collect();
+    if patterns.is_empty() {
+        return false;
+    }
+    // An explicit `*` allows any source, including a missing Referer.
+    if patterns.iter().any(|p| *p == "*") {
+        return true;
+    }
+    let Some(host) = referer_host(referer) else {
+        // No Referer (or an unusable one) never matches a host pattern.
+        return false;
+    };
+    patterns
+        .iter()
+        .any(|pattern| host_matches(pattern, &host))
 }
 
 /// JS challenges require a top-level HTML document navigation. JSON/XHR
@@ -3171,6 +3247,86 @@ mod tests {
         ));
         assert!(!hotlink_allowed("example.com", "https://evil.test/a"));
         assert!(!hotlink_allowed("example.com", ""));
+    }
+
+    /// The whitelist used to be applied with `referer.contains(pattern)`, so a
+    /// page on an attacker domain could embed the allowed host in its query
+    /// string or path and steal the asset.
+    #[test]
+    fn hotlink_rejects_pattern_smuggled_in_query_or_path() {
+        for referer in [
+            "https://evil.test/?ref=https://example.com",
+            "https://evil.test/example.com/a.js",
+            "https://evil.test/#example.com",
+            "https://evil.test/a?next=example.com",
+        ] {
+            assert!(
+                !hotlink_allowed("example.com", referer),
+                "{referer} must not be allowed"
+            );
+        }
+    }
+
+    /// A matching suffix is not a matching host: only a real label boundary
+    /// counts.
+    #[test]
+    fn hotlink_requires_label_boundary() {
+        assert!(!hotlink_allowed("example.com", "https://evil-example.com/a"));
+        assert!(!hotlink_allowed(
+            "example.com",
+            "https://example.com.evil.test/a"
+        ));
+        assert!(!hotlink_allowed("example.com", "https://notexample.com/a"));
+        // Real subdomains are allowed.
+        assert!(hotlink_allowed(
+            "example.com",
+            "https://www.example.com/a"
+        ));
+        assert!(hotlink_allowed("example.com", "https://a.b.example.com/x"));
+    }
+
+    /// `https://example.com@evil.test/` puts the allowed name in the userinfo.
+    #[test]
+    fn hotlink_ignores_userinfo() {
+        assert!(!hotlink_allowed(
+            "example.com",
+            "https://example.com@evil.test/a"
+        ));
+    }
+
+    /// Wildcard entries mean "subdomains of", not "everything".
+    #[test]
+    fn hotlink_wildcard_prefix_means_subdomains() {
+        assert!(hotlink_allowed("*.example.com", "https://a.example.com/x"));
+        assert!(!hotlink_allowed("*.example.com", "https://evil.test/x"));
+        assert!(!hotlink_allowed("*.example.com", "https://evilexample.com/x"));
+    }
+
+    /// Only http(s) referers name a site; opaque schemes never grant access.
+    #[test]
+    fn hotlink_rejects_non_http_referers() {
+        for referer in ["about:blank", "file:///etc/passwd", "data:text/html,x"] {
+            assert!(
+                !hotlink_allowed("example.com", referer),
+                "{referer} must not be allowed"
+            );
+        }
+    }
+
+    /// Ports, trailing dots and case must not defeat the match.
+    #[test]
+    fn hotlink_normalizes_referer_host() {
+        assert!(hotlink_allowed("example.com", "https://EXAMPLE.com:8443/a"));
+        assert!(hotlink_allowed("example.com", "https://example.com./a"));
+        assert!(hotlink_allowed("Example.COM", "https://example.com/a"));
+    }
+
+    /// An empty whitelist denies everything; only an explicit `*` opens it up.
+    #[test]
+    fn hotlink_empty_list_denies() {
+        assert!(!hotlink_allowed("", "https://example.com/a"));
+        assert!(!hotlink_allowed("  ,  ", "https://example.com/a"));
+        assert!(hotlink_allowed("*", "https://anything.test/a"));
     }
 
     fn signed_domain(mode: &str, secret: &str) -> DomainEntry {

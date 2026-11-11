@@ -30,6 +30,10 @@ pub struct DnsConfig {
     pub stale_secs: u64,
     pub workers: usize,
     pub tcp_enabled: bool,
+    /// Maximum concurrent TCP connections (one thread each).
+    pub max_tcp_connections: usize,
+    /// Per-source query budget.
+    pub rate_limit: crate::ratelimit::RateLimitConfig,
     pub fallback_ip: Option<String>,
 }
 
@@ -105,6 +109,29 @@ impl DnsConfig {
             tcp_enabled: std::env::var("DNS_TCP")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
+            max_tcp_connections: std::env::var("DNS_MAX_TCP_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512)
+                .clamp(16, 65_536),
+            rate_limit: crate::ratelimit::RateLimitConfig {
+                // 0 disables limiting, which is only sensible behind a scrubber.
+                per_source: std::env::var("DNS_RATE_LIMIT_PER_SOURCE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(100)
+                    .min(100_000),
+                per_prefix: std::env::var("DNS_RATE_LIMIT_PER_PREFIX")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1_000)
+                    .min(1_000_000),
+                max_tracked: std::env::var("DNS_RATE_LIMIT_MAX_TRACKED")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(50_000)
+                    .clamp(1_000, 1_000_000),
+            },
             fallback_ip: std::env::var("DNS_FALLBACK_IP")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),

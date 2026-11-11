@@ -942,6 +942,126 @@ fn submitted_secret(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Validate the comma-separated hotlink referer whitelist.
+///
+/// The edge now matches these entries against the parsed `Referer` host with
+/// label boundaries, so an entry must be a bare host (`example.com`), a
+/// subdomain wildcard (`*.example.com`) or `*`. Rejecting anything else at write
+/// time stops operators from pasting a full URL, which would silently never
+/// match and lock legitimate referers out.
+pub fn validate_hotlink_referers(raw: &str) -> Result<String, String> {
+    let mut out = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry == "*" {
+            out.push("*".to_string());
+            continue;
+        }
+        if entry.len() > 253 {
+            return Err("hotlink referer entry is too long".into());
+        }
+        if entry.contains("://") {
+            return Err(format!(
+                "hotlink referer {entry:?} must be a bare host such as example.com, not a URL"
+            ));
+        }
+        if entry.contains('/') || entry.contains(' ') {
+            return Err(format!(
+                "hotlink referer {entry:?} must contain only a host name"
+            ));
+        }
+        let host = entry.strip_prefix("*.").unwrap_or(entry);
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let valid = !host.is_empty()
+            && host.contains('.')
+            && host.split('.').all(|label| {
+                let bytes = label.as_bytes();
+                !label.is_empty()
+                    && label.len() <= 63
+                    && bytes[0] != b'-'
+                    && bytes[bytes.len() - 1] != b'-'
+                    && bytes
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+            });
+        if !valid {
+            return Err(format!("hotlink referer {entry:?} is not a valid host name"));
+        }
+        out.push(if entry.starts_with("*.") {
+            format!("*.{host}")
+        } else {
+            host
+        });
+    }
+    Ok(out.join(","))
+}
+
+/// Which sensitive settings a `PUT /settings` request actually changed.
+///
+/// The audit entry used to read `"updated"` for every settings write, so a
+/// review could not tell a cosmetic cache-header tweak from an origin
+/// credential rotation. Only **field names** are recorded here: the values are
+/// secrets, and an audit log is retained and broadly readable.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SensitiveChanges {
+    /// `origin_auth_value` was replaced (value never logged).
+    pub origin_auth_value: bool,
+    /// `origin_auth_header` was changed.
+    pub origin_auth_header: bool,
+    /// A new `signed_url_secret` was supplied.
+    pub signed_url_secret: bool,
+    /// The previous-key slot was written (used for rotation compatibility).
+    pub signed_url_previous_secret: bool,
+    /// A secret was generated automatically (hotlink signing enabled).
+    pub signed_url_secret_generated: bool,
+}
+
+impl SensitiveChanges {
+    pub fn is_empty(&self) -> bool {
+        !(self.origin_auth_value
+            || self.origin_auth_header
+            || self.signed_url_secret
+            || self.signed_url_previous_secret
+            || self.signed_url_secret_generated)
+    }
+
+    /// Comma-separated field names for the audit `detail` column.
+    pub fn to_detail(&self) -> String {
+        let mut changed = Vec::new();
+        if self.origin_auth_value {
+            changed.push("origin_auth_value");
+        }
+        if self.origin_auth_header {
+            changed.push("origin_auth_header");
+        }
+        if self.signed_url_secret {
+            changed.push("signed_url_secret");
+        }
+        if self.signed_url_previous_secret {
+            changed.push("signed_url_previous_secret");
+        }
+        if self.signed_url_secret_generated {
+            changed.push("signed_url_secret(generated)");
+        }
+        changed.join(",")
+    }
+
+    /// Audit detail for a settings update.
+    ///
+    /// Always names the event, and appends the changed secret fields when there
+    /// are any, so the absence of names means "no credential changed".
+    pub fn audit_detail(&self) -> String {
+        if self.is_empty() {
+            "updated".to_string()
+        } else {
+            format!("updated; sensitive: {}", self.to_detail())
+        }
+    }
+}
+
 /// Canonical domain name, validated.
 ///
 /// The edge lowercases the `Host` header and strips a trailing root dot before
@@ -1305,6 +1425,40 @@ pub async fn put_settings(
     if !actor.can_write_domain(&state, uid).await {
         return Err(forbidden());
     }
+    // Snapshot of the current row, used both to compare a few non-secret fields
+    // and to know whether a secret already exists.
+    let stored_settings = repository::get_domain_settings(&state.pool, &domain_name)
+        .await
+        .ok()
+        .flatten();
+
+    // Tracks credential changes so the audit entry can name them. Values are
+    // never recorded: only which field changed.
+    //
+    // Secrets: any submitted value that is not the mask replaces the secret, so
+    // its presence in the request is the signal.
+    let mut sensitive = SensitiveChanges::default();
+    if submitted_secret(req.origin_auth_value.as_deref()).is_some() {
+        sensitive.origin_auth_value = true;
+    }
+    if submitted_secret(req.signed_url_secret.as_deref()).is_some() {
+        sensitive.signed_url_secret = true;
+    }
+    if submitted_secret(req.signed_url_previous_secret.as_deref()).is_some() {
+        sensitive.signed_url_previous_secret = true;
+    }
+    // The header *name* is not a secret, so compare against the stored value
+    // instead of just checking for non-empty: clearing it, renaming it and
+    // re-sending the current one are three different events.
+    if let (Some(header), Some(current)) = (
+        req.origin_auth_header.as_deref(),
+        stored_settings.as_ref(),
+    ) {
+        if header.trim() != current.origin_auth_header.trim() {
+            sensitive.origin_auth_header = true;
+        }
+    }
+
     let cc_mode = match req
         .cc_mode
         .as_deref()
@@ -1348,12 +1502,19 @@ pub async fn put_settings(
         },
         None => None,
     };
+    let hotlink_referers = match req.hotlink_allow_referers.as_deref() {
+        Some(value) => Some(
+            validate_hotlink_referers(value)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?,
+        ),
+        None => None,
+    };
     let n = repository::update_domain_settings(
         &state.pool,
         uid,
         req.ignore_query_string,
         req.cors_origins.as_deref(),
-        req.hotlink_allow_referers.as_deref(),
+        hotlink_referers.as_deref(),
         req.origin_timeout_ms.map(|v| v as i32),
         req.custom_headers.as_deref(),
         req.rate_limit_rps.map(|v| v as i32),
@@ -1431,11 +1592,13 @@ pub async fn put_settings(
         let mut secret = submitted_secret(req.signed_url_secret.as_deref());
         let wanted_on = enabled_arg.unwrap_or(false);
         if wanted_on && secret.is_none() {
-            let existing = repository::get_domain_settings(&state.pool, &domain_name)
-                .await
-                .ok()
-                .flatten();
-            if existing.map(|s| s.signed_url_secret.is_empty()).unwrap_or(true) {
+            if stored_settings
+                .as_ref()
+                .map(|s| s.signed_url_secret.is_empty())
+                .unwrap_or(true)
+            {
+                // Enabling signed URLs without supplying a key creates one.
+                sensitive.signed_url_secret_generated = true;
                 secret = Some(generate_secret());
             }
         }
@@ -1461,11 +1624,12 @@ pub async fn put_settings(
         || req.hotlink_signature_enabled.is_some();
     if security_requested {
         if req.hotlink_signature_enabled == Some(true) {
-            let settings = repository::get_domain_settings(&state.pool, &domain_name)
-                .await
-                .map_err(|_| db_error())?
+            let settings = stored_settings
+                .as_ref()
                 .ok_or_else(|| not_found(&id))?;
             if settings.signed_url_secret.is_empty() {
+                // Enabling hotlink signing creates a signing key implicitly.
+                sensitive.signed_url_secret_generated = true;
                 let secret = generate_secret();
                 repository::update_domain_signed_url(
                     &state.pool,
@@ -1512,7 +1676,7 @@ pub async fn put_settings(
         &actor.email,
         "domain.settings",
         &row.name,
-        "updated",
+        &sensitive.audit_detail(),
     )
     .await;
     let _ = crate::service::config_version::record_domain(
@@ -1535,6 +1699,89 @@ mod tests {
     /// The edge resolves a domain by the lowercased, root-dot-stripped `Host`.
     /// Anything that normalizes to an existing name must be rejected rather
     /// than stored as a second row that overwrites the first on the edge.
+    /// Entries must be bare hosts, otherwise the edge can never match them and
+    /// legitimate referers are silently blocked.
+    #[test]
+    fn hotlink_referers_are_validated() {
+        assert_eq!(
+            validate_hotlink_referers("Example.COM, *.Foo.com").unwrap(),
+            "example.com,*.foo.com"
+        );
+        assert_eq!(validate_hotlink_referers("*").unwrap(), "*");
+        assert_eq!(validate_hotlink_referers("  ").unwrap(), "");
+
+        for bad in [
+            "https://example.com",
+            "example.com/path",
+            "notextension",
+            "-bad.com",
+            "bad-.com",
+            "a..b.com",
+        ] {
+            assert!(
+                validate_hotlink_referers(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    /// A full URL pasted by an operator used to be stored verbatim and never
+    /// matched, quietly locking out the very referers it was meant to allow.
+    #[test]
+    fn hotlink_referer_url_is_rejected_with_a_hint() {
+        let err = validate_hotlink_referers("https://example.com/page").unwrap_err();
+        assert!(err.contains("bare host"), "unexpected message: {err}");
+    }
+
+    /// The audit entry must name which credentials changed. It used to read
+    /// only "updated", so a review could not distinguish an origin credential
+    /// rotation from a cosmetic change.
+    #[test]
+    fn audit_detail_names_changed_secrets() {
+        let mut changes = SensitiveChanges::default();
+        assert_eq!(changes.audit_detail(), "updated");
+
+        changes.origin_auth_value = true;
+        assert_eq!(
+            changes.audit_detail(),
+            "updated; sensitive: origin_auth_value"
+        );
+
+        changes.signed_url_secret = true;
+        assert_eq!(
+            changes.audit_detail(),
+            "updated; sensitive: origin_auth_value,signed_url_secret"
+        );
+
+        changes.signed_url_secret_generated = true;
+        assert!(changes
+            .audit_detail()
+            .contains("signed_url_secret(generated)"));
+    }
+
+    /// The audit log is retained and broadly readable, so it must never contain
+    /// the secret value itself — only its field name.
+    #[test]
+    fn audit_detail_never_contains_secret_values() {
+        let value = "super-secret-origin-token";
+        let mut changes = SensitiveChanges::default();
+        changes.origin_auth_value = true;
+        changes.signed_url_secret = true;
+        let detail = changes.audit_detail();
+        assert!(!detail.contains(value));
+        assert!(!detail.contains(SECRET_MASK));
+        assert!(detail.contains("origin_auth_value"));
+    }
+
+    /// A request that only touches non-secret settings must not claim a
+    /// credential change.
+    #[test]
+    fn unrelated_settings_update_reports_no_sensitive_change() {
+        let changes = SensitiveChanges::default();
+        assert!(changes.is_empty());
+        assert_eq!(changes.audit_detail(), "updated");
+    }
+
     /// A project member with only `domain:read` must not be able to lift the
     /// origin auth credentials or the signed-URL key from the settings API.
     #[test]

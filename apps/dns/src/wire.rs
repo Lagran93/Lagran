@@ -145,15 +145,18 @@ fn read_name(buf: &[u8], start: usize) -> Result<(String, usize), WireError> {
 
 fn skip_rr(buf: &[u8], pos: usize) -> Result<usize, WireError> {
     let (_, mut p) = read_name(buf, pos)?;
-    p += 8; // type, class, ttl
-    if p + 2 > buf.len() {
-        return Err(WireError::Short);
-    }
+    // `read_name` already bounds `p`, but use checked arithmetic so a malformed
+    // record can never wrap the offset and make the caller loop in place.
+    p = p
+        .checked_add(8) // type, class, ttl
+        .filter(|p| *p <= buf.len())
+        .ok_or(WireError::Short)?;
     let rdlen = be16(buf, p)? as usize;
-    p += 2 + rdlen;
-    if p > buf.len() {
-        return Err(WireError::Short);
-    }
+    p = p
+        .checked_add(2)
+        .and_then(|p| p.checked_add(rdlen))
+        .filter(|p| *p <= buf.len())
+        .ok_or(WireError::Short)?;
     Ok(p)
 }
 
@@ -229,6 +232,15 @@ pub fn mask_addr(addr: IpAddr, prefix: u8) -> IpAddr {
     }
 }
 
+/// Upper bound on resource records accepted in a single query.
+///
+/// The header fields are attacker-controlled `u16`s. Without a cap, a ~12 byte
+/// packet could ask us to walk `an + ns + ar` records, each of which triggers a
+/// full name parse — roughly 196k name resolutions from one datagram, which
+/// pins a worker thread. The server never sends more than a handful of
+/// records, so anything beyond this is malformed by definition.
+pub const MAX_RECORDS: usize = 64;
+
 pub fn parse_query(buf: &[u8]) -> Result<Query, WireError> {
     if buf.len() < 12 {
         return Err(WireError::Short);
@@ -240,6 +252,10 @@ pub fn parse_query(buf: &[u8]) -> Result<Query, WireError> {
     let ns = be16(buf, 8)?;
     let ar = be16(buf, 10)?;
     if qd != 1 {
+        return Err(WireError::BadMessage);
+    }
+    let total = usize::from(an) + usize::from(ns) + usize::from(ar);
+    if total > MAX_RECORDS {
         return Err(WireError::BadMessage);
     }
     let (qname, mut pos) = read_name(buf, 12)?;
@@ -470,6 +486,36 @@ mod tests {
             out.extend_from_slice(&rdata);
         }
         out
+    }
+
+    /// Header counts are attacker-controlled `u16`s. Without a cap a tiny
+    /// packet could make us walk ~196k records, pinning a worker.
+    #[test]
+    fn record_count_is_capped() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0u16.to_be_bytes()); // id
+        msg.extend_from_slice(&0u16.to_be_bytes()); // flags
+        msg.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+        msg.extend_from_slice(&60_000u16.to_be_bytes()); // ancount
+        msg.extend_from_slice(&60_000u16.to_be_bytes()); // nscount
+        msg.extend_from_slice(&60_000u16.to_be_bytes()); // arcount
+        msg.extend_from_slice(&[0u8]); // root name
+        msg.extend_from_slice(&1u16.to_be_bytes()); // type A
+        msg.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        assert!(matches!(parse_query(&msg), Err(WireError::BadMessage)));
+
+        // A normal query with no records still parses.
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&0u16.to_be_bytes());
+        ok.extend_from_slice(&0u16.to_be_bytes());
+        ok.extend_from_slice(&1u16.to_be_bytes());
+        ok.extend_from_slice(&0u16.to_be_bytes());
+        ok.extend_from_slice(&0u16.to_be_bytes());
+        ok.extend_from_slice(&0u16.to_be_bytes());
+        ok.extend_from_slice(&[0u8]);
+        ok.extend_from_slice(&1u16.to_be_bytes());
+        ok.extend_from_slice(&1u16.to_be_bytes());
+        assert!(parse_query(&ok).is_ok());
     }
 
     #[test]
