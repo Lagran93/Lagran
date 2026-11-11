@@ -130,257 +130,238 @@
     </div>
 
     <BaseModal v-model="formOpen" :title="editing ? '编辑缓存规则' : '新建缓存规则'" :confirm-text="editing ? '保存修改' : '创建规则'"
-      :loading="submitting" width="920px" @confirm="submit">
+      :loading="submitting" width="880px" @confirm="submit">
       <div class="rule-editor">
-        <div class="rule-preview">
-          <div class="rule-preview-main">
-            <div class="rule-preview-kicker">{{ editing ? '正在编辑规则' : '新建规则预览' }}</div>
-            <div class="rule-preview-title">
-              <span class="rule-method">{{ previewMethods }}</span>
-              <span class="rule-path mono">{{ form.path_pattern || '未设置路径' }}</span>
+        <div class="rule-summary">
+          <div class="rule-summary-main">
+            <div class="rule-summary-path mono">{{ form.path_pattern || '未设置路径' }}</div>
+            <div class="rule-summary-tags">
+              <span class="rule-tag">{{ previewDomain }}</span>
+              <span class="rule-tag">{{ previewMethods }}</span>
+              <span class="rule-tag" :class="`tone-${actionTone(form.action)}`">{{ actionLabel(form.action) }}</span>
+              <span v-if="form.action === 'cache'" class="rule-tag">{{ formatDuration(form.ttl_seconds) }}</span>
+              <span class="rule-tag">P{{ form.priority }}</span>
             </div>
           </div>
-          <div class="rule-preview-meta">
-            <span class="rule-pill" :class="`tone-${actionTone(form.action)}`">{{ actionLabel(form.action) }}</span>
-            <span v-if="form.action === 'cache'" class="rule-pill subtle">{{ formatDuration(form.ttl_seconds) }}</span>
-            <span class="rule-pill subtle">P{{ form.priority }}</span>
-            <span class="rule-pill" :class="form.enabled ? 'tone-success' : 'subtle'">
-              {{ form.enabled ? '启用' : '停用' }}
-            </span>
-          </div>
+          <label class="switch rule-summary-switch" :class="{ on: form.enabled }">
+            <span class="rule-summary-switch-text">{{ form.enabled ? '已启用' : '已停用' }}</span>
+            <span class="switch-track" />
+            <input v-model="form.enabled" type="checkbox" style="display: none" />
+          </label>
         </div>
 
-        <div v-if="!editing" class="rule-preset-bar">
-          <span class="rule-preset-label">快速模板</span>
-          <div class="rule-preset-list">
-            <button v-for="p in presets" :key="p.label" class="rule-preset" type="button" @click="applyPreset(p)">
-              {{ p.label }}
-            </button>
+        <div class="rule-layout">
+          <div class="rule-main">
+            <section class="rule-block">
+              <header class="rule-block-head">
+                <h4>基础匹配</h4>
+                <span>域名、路径与请求方法</span>
+              </header>
+              <div class="rule-block-body">
+                <div class="rule-grid rule-grid-match">
+                  <div class="field">
+                    <label class="field-label">所属域名 <span class="req">*</span></label>
+                    <select v-model="form.domain_id" class="select" :disabled="!!editing">
+                      <option value="">请选择域名</option>
+                      <option v-for="d in domains" :key="d.id" :value="d.id">{{ d.name }}</option>
+                    </select>
+                  </div>
+
+                  <div class="field">
+                    <label class="field-label">匹配路径 <span class="req">*</span></label>
+                    <div class="path-combo">
+                      <select v-model="form.match_type" class="select">
+                        <option value="glob">通配符</option>
+                        <option value="regex">正则</option>
+                      </select>
+                      <input v-model="form.path_pattern" class="input mono"
+                        :placeholder="form.match_type === 'regex' ? '\\.(css|js)$' : '/static/*'" />
+                    </div>
+                  </div>
+
+                  <div class="field span-2">
+                    <label class="field-label">请求方法</label>
+                    <div class="chip-row">
+                      <button v-for="m in methodOptions" :key="m" type="button" class="chip"
+                        :class="{ on: form.methods.includes(m) }" @click="toggleMethod(m)">
+                        {{ m }}
+                      </button>
+                    </div>
+                    <span class="field-hint">不选表示全部方法；路径支持 `/static/*`、`/img*`，`/*` 匹配全部。</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="rule-block">
+              <header class="rule-block-head">
+                <h4>匹配条件</h4>
+                <span>可选，进一步缩小命中范围</span>
+              </header>
+              <div class="rule-block-body">
+                <div class="rule-grid">
+                  <div class="field">
+                    <label class="field-label">查询串包含</label>
+                    <input v-model="form.match_query" class="input" placeholder="例如 debug=1" />
+                  </div>
+                  <div class="field">
+                    <label class="field-label">Content-Type 包含</label>
+                    <input v-model="form.match_content_type" class="input" placeholder="例如 text/html" />
+                  </div>
+                </div>
+                <p class="rule-tip">
+                  <AppIcon name="info" :size="13" />
+                  <span>留空表示不限制；Content-Type 在响应阶段匹配，因此不能配置 Cache Key 请求头。</span>
+                </p>
+              </div>
+            </section>
+
+            <section class="rule-block">
+              <header class="rule-block-head">
+                <h4>缓存策略</h4>
+                <span>命中后如何处理与缓存多久</span>
+              </header>
+              <div class="rule-block-body">
+                <div class="rule-action-row">
+                  <div class="field">
+                    <label class="field-label">缓存动作</label>
+                    <div class="segmented rule-segmented">
+                      <button v-for="opt in actionOptions" :key="opt.value" type="button"
+                        :class="{ active: form.action === opt.value }" @click="form.action = opt.value">
+                        {{ opt.label }}
+                      </button>
+                    </div>
+                  </div>
+                  <div class="field rule-priority">
+                    <label class="field-label">优先级</label>
+                    <input v-model.number="form.priority" class="input" type="number" title="数值越大越优先" />
+                  </div>
+                </div>
+                <span class="field-hint rule-action-hint">{{ actionHint }}</span>
+
+                <div v-if="form.action === 'cache'" class="ttl-grid">
+                  <div class="field">
+                    <label class="field-label">边缘 TTL</label>
+                    <div class="input-affix">
+                      <input v-model.number="form.ttl_seconds" class="input" type="number" min="1" />
+                      <span>秒</span>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label class="field-label">SWR</label>
+                    <div class="input-affix">
+                      <input v-model.number="form.swr_seconds" class="input" type="number" min="0" />
+                      <span>秒</span>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label class="field-label">浏览器 TTL</label>
+                    <div class="input-affix">
+                      <input v-model.number="form.browser_ttl_seconds" class="input" type="number" min="0" />
+                      <span>秒</span>
+                    </div>
+                  </div>
+                </div>
+
+              </div>
+            </section>
           </div>
-        </div>
 
-        <div class="rule-editor-grid">
-          <section class="rule-section">
-            <div class="rule-section-head">
-              <span class="rule-section-num">01</span>
-              <div>
-                <div class="rule-section-title">基本信息</div>
-                <div class="rule-section-desc">选择域名与要匹配的路径</div>
+          <aside class="rule-side">
+            <section v-if="!editing" class="rule-block">
+              <header class="rule-block-head">
+                <h4>快速模板</h4>
+                <span>一键套用常用策略</span>
+              </header>
+              <div class="rule-block-body rule-presets">
+                <button v-for="p in presets" :key="p.label" class="rule-preset" type="button" @click="applyPreset(p)">
+                  {{ p.label }}
+                </button>
               </div>
-            </div>
-            <div class="rule-section-body">
-              <div class="field">
-                <label class="field-label">所属域名 <span class="req">*</span></label>
-                <select v-model="form.domain_id" class="select" :disabled="!!editing">
-                  <option value="">请选择域名</option>
-                  <option v-for="d in domains" :key="d.id" :value="d.id">{{ d.name }}</option>
-                </select>
-              </div>
+            </section>
 
-              <div class="field">
-                <label class="field-label">匹配路径 <span class="req">*</span></label>
-                <div class="path-combo">
-                  <select v-model="form.match_type" class="select">
-                    <option value="glob">通配符</option>
-                    <option value="regex">正则</option>
-                  </select>
-                  <input v-model="form.path_pattern" class="input mono"
-                    :placeholder="form.match_type === 'regex' ? '\\.(css|js)$' : '/static/*'" />
-                </div>
-                <span class="field-hint">
-                  {{ form.match_type === 'regex'
-                    ? 'Rust regex；例如 `\\.(css|js)$`。'
-                    : '支持 `/static/*` 和 `/img*`；`/*` 匹配全部。' }}
-                </span>
-              </div>
+            <section class="rule-block">
+              <header class="rule-block-head">
+                <h4>附加选项</h4>
+                <span>Cookie 与备注</span>
+              </header>
+              <div class="rule-block-body">
+                <label class="option-row">
+                  <div>
+                    <div class="option-title">忽略 Cookie</div>
+                    <div class="option-desc">仅用于公共静态资源。</div>
+                  </div>
+                  <span class="switch" :class="{ on: form.ignore_cookie }">
+                    <span class="switch-track" />
+                    <input v-model="form.ignore_cookie" type="checkbox" style="display: none" />
+                  </span>
+                </label>
 
-              <div class="field">
-                <label class="field-label">请求方法</label>
-                <div class="chip-row">
-                  <button v-for="m in methodOptions" :key="m" type="button" class="chip"
-                    :class="{ on: form.methods.includes(m) }" @click="toggleMethod(m)">
-                    {{ m }}
-                  </button>
-                </div>
-                <span class="field-hint">不选表示全部方法</span>
-              </div>
-            </div>
-          </section>
-
-          <section class="rule-section">
-            <div class="rule-section-head">
-              <span class="rule-section-num">02</span>
-              <div>
-                <div class="rule-section-title">匹配条件</div>
-                <div class="rule-section-desc">进一步缩小规则命中范围</div>
-              </div>
-            </div>
-            <div class="rule-section-body">
-              <div class="field">
-                <label class="field-label">查询串包含</label>
-                <input v-model="form.match_query" class="input" placeholder="例如 debug=1" />
-                <span class="field-hint">不区分大小写；留空不限制查询串。</span>
-              </div>
-
-              <div class="field">
-                <label class="field-label">响应 Content-Type 包含</label>
-                <input v-model="form.match_content_type" class="input" placeholder="例如 text/html" />
-                <span class="field-hint">
-                  留空匹配所有类型；例如 `text/html` + 绕过缓存。
-                </span>
-              </div>
-
-              <div class="rule-tip">
-                <AppIcon name="info" :size="14" />
-                <span>Content-Type 规则在响应阶段匹配，不能配置 Cache Key 请求头。</span>
-              </div>
-            </div>
-          </section>
-
-          <section class="rule-section">
-            <div class="rule-section-head">
-              <span class="rule-section-num">03</span>
-              <div>
-                <div class="rule-section-title">缓存策略</div>
-                <div class="rule-section-desc">命中后如何处理与缓存多久</div>
-              </div>
-            </div>
-            <div class="rule-section-body">
-              <div class="field">
-                <label class="field-label">缓存动作</label>
-                <div class="segmented">
-                  <button v-for="opt in actionOptions" :key="opt.value" type="button"
-                    :class="{ active: form.action === opt.value }" @click="form.action = opt.value">
-                    {{ opt.label }}
-                  </button>
-                </div>
-                <span class="field-hint">{{ actionHint }}</span>
-              </div>
-
-              <div v-if="form.action === 'cache'" class="ttl-grid">
                 <div class="field">
-                  <label class="field-label">边缘 TTL</label>
-                  <div class="input-affix">
-                    <input v-model.number="form.ttl_seconds" class="input" type="number" min="1" />
-                    <span>秒</span>
-                  </div>
-                </div>
-                <div class="field">
-                  <label class="field-label">SWR</label>
-                  <div class="input-affix">
-                    <input v-model.number="form.swr_seconds" class="input" type="number" min="0" />
-                    <span>秒</span>
-                  </div>
-                </div>
-                <div class="field">
-                  <label class="field-label">浏览器 TTL</label>
-                  <div class="input-affix">
-                    <input v-model.number="form.browser_ttl_seconds" class="input" type="number" min="0" />
-                    <span>秒</span>
-                  </div>
+                  <label class="field-label">备注</label>
+                  <input v-model="form.note" class="input" placeholder="可选，便于团队识别" maxlength="200" />
                 </div>
               </div>
+            </section>
 
-              <div class="field">
-                <label class="field-label">优先级</label>
-                <input v-model.number="form.priority" class="input" type="number" />
-                <span class="field-hint">数值越大越优先。</span>
-              </div>
-            </div>
-          </section>
-
-          <section class="rule-section">
-            <div class="rule-section-head">
-              <span class="rule-section-num">04</span>
-              <div>
-                <div class="rule-section-title">附加选项</div>
-                <div class="rule-section-desc">Cookie、备注与启用状态</div>
-              </div>
-            </div>
-            <div class="rule-section-body">
-              <label class="option-row">
-                <div>
-                  <div class="option-title">忽略 Cookie</div>
-                  <div class="option-desc">仅用于公共静态资源，不要用于登录态内容。</div>
-                </div>
-                <input v-model="form.ignore_cookie" type="checkbox" class="option-switch" />
-              </label>
-
-              <label class="option-row">
-                <div>
-                  <div class="option-title">启用规则</div>
-                  <div class="option-desc">停用后边缘忽略此规则。</div>
-                </div>
-                <input v-model="form.enabled" type="checkbox" class="option-switch" />
-              </label>
-
-              <div class="field">
-                <label class="field-label">备注</label>
-                <input v-model="form.note" class="input" placeholder="可选，便于团队识别" maxlength="200" />
-              </div>
-            </div>
-          </section>
-
-          <section class="rule-section span-2">
-            <div class="rule-section-head">
-              <span class="rule-section-num">05</span>
-              <div>
-                <div class="rule-section-title">Cache Key 组成</div>
-                <div class="rule-section-desc">选择哪些请求维度用于区分缓存对象</div>
-              </div>
-            </div>
-            <div class="rule-section-body">
-              <div class="key-table">
-                <div class="key-row">
-                  <div class="key-name">
-                    <div>Query</div>
-                    <small>URL 查询串</small>
+            <section class="rule-block">
+              <header class="rule-block-head">
+                <h4>Cache Key 组成</h4>
+                <span>区分缓存对象的维度</span>
+              </header>
+              <div class="rule-block-body">
+                <div class="key-table">
+                  <div class="key-row">
+                    <div class="key-name">
+                      <div>Query</div>
+                      <small>URL 查询串</small>
+                    </div>
+                    <div class="key-toggle">
+                      <button type="button" :class="{ active: form.ignore_query === 'inherit' }"
+                        @click="form.ignore_query = 'inherit'">继承</button>
+                      <button type="button" :class="{ active: form.ignore_query === 'on' }"
+                        @click="form.ignore_query = 'on'">忽略</button>
+                      <button type="button" :class="{ active: form.ignore_query === 'off' }"
+                        @click="form.ignore_query = 'off'">区分</button>
+                    </div>
                   </div>
-                  <div class="key-toggle">
-                    <button type="button" :class="{ active: form.ignore_query === 'inherit' }"
-                      @click="form.ignore_query = 'inherit'">继承域名</button>
-                    <button type="button" :class="{ active: form.ignore_query === 'on' }"
-                      @click="form.ignore_query = 'on'">忽略</button>
-                    <button type="button" :class="{ active: form.ignore_query === 'off' }"
-                      @click="form.ignore_query = 'off'">区分</button>
+
+                  <div class="key-row">
+                    <div class="key-name">
+                      <div>Origin</div>
+                      <small>CORS 来源</small>
+                    </div>
+                    <div class="key-toggle">
+                      <button type="button" :class="{ active: form.origin_mode === 'inherit' }"
+                        @click="form.origin_mode = 'inherit'">继承</button>
+                      <button type="button" :class="{ active: form.origin_mode === 'ignore' }"
+                        @click="form.origin_mode = 'ignore'">忽略</button>
+                      <button type="button" :class="{ active: form.origin_mode === 'keep' }"
+                        @click="form.origin_mode = 'keep'">区分</button>
+                    </div>
+                  </div>
+
+                  <div class="key-row">
+                    <div class="key-name">
+                      <div>Language</div>
+                      <small>Accept-Language</small>
+                    </div>
+                    <div class="key-toggle">
+                      <button type="button" :class="{ active: form.language_mode === 'inherit' }"
+                        @click="form.language_mode = 'inherit'">继承</button>
+                      <button type="button" :class="{ active: form.language_mode === 'ignore' }"
+                        @click="form.language_mode = 'ignore'">忽略</button>
+                      <button type="button" :class="{ active: form.language_mode === 'keep' }"
+                        @click="form.language_mode = 'keep'">区分</button>
+                    </div>
                   </div>
                 </div>
-
-                <div class="key-row">
-                  <div class="key-name">
-                    <div>Origin</div>
-                    <small>CORS 来源</small>
-                  </div>
-                  <div class="key-toggle">
-                    <button type="button" :class="{ active: form.origin_mode === 'inherit' }"
-                      @click="form.origin_mode = 'inherit'">继承域名</button>
-                    <button type="button" :class="{ active: form.origin_mode === 'ignore' }"
-                      @click="form.origin_mode = 'ignore'">忽略</button>
-                    <button type="button" :class="{ active: form.origin_mode === 'keep' }"
-                      @click="form.origin_mode = 'keep'">区分</button>
-                  </div>
-                </div>
-
-                <div class="key-row">
-                  <div class="key-name">
-                    <div>Accept-Language</div>
-                    <small>请求语言</small>
-                  </div>
-                  <div class="key-toggle">
-                    <button type="button" :class="{ active: form.language_mode === 'inherit' }"
-                      @click="form.language_mode = 'inherit'">继承域名</button>
-                    <button type="button" :class="{ active: form.language_mode === 'ignore' }"
-                      @click="form.language_mode = 'ignore'">忽略</button>
-                    <button type="button" :class="{ active: form.language_mode === 'keep' }"
-                      @click="form.language_mode = 'keep'">区分</button>
-                  </div>
+                <div class="key-note">
+                  「继承」跟随域名设置；忽略后对应 Vary 也按忽略处理。
                 </div>
               </div>
-              <div class="key-note">
-                继承域名跟随域名设置；忽略后对应 Vary 也按忽略处理。仅在响应内容不受该维度影响时忽略。
-              </div>
-            </div>
-          </section>
+            </section>
+          </aside>
         </div>
 
         <p v-if="error" class="rule-error">{{ error }}</p>
@@ -586,6 +567,11 @@ function actionTone(action: string) {
 const previewMethods = computed(() =>
   form.value.methods.length ? form.value.methods.join(' · ') : 'ALL',
 )
+
+const previewDomain = computed(() => {
+  if (editing.value?.domain_name) return editing.value.domain_name
+  return domains.value.find((d) => d.id === form.value.domain_id)?.name || '未选择域名'
+})
 
 function formatDuration(seconds: number) {
   const value = Number(seconds) || 0
@@ -978,211 +964,210 @@ onMounted(load)
 .rule-editor {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
 }
 
-.rule-preview {
+/* --- compact live summary ------------------------------------------- */
+
+.rule-summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 16px 18px;
+  gap: 14px;
+  padding: 11px 14px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background:
-    linear-gradient(135deg, var(--brand-bg), transparent 55%),
+    linear-gradient(120deg, var(--brand-bg), transparent 62%),
     var(--bg);
 }
 
-.rule-preview-main {
+.rule-summary-main {
   min-width: 0;
 }
 
-.rule-preview-kicker {
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-3);
-}
-
-.rule-preview-title {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  margin-top: 5px;
-}
-
-.rule-method {
-  flex: none;
-  padding: 2px 8px;
-  border-radius: 6px;
-  background: var(--brand);
-  color: #fff;
-  font-size: 11px;
+.rule-summary-path {
+  font-size: 14px;
   font-weight: 600;
-  letter-spacing: 0.03em;
-}
-
-.rule-path {
-  min-width: 0;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text);
 }
 
-.rule-preview-meta {
+.rule-summary-tags {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
   flex-wrap: wrap;
-  gap: 6px;
-  flex: none;
+  gap: 5px;
+  margin-top: 6px;
 }
 
-.rule-pill {
-  padding: 3px 9px;
+.rule-tag {
+  padding: 1px 7px;
+  border: 1px solid var(--border);
   border-radius: 999px;
-  border: 1px solid transparent;
+  background: var(--card);
+  color: var(--text-3);
   font-size: 11px;
-  font-weight: 600;
+  line-height: 16px;
   white-space: nowrap;
 }
 
-.rule-pill.subtle {
-  border-color: var(--border);
-  background: var(--card);
-  color: var(--text-3);
-}
-
-.rule-pill.tone-success {
+.rule-tag.tone-success {
+  border-color: transparent;
   background: var(--success-bg);
   color: var(--success);
 }
 
-.rule-pill.tone-warning {
+.rule-tag.tone-warning {
+  border-color: transparent;
   background: var(--warning-bg);
   color: var(--warning);
 }
 
-.rule-pill.tone-danger {
+.rule-tag.tone-danger {
+  border-color: transparent;
   background: var(--danger-bg);
   color: var(--danger);
 }
 
-.rule-preset-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  padding: 0 2px;
+.rule-summary-switch {
+  flex: none;
+  gap: 8px;
 }
 
-.rule-preset-label {
-  flex: none;
+.rule-summary-switch-text {
   font-size: 12px;
   color: var(--text-3);
 }
 
-.rule-preset-list {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-}
+/* --- two column shell ----------------------------------------------- */
 
-.rule-preset {
-  padding: 4px 10px;
-  border: 1px dashed var(--border-strong);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--text-2);
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.rule-preset:hover {
-  border-color: var(--brand);
-  background: var(--brand-bg);
-  color: var(--brand);
-}
-
-.rule-editor-grid {
+.rule-layout {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) 296px;
+  gap: 12px;
   align-items: start;
 }
 
-.rule-section {
+.rule-main,
+.rule-side {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* --- flat blocks ---------------------------------------------------- */
+
+.rule-block {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--card);
   overflow: hidden;
 }
 
-.rule-section.span-2 {
-  grid-column: 1 / -1;
-}
-
-.rule-section-head {
+.rule-block-head {
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 14px 16px 0;
+  align-items: baseline;
+  gap: 8px;
+  padding: 9px 13px;
+  border-bottom: 1px solid var(--divider);
+  background: #fbfcfd;
 }
 
-.rule-section-num {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  margin-top: 1px;
-  border-radius: 7px;
-  background: var(--brand-bg);
-  color: var(--brand);
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.rule-section-title {
+.rule-block-head h4 {
+  margin: 0;
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
 }
 
-.rule-section-desc {
-  margin-top: 2px;
+.rule-block-head span {
   font-size: 11px;
   color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.rule-section-body {
+.rule-block-body {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 14px 16px 16px;
+  gap: 11px;
+  padding: 12px 13px 13px;
+}
+
+.rule-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 11px 12px;
+}
+
+.rule-grid .span-2 {
+  grid-column: 1 / -1;
+}
+
+.rule-grid-match {
+  grid-template-columns: 168px minmax(0, 1fr);
+}
+
+.rule-block .field {
+  gap: 5px;
+}
+
+.rule-block .field-label {
+  font-size: 12px;
+}
+
+.rule-block .field-hint {
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.rule-segmented {
+  display: flex;
+  width: 100%;
+}
+
+.rule-action-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.rule-action-row .field:first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.rule-priority {
+  flex: none;
+  width: 104px;
+}
+
+.rule-action-hint {
+  margin-top: -4px;
+}
+
+.rule-segmented button {
+  flex: 1;
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12.5px;
 }
 
 .path-combo {
   display: grid;
-  grid-template-columns: 128px minmax(0, 1fr);
+  grid-template-columns: 106px minmax(0, 1fr);
   gap: 8px;
-}
-
-.path-combo .select,
-.path-combo .input {
-  height: 38px;
 }
 
 .ttl-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  gap: 9px;
 }
 
 .input-affix {
@@ -1190,13 +1175,13 @@ onMounted(load)
 }
 
 .input-affix .input {
-  padding-right: 32px;
+  padding-right: 30px;
 }
 
-.input-affix>span {
+.input-affix > span {
   position: absolute;
   top: 50%;
-  right: 10px;
+  right: 9px;
   transform: translateY(-50%);
   font-size: 11px;
   color: var(--text-3);
@@ -1206,8 +1191,9 @@ onMounted(load)
 .rule-tip {
   display: flex;
   align-items: flex-start;
-  gap: 7px;
-  padding: 9px 10px;
+  gap: 6px;
+  margin: 0;
+  padding: 7px 9px;
   border-radius: var(--radius);
   background: var(--brand-bg);
   color: var(--text-2);
@@ -1215,9 +1201,36 @@ onMounted(load)
   line-height: 1.5;
 }
 
-.rule-tip .icon {
+.rule-tip .app-icon {
   flex: none;
   margin-top: 1px;
+  color: var(--brand);
+}
+
+/* --- side column ---------------------------------------------------- */
+
+.rule-presets {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 11px 12px 12px;
+}
+
+.rule-preset {
+  padding: 3px 9px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 17px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.rule-preset:hover {
+  border-color: var(--brand);
+  background: var(--brand-bg);
   color: var(--brand);
 }
 
@@ -1225,8 +1238,8 @@ onMounted(load)
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
+  gap: 10px;
+  padding: 8px 10px;
   border: 1px solid var(--divider);
   border-radius: var(--radius);
   background: var(--bg);
@@ -1240,16 +1253,9 @@ onMounted(load)
 }
 
 .option-desc {
-  margin-top: 2px;
+  margin-top: 1px;
   font-size: 11px;
   color: var(--text-3);
-}
-
-.option-switch {
-  flex: none;
-  width: 16px;
-  height: 16px;
-  accent-color: var(--brand);
 }
 
 .key-table {
@@ -1260,18 +1266,18 @@ onMounted(load)
 
 .key-row {
   display: grid;
-  grid-template-columns: minmax(130px, 180px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 126px;
   align-items: center;
-  gap: 16px;
-  padding: 10px 12px;
+  gap: 8px;
+  padding: 7px 9px;
   background: var(--bg);
 }
 
-.key-row+.key-row {
+.key-row + .key-row {
   border-top: 1px solid var(--divider);
 }
 
-.key-name>div {
+.key-name > div {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-2);
@@ -1287,19 +1293,20 @@ onMounted(load)
 .key-toggle {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 3px;
-  padding: 3px;
-  border-radius: 9px;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
   background: var(--card);
 }
 
 .key-toggle button {
-  height: 28px;
+  height: 24px;
+  padding: 0;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -1315,56 +1322,55 @@ onMounted(load)
 }
 
 .key-note {
-  margin-top: 9px;
   font-size: 11px;
-  line-height: 1.55;
+  line-height: 1.5;
   color: var(--text-3);
 }
 
 .rule-error {
   margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: var(--danger-bg);
   font-size: 12px;
   color: var(--danger);
 }
 
-@media (max-width: 760px) {
-  .rule-preview {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 12px;
-  }
-
-  .rule-preview-meta {
-    justify-content: flex-start;
-  }
-
-  .rule-editor-grid {
+@media (max-width: 860px) {
+  .rule-layout {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .rule-section.span-2 {
-    grid-column: auto;
-  }
-
-  .path-combo {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .ttl-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .key-row {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 8px;
-  }
-
-  .key-toggle button {
-    font-size: 11px;
   }
 }
 
 @media (max-width: 760px) {
+  .rule-summary {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .rule-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .rule-grid .span-2 {
+    grid-column: auto;
+  }
+
+  .path-combo,
+  .ttl-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .rule-action-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .rule-priority {
+    width: auto;
+  }
+
   .effective-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
