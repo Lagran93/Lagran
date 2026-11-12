@@ -169,9 +169,22 @@ fn secure_request(req: &Request<Body>, headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Constrain a post-challenge redirect to a path on this host.
+///
+/// The value arrives in the query string, so it must not be able to send the
+/// user to another origin. Browsers treat `\` as `/` in a special-scheme URL
+/// (the WHATWG URL standard calls this `invalid-reverse-solidus`), which made
+/// `/\evil.test` behave as `//evil.test`: a protocol-relative URL pointing at
+/// an attacker's host, reached through a link on our own domain. Rejecting only
+/// a leading `//` missed that, so a backslash is refused anywhere in the value.
 fn safe_next(next: &str) -> String {
     let next = next.trim();
-    if next.starts_with('/') && !next.starts_with("//") && !next.contains(['\r', '\n']) {
+    let ok = next.starts_with('/')
+        && !next.starts_with("//")
+        && !next.starts_with("/\\")
+        && !next.starts_with("\\\\")
+        && !next.contains(['\r', '\n', '\\']);
+    if ok {
         next.to_string()
     } else {
         "/".to_string()
@@ -556,5 +569,61 @@ mod tests {
         assert_eq!(safe_next("//evil.test"), "/");
         assert_eq!(safe_next("https://evil.test"), "/");
         assert_eq!(safe_next("/ok\r\nX: y"), "/");
+    }
+
+    /// Redirect targets that must be refused because a browser would resolve
+    /// them to another origin.
+    ///
+    /// `\` is treated as `/` in a special-scheme URL, so `/\evil.test` and
+    /// `//evil.test` are the same protocol-relative URL to an attacker's host.
+    /// The original check only looked for a leading `//`.
+    #[test]
+    fn safe_next_rejects_cross_origin_targets() {
+        for probe in [
+            "//evil.test",
+            "///evil.test",
+            "/\\evil.test",
+            "/\\/evil.test",
+            "\\\\evil.test",
+            "\\evil.test",
+            "/path\\..\\..\\evil.test",
+            "https://evil.test",
+            "http://evil.test",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "",
+            "   ",
+            "/ok\r\nX: y",
+        ] {
+            assert_eq!(
+                safe_next(probe),
+                "/",
+                "{probe:?} must not be used as a redirect target"
+            );
+        }
+    }
+
+    /// Ordinary same-origin paths still round-trip unchanged.
+    #[test]
+    fn safe_next_keeps_same_origin_paths() {
+        for probe in [
+            "/",
+            "/a",
+            "/a?b=1",
+            "/a/b/c",
+            "/a%20b",
+            "/a?next=/b",
+            "/../etc",
+            "/a#frag",
+        ] {
+            assert_eq!(safe_next(probe), probe, "{probe:?} should pass through");
+        }
+    }
+
+    /// Surrounding whitespace is trimmed before the decision.
+    #[test]
+    fn safe_next_trims_before_deciding() {
+        assert_eq!(safe_next("  /a  "), "/a");
+        assert_eq!(safe_next("\t//evil.test\t"), "/");
     }
 }
