@@ -143,6 +143,13 @@ jobs:
           cp dist/lagran-binaries/lagran-edge stage/bin/
           cp dist/lagran-binaries/lagran-dns stage/bin/
           cp -a dist/lagran-web/. stage/web/
+          # `actions/download-artifact` does not restore the file modes the job
+          # uploaded: the SPA lands as 0600/0700 owned by the runner. Packaging
+          # that as-is shipped a tarball whose web root only root could read, and
+          # the reverse proxy serving it answered 403 after an upgrade. Normalise
+          # the modes here so the archive is correct regardless of how the
+          # installer copies it.
+          chmod -R a+rX stage/web
           cp control.env.example edge.env.example dns.env.example install.sh update.sh edge-update.sh README.md LICENSE stage/
           printf '%s\n' "${TAG}" > stage/VERSION
           tar -C stage -czf "lagran-cdn-${VERSION}-linux-amd64.tar.gz" .

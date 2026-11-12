@@ -154,6 +154,13 @@ WEB_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type d -name web -print -quit 2>/de
 if [[ -n "${WEB_SRC}" && -d "${PREFIX}/web" ]]; then
   status "running" "${TAG}" "updating web assets"
   cp -a "${WEB_SRC}/." "${PREFIX}/web/" || fail "update web failed"
+  # `cp -a` preserves the archive's modes, and the release tarball is built with
+  # a restrictive umask, so the SPA arrived as 0700/0600 owned by root. The
+  # reverse proxy runs as its own user and cannot traverse or read that, and
+  # `file_server` answers 403 rather than 404 — the console became unreachable
+  # after an upgrade even though the control plane was healthy. `install.sh`
+  # already normalises these; the update path did not.
+  chmod -R a+rX "${PREFIX}/web" || fail "fix web permissions failed"
 fi
 HELPER_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name update.sh -print -quit 2>/dev/null || true)"
 if [[ -n "${HELPER_SRC}" ]]; then
