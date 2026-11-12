@@ -25,33 +25,40 @@ struct Ban {
 }
 
 pub fn spawn_cc_sync(config: EdgeConfig, control: ControlClient, cc: CcProtector) {
-    tokio::spawn(async move {
-        let interval = Duration::from_secs(config.cc_sync_interval_secs.max(2));
-        loop {
-            match control.get_json::<BanList>("/api/v1/cc/bans").await {
-                Ok(list) => {
-                    let bans = list
-                        .bans
-                        .into_iter()
-                        .filter(|b| b.remaining_secs > 0)
-                        .map(|b| {
-                            (
-                                format!(
-                                    "{}|{}",
-                                    b.domain.trim_end_matches('.').to_ascii_lowercase(),
-                                    b.ip
-                                ),
-                                b.remaining_secs,
-                            )
-                        })
-                        .collect();
-                    cc.replace_shared(bans).await;
+    // Supervised: a panic here would silently stop refreshing the shared ban
+    // list, so this edge would keep enforcing whatever it had at that moment.
+    crate::agent::spawn_supervised("cc-sync", move || {
+        let config = config.clone();
+        let control = control.clone();
+        let cc = cc.clone();
+        async move {
+            let interval = Duration::from_secs(config.cc_sync_interval_secs.max(2));
+            loop {
+                match control.get_json::<BanList>("/api/v1/cc/bans").await {
+                    Ok(list) => {
+                        let bans = list
+                            .bans
+                            .into_iter()
+                            .filter(|b| b.remaining_secs > 0)
+                            .map(|b| {
+                                (
+                                    format!(
+                                        "{}|{}",
+                                        b.domain.trim_end_matches('.').to_ascii_lowercase(),
+                                        b.ip
+                                    ),
+                                    b.remaining_secs,
+                                )
+                            })
+                            .collect();
+                        cc.replace_shared(bans).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "shared CC ban sync failed");
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "shared CC ban sync failed");
-                }
+                tokio::time::sleep(interval).await;
             }
-            tokio::time::sleep(interval).await;
         }
     });
 }

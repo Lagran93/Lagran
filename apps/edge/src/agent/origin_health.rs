@@ -198,100 +198,111 @@ pub fn spawn_origin_health(
     let probe_timeout =
         Duration::from_secs(env_u32("ORIGIN_HEALTH_TIMEOUT_SECS", 5).clamp(1, 120) as u64);
     let concurrency = env_u32("ORIGIN_HEALTH_CONCURRENCY", 16).clamp(1, 256) as usize;
-    tokio::spawn(async move {
-        tracing::info!(
-            url = %control.endpoint("/api/v1/origin-health/report"),
-            ?interval,
-            ?probe_timeout,
-            concurrency,
-            fail_threshold = health_map.fail_threshold,
-            recover_threshold = health_map.recover_threshold,
-            "origin health probe started"
-        );
+    // Supervised: a panic here would silently stop health probing, so dead
+    // origins would keep receiving traffic.
+    crate::agent::spawn_supervised("origin-health", move || {
+        let control = control.clone();
+        let registry = registry.clone();
+        let origin = origin.clone();
+        let health_map = health_map.clone();
+        async move {
+            tracing::info!(
+                url = %control.endpoint("/api/v1/origin-health/report"),
+                ?interval,
+                ?probe_timeout,
+                concurrency,
+                fail_threshold = health_map.fail_threshold,
+                recover_threshold = health_map.recover_threshold,
+                "origin health probe started"
+            );
 
-        loop {
-            let mut targets = Vec::new();
-            for entry in registry.snapshot().await {
-                let origins: Vec<(String, Option<String>, Option<String>)> =
-                    if entry.origins.is_empty() {
-                        vec![(entry.origin_url.clone(), None, None)]
-                    } else {
-                        entry
-                            .origins
-                            .iter()
-                            .filter(|o| o.enabled)
-                            .map(|o| (o.url.clone(), o.host_header.clone(), o.sni.clone()))
-                            .collect()
-                    };
-                for (url, host, sni) in origins {
-                    let mut headers = HeaderMap::new();
-                    if let Some(host) = host.as_deref() {
-                        if let Ok(value) = HeaderValue::from_str(host) {
-                            headers.insert(header::HOST, value);
+            loop {
+                let mut targets = Vec::new();
+                for entry in registry.snapshot().await {
+                    let origins: Vec<(String, Option<String>, Option<String>)> =
+                        if entry.origins.is_empty() {
+                            vec![(entry.origin_url.clone(), None, None)]
+                        } else {
+                            entry
+                                .origins
+                                .iter()
+                                .filter(|o| o.enabled)
+                                .map(|o| (o.url.clone(), o.host_header.clone(), o.sni.clone()))
+                                .collect()
+                        };
+                    for (url, host, sni) in origins {
+                        let mut headers = HeaderMap::new();
+                        if let Some(host) = host.as_deref() {
+                            if let Ok(value) = HeaderValue::from_str(host) {
+                                headers.insert(header::HOST, value);
+                            }
                         }
+                        crate::security::origin_auth::apply(
+                            &mut headers,
+                            &entry.origin_auth_header,
+                            &entry.origin_auth_value,
+                        );
+                        targets.push((entry.domain.clone(), url, headers, sni));
                     }
-                    crate::security::origin_auth::apply(
-                        &mut headers,
-                        &entry.origin_auth_header,
-                        &entry.origin_auth_value,
-                    );
-                    targets.push((entry.domain.clone(), url, headers, sni));
                 }
-            }
 
-            let origin = origin.clone();
-            let health_map = health_map.clone();
-            let control = control.clone();
-            run_limited(targets, concurrency, move |(domain, url, headers, sni)| {
                 let origin = origin.clone();
                 let health_map = health_map.clone();
                 let control = control.clone();
-                async move {
-                    let start = Instant::now();
-                    let result = tokio::time::timeout(
-                        probe_timeout,
-                        origin.fetch_from_with_sni(&url, "/", &headers, sni.as_deref()),
-                    )
-                    .await;
-                    let latency = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-                    let (ok, err) = match result {
-                        Ok(Ok((status, _, _))) => {
-                            let ok = status.as_u16() < 500;
-                            (
-                                ok,
-                                if ok {
-                                    String::new()
-                                } else {
-                                    format!("HTTP {status}")
-                                },
-                            )
-                        }
-                        Ok(Err(e)) => (false, e.to_string()),
-                        Err(_) => (
-                            false,
-                            format!("health probe timed out after {}s", probe_timeout.as_secs()),
-                        ),
-                    };
-                    let healthy = health_map
-                        .record_origin(&domain, &url, ok, latency, &err)
+                run_limited(targets, concurrency, move |(domain, url, headers, sni)| {
+                    let origin = origin.clone();
+                    let health_map = health_map.clone();
+                    let control = control.clone();
+                    async move {
+                        let start = Instant::now();
+                        let result = tokio::time::timeout(
+                            probe_timeout,
+                            origin.fetch_from_with_sni(&url, "/", &headers, sni.as_deref()),
+                        )
                         .await;
-                    let body = json!({
-                        "domain_name": domain,
-                        "origin_url": url,
-                        "healthy": healthy,
-                        "latency_ms": latency,
-                        "error": err,
-                    });
-                    if let Err(e) = control
-                        .post_json("/api/v1/origin-health/report", &body)
-                        .await
-                    {
-                        tracing::debug!(error = %e, "origin health report failed");
+                        let latency = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                        let (ok, err) = match result {
+                            Ok(Ok((status, _, _))) => {
+                                let ok = status.as_u16() < 500;
+                                (
+                                    ok,
+                                    if ok {
+                                        String::new()
+                                    } else {
+                                        format!("HTTP {status}")
+                                    },
+                                )
+                            }
+                            Ok(Err(e)) => (false, e.to_string()),
+                            Err(_) => (
+                                false,
+                                format!(
+                                    "health probe timed out after {}s",
+                                    probe_timeout.as_secs()
+                                ),
+                            ),
+                        };
+                        let healthy = health_map
+                            .record_origin(&domain, &url, ok, latency, &err)
+                            .await;
+                        let body = json!({
+                            "domain_name": domain,
+                            "origin_url": url,
+                            "healthy": healthy,
+                            "latency_ms": latency,
+                            "error": err,
+                        });
+                        if let Err(e) = control
+                            .post_json("/api/v1/origin-health/report", &body)
+                            .await
+                        {
+                            tracing::debug!(error = %e, "origin health report failed");
+                        }
                     }
-                }
-            })
-            .await;
-            tokio::time::sleep(interval).await;
+                })
+                .await;
+                tokio::time::sleep(interval).await;
+            }
         }
     });
 }

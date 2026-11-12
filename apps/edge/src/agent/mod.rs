@@ -108,51 +108,59 @@ where
 }
 
 pub fn spawn_heartbeat(config: EdgeConfig, control: ControlClient, node_control: NodeControl) {
-    tokio::spawn(async move {
-        let interval = Duration::from_secs(config.heartbeat_interval_secs.max(5));
-        tracing::info!(
-            target = %control.endpoint("/api/v1/nodes/heartbeat"),
-            node_id = %config.node_id,
-            version = crate::version::VERSION,
-            "heartbeat agent started"
-        );
+    // Supervised: heartbeats are how the control plane decides a node is alive.
+    // A silent panic would leave the node serving traffic while the console
+    // eventually marks it offline.
+    spawn_supervised("heartbeat", move || {
+        let config = config.clone();
+        let control = control.clone();
+        let node_control = node_control.clone();
+        async move {
+            let interval = Duration::from_secs(config.heartbeat_interval_secs.max(5));
+            tracing::info!(
+                target = %control.endpoint("/api/v1/nodes/heartbeat"),
+                node_id = %config.node_id,
+                version = crate::version::VERSION,
+                "heartbeat agent started"
+            );
 
-        loop {
-            let body = json!({
-                "node_id": config.node_id,
-                "region": config.region,
-                "ip": config.listen_addr,
-                "agent_url": config.agent_url,
-                "public_ip": config.public_ip,
-                "version": crate::version::VERSION,
-                "cpu_usage": cpu_usage(),
-                "memory_usage": memory_usage(),
-            });
-            match control
-                .post_json_for::<_, HeartbeatReply>("/api/v1/nodes/heartbeat", &body)
-                .await
-            {
-                Ok(reply) => {
-                    if !reply.accepted {
-                        tracing::warn!(message = %reply.message, "heartbeat rejected");
-                    }
-                    if node_control.set_serving(reply.enabled) {
-                        if reply.enabled {
-                            tracing::info!(
-                                status = %reply.status,
-                                "node enabled by control plane; serving traffic"
-                            );
-                        } else {
-                            tracing::warn!(
-                                status = %reply.status,
-                                "node disabled by control plane; returning 503 until re-enabled"
-                            );
+            loop {
+                let body = json!({
+                    "node_id": config.node_id,
+                    "region": config.region,
+                    "ip": config.listen_addr,
+                    "agent_url": config.agent_url,
+                    "public_ip": config.public_ip,
+                    "version": crate::version::VERSION,
+                    "cpu_usage": cpu_usage(),
+                    "memory_usage": memory_usage(),
+                });
+                match control
+                    .post_json_for::<_, HeartbeatReply>("/api/v1/nodes/heartbeat", &body)
+                    .await
+                {
+                    Ok(reply) => {
+                        if !reply.accepted {
+                            tracing::warn!(message = %reply.message, "heartbeat rejected");
+                        }
+                        if node_control.set_serving(reply.enabled) {
+                            if reply.enabled {
+                                tracing::info!(
+                                    status = %reply.status,
+                                    "node enabled by control plane; serving traffic"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    status = %reply.status,
+                                    "node disabled by control plane; returning 503 until re-enabled"
+                                );
+                            }
                         }
                     }
+                    Err(e) => tracing::warn!(error = %e, "heartbeat failed"),
                 }
-                Err(e) => tracing::warn!(error = %e, "heartbeat failed"),
+                tokio::time::sleep(interval).await;
             }
-            tokio::time::sleep(interval).await;
         }
     });
 }

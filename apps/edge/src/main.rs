@@ -225,10 +225,8 @@ async fn main() -> anyhow::Result<()> {
         // handler combined with a client header once the request arrived
         // directly.
         trust_proxy_headers: true,
-        trusted_proxies: edge::security::trusted_proxy::TrustedProxies::parse(
-            "127.0.0.0/8, ::1",
-        )
-        .unwrap_or_default(),
+        trusted_proxies: edge::security::trusted_proxy::TrustedProxies::parse("127.0.0.0/8, ::1")
+            .unwrap_or_default(),
         challenge_secret,
         geo: Arc::new(edge::waf::geo::GeoLookup::load(
             &config.geoip_country_db,
@@ -269,6 +267,9 @@ async fn main() -> anyhow::Result<()> {
         let admin_addr: SocketAddr = admin.parse()?;
         let admin_app = listener::create_admin_router(state.clone());
         tracing::info!(admin = %admin_addr, "edge management listener started");
+        // Not supervised: the listener owns a bound socket, so a restart would
+        // fail with "address in use" and loop. Report a panic explicitly instead,
+        // and keep the error path for a normal shutdown.
         tokio::spawn(async move {
             if let Err(e) = tls::serve_http(admin_addr, admin_app).await {
                 tracing::error!(error = %e, "management listener stopped");
@@ -322,7 +323,11 @@ fn handle_cli() -> anyhow::Result<bool> {
     }
     match command {
         "version" | "-V" | "--version" => {
-            println!("lagran-edge {} ({})", edge::version::VERSION, edge::version::GIT_HASH);
+            println!(
+                "lagran-edge {} ({})",
+                edge::version::VERSION,
+                edge::version::GIT_HASH
+            );
             Ok(true)
         }
         "help" | "-h" | "--help" => {
@@ -355,20 +360,42 @@ fn check_config(config: &EdgeConfig) -> anyhow::Result<()> {
     }
     println!("config: ok");
     println!("listen: {}", config.listen_addr);
-    println!("admin_listen: {}", config.admin_listen_addr.as_deref().unwrap_or("(same as listen)"));
-    println!("https_listen: {}", config.https_listen_addr.as_deref().unwrap_or("disabled"));
+    println!(
+        "admin_listen: {}",
+        config
+            .admin_listen_addr
+            .as_deref()
+            .unwrap_or("(same as listen)")
+    );
+    println!(
+        "https_listen: {}",
+        config.https_listen_addr.as_deref().unwrap_or("disabled")
+    );
     println!("control_url: {}", config.control_url);
     println!("domain: {}", config.domain);
     println!("node_id: {}", config.node_id);
     println!("region: {}", config.region);
     println!("cache_backend: {}", config.cache_backend);
-    println!("redis: {}", if config.redis_url.trim().is_empty() { "disabled" } else { "configured" });
+    println!(
+        "redis: {}",
+        if config.redis_url.trim().is_empty() {
+            "disabled"
+        } else {
+            "configured"
+        }
+    );
     println!("cert_dir: {}", config.cert_dir);
     println!("waf_rulepack_cache_dir: {}", config.waf_rulepack_cache_dir);
     println!("origin_read_timeout_ms: {}", config.origin_read_timeout_ms);
-    println!("origin_stream_read_timeout_ms: {}", config.origin_stream_read_timeout_ms);
+    println!(
+        "origin_stream_read_timeout_ms: {}",
+        config.origin_stream_read_timeout_ms
+    );
     println!("range_fill_max_bytes: {}", config.range_fill_max_bytes);
-    println!("access_log: {}", config.access_log_path.as_deref().unwrap_or("disabled"));
+    println!(
+        "access_log: {}",
+        config.access_log_path.as_deref().unwrap_or("disabled")
+    );
     println!("large_cache: {}", config.large_cache_enabled);
     Ok(())
 }
@@ -389,7 +416,9 @@ fn health(config: &EdgeConfig) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect_timeout(&target, std::time::Duration::from_secs(3))
         .map_err(|e| anyhow::anyhow!("edge health connect failed: {e}"))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
-    stream.write_all(b"GET /__lagran/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    stream.write_all(
+        b"GET /__lagran/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     let status = response.lines().next().unwrap_or("");

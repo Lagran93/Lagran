@@ -80,7 +80,11 @@ impl AccessLog {
 
         {
             let buffer = buffer.clone();
-            tokio::spawn(async move {
+            // Not `spawn_supervised`: the writer owns the file handle and the
+            // channel receiver, neither of which can be rebuilt, so restarting it
+            // would silently lose the log file. Watch it instead — a panic would
+            // otherwise only surface as a rejected `try_send` with no cause.
+            let writer = tokio::spawn(async move {
                 let mut file = file;
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -136,6 +140,17 @@ impl AccessLog {
                 }
                 if let Some(f) = file.as_mut() {
                     let _ = f.flush().await;
+                }
+            });
+            // Surface a panic with its cause. Without this the only symptom was
+            // `try_send` failing with `Closed` and a generic warning.
+            tokio::spawn(async move {
+                if let Err(e) = writer.await {
+                    if e.is_panic() {
+                        tracing::error!(
+                            "access log writer panicked; access records are no longer persisted"
+                        );
+                    }
                 }
             });
         }
