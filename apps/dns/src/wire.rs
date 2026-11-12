@@ -200,16 +200,40 @@ fn parse_opt(buf: &[u8], pos: usize) -> Result<(Edns, Option<Ecs>), WireError> {
                 } else {
                     IpAddr::V6(Ipv6Addr::from(octets))
                 };
-                ecs = Some(Ecs {
-                    source_prefix: source.min(if family == 1 { 32 } else { 128 }),
-                    addr: mask_addr(addr, source.min(if family == 1 { 32 } else { 128 })),
-                });
+                let max = if family == 1 { 32 } else { 128 };
+                let prefix = source.min(max);
+                // A /0 option says "no subnet information": masking with it yields
+                // 0.0.0.0/0 (or ::/0), which is the same cache key for every client
+                // and tells the scheduler nothing about where the resolver is. One
+                // client's answer would then be served to everyone until the entry
+                // expires. Treat it as absent so the caller falls back to the
+                // client address.
+                if prefix >= MIN_USABLE_ECS_PREFIX {
+                    ecs = Some(Ecs {
+                        source_prefix: prefix,
+                        addr: mask_addr(addr, prefix),
+                    });
+                }
             }
         }
         rdata += len;
     }
     Ok((edns, ecs))
 }
+
+/// Smallest ECS prefix this server will act on.
+///
+/// A `/0` option (RFC 7871 section 7.1.1) is the form a resolver uses to say "I
+/// have no subnet information". Masking an address with it yields `0.0.0.0/0` or
+/// `::/0`, which is one cache key for every client and tells the scheduler nothing
+/// about where the resolver sits — so the first client's answer would be served to
+/// everyone until the entry expired. Treating it as absent makes the caller fall
+/// back to the client address, which is what a resolver sending `/0` is asking for.
+///
+/// Narrower prefixes are honoured as sent: RFC 7871 leaves the choice to the
+/// resolver, and second-guessing it would break resolvers that legitimately opt
+/// into coarser grouping.
+const MIN_USABLE_ECS_PREFIX: u8 = 1;
 
 pub fn mask_addr(addr: IpAddr, prefix: u8) -> IpAddr {
     match addr {
@@ -567,5 +591,47 @@ mod tests {
         let resp = encode_response(&q, RCODE_NOERROR, &big, &[], &[], false, 512);
         assert!(resp.len() <= 512);
         assert_ne!(be16(&resp, 2).unwrap() & 0x0200, 0, "TC bit set");
+    }
+    /// A `/0` ECS option must be treated as "no subnet information".
+    ///
+    /// Masking with `/0` produces `0.0.0.0/0`, which is a single cache key for
+    /// every client: the first caller's routing decision would then be served to
+    /// everyone until the entry expired, and the scheduler would be told nothing
+    /// about where the resolver is.
+    #[test]
+    fn ecs_zero_prefix_is_ignored() {
+        for (ip, label) in [
+            ("203.0.113.9".parse::<IpAddr>().unwrap(), "v4"),
+            ("2001:db8::1".parse::<IpAddr>().unwrap(), "v6"),
+        ] {
+            let buf = build_query("cdn.edge.lagran.net", TYPE_A, Some((ip, 0)));
+            let q = parse_query(&buf).expect("parse");
+            assert!(
+                q.ecs.is_none(),
+                "{label}: a /0 prefix must not produce an ECS scope"
+            );
+        }
+    }
+
+    /// A usable prefix is still honoured and masked.
+    #[test]
+    fn ecs_prefixes_are_masked() {
+        for (ip, prefix, want) in [
+            ("203.0.113.9", 24u8, "203.0.113.0"),
+            ("203.0.113.9", 1u8, "128.0.0.0"),
+            ("2001:db8::1", 48u8, "2001:db8::"),
+            ("2001:db8::1", 128u8, "2001:db8::1"),
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            let buf = build_query("cdn.edge.lagran.net", TYPE_A, Some((ip, prefix)));
+            let q = parse_query(&buf).expect("parse");
+            let ecs = q.ecs.expect("ecs present");
+            assert_eq!(ecs.source_prefix, prefix, "prefix for {ip}/{prefix}");
+            assert_eq!(
+                ecs.addr,
+                want.parse::<IpAddr>().unwrap(),
+                "mask for {ip}/{prefix}"
+            );
+        }
     }
 }
