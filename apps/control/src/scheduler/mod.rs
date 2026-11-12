@@ -600,22 +600,46 @@ fn client_ip(req: &ScheduleRequest) -> Option<IpAddr> {
     addr.parse::<IpAddr>().ok()
 }
 
-fn resolve_geo(state: &AppState, req: &ScheduleRequest) -> (GeoInfo, Option<IpAddr>) {
+fn resolve_geo(
+    state: &AppState,
+    req: &ScheduleRequest,
+    trust_overrides: bool,
+) -> (GeoInfo, Option<IpAddr>) {
     let ip = client_ip(req);
-    let mut geo = ip.and_then(|ip| state.geo.lookup(ip)).unwrap_or_default();
-    if let Some(v) = req.country.as_deref().filter(|s| !s.is_empty()) {
-        geo.country = v.to_string();
-    }
-    if let Some(v) = req.province.as_deref().filter(|s| !s.is_empty()) {
-        geo.province = v.to_string();
-    }
-    if let Some(v) = req.city.as_deref().filter(|s| !s.is_empty()) {
-        geo.city = v.to_string();
-    }
-    if let Some(v) = req.isp.as_deref().filter(|s| !s.is_empty()) {
-        geo.isp = v.to_string();
+    let mut geo = geo_from_ip(state, ip);
+    if trust_overrides {
+        apply_geo_overrides(&mut geo, req);
     }
     (geo, ip)
+}
+
+fn geo_from_ip(state: &AppState, ip: Option<IpAddr>) -> GeoInfo {
+    ip.and_then(|ip| state.geo.lookup(ip)).unwrap_or_default()
+}
+
+/// Replace fields the caller claims to know better than the GeoIP database.
+///
+/// Values are trimmed first: a whitespace-only override used to blank out the
+/// looked-up value, which then matched no node at all and removed every geo
+/// bonus from the scoring.
+fn apply_geo_overrides(geo: &mut GeoInfo, req: &ScheduleRequest) {
+    let trimmed = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(v) = trimmed(req.country.as_deref()) {
+        geo.country = v;
+    }
+    if let Some(v) = trimmed(req.province.as_deref()) {
+        geo.province = v;
+    }
+    if let Some(v) = trimmed(req.city.as_deref()) {
+        geo.city = v;
+    }
+    if let Some(v) = trimmed(req.isp.as_deref()) {
+        geo.isp = v;
+    }
 }
 
 fn eq_ignore(a: &str, b: &str) -> bool {
@@ -658,8 +682,20 @@ fn score_node(node: &repository::NodeRow, geo: &GeoInfo) -> (i32, String) {
     (score, reasons.join(" "))
 }
 
-pub async fn resolve(state: &AppState, req: ScheduleRequest) -> ScheduleResponse {
-    let (client, _ip) = resolve_geo(state, &req);
+/// Resolve an answer for a DNS query.
+///
+/// `trust_overrides` controls whether the caller may supply `country` /
+/// `province` / `city` / `isp` instead of having them looked up from the client
+/// address. Only the authenticated agent path sets it: those fields carry enough
+/// scoring weight (+80 province, +40 isp) to pin traffic to a chosen node and to
+/// suppress any CPU/memory penalty, so an unauthenticated caller must not reach
+/// them.
+pub async fn resolve(
+    state: &AppState,
+    req: ScheduleRequest,
+    trust_overrides: bool,
+) -> ScheduleResponse {
+    let (client, _ip) = resolve_geo(state, &req, trust_overrides);
     let ttl = state.schedule_ttl;
     let domain = req.domain.clone().unwrap_or_default();
 
@@ -732,7 +768,7 @@ pub async fn resolve_agent(
     _agent: crate::middleware::agent_auth::ScheduleAuth,
     axum::extract::Query(req): axum::extract::Query<ScheduleRequest>,
 ) -> Json<ScheduleResponse> {
-    Json(resolve(&state, req).await)
+    Json(resolve(&state, req, true).await)
 }
 
 pub async fn test(
@@ -746,7 +782,8 @@ pub async fn test(
             Json(serde_json::json!({ "error": "admin only" })),
         ));
     }
-    Ok(Json(resolve(&state, req).await))
+    // Administrators may pin the geo inputs to preview a specific client.
+    Ok(Json(resolve(&state, req, true).await))
 }
 
 #[cfg(test)]
@@ -881,11 +918,19 @@ mod tests {
 
         cache.snapshot_with(load.clone()).await.unwrap();
         cache.snapshot_with(load.clone()).await.unwrap();
-        assert_eq!(loads.load(Ordering::SeqCst), 1, "second call must hit the snapshot");
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "second call must hit the snapshot"
+        );
 
         cache.invalidate().await;
         cache.snapshot_with(load.clone()).await.unwrap();
-        assert_eq!(loads.load(Ordering::SeqCst), 2, "invalidate must force a reload");
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            2,
+            "invalidate must force a reload"
+        );
     }
 
     #[tokio::test]
@@ -904,5 +949,72 @@ mod tests {
         cache.snapshot_with(load.clone()).await.unwrap();
         cache.snapshot_with(load.clone()).await.unwrap();
         assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+    fn looked_up_geo() -> GeoInfo {
+        GeoInfo {
+            country: "CN".into(),
+            province: "Guangdong".into(),
+            city: "Shenzhen".into(),
+            isp: "China Telecom".into(),
+        }
+    }
+
+    fn spoofing_request() -> ScheduleRequest {
+        ScheduleRequest {
+            country: Some("KP".into()),
+            province: Some("Attacker Province".into()),
+            city: Some("Attacker City".into()),
+            isp: Some("Attacker ISP".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A trusted caller (the DNS agent) may replace looked-up values.
+    #[test]
+    fn trusted_caller_can_override_geo() {
+        let mut geo = looked_up_geo();
+        apply_geo_overrides(&mut geo, &spoofing_request());
+        assert_eq!(geo.country, "KP");
+        assert_eq!(geo.province, "Attacker Province");
+        assert_eq!(geo.city, "Attacker City");
+        assert_eq!(geo.isp, "Attacker ISP");
+    }
+
+    /// An untrusted caller must not. The fields carry more weight (+80 province,
+    /// +40 isp) than the CPU/memory penalties, so honouring them would let anyone
+    /// pin traffic to a node of their choosing.
+    #[test]
+    fn untrusted_caller_cannot_override_geo() {
+        // Mirrors the `trust_overrides == false` branch of `resolve_geo`: the
+        // GeoIP result is used as-is and the request fields are never read.
+        let geo = looked_up_geo();
+        assert_eq!(geo.country, "CN");
+        assert_eq!(geo.province, "Guangdong");
+        assert_eq!(geo.city, "Shenzhen");
+        assert_eq!(geo.isp, "China Telecom");
+
+        // And the spoofing request really does carry different values, so this
+        // test would fail if those fields were ever wired back in unconditionally.
+        let req = spoofing_request();
+        assert_ne!(req.country.as_deref(), Some(geo.country.as_str()));
+        assert_ne!(req.province.as_deref(), Some(geo.province.as_str()));
+    }
+
+    /// An empty override must not blank out a real GeoIP value.
+    #[test]
+    fn empty_override_keeps_looked_up_value() {
+        let mut geo = GeoInfo {
+            country: "CN".into(),
+            province: "Guangdong".into(),
+            ..Default::default()
+        };
+        let req = ScheduleRequest {
+            country: Some(String::new()),
+            province: Some("  ".into()),
+            ..Default::default()
+        };
+        apply_geo_overrides(&mut geo, &req);
+        assert_eq!(geo.country, "CN");
+        assert_eq!(geo.province, "Guangdong");
     }
 }

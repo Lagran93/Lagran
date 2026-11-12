@@ -41,6 +41,21 @@ impl IntoResponse for AgentAuthError {
     }
 }
 
+/// Whether an unset `AGENT_TOKEN` may leave the scheduling API open.
+///
+/// Off by default. Only a local development environment should set this, and it
+/// is logged loudly when used.
+fn allow_unauthenticated_schedule() -> bool {
+    matches!(
+        std::env::var("ALLOW_UNAUTHENTICATED_SCHEDULE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn agent_token(parts: &Parts) -> &str {
     parts
         .headers
@@ -78,12 +93,23 @@ impl FromRequestParts<AppState> for ScheduleAuth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let expected = state.config.agent_token.as_str();
-        // Empty global token keeps the old development behavior: auth disabled.
         if expected.is_empty() {
-            return Ok(ScheduleAuth);
+            // An unset AGENT_TOKEN used to disable this check entirely, so anyone
+            // who could reach the control plane could query `/api/v1/schedule`
+            // and read every node's public IP along with the whole scheduling
+            // topology. Opening it must now be an explicit, local-development
+            // choice rather than the default.
+            if allow_unauthenticated_schedule() {
+                tracing::warn!(
+                    "AGENT_TOKEN is empty and ALLOW_UNAUTHENTICATED_SCHEDULE is set; \
+                     the scheduling API is open to anyone who can reach this port"
+                );
+                return Ok(ScheduleAuth);
+            }
+            return Err(AgentAuthError);
         }
         let got = agent_token(parts);
-        if !expected.is_empty() && got == expected {
+        if got == expected {
             return Ok(ScheduleAuth);
         }
         if repository::node_token_exists(&state.pool, got)
