@@ -195,7 +195,8 @@ pub async fn claim_prefetch_tasks(pool: &PgPool, limit: i64) -> sqlx::Result<Vec
             LIMIT $1
             FOR UPDATE SKIP LOCKED
         )
-        UPDATE prefetch_tasks t SET status = 'running'
+        UPDATE prefetch_tasks t
+        SET status = 'running', started_at = NOW(), attempts = t.attempts + 1
         FROM claimed
         WHERE t.id = claimed.id
         RETURNING t.id, t.domain, t.url_path, t.headers, t.status, t.message,
@@ -228,6 +229,57 @@ pub async fn finish_prefetch_task(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Reclaim tasks that were claimed but never finished.
+///
+/// A task is abandoned when it has been `running` longer than `stale_secs`. Such a
+/// row is either retried (`pending`) or, once it has been attempted
+/// `max_attempts` times, marked `failed` with a reason — the previous code left it
+/// `running` forever, so it was never retried and the console showed a stuck
+/// entry that no operator could clear.
+///
+/// Returns `(requeued, failed)`.
+pub async fn reclaim_stale_prefetch_tasks(
+    pool: &PgPool,
+    stale_secs: i64,
+    max_attempts: i32,
+) -> sqlx::Result<(u64, u64)> {
+    let requeued = sqlx::query(
+        r#"
+        UPDATE prefetch_tasks
+        SET status = 'pending', started_at = NULL,
+            message = 'reclaimed: previous attempt did not finish'
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at < NOW() - make_interval(secs => $1)
+          AND attempts < $2
+        "#,
+    )
+    .bind(stale_secs)
+    .bind(max_attempts)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let failed = sqlx::query(
+        r#"
+        UPDATE prefetch_tasks
+        SET status = 'failed', finished_at = NOW(),
+            message = 'abandoned: exceeded the retry limit'
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at < NOW() - make_interval(secs => $1)
+          AND attempts >= $2
+        "#,
+    )
+    .bind(stale_secs)
+    .bind(max_attempts)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok((requeued, failed))
 }
 
 pub async fn list_prefetch_tasks(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<PrefetchTaskRow>> {

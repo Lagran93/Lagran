@@ -6,6 +6,15 @@ use crate::state::AppState;
 use serde::Deserialize;
 use std::time::Duration;
 
+/// How long a claimed task may stay `running` before it is considered abandoned.
+///
+/// The dispatch timeout for one node is 300s by default and the queue runs tasks
+/// sequentially, so this must be comfortably larger than one dispatch.
+const STALE_TASK_SECS: i64 = 900;
+
+/// Attempts allowed before an abandoned task is failed instead of retried.
+const MAX_ATTEMPTS: i32 = 3;
+
 #[derive(Deserialize)]
 struct EdgePrefetchReply {
     success: bool,
@@ -50,6 +59,23 @@ pub fn spawn(state: AppState, interval_secs: u64) {
 }
 
 async fn run_once(state: &AppState) -> Result<(), sqlx::Error> {
+    // Release tasks a previous run claimed but never finished, before claiming
+    // new ones. Without this a worker that died mid-task left its row `running`
+    // forever: never retried, never reported, and impossible to clear from the
+    // console.
+    match repository::reclaim_stale_prefetch_tasks(&state.pool, STALE_TASK_SECS, MAX_ATTEMPTS).await
+    {
+        Ok((requeued, failed)) => {
+            if requeued > 0 || failed > 0 {
+                tracing::warn!(requeued, failed, "reclaimed abandoned prefetch tasks");
+            }
+        }
+        Err(e) => {
+            // Never let reclaim block the queue: a broken reclaim must not stop
+            // healthy tasks from running.
+            tracing::warn!(error = %e, "reclaim prefetch tasks failed");
+        }
+    }
     enqueue_due_schedules(state).await?;
     let tasks = repository::claim_prefetch_tasks(&state.pool, 20).await?;
     if tasks.is_empty() {

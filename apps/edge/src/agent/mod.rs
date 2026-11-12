@@ -55,14 +55,18 @@ struct HeartbeatReply {
     accepted: bool,
     #[serde(default)]
     message: String,
-    #[serde(default = "default_enabled")]
+    /// Whether this node may serve traffic.
+    ///
+    /// Absent means "no answer", not "yes". The field used to default to `true`,
+    /// so a response that omitted it — an older control plane, a proxy that
+    /// stripped it, a changed serialisation — silently re-enabled a node an
+    /// administrator had drained. The control plane always sends this field, so
+    /// failing closed costs nothing when everything is healthy and stops a
+    /// drained node from resuming on its own.
+    #[serde(default)]
     enabled: bool,
     #[serde(default)]
     status: String,
-}
-
-fn default_enabled() -> bool {
-    true
 }
 
 /// Run a background task, restarting it if its future panics.
@@ -249,5 +253,29 @@ mod tests {
             1,
             "a finished task must not be re-run"
         );
+    }
+    /// A heartbeat reply that omits `enabled` must not re-enable a node.
+    ///
+    /// The field used to default to `true`, so a response without it — an older
+    /// control plane, or a proxy that dropped it — resumed traffic on a node an
+    /// administrator had drained.
+    #[test]
+    fn heartbeat_reply_without_enabled_fails_closed() {
+        let minimal: HeartbeatReply =
+            serde_json::from_str(r#"{"accepted":true,"message":"ok","status":"online"}"#)
+                .expect("parse minimal reply");
+        assert!(
+            !minimal.enabled,
+            "a missing `enabled` must not mean \"serve traffic\""
+        );
+    }
+
+    /// An explicit value is honoured in both directions.
+    #[test]
+    fn heartbeat_reply_honours_explicit_enabled() {
+        let on: HeartbeatReply = serde_json::from_str(r#"{"enabled":true}"#).expect("parse");
+        assert!(on.enabled);
+        let off: HeartbeatReply = serde_json::from_str(r#"{"enabled":false}"#).expect("parse");
+        assert!(!off.enabled);
     }
 }

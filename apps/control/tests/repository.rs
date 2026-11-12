@@ -298,3 +298,96 @@ async fn refresh_alert_event_ignores_resolved_rows() {
     assert_eq!(message, "original");
     db.close().await;
 }
+
+/// A task claimed but never finished must be reclaimed, not left running.
+///
+/// `claim_prefetch_tasks` set `running` and nothing moved the row back, so a
+/// worker that died mid-task left it stuck forever: never retried, never
+/// reported, and impossible to clear from the console.
+#[tokio::test]
+async fn stale_prefetch_tasks_are_reclaimed() {
+    let db = TestDb::new().await;
+    db_or_skip!(db);
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO prefetch_tasks (domain, url_path, status)
+         VALUES ('pf.test', '/a', 'pending') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("insert task");
+
+    let claimed = repository::claim_prefetch_tasks(&db.pool, 10)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+    let (status, attempts): (String, i32) =
+        sqlx::query_as("SELECT status, attempts FROM prefetch_tasks WHERE id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read");
+    assert_eq!(status, "running");
+    assert_eq!(attempts, 1, "claiming counts as an attempt");
+
+    // A fresh claim is not stale: nothing must be reclaimed.
+    let (requeued, failed) = repository::reclaim_stale_prefetch_tasks(&db.pool, 900, 3)
+        .await
+        .expect("reclaim fresh");
+    assert_eq!(
+        (requeued, failed),
+        (0, 0),
+        "a fresh claim must be left alone"
+    );
+
+    // Age it past the threshold.
+    sqlx::query("UPDATE prefetch_tasks SET started_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .expect("age task");
+
+    let (requeued, failed) = repository::reclaim_stale_prefetch_tasks(&db.pool, 900, 3)
+        .await
+        .expect("reclaim stale");
+    assert_eq!(requeued, 1, "a stale under-limit task is requeued");
+    assert_eq!(failed, 0);
+    let status: String = sqlx::query_scalar("SELECT status FROM prefetch_tasks WHERE id = $1")
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("read status");
+    assert_eq!(status, "pending");
+    db.close().await;
+}
+
+/// A task that keeps getting abandoned must eventually fail, not loop forever.
+#[tokio::test]
+async fn stale_prefetch_tasks_fail_after_the_retry_limit() {
+    let db = TestDb::new().await;
+    db_or_skip!(db);
+
+    // Already at the attempt limit and stale.
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO prefetch_tasks (domain, url_path, status, attempts, started_at)
+         VALUES ('pf.test', '/b', 'running', 3, NOW() - INTERVAL '1 hour') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("insert");
+
+    let (requeued, failed) = repository::reclaim_stale_prefetch_tasks(&db.pool, 900, 3)
+        .await
+        .expect("reclaim");
+    assert_eq!(requeued, 0);
+    assert_eq!(failed, 1, "a task past the attempt limit must fail");
+    let (status, message): (String, String) =
+        sqlx::query_as("SELECT status, message FROM prefetch_tasks WHERE id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read");
+    assert_eq!(status, "failed");
+    assert!(message.contains("abandoned"), "message: {message}");
+    db.close().await;
+}
