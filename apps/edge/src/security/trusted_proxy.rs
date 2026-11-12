@@ -168,6 +168,34 @@ pub fn resolve(
 /// right, discarding our own trusted proxies, and take the first address that is
 /// not trusted. If every entry is trusted (or the list is malformed) we return
 /// the rightmost address we could parse: it is the closest hop we can see.
+/// Parse one `X-Forwarded-For` entry, which may carry a `host:port` suffix.
+///
+/// A bare IPv6 literal such as `2001:db8::1` contains colons of its own. Splitting
+/// on the last colon there yields `2001:db8:` — unparseable — and the address was
+/// silently dropped, so every IPv6 client collapsed onto the proxy address and
+/// per-IP deny lists, CC limits and access logs all stopped distinguishing them.
+fn parse_forwarded_addr(part: &str) -> Option<IpAddr> {
+    let part = part.trim();
+    if part.is_empty() {
+        return None;
+    }
+    // Bracketed form `[v6]` or `[v6]:port`: the address is what the brackets hold.
+    if let Some(rest) = part.strip_prefix('[') {
+        let (host, _) = rest.split_once(']')?;
+        return host.parse::<IpAddr>().ok();
+    }
+    // A bare address always wins: it may legitimately contain many colons.
+    if let Ok(ip) = part.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    // Otherwise treat a trailing all-digit field as a port (`1.2.3.4:5678`).
+    let (host, port) = part.rsplit_once(':')?;
+    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    host.trim().parse::<IpAddr>().ok()
+}
+
 fn client_from_chain(trusted: &TrustedProxies, value: &str) -> Option<IpAddr> {
     let mut parsed: Vec<IpAddr> = Vec::new();
     for part in value.split(',') {
@@ -175,13 +203,7 @@ fn client_from_chain(trusted: &TrustedProxies, value: &str) -> Option<IpAddr> {
         if part.is_empty() {
             continue;
         }
-        // Tolerate `1.2.3.4:5678` and `[::1]:5678` by stripping a trailing port.
-        let candidate = part
-            .rsplit_once(':')
-            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty())
-            .map(|(host, _)| host.trim_matches(|c| c == '[' || c == ']'))
-            .unwrap_or(part);
-        if let Ok(ip) = candidate.parse::<IpAddr>() {
+        if let Some(ip) = parse_forwarded_addr(part) {
             parsed.push(ip);
         }
     }
@@ -295,10 +317,67 @@ mod tests {
     #[test]
     fn empty_configuration_trusts_nobody() {
         let t = TrustedProxies::default();
-        let id = resolve(&t, Some(peer("10.0.0.7")), Some("1.2.3.4"), Some("https"), false);
+        let id = resolve(
+            &t,
+            Some(peer("10.0.0.7")),
+            Some("1.2.3.4"),
+            Some("https"),
+            false,
+        );
         assert_eq!(id.ip, Some("10.0.0.7".parse().unwrap()));
         assert!(!id.is_https);
         assert!(!id.trusted_chain);
+    }
+
+    /// A bare IPv6 literal must survive parsing. Splitting on the last colon
+    /// turned `2001:db8::1` into `2001:db8:`, the address was dropped, and every
+    /// IPv6 client collapsed onto the proxy address.
+    #[test]
+    fn parses_bare_ipv6_and_compressed_forms() {
+        assert_eq!(
+            parse_forwarded_addr("2001:db8::1"),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(parse_forwarded_addr("::1"), Some("::1".parse().unwrap()));
+        assert_eq!(
+            parse_forwarded_addr("2001:db8:0:0:0:0:0:1"),
+            Some("2001:db8:0:0:0:0:0:1".parse().unwrap())
+        );
+        // Bracketed forms, with and without a port.
+        assert_eq!(
+            parse_forwarded_addr("[2001:db8::1]"),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(
+            parse_forwarded_addr("[2001:db8::1]:8080"),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        // IPv4 with and without a port.
+        assert_eq!(
+            parse_forwarded_addr("203.0.113.9"),
+            Some("203.0.113.9".parse().unwrap())
+        );
+        assert_eq!(
+            parse_forwarded_addr("203.0.113.9:443"),
+            Some("203.0.113.9".parse().unwrap())
+        );
+        assert_eq!(parse_forwarded_addr(""), None);
+        assert_eq!(parse_forwarded_addr("not-an-ip"), None);
+    }
+
+    /// An IPv6 client must keep its own identity end to end, not the proxy's.
+    #[test]
+    fn ipv6_client_is_not_collapsed_onto_the_proxy() {
+        let id = resolve(
+            &proxy_list(),
+            Some(peer("10.0.0.7")),
+            Some("2001:db8::1"),
+            None,
+            false,
+        );
+        assert_eq!(id.ip, Some("2001:db8::1".parse().unwrap()));
+        assert_ne!(id.ip, Some("10.0.0.7".parse().unwrap()));
+        assert!(id.trusted_chain);
     }
 
     #[test]

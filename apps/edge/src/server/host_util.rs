@@ -94,6 +94,15 @@ pub struct TlsSni(pub String);
 #[derive(Clone, Copy, Debug)]
 pub struct TlsTerminated;
 
+/// Set when the Pingora data plane forwards into the in-process handler.
+///
+/// The two planes share `proxy_handler`, so it cannot tell them apart on its
+/// own. Headers the Pingora filter already sanitised and populated (the signed
+/// URL marker in particular) must survive that hand-off, while a request that
+/// arrives directly from a client must have them stripped.
+#[derive(Clone, Copy, Debug)]
+pub struct FromPingora;
+
 /// Whether this request arrived over TLS, from either data plane.
 pub fn request_is_tls<B>(req: &Request<B>) -> bool {
     req.extensions().get::<TlsSni>().is_some() || req.extensions().get::<TlsTerminated>().is_some()

@@ -13,10 +13,10 @@ use crate::agent::origin_health::OriginHealthMap;
 use crate::agent::{ControlClient, NodeControl};
 use crate::cache::flight::RedisFlight;
 use crate::cache::policy::{
-    compute_etag, decide_storage_reason, etag_matches, is_uncacheable_header,
-    request_method_cacheable, resolve_rule_policy, resolve_rule_policy_for_response_with_domain,
-    strip_response_headers, CacheDecision, CacheRule, CacheStatus, ResolvedPolicy, RuleAction,
-    RuleSet, VALIDATOR_SOURCE_HEADER,
+    compute_etag, decide_storage_reason, decide_storage_reason_map, etag_matches,
+    is_uncacheable_header, request_method_cacheable, resolve_rule_policy,
+    resolve_rule_policy_for_response_with_domain, strip_response_headers, CacheDecision, CacheRule,
+    CacheStatus, ResolvedPolicy, RuleAction, RuleSet, VALIDATOR_SOURCE_HEADER,
 };
 use crate::cache::{CacheEntry, CacheGetResult, LargeCache, SharedCache};
 use crate::config::registry::{DomainEntry, DomainRegistry, OriginTarget};
@@ -266,6 +266,14 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
     let mut headers = req.headers().clone();
+    // The hotlink marker is set by this edge after it verifies a signed URL, so a
+    // client-supplied value must never be trusted. Requests forwarded from the
+    // Pingora filter already had it sanitised there and re-populated on success;
+    // a request arriving directly still carries whatever the client sent.
+    strip_untrusted_hotlink_marker(
+        &mut headers,
+        req.extensions().get::<host_util::FromPingora>().is_some(),
+    );
     // Client identity comes from the shared trusted-proxy resolver so this data
     // plane and the Pingora one cannot disagree. Taking the leftmost
     // `X-Forwarded-For` entry let any client choose its own source IP, which
@@ -497,7 +505,9 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
         if let Some(resp) = pipeline.preflight(domain, &facts).await {
             return resp;
         }
-        headers.remove(crate::security::signed_url::HOTLINK_OK_HEADER);
+        // The marker written by the Pingora filter must survive: the hotlink
+        // check later in this function reads it to honour a URL that already
+        // passed signature verification.
     }
 
     // NOTE: origin health is checked where an origin fetch is actually needed
@@ -776,6 +786,8 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                 eff.policy,
                 eff.rules.clone(),
                 eff.path.clone(),
+                eff.origin_auth_header.clone(),
+                eff.origin_auth_value.clone(),
             );
             serve_cached(
                 &state,
@@ -1075,9 +1087,9 @@ async fn bypass_to_origin(
                         &eff.key_ignore_headers,
                     );
                     if response_policy.action == RuleAction::Cache {
-                        if let Ok(decision) = decide_storage_reason(
+                        if let Ok(decision) = decide_storage_reason_map(
                             status.as_u16(),
-                            &headers_vec(&resp.headers),
+                            &resp.headers,
                             response_policy,
                             state.default_ttl_secs,
                         ) {
@@ -1888,6 +1900,8 @@ fn spawn_revalidation(
     policy: ResolvedPolicy,
     rules: Vec<CacheRule>,
     path: String,
+    origin_auth_header: String,
+    origin_auth_value: String,
 ) {
     tokio::spawn(async move {
         let Slot::Leader(leader) = state.inflight.begin(&key).await else {
@@ -1905,8 +1919,11 @@ fn spawn_revalidation(
             key_ignore: 0,
             key_ignore_headers: String::new(),
             response_headers: ResponseHeaderOverrides::empty_arc(),
-            origin_auth_header: String::new(),
-            origin_auth_value: String::new(),
+            // The revalidation request must carry the origin credentials. Leaving
+            // these empty made an origin with auth reject every revalidation, so
+            // the cached entry stayed stale forever.
+            origin_auth_header,
+            origin_auth_value,
             timeout_ms,
         };
         match fetch_origin(&state, &eff, &host, &path_and_query, &headers, &Method::GET).await {
@@ -2738,6 +2755,18 @@ pub(crate) async fn preflight_cacheable(
     None
 }
 
+/// Drop the signed-URL marker unless this edge set it itself.
+///
+/// The marker tells the hotlink check that a URL already passed signature
+/// verification. A client can send the same header, so a request arriving from
+/// outside must have it removed; a request handed over by the Pingora filter
+/// carries a value that filter sanitised and re-populated on success.
+fn strip_untrusted_hotlink_marker(headers: &mut HeaderMap, from_pingora: bool) {
+    if !from_pingora {
+        headers.remove(crate::security::signed_url::HOTLINK_OK_HEADER);
+    }
+}
+
 fn url_query(path_and_query: &str) -> &str {
     path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("")
 }
@@ -3410,5 +3439,41 @@ mod tests {
         assert_eq!(resp.headers().get("age").unwrap(), "0");
         assert!(resp.headers().get(header::DATE).is_some());
         assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
+    }
+    /// A client-supplied hotlink marker must not survive into the legacy path,
+    /// or anyone could skip the referer check by sending one header.
+    #[test]
+    fn strips_client_supplied_hotlink_marker() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(crate::security::signed_url::HOTLINK_OK_HEADER),
+            HeaderValue::from_static("1"),
+        );
+        strip_untrusted_hotlink_marker(&mut headers, false);
+        assert!(
+            headers
+                .get(crate::security::signed_url::HOTLINK_OK_HEADER)
+                .is_none(),
+            "forged marker must be dropped"
+        );
+    }
+
+    /// The marker written by the Pingora filter after it verified a signature is
+    /// trusted and must reach the hotlink check.
+    #[test]
+    fn keeps_marker_set_by_pingora() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(crate::security::signed_url::HOTLINK_OK_HEADER),
+            HeaderValue::from_static("1"),
+        );
+        strip_untrusted_hotlink_marker(&mut headers, true);
+        assert_eq!(
+            headers
+                .get(crate::security::signed_url::HOTLINK_OK_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "a verified marker must survive the hand-off"
+        );
     }
 }
