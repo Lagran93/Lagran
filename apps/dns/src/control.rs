@@ -44,10 +44,22 @@ fn parse_target(url: &str) -> Result<Target> {
         "https" => true,
         other => return Err(anyhow!("unsupported CONTROL_URL scheme: {other}")),
     };
+
     let (authority, path) = match rest.split_once('/') {
         Some((a, p)) => (a, format!("/{p}")),
         None => (rest, String::new()),
     };
+    // Plaintext is only acceptable to a control plane on this machine. Over the
+    // network the response carries node public IPs and scheduling data, and the
+    // request carries the agent token; anyone on the path could read the token,
+    // rewrite the schedule, or inject a poisoned response into the connection
+    // pool. The default URL is loopback, so local development is unaffected.
+    if !tls && !host_is_loopback(authority_host(authority)) {
+        return Err(anyhow!(
+            "CONTROL_URL uses http:// for non-loopback host {:?}; use https://",
+            authority_host(authority)
+        ));
+    }
     let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
         let (h, tail) = stripped
             .split_once(']')
@@ -129,6 +141,48 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// Largest response body the control client will buffer.
+///
+/// DNS only reads small JSON documents (a schedule reply, a ban list), so a few
+/// megabytes is generous. Without a cap, `Content-Length` and the chunk-size field
+/// were trusted verbatim: a compromised or misbehaving control plane could make
+/// this process allocate until the OOM killer ran, taking authoritative DNS down
+/// with it. The connection pool made it worse — a poisoned connection stayed in
+/// the pool and could be reused for the next request.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Host part of an authority, without userinfo or port.
+fn authority_host(authority: &str) -> &str {
+    let after_user = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    if let Some(rest) = after_user.strip_prefix('[') {
+        return rest.split_once(']').map(|(h, _)| h).unwrap_or(rest);
+    }
+    after_user
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(after_user)
+}
+
+/// Whether a host literal names this machine.
+///
+/// Only literal addresses and `localhost` count. A hostname that merely resolves
+/// to a loopback address is not enough: DNS is exactly what this process talks to,
+/// so a resolution-based check could be steered.
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 fn read_more(stream: &mut dyn ReadWrite, buf: &mut Vec<u8>) -> Result<bool> {
     let mut chunk = [0u8; 4096];
     match stream.read(&mut chunk) {
@@ -186,9 +240,18 @@ fn read_response(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<u8>, bool)> {
 
     let mut body = raw[head_end..].to_vec();
     if let Some(len) = content_length {
+        // Trust nothing: refuse before allocating rather than while reading.
+        if len > MAX_BODY_BYTES {
+            return Err(anyhow!(
+                "HTTP body too large: Content-Length {len} exceeds {MAX_BODY_BYTES}"
+            ));
+        }
         while body.len() < len {
             if !read_more(stream, &mut body)? {
                 return Err(anyhow!("short HTTP body"));
+            }
+            if body.len() > MAX_BODY_BYTES {
+                return Err(anyhow!("HTTP body exceeded {MAX_BODY_BYTES} bytes"));
             }
         }
         body.truncate(len);
@@ -199,8 +262,13 @@ fn read_response(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<u8>, bool)> {
         return Ok((status, body, !close));
     }
 
-    // No framing: read until close/timeout. Never reuse this connection.
-    while read_more(stream, &mut body)? {}
+    // No framing: read until close/timeout. Never reuse this connection. Bounded,
+    // because an origin that never closes would otherwise stream forever.
+    while read_more(stream, &mut body)? {
+        if body.len() > MAX_BODY_BYTES {
+            return Err(anyhow!("HTTP body exceeded {MAX_BODY_BYTES} bytes"));
+        }
+    }
     Ok((status, body, false))
 }
 
@@ -218,6 +286,14 @@ fn decode_chunked(stream: &mut dyn ReadWrite, mut raw: Vec<u8>) -> Result<Vec<u8
         let line = String::from_utf8_lossy(&raw[..line_end]);
         let size_str = line.split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_str, 16).map_err(|_| anyhow!("bad chunk size"))?;
+        // A chunk header is attacker-controlled too: `ffffffffffff` used to
+        // allocate that many bytes in one grow.
+        if size > MAX_BODY_BYTES || out.len().saturating_add(size) > MAX_BODY_BYTES {
+            return Err(anyhow!(
+                "chunked body exceeds {MAX_BODY_BYTES} bytes (chunk {size}, have {})",
+                out.len()
+            ));
+        }
         raw.drain(..line_end + 2);
         if size == 0 {
             // Consume optional trailer headers so the connection is reusable.
@@ -411,5 +487,128 @@ mod tests {
         assert_eq!(first.ip, Some(Ipv4Addr::new(203, 0, 113, 10).into()));
         assert_eq!(second.ip, first.ip);
         assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn http_is_allowed_only_for_loopback() {
+        for ok in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(parse_target(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in [
+            "http://control.example.com",
+            "http://10.0.0.5:8080",
+            "http://192.168.1.10",
+            "http://[2001:db8::1]:8080",
+        ] {
+            assert!(
+                parse_target(bad).is_err(),
+                "{bad} is plaintext to a remote host and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn https_is_allowed_for_any_host() {
+        for ok in [
+            "https://control.example.com",
+            "https://10.0.0.5:8443",
+            "https://[2001:db8::1]/",
+        ] {
+            assert!(parse_target(ok).is_ok(), "{ok} should be accepted");
+        }
+    }
+
+    #[test]
+    fn authority_host_strips_userinfo_and_port() {
+        assert_eq!(
+            authority_host("control.example.com:8080"),
+            "control.example.com"
+        );
+        assert_eq!(authority_host("control.example.com"), "control.example.com");
+        assert_eq!(
+            authority_host("user:pass@control.example.com"),
+            "control.example.com"
+        );
+        assert_eq!(authority_host("[::1]:8080"), "::1");
+        assert_eq!(authority_host("[::1]"), "::1");
+    }
+
+    #[test]
+    fn loopback_detection_is_literal_only() {
+        assert!(host_is_loopback("127.0.0.1"));
+        assert!(host_is_loopback("127.1.2.3"));
+        assert!(host_is_loopback("::1"));
+        assert!(host_is_loopback("LOCALHOST"));
+        // A hostname that merely resolves to loopback is not trusted: DNS is what
+        // this process talks to, so a resolution-based check could be steered.
+        assert!(!host_is_loopback("localhost.attacker.test"));
+        assert!(!host_is_loopback("10.0.0.5"));
+        assert!(!host_is_loopback("example.com"));
+        assert!(!host_is_loopback(""));
+    }
+
+    /// A chunk header claiming more than the cap must fail without allocating.
+    #[test]
+    fn oversized_chunk_is_rejected() {
+        let mut stream = std::io::Cursor::new(b"ffffffff\r\ndata".to_vec());
+        let mut raw = Vec::new();
+        let err = decode_chunked(&mut dyn_read(&mut stream), raw.drain(..).collect())
+            .expect_err("oversized chunk must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `Content-Length` larger than the cap must be refused before reading.
+    #[test]
+    fn oversized_content_length_is_rejected() {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let mut stream = std::io::Cursor::new(head.into_bytes());
+        let err = read_response(&mut dyn_read(&mut stream))
+            .expect_err("oversized Content-Length must be rejected");
+        assert!(
+            err.to_string().contains("too large"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A normal small body still parses.
+    #[test]
+    fn small_body_is_accepted() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let mut stream = std::io::Cursor::new(raw);
+        let (status, body, _) = read_response(&mut dyn_read(&mut stream)).expect("parse");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello".to_vec());
+    }
+
+    fn dyn_read(r: &mut std::io::Cursor<Vec<u8>>) -> TestStream<'_> {
+        TestStream(r)
+    }
+
+    struct TestStream<'a>(&'a mut std::io::Cursor<Vec<u8>>);
+
+    impl std::io::Read for TestStream<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl std::io::Write for TestStream<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
