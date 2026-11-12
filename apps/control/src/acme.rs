@@ -78,7 +78,10 @@ fn acme_http() -> &'static AcmeHttp {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
-            .https_or_http()
+            // https only: the origin check in `Session::check_origin` already
+            // rejects a plaintext URL, and the connector must not be the weaker
+            // of the two.
+            .https_only()
             .enable_http1()
             .build();
         Client::builder(TokioExecutor::new()).build(https)
@@ -217,10 +220,73 @@ struct Session {
     dir: Directory,
     key: AccountKey,
     kid: String,
+    /// Origin every ACME URL in this session must belong to.
+    ///
+    /// The protocol returns URLs (`authorizations`, `challenge.url`, `finalize`,
+    /// `certificate`) that the client is expected to follow. Nothing in ACME
+    /// binds them to the directory we started from, so a hostile or compromised
+    /// directory — or a tampered response — could point them at another host and
+    /// have this server sign a JWS against it, or fetch a certificate it never
+    /// ordered, and then push that certificate to every edge.
+    origin: Origin,
+}
+
+/// scheme + host + effective port of an ACME URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Origin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl Origin {
+    fn parse(url: &str) -> Result<Self, String> {
+        let uri: axum::http::Uri = url
+            .parse()
+            .map_err(|e| format!("ACME url {url:?} is not a valid URI: {e}"))?;
+        let scheme = uri
+            .scheme_str()
+            .ok_or_else(|| format!("ACME url {url:?} has no scheme"))?
+            .to_ascii_lowercase();
+        // Plaintext ACME would let anyone on the path rewrite the URLs below, so
+        // refuse it outright rather than relying on the origin check.
+        if scheme != "https" {
+            return Err(format!("ACME url {url:?} must use https, not {scheme:?}"));
+        }
+        let host = uri
+            .host()
+            .ok_or_else(|| format!("ACME url {url:?} has no host"))?
+            .to_ascii_lowercase();
+        let port = uri.port_u16().unwrap_or(443);
+        Ok(Self { scheme, host, port })
+    }
+
+    fn same_origin(&self, other: &Self) -> bool {
+        self.scheme == other.scheme && self.host == other.host && self.port == other.port
+    }
 }
 
 impl Session {
+    /// Reject a URL that is not on this session's origin.
+    fn check_origin(&self, url: &str) -> Result<(), String> {
+        let origin = Origin::parse(url)?;
+        if origin.same_origin(&self.origin) {
+            Ok(())
+        } else {
+            Err(format!(
+                "ACME url {url:?} is on {}://{}:{}, not on the directory origin {}://{}:{}",
+                origin.scheme,
+                origin.host,
+                origin.port,
+                self.origin.scheme,
+                self.origin.host,
+                self.origin.port
+            ))
+        }
+    }
+
     async fn nonce(&self) -> Result<String, String> {
+        self.check_origin(&self.dir.new_nonce)?;
         let reply = http_request("HEAD", &self.dir.new_nonce, None, &[]).await?;
         if !(200..300).contains(&reply.status) {
             return Err(reply_error(&reply));
@@ -271,6 +337,8 @@ impl Session {
         use_jwk: bool,
         accept: Option<&str>,
     ) -> Result<HttpReply, String> {
+        // Every ACME URL we follow must stay on the directory's origin.
+        self.check_origin(url)?;
         let nonce = self.nonce().await?;
         let body = self.signed_body(url, payload, use_jwk, &nonce)?;
         let mut headers: Vec<(&str, &str)> = vec![("content-type", "application/jose+json")];
@@ -314,10 +382,12 @@ async fn ensure_account(
         }
     };
 
+    let origin = Origin::parse(directory_url)?;
     let mut session = Session {
         dir,
         key,
         kid: String::new(),
+        origin,
     };
 
     if kid.is_empty() {
@@ -728,6 +798,7 @@ mod tests {
             },
             key,
             kid: "https://example.test/acct/1".into(),
+            origin: Origin::parse("https://example.test/directory").unwrap(),
         };
         let body = session
             .signed_body(
@@ -790,5 +861,88 @@ mod tests {
             .challenges
             .iter()
             .any(|c| c.kind == "dns-persist-01" && c.token.is_none()));
+    }
+    fn directory_origin() -> Origin {
+        Origin::parse("https://acme-v02.api.letsencrypt.org/directory").unwrap()
+    }
+
+    /// URLs on the directory's origin are allowed, including a different path,
+    /// an explicit default port, and a case difference in the host.
+    #[test]
+    fn same_origin_urls_are_accepted() {
+        let origin = directory_origin();
+        for url in [
+            "https://acme-v02.api.letsencrypt.org/acme/authz/123",
+            "https://acme-v02.api.letsencrypt.org/acme/chall/1/2",
+            "https://acme-v02.api.letsencrypt.org:443/acme/order/9/finalize",
+            "https://ACME-V02.API.LETSENCRYPT.ORG/acme/cert/1",
+            "https://acme-v02.api.letsencrypt.org/",
+        ] {
+            let parsed = Origin::parse(url).expect(url);
+            assert!(origin.same_origin(&parsed), "{url} should be same-origin");
+        }
+    }
+
+    /// Anything else must be rejected: another host, another port, another scheme.
+    #[test]
+    fn cross_origin_urls_are_rejected() {
+        let origin = directory_origin();
+        for url in [
+            "https://attacker.test/acme/authz/123",
+            "https://acme-v02.api.letsencrypt.org.attacker.test/acme/authz",
+            "https://acme-v02.api.letsencrypt.org:8443/acme/authz",
+            // Plaintext never reaches the same-origin comparison: `Origin::parse`
+            // refuses it first, which `non_https_and_malformed_urls_are_refused`
+            // covers.
+            "https://evil@acme-v02.api.letsencrypt.org@attacker.test/x",
+        ] {
+            let parsed = Origin::parse(url).expect(url);
+            assert!(
+                !origin.same_origin(&parsed),
+                "{url} must not be treated as same-origin"
+            );
+        }
+    }
+
+    /// Plaintext and malformed URLs are refused outright.
+    #[test]
+    fn non_https_and_malformed_urls_are_refused() {
+        for url in [
+            "http://acme.test/dir",
+            "ftp://acme.test/dir",
+            "not a url",
+            "/relative/path",
+            "https://",
+        ] {
+            assert!(
+                Origin::parse(url).is_err(),
+                "{url:?} should not produce an origin"
+            );
+        }
+    }
+
+    /// The session rejects a URL it was not created for.
+    #[test]
+    fn session_rejects_foreign_urls() {
+        let (key, _) = AccountKey::generate().expect("generate key");
+        let session = Session {
+            dir: Directory {
+                new_nonce: "https://acme.test/nonce".into(),
+                new_account: "https://acme.test/account".into(),
+                new_order: "https://acme.test/order".into(),
+            },
+            key,
+            kid: "https://acme.test/acct/1".into(),
+            origin: Origin::parse("https://acme.test/directory").unwrap(),
+        };
+        assert!(session
+            .check_origin("https://acme.test/acme/authz/1")
+            .is_ok());
+        assert!(session
+            .check_origin("https://attacker.test/acme/authz/1")
+            .is_err());
+        assert!(session
+            .check_origin("http://acme.test/acme/authz/1")
+            .is_err());
     }
 }
