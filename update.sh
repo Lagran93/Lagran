@@ -161,6 +161,23 @@ if [[ -n "${WEB_SRC}" && -d "${PREFIX}/web" ]]; then
   # after an upgrade even though the control plane was healthy. `install.sh`
   # already normalises these; the update path did not.
   chmod -R a+rX "${PREFIX}/web" || fail "fix web permissions failed"
+  # Verify from an unprivileged account, the way the reverse proxy sees it. A
+  # root-side `test -r` succeeds regardless of the mode, so it would not have
+  # caught the original 403. Skipped (not failed) when this process cannot drop
+  # privileges: a missing probe must not abort an otherwise correct update.
+  if command -v setpriv >/dev/null 2>&1 \
+     && setpriv --reuid=65534 --regid=65534 --clear-groups true 2>/dev/null; then
+    if ! setpriv --reuid=65534 --regid=65534 --clear-groups \
+        test -r "${PREFIX}/web/index.html" 2>/dev/null; then
+      fail "web assets are not readable by an unprivileged user (the proxy would answer 403); fix: chmod -R a+rX ${PREFIX}/web"
+    fi
+    if ! setpriv --reuid=65534 --regid=65534 --clear-groups \
+        test -x "${PREFIX}/web" 2>/dev/null; then
+      fail "web root ${PREFIX}/web is not traversable by an unprivileged user (the proxy would answer 403); fix: chmod a+x ${PREFIX}/web"
+    fi
+  else
+    warn "cannot drop privileges to verify ${PREFIX}/web; skipping the readability check"
+  fi
 fi
 HELPER_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name update.sh -print -quit 2>/dev/null || true)"
 if [[ -n "${HELPER_SRC}" ]]; then

@@ -570,6 +570,33 @@ WantedBy=multi-user.target
 EOF
 }
 
+# Fail loudly if the SPA directory is not readable by a non-root user.
+#
+# The reverse proxy runs as its own account, and `file_server` answers 403 rather
+# than 404 when it cannot traverse the root — which is how an upgrade made the
+# console unreachable while the control plane stayed healthy. Checking from root
+# would not catch it, so the read is attempted as `nobody`.
+check_web_readable() {
+  local dir="$1"
+  local index="${dir}/index.html"
+  [[ -f "$index" ]] || die "web root is missing ${index}"
+  # Probe as uid 65534 if this process can drop privileges and setpriv exists.
+  # When it cannot, skip rather than fail: a missing probe tool must not abort an
+  # otherwise correct install (the earlier draft treated "setpriv unavailable" as
+  # "not readable" and would have blocked every non-root run).
+  if ! command -v setpriv >/dev/null 2>&1 \
+     || ! setpriv --reuid=65534 --regid=65534 --clear-groups true 2>/dev/null; then
+    warn "cannot drop privileges to verify ${dir}; skipping the readability check"
+    return 0
+  fi
+  if ! setpriv --reuid=65534 --regid=65534 --clear-groups test -r "$index" 2>/dev/null; then
+    die "web root ${dir} is not readable by an unprivileged user; the reverse proxy would answer 403 (fix: chmod -R a+rX ${dir})"
+  fi
+  if ! setpriv --reuid=65534 --regid=65534 --clear-groups test -x "$dir" 2>/dev/null; then
+    die "web root ${dir} is not traversable by an unprivileged user; the reverse proxy would answer 403 (fix: chmod a+x ${dir})"
+  fi
+}
+
 install_frontend() {
   [[ -f "$STAGE/web/index.html" ]] || die "release does not contain web/index.html"
   install -d -m 0755 "$WEB_DIR"
@@ -579,6 +606,7 @@ install_frontend() {
     cp -a "$STAGE/web/." "$WEB_DIR/"
   fi
   chmod -R a+rX "$WEB_DIR"
+  check_web_readable "$WEB_DIR"
   install_env_example frontend.env.example
   if [[ "$WITH_CADDY" == "1" ]]; then
     cat > "$CONF_DIR/Caddyfile.lagran" <<EOF
