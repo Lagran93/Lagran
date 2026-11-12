@@ -320,7 +320,10 @@ fn public_base(state: &AppState, headers: &HeaderMap) -> String {
     } else {
         host
     };
-    let proto = match headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) {
+    let proto = match headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(p) if p.eq_ignore_ascii_case("https") => "https",
         _ => "http",
     };
@@ -343,7 +346,24 @@ fn safe_public_base(raw: &str) -> Option<String> {
     if rest.chars().any(|c| {
         c.is_whitespace()
             || c.is_control()
-            || matches!(c, '"' | '\'' | '`' | ';' | '&' | '|' | '$' | '(' | ')' | '<' | '>' | '*' | '?' | '!' | '{' | '}')
+            || matches!(
+                c,
+                '"' | '\''
+                    | '`'
+                    | ';'
+                    | '&'
+                    | '|'
+                    | '$'
+                    | '('
+                    | ')'
+                    | '<'
+                    | '>'
+                    | '*'
+                    | '?'
+                    | '!'
+                    | '{'
+                    | '}'
+            )
     }) {
         return None;
     }
@@ -411,7 +431,10 @@ fn validate_agent_url(agent_url: &str) -> Result<String, String> {
     if rest.chars().any(|c| {
         c.is_whitespace()
             || c.is_control()
-            || matches!(c, '"' | '\'' | '`' | ';' | '&' | '|' | '$' | '(' | ')' | '<' | '>')
+            || matches!(
+                c,
+                '"' | '\'' | '`' | ';' | '&' | '|' | '$' | '(' | ')' | '<' | '>'
+            )
     }) {
         return Err("agent_url contains characters that are not allowed".into());
     }
@@ -545,6 +568,18 @@ pub async fn create(
     )
     .await
     .map_err(|e| {
+        // The pre-check above cannot stop two concurrent requests: the unique
+        // index does. Report that race as a conflict rather than a 500.
+        if let sqlx::Error::Database(db) = &e {
+            if db.constraint() == Some("idx_edge_nodes_name") {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ErrorBody {
+                        error: "节点名称已存在，请更换名称".into(),
+                    }),
+                );
+            }
+        }
         tracing::error!(error = %e, "create node");
         db_error()
     })?;

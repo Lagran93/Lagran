@@ -302,9 +302,7 @@ fn waf_config_from(
     });
     let ruleset_categories = selected
         .map(|p| p.categories_for(&managed_rulesets))
-        .unwrap_or_else(|| {
-            crate::waf_rulesets::Categories::from_csv(&settings.managed_rulesets)
-        });
+        .unwrap_or_else(|| crate::waf_rulesets::Categories::from_csv(&settings.managed_rulesets));
     let rulepack_out = selected.map(|p| RulepackOut {
         version: p.version.clone(),
         payload: p.payload.clone(),
@@ -456,7 +454,11 @@ pub(crate) fn build(
         shield_url: row.shield_url.clone(),
         signed_url_enabled: row.signed_url_enabled,
         signed_url_mode: if row.signed_url_mode.is_empty() {
-            if row.signed_url_enabled { "all".into() } else { "off".into() }
+            if row.signed_url_enabled {
+                "all".into()
+            } else {
+                "off".into()
+            }
         } else {
             row.signed_url_mode.clone()
         },
@@ -516,12 +518,7 @@ pub async fn snapshot_domain(
             let waf_ips = repository::list_waf_ips(pool, row.id).await?;
             let waf_geo = repository::list_waf_geo(pool, row.id).await?;
             Some(waf_config_from(
-                &row.name,
-                settings,
-                waf_rules,
-                waf_ips,
-                waf_geo,
-                &rulepacks,
+                &row.name, settings, waf_rules, waf_ips, waf_geo, &rulepacks,
             ))
         }
         None => None,
@@ -547,19 +544,16 @@ pub async fn get_domain_config(
             tracing::error!(error = %e, domain = %row.name, "load cache rules for config");
             db_error()
         })?;
-    let rulepacks = crate::waf_rulepack::list(&state.pool)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "load rulepacks for config");
-            db_error()
-        })?;
+    let rulepacks = crate::waf_rulepack::list(&state.pool).await.map_err(|e| {
+        tracing::error!(error = %e, "load rulepacks for config");
+        db_error()
+    })?;
     let waf = match repository::get_waf_settings(&state.pool, row.id)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, domain = %row.name, "load waf settings for config");
             db_error()
-        })?
-    {
+        })? {
         Some(settings) => {
             let waf_rules = repository::list_waf_rules(&state.pool, row.id)
                 .await
@@ -580,12 +574,7 @@ pub async fn get_domain_config(
                     db_error()
                 })?;
             Some(waf_config_from(
-                &row.name,
-                settings,
-                waf_rules,
-                waf_ips,
-                waf_geo,
-                &rulepacks,
+                &row.name, settings, waf_rules, waf_ips, waf_geo, &rulepacks,
             ))
         }
         None => None,
@@ -689,12 +678,10 @@ pub async fn list_all_configs(
             db_error()
         })?;
 
-    let rulepacks = crate::waf_rulepack::list(&state.pool)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "list rulepacks for config");
-            db_error()
-        })?;
+    let rulepacks = crate::waf_rulepack::list(&state.pool).await.map_err(|e| {
+        tracing::error!(error = %e, "list rulepacks for config");
+        db_error()
+    })?;
     let mut waf_settings_by: HashMap<Uuid, repository::WafSettingsRow> =
         waf_settings.into_iter().map(|s| (s.domain_id, s)).collect();
     let mut waf_rules_by: HashMap<Uuid, Vec<repository::WafRuleRow>> = HashMap::new();
@@ -710,29 +697,58 @@ pub async fn list_all_configs(
         waf_geo_by.entry(rule.domain_id).or_default().push(rule);
     }
 
+    // Collect every version this document needs and load them in one query.
+    //
+    // This used to await `get_version` once per domain for the release set and
+    // again for each pinned `published_version_id`, so an N-domain document cost
+    // O(N) sequential round trips on a path every edge polls every 15s.
+    let release_versions: Vec<(String, Uuid)> = active_release
+        .as_ref()
+        .and_then(|release| release.versions.as_object())
+        .map(|map| {
+            map.iter()
+                .filter_map(|(domain, value)| {
+                    value
+                        .as_str()
+                        .and_then(|v| Uuid::parse_str(v).ok())
+                        .map(|id| (domain.clone(), id))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut wanted: Vec<Uuid> = release_versions.iter().map(|(_, id)| *id).collect();
+    wanted.extend(rows.iter().filter_map(|row| row.published_version_id));
+    wanted.sort_unstable();
+    wanted.dedup();
+    let versions = repository::config_release::versions_by_ids(&state.pool, &wanted)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "load config versions");
+            db_error()
+        })?;
+
+    // Parsing a snapshot allocates a whole document, so decode each version once
+    // and share it between the release map and the per-domain lookup.
+    let mut parsed_versions: HashMap<Uuid, DomainConfigResponse> = HashMap::new();
+    for (id, row) in versions.iter() {
+        if let Ok(snapshot) = serde_json::from_value::<DomainConfigResponse>(row.snapshot.clone()) {
+            parsed_versions.insert(*id, snapshot);
+        }
+    }
+
     let mut release_snapshots: HashMap<String, DomainConfigResponse> = HashMap::new();
     let mut release_id = None;
-    if let Some(release) = active_release {
-        if let Some(map) = release.versions.as_object() {
-            for (domain, version_id) in map {
-                let Some(version_id) = version_id.as_str().and_then(|v| Uuid::parse_str(v).ok())
-                else {
-                    continue;
-                };
-                if let Ok(Some(version)) = repository::get_version(&state.pool, version_id).await {
-                    if let Ok(snapshot) =
-                        serde_json::from_value::<DomainConfigResponse>(version.snapshot)
-                    {
-                        release_snapshots.insert(domain.clone(), snapshot);
-                    }
-                }
+    if let Some(release) = active_release.as_ref() {
+        for (domain, version_id) in &release_versions {
+            if let Some(snapshot) = parsed_versions.get(version_id) {
+                release_snapshots.insert(domain.clone(), snapshot.clone());
             }
         }
         if !release_snapshots.is_empty() {
             release_id = Some(release.id.to_string());
         }
     }
-    let mut published_snapshots: HashMap<Uuid, DomainConfigResponse> = HashMap::new();
+    let published_snapshots: HashMap<Uuid, DomainConfigResponse> = parsed_versions;
 
     let mut domains = Vec::with_capacity(rows.len());
     let mut version_parts = Vec::with_capacity(rows.len());
@@ -757,16 +773,11 @@ pub async fn list_all_configs(
             cfg = snapshot;
             effective_version = None;
         } else if let Some(version_id) = row.published_version_id {
+            // Already loaded in the batch above; a missing entry means the
+            // snapshot failed to parse, so keep the live config instead of
+            // issuing another query.
             if let Some(snapshot) = published_snapshots.get(&version_id) {
                 cfg = snapshot.clone();
-            } else if let Ok(Some(version)) = repository::get_version(&state.pool, version_id).await
-            {
-                if let Ok(snapshot) =
-                    serde_json::from_value::<DomainConfigResponse>(version.snapshot)
-                {
-                    published_snapshots.insert(version_id, snapshot.clone());
-                    cfg = snapshot;
-                }
             }
         }
         version_parts.push(format!(
@@ -1153,7 +1164,10 @@ mod tests {
             "example.com",
             settings(),
             Vec::new(),
-            vec![ip("allow", "203.0.113.10", true), ip("deny", "198.51.100.10", false)],
+            vec![
+                ip("allow", "203.0.113.10", true),
+                ip("deny", "198.51.100.10", false),
+            ],
             Vec::new(),
             &[],
         );

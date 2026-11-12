@@ -323,6 +323,58 @@ dns.AGENT_TOKEN     = G
 edge.AGENT_TOKEN    = 该节点的 auth_token（安装命令自动带）
 ```
 
+### 4.3.1 升级前预建索引（大表必读）
+
+新版本为遥测表和节点表增加了索引。迁移本身可以正常运行，但 `CREATE INDEX` 会在
+`access_logs` / `waf_events` 上持写锁直到建完；这两张表在长期运行的环境里通常是全库最大的，
+千万级数据下可能阻塞写入数分钟到数十分钟。
+
+迁移脚本用的是 `CREATE INDEX IF NOT EXISTS`，所以**先在低峰期用 `CONCURRENTLY` 手工建好，
+迁移执行时就会直接跳过**，不产生锁。
+
+```bash
+psql "$DATABASE_URL" <<'SQL'
+-- 不阻塞读写；失败会留下 invalid 索引，见下方清理
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_access_logs_status_ts
+    ON access_logs (status, ts DESC);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_waf_events_action_ts
+    ON waf_events (action, ts DESC);
+SQL
+```
+
+`CONCURRENTLY` 不能在事务块内运行，所以这里用 `psql` 直接执行，而不是包在 `BEGIN/COMMIT` 里。
+
+**如果中途失败**，会残留一个 `INVALID` 状态的索引，它不会被查询使用，但会阻塞后续 `IF NOT EXISTS`：
+
+```sql
+-- 检查
+SELECT indexrelid::regclass AS index, indisvalid
+FROM pg_index
+WHERE indexrelid::regclass::text IN ('idx_access_logs_status_ts','idx_waf_events_action_ts');
+
+-- 有 indisvalid = false 时先删掉再重建
+DROP INDEX CONCURRENTLY IF EXISTS idx_access_logs_status_ts;
+DROP INDEX CONCURRENTLY IF EXISTS idx_waf_events_action_ts;
+```
+
+#### `edge_nodes.name` 唯一索引
+
+这条**不建议预建**，因为迁移需要先把可能存在的重名节点改名，预建唯一索引会在有重名时失败。
+先确认没有重名即可（正常情况下不会有）：
+
+```bash
+psql "$DATABASE_URL" -c \
+  "select name, count(*) from edge_nodes group by name having count(*) > 1;"
+```
+
+若查询为空，迁移会顺利完成；若有结果，迁移会自动把较晚的节点改名为 `<name>~<n>`，
+升级后请到控制台确认并清理这些节点。
+
+> 提示：即使要预建，也**不要**用 `CONCURRENTLY` 建这个唯一索引。按 PostgreSQL 文档，
+> 唯一索引在并发构建的第二次扫描开始时就会对其他事务生效，构建若失败还会留下一个
+> 仍在强制唯一性的 `INVALID` 索引，清理起来比普通构建更麻烦。
+
 ### 升级顺序（重要）
 
 该版本开始，边缘接口不再接受全局 `AGENT_TOKEN`，也不会自动创建未知节点。升级时建议按以下顺序：
