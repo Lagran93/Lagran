@@ -16,10 +16,10 @@ pub fn request_config_reload() {
 // Runs periodically, sends the agent token, and follows the control plane's
 // aggregate version so unchanged config is not re-applied.
 
-use crate::cache::large::LargeCache;
-use crate::cache::SharedCache;
 use crate::agent::ControlClient;
+use crate::cache::large::LargeCache;
 use crate::cache::policy::{CacheRule, RuleSet};
+use crate::cache::SharedCache;
 use crate::config::registry::{DomainEntry, DomainRegistry};
 use crate::config::EdgeConfig;
 use crate::origin::OriginClient;
@@ -261,12 +261,14 @@ impl DomainCfg {
             origin_url,
             origins,
             rules: self.rules.into_iter().map(RuleCfg::into_rule).collect(),
+            has_content_type_rules: false,
             version: self.version,
             rate_limit_rps: global_rps,
             rate_limit_burst: global_burst,
             ignore_query_string: self.ignore_query_string,
             cache_key_ignore_headers: self.cache_key_ignore_headers,
             cors_origins: self.cors_origins,
+            response_headers: std::sync::Arc::default(),
             hotlink_allow_referers: self.hotlink_allow_referers,
             // 0 means "inherit the edge-wide ORIGIN_CONNECT_TIMEOUT_MS".
             // A non-zero value overrides the TCP connect timeout for this
@@ -538,6 +540,7 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
         challenge_difficulty: cfg.challenge_difficulty.clamp(1, 6),
         challenge_ttl_secs: cfg.challenge_ttl_secs.clamp(60, 86_400),
         security_level: SecurityLevel::parse(&cfg.security_level),
+        compiled: Default::default(),
     };
     // Sort and filter the custom rules once here so the request path never
     // builds or sorts a temporary rule list.
@@ -567,10 +570,7 @@ fn origin_target(o: &OriginCfg) -> crate::config::registry::OriginTarget {
     // When an origin is addressed by IP but the certificate is issued for a
     // hostname, `sni` is also the natural Host header. An explicit host_header
     // still wins.
-    let host_header = o
-        .host_header
-        .clone()
-        .or_else(|| o.sni.clone());
+    let host_header = o.host_header.clone().or_else(|| o.sni.clone());
     crate::config::registry::OriginTarget {
         url: format_origin(o),
         weight: if o.weight == 0 { 100 } else { o.weight },
@@ -616,8 +616,11 @@ pub fn spawn_config_sync(
                     if let Some(cfg) = conditional.value {
                         if cfg.version != last_version {
                             let release_id = cfg.release_id.clone();
-                            let entries: Vec<DomainEntry> =
-                                cfg.domains.into_iter().map(|d| d.into_entry(&config)).collect();
+                            let entries: Vec<DomainEntry> = cfg
+                                .domains
+                                .into_iter()
+                                .map(|d| d.into_entry(&config))
+                                .collect();
                             let n = entries.len();
 
                             // Any domain whose per-domain version changed must
@@ -659,9 +662,10 @@ pub fn spawn_config_sync(
                                 .replace_all(entries.clone(), cfg.version.clone())
                                 .await;
                             for domain in &changed_domains {
-                                let purged = cache.purge_matching(&[domain.clone()]).await;
+                                let purged =
+                                    cache.purge_matching(std::slice::from_ref(domain)).await;
                                 let large_purged = if let Some(large) = large_cache.as_ref() {
-                                    large.purge_patterns(&[domain.clone()]).await
+                                    large.purge_patterns(std::slice::from_ref(domain)).await
                                 } else {
                                     0
                                 };

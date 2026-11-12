@@ -171,7 +171,7 @@ pub fn client_group(ip: IpAddr) -> String {
             None => {
                 let mut octets = v6.octets();
                 octets[8..].fill(0);
-                format!("{}/{IPV6_PREFIX}", Ipv6Addr::from(octets).to_string())
+                format!("{}/{IPV6_PREFIX}", Ipv6Addr::from(octets))
             }
         },
     }
@@ -655,10 +655,7 @@ impl CcProtector {
             } else {
                 state.window_over = true;
                 state.violations = state.violations.saturating_add(1);
-                if cfg.ban_after > 0
-                    && cfg.ban_seconds > 0
-                    && state.violations >= cfg.ban_after
-                {
+                if cfg.ban_after > 0 && cfg.ban_seconds > 0 && state.violations >= cfg.ban_after {
                     let until = now + Duration::from_secs(cfg.ban_seconds);
                     state.banned_until = Some(until);
                     state.violations = 0;
@@ -689,15 +686,18 @@ impl CcProtector {
     /// request count.
     async fn note_over_limit(&self, key: &str, cfg: &CcConfig, now: Instant) -> CcDecision {
         self.maybe_maintain(now);
-        let mut entry = self.inner.entry(key.to_string()).or_insert_with(|| ClientState {
-            window_start: now,
-            count: 0,
-            window_over: false,
-            violations: 0,
-            banned_until: None,
-            last_seen: now,
-            reported: false,
-        });
+        let mut entry = self
+            .inner
+            .entry(key.to_string())
+            .or_insert_with(|| ClientState {
+                window_start: now,
+                count: 0,
+                window_over: false,
+                violations: 0,
+                banned_until: None,
+                last_seen: now,
+                reported: false,
+            });
         let mut ban_until = None;
         let decision = {
             let state = entry.value_mut();
@@ -728,10 +728,7 @@ impl CcProtector {
             } else {
                 state.window_over = true;
                 state.violations = state.violations.saturating_add(1);
-                if cfg.ban_after > 0
-                    && cfg.ban_seconds > 0
-                    && state.violations >= cfg.ban_after
-                {
+                if cfg.ban_after > 0 && cfg.ban_seconds > 0 && state.violations >= cfg.ban_after {
                     let until = now + Duration::from_secs(cfg.ban_seconds);
                     state.banned_until = Some(until);
                     state.violations = 0;

@@ -15,6 +15,7 @@ pub mod rulepack;
 
 use axum::http::HeaderMap;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -149,6 +150,62 @@ pub struct WafRule {
     pub expr: Option<lagran_waf_dsl::Expr>,
 }
 
+/// Static data extracted from custom rules when a domain snapshot is loaded.
+///
+/// This keeps CIDR parsing and header lookup preparation out of the request
+/// path while preserving the public rule representation used by callers.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct WafCompiled {
+    header_names: Vec<String>,
+    cidrs: HashMap<String, Vec<IpNet>>,
+}
+
+impl WafCompiled {
+    fn compile(rules: &[WafRule]) -> Self {
+        let mut compiled = Self::default();
+        for rule in rules {
+            if let Some(expr) = &rule.expr {
+                compiled.add_expr(expr);
+            } else if let WafField::Header(name) = &rule.field {
+                compiled.add_header(name);
+            }
+        }
+        compiled
+    }
+
+    fn add_header(&mut self, name: &str) {
+        let name = name.trim().to_ascii_lowercase();
+        if !name.is_empty() && !self.header_names.contains(&name) {
+            self.header_names.push(name);
+        }
+    }
+
+    fn add_expr(&mut self, expr: &lagran_waf_dsl::Expr) {
+        match expr {
+            lagran_waf_dsl::Expr::Condition { field, op, value } => {
+                if let lagran_waf_dsl::Field::Header(name) = field {
+                    self.add_header(name);
+                }
+                if *op == lagran_waf_dsl::Op::In {
+                    self.cidrs.entry(value.clone()).or_insert_with(|| {
+                        value
+                            .split(',')
+                            .filter_map(IpNet::parse)
+                            .collect::<Vec<_>>()
+                    });
+                }
+            }
+            lagran_waf_dsl::Expr::And(parts) | lagran_waf_dsl::Expr::Or(parts) => {
+                for part in parts {
+                    self.add_expr(part);
+                }
+            }
+            lagran_waf_dsl::Expr::Not(inner) => self.add_expr(inner),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ManagedRules {
     pub sqli: bool,
@@ -270,6 +327,8 @@ pub struct WafConfig {
     pub challenge_ttl_secs: u64,
     /// Challenge policy applied after explicit rules.
     pub security_level: SecurityLevel,
+    #[doc(hidden)]
+    pub compiled: WafCompiled,
 }
 
 impl Default for WafConfig {
@@ -288,6 +347,7 @@ impl Default for WafConfig {
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
             security_level: SecurityLevel::Off,
+            compiled: WafCompiled::default(),
         }
     }
 }
@@ -317,6 +377,7 @@ impl WafConfig {
         // Highest priority first; ties keep declaration order (stable sort).
         self.rules
             .sort_by_key(|rule| std::cmp::Reverse(rule.priority));
+        self.compiled = WafCompiled::compile(&self.rules);
     }
 
     /// Whether [`WafConfig::finalize`] already prepared `rules` for the hot
@@ -832,11 +893,19 @@ fn contains_any_joined(parts: &[&str], separators: &[char], needles: &[&str]) ->
 }
 
 /// Evaluate a parsed DSL expression against the decoded request fields.
-fn eval_dsl(expr: &lagran_waf_dsl::Expr, fields: &RuleFields<'_, '_>) -> bool {
+fn eval_dsl(
+    expr: &lagran_waf_dsl::Expr,
+    fields: &RuleFields<'_, '_>,
+    compiled: &WafCompiled,
+) -> bool {
     match expr {
-        lagran_waf_dsl::Expr::And(parts) => parts.iter().all(|part| eval_dsl(part, fields)),
-        lagran_waf_dsl::Expr::Or(parts) => parts.iter().any(|part| eval_dsl(part, fields)),
-        lagran_waf_dsl::Expr::Not(inner) => !eval_dsl(inner, fields),
+        lagran_waf_dsl::Expr::And(parts) => {
+            parts.iter().all(|part| eval_dsl(part, fields, compiled))
+        }
+        lagran_waf_dsl::Expr::Or(parts) => {
+            parts.iter().any(|part| eval_dsl(part, fields, compiled))
+        }
+        lagran_waf_dsl::Expr::Not(inner) => !eval_dsl(inner, fields, compiled),
         lagran_waf_dsl::Expr::Condition { field, op, value } => {
             let op = match op {
                 lagran_waf_dsl::Op::Contains => WafOp::Contains,
@@ -849,14 +918,15 @@ fn eval_dsl(expr: &lagran_waf_dsl::Expr, fields: &RuleFields<'_, '_>) -> bool {
                 let Ok(ip) = fields.ip_text.parse::<IpAddr>() else {
                     return false;
                 };
-                return value.split(',').any(|part| {
-                    IpNet::parse(part)
-                        .map(|net| net.contains(ip))
-                        .unwrap_or(false)
-                });
+                if let Some(nets) = compiled.cidrs.get(value) {
+                    return nets.iter().any(|net| net.contains(ip));
+                }
+                return value
+                    .split(',')
+                    .any(|part| IpNet::parse(part).is_some_and(|net| net.contains(ip)));
             }
             if let lagran_waf_dsl::Field::Header(name) = field {
-                return op.matches(&header_value(fields.req.headers, name), value);
+                return op.matches(&fields.header_for(name), value);
             }
             let haystack = match field {
                 lagran_waf_dsl::Field::Path => fields.path,
@@ -1024,6 +1094,17 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
         Some(ip) => Cow::Owned(ip.to_string()),
         None => Cow::Borrowed(""),
     };
+    let header_values: Vec<Option<Cow<'_, str>>> = cfg
+        .compiled
+        .header_names
+        .iter()
+        .map(|name| {
+            req.headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(decode_lower)
+        })
+        .collect();
     let mut fields = RuleFields {
         req,
         path: path.as_ref(),
@@ -1032,10 +1113,12 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
         referer: referer.as_ref(),
         method: method.as_ref(),
         ip_text: ip_text.as_ref(),
+        header_names: &cfg.compiled.header_names,
+        header_values: &header_values,
     };
     if cfg.rules_are_finalized() {
         for rule in cfg.rules.iter() {
-            if let Some(verdict) = rule_verdict(rule, &mut fields) {
+            if let Some(verdict) = rule_verdict(rule, &mut fields, &cfg.compiled) {
                 return Some(verdict);
             }
         }
@@ -1046,7 +1129,7 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
         let mut rules: Vec<&WafRule> = cfg.rules.iter().filter(|r| r.enabled).collect();
         rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
         for rule in rules {
-            if let Some(verdict) = rule_verdict(rule, &mut fields) {
+            if let Some(verdict) = rule_verdict(rule, &mut fields, &cfg.compiled) {
                 return Some(verdict);
             }
         }
@@ -1067,9 +1150,26 @@ struct RuleFields<'a, 'r> {
     referer: &'a str,
     method: &'a str,
     ip_text: &'a str,
+    header_names: &'a [String],
+    header_values: &'a [Option<Cow<'r, str>>],
 }
 
 impl RuleFields<'_, '_> {
+    fn header_for(&self, name: &str) -> Cow<'_, str> {
+        if let Some(index) = self
+            .header_names
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(name))
+        {
+            return match self.header_values.get(index).and_then(Option::as_ref) {
+                Some(Cow::Borrowed(value)) => Cow::Borrowed(value),
+                Some(Cow::Owned(value)) => Cow::Borrowed(value.as_str()),
+                None => Cow::Borrowed(""),
+            };
+        }
+        Cow::Owned(header_value(self.req.headers, name))
+    }
+
     fn value_for(&self, field: &WafField) -> Cow<'_, str> {
         match field {
             WafField::Path => Cow::Borrowed(self.path),
@@ -1079,15 +1179,19 @@ impl RuleFields<'_, '_> {
             WafField::Method => Cow::Borrowed(self.method),
             WafField::Ip => Cow::Borrowed(self.ip_text),
             // Header lookups are rare and already decoded on demand.
-            WafField::Header(name) => Cow::Owned(header_value(self.req.headers, name)),
+            WafField::Header(name) => self.header_for(name),
         }
     }
 }
 
 /// Evaluate one custom rule; `None` means it did not match.
-fn rule_verdict(rule: &WafRule, fields: &mut RuleFields<'_, '_>) -> Option<WafVerdict> {
+fn rule_verdict(
+    rule: &WafRule,
+    fields: &mut RuleFields<'_, '_>,
+    compiled: &WafCompiled,
+) -> Option<WafVerdict> {
     let matched = if let Some(expr) = &rule.expr {
-        eval_dsl(expr, fields)
+        eval_dsl(expr, fields, compiled)
     } else {
         let value = fields.value_for(&rule.field);
         rule.op.matches(&value, &rule.value)
@@ -1126,6 +1230,7 @@ mod tests {
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
             security_level: SecurityLevel::Off,
+            compiled: Default::default(),
         }
     }
 
@@ -1672,9 +1777,7 @@ mod tests {
             action: WafAction::Block,
             priority: 10,
             enabled: true,
-            expr: Some(
-                lagran_waf_dsl::parse(r#"ip in "10.0.0.0/8,198.51.100.0/24""#).unwrap(),
-            ),
+            expr: Some(lagran_waf_dsl::parse(r#"ip in "10.0.0.0/8,198.51.100.0/24""#).unwrap()),
         }];
         let h = HeaderMap::new();
         assert_eq!(
@@ -1684,6 +1787,44 @@ mod tests {
         let mut req_bad = req(&h, "/", "", "curl");
         req_bad.ip = Some("203.0.113.5".parse().unwrap());
         assert!(evaluate(&c, &req_bad).is_none());
+    }
+
+    #[test]
+    fn finalize_precompiles_cidrs_and_header_names() {
+        let mut c = cfg();
+        c.rules = vec![WafRule {
+            name: "compiled".into(),
+            field: WafField::Path,
+            op: WafOp::Contains,
+            value: "/admin".into(),
+            action: WafAction::Block,
+            priority: 10,
+            enabled: true,
+            expr: Some(
+                lagran_waf_dsl::parse(
+                    r#"ip in "10.0.0.0/8,198.51.100.0/24" AND header:x-api-key equals "bad""#,
+                )
+                .unwrap(),
+            ),
+        }];
+        c.finalize();
+
+        assert_eq!(c.compiled.header_names, ["x-api-key"]);
+        assert_eq!(
+            c.compiled
+                .cidrs
+                .get("10.0.0.0/8,198.51.100.0/24")
+                .map(Vec::len),
+            Some(2)
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "BAD".parse().unwrap());
+        assert_eq!(
+            evaluate(&c, &req(&headers, "/", "", "curl"))
+                .unwrap()
+                .rule_name,
+            "compiled"
+        );
     }
 
     #[test]
@@ -1767,11 +1908,15 @@ mod geo_policy_tests {
         c.country_deny = vec!["KP".into()];
         c.asn_deny = vec![4134];
         assert_eq!(
-            evaluate(&c, &req(&h, Some("KP"), None, "/", "")).unwrap().category,
+            evaluate(&c, &req(&h, Some("KP"), None, "/", ""))
+                .unwrap()
+                .category,
             "geo_deny"
         );
         assert_eq!(
-            evaluate(&c, &req(&h, Some("CN"), Some(4134), "/", "")).unwrap().category,
+            evaluate(&c, &req(&h, Some("CN"), Some(4134), "/", ""))
+                .unwrap()
+                .category,
             "asn_deny"
         );
         assert!(evaluate(&c, &req(&h, Some("cn"), Some(4808), "/", "")).is_none());
@@ -1797,7 +1942,9 @@ mod geo_policy_tests {
         c.asn_allow = vec![13335];
         assert!(evaluate(&c, &req(&h, None, Some(13335), "/", "")).is_none());
         assert_eq!(
-            evaluate(&c, &req(&h, None, Some(16509), "/", "")).unwrap().category,
+            evaluate(&c, &req(&h, None, Some(16509), "/", ""))
+                .unwrap()
+                .category,
             "geo_allow"
         );
     }
@@ -1812,7 +1959,9 @@ mod geo_policy_tests {
         let mut allow = cfg();
         allow.country_allow = vec!["CN".into()];
         assert_eq!(
-            evaluate(&allow, &req(&h, None, None, "/", "")).unwrap().category,
+            evaluate(&allow, &req(&h, None, None, "/", ""))
+                .unwrap()
+                .category,
             "geo_allow"
         );
     }

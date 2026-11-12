@@ -2424,7 +2424,8 @@ pub async fn list_access_logs(
         SELECT id, ts, node_id, client_ip, method, host, path, status, bytes,
                latency_ms, cache_status, action, user_agent, referer
         FROM access_logs
-        WHERE ($1::text IS NULL OR host = $1)
+        WHERE host <> ''
+          AND ($1::text IS NULL OR host = $1)
           AND ($2::text[] IS NULL OR host = ANY($2))
           AND ($3::int IS NULL OR status >= $3)
           AND ($4::int IS NULL OR status < $4)
@@ -3644,11 +3645,7 @@ pub async fn delete_user_group(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
     Ok(r.rows_affected())
 }
 
-pub async fn set_user_groups(
-    pool: &PgPool,
-    user_id: Uuid,
-    group_ids: &[Uuid],
-) -> sqlx::Result<()> {
+pub async fn set_user_groups(pool: &PgPool, user_id: Uuid, group_ids: &[Uuid]) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM user_group_members WHERE user_id = $1")
         .bind(user_id)
@@ -3700,10 +3697,12 @@ pub async fn permissions_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<
 }
 
 pub async fn group_member_ids(pool: &PgPool, group_id: Uuid) -> sqlx::Result<Vec<Uuid>> {
-    sqlx::query_scalar("SELECT user_id FROM user_group_members WHERE group_id = $1 ORDER BY user_id")
-        .bind(group_id)
-        .fetch_all(pool)
-        .await
+    sqlx::query_scalar(
+        "SELECT user_id FROM user_group_members WHERE group_id = $1 ORDER BY user_id",
+    )
+    .bind(group_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// Member ids for many groups in one query.
@@ -3752,7 +3751,6 @@ pub async fn set_group_members(
     tx.commit().await
 }
 
-
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PurgeRetryRow {
     pub id: uuid::Uuid,
@@ -3798,10 +3796,7 @@ pub async fn enqueue_purge_retry(
     Ok(())
 }
 
-pub async fn due_purge_retries(
-    pool: &PgPool,
-    limit: i64,
-) -> sqlx::Result<Vec<PurgeRetryRow>> {
+pub async fn due_purge_retries(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<PurgeRetryRow>> {
     sqlx::query_as::<_, PurgeRetryRow>(
         r#"
         SELECT r.id, r.node_id, r.agent_url, r.payload, r.attempts,

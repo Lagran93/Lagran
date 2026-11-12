@@ -2,7 +2,8 @@
 
 use crate::server::agent_auth::RequireAgentToken;
 use crate::server::handler::AppState;
-use crate::server::purge::{self, EdgePurgeRequest};use axum::{
+use crate::server::purge::{self, EdgePurgeRequest};
+use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
@@ -230,14 +231,18 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
          lagran_edge_datapath_pingora_total {}\n\
          # HELP lagran_edge_datapath_legacy_total Requests handled by legacy\n\
          # TYPE lagran_edge_datapath_legacy_total counter\n\
-         lagran_edge_datapath_legacy_total {}\n",
+         lagran_edge_datapath_legacy_total {}\n\
+         # HELP lagran_edge_downstream_cancels_total Client stopped reading the response\n\
+         # TYPE lagran_edge_downstream_cancels_total counter\n\
+         lagran_edge_downstream_cancels_total {}\n",
         global.origin_timeouts,
         global.origin_errors,
         global.stream_requests,
         global.stream_bytes,
         global.stream_errors,
         global.datapath_pingora,
-        global.datapath_legacy
+        global.datapath_legacy,
+        global.downstream_cancels
     ));
     out.push_str(&format!("lagran_edge_domains {}\n", snaps.len()));
     (

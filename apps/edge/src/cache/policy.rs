@@ -76,10 +76,13 @@ pub enum RuleAction {
 
 impl RuleAction {
     pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "bypass" | "no_cache" => RuleAction::Bypass,
-            "no_store" | "nostore" => RuleAction::NoStore,
-            _ => RuleAction::Cache,
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("bypass") || s.eq_ignore_ascii_case("no_cache") {
+            RuleAction::Bypass
+        } else if s.eq_ignore_ascii_case("no_store") || s.eq_ignore_ascii_case("nostore") {
+            RuleAction::NoStore
+        } else {
+            RuleAction::Cache
         }
     }
 
@@ -287,14 +290,14 @@ pub fn match_rule_for_response<'a>(
     query: &str,
     content_type: &str,
 ) -> Option<&'a CacheRule> {
-    let content_type = content_type.trim().to_ascii_lowercase();
+    let content_type = content_type.trim();
     let mut best: Option<&CacheRule> = None;
     for r in rules {
         if !r.enabled || !request_matches_rule(r, path, method, query) {
             continue;
         }
-        let needle = r.match_content_type.trim().to_ascii_lowercase();
-        if !needle.is_empty() && !content_type.contains(&needle) {
+        let needle = r.match_content_type.trim();
+        if !needle.is_empty() && !contains_ascii_case_insensitive(content_type, needle) {
             continue;
         }
         match best {
@@ -333,13 +336,23 @@ fn method_matches_rule(csv: &str, method: &str) -> bool {
 
 fn query_matches_rule(needle: &str, query: &str) -> bool {
     let needle = needle.trim();
+    needle.is_empty() || contains_ascii_case_insensitive(query, needle)
+}
+
+/// Match with the same ASCII-only case folding as `to_ascii_lowercase`,
+/// without allocating lowercase copies for every configured rule.
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
     needle.is_empty()
-        || query
-            .to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase())
+        || (needle.len() <= haystack.len()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle)))
 }
 
 pub fn rule_policy(rule: &CacheRule) -> ResolvedPolicy {
+    let header_modes = header_modes(rule.ignore_key_headers.as_deref());
     ResolvedPolicy {
         action: rule.action_kind(),
         ttl_override: (rule.ttl_seconds > 0).then_some(rule.ttl_seconds),
@@ -348,8 +361,8 @@ pub fn rule_policy(rule: &CacheRule) -> ResolvedPolicy {
         ignore_query: rule.ignore_query,
         ignore_cookie: rule.ignore_cookie,
         key_ignore: 0,
-        key_ignore_origin: header_modes(rule.ignore_key_headers.as_deref()).origin,
-        key_ignore_language: header_modes(rule.ignore_key_headers.as_deref()).language,
+        key_ignore_origin: header_modes.origin,
+        key_ignore_language: header_modes.language,
     }
 }
 
@@ -375,10 +388,17 @@ pub fn header_modes(value: Option<&str>) -> KeyHeaderModes {
         };
     }
     if !value.contains('=') {
-        let lower = value.to_ascii_lowercase();
         return KeyHeaderModes {
-            origin: Some(lower.split(',').any(|v| v.trim() == "origin")),
-            language: Some(lower.split(',').any(|v| v.trim() == "accept-language")),
+            origin: Some(
+                value
+                    .split(',')
+                    .any(|v| v.trim().eq_ignore_ascii_case("origin")),
+            ),
+            language: Some(
+                value
+                    .split(',')
+                    .any(|v| v.trim().eq_ignore_ascii_case("accept-language")),
+            ),
         };
     }
     let mut modes = KeyHeaderModes::default();
@@ -386,16 +406,21 @@ pub fn header_modes(value: Option<&str>) -> KeyHeaderModes {
         let Some((name, state)) = part.split_once('=') else {
             continue;
         };
-        let state = match state.trim().to_ascii_lowercase().as_str() {
-            "ignore" => Some(true),
-            "keep" => Some(false),
-            "inherit" => None,
-            _ => continue,
+        let state = state.trim();
+        let state = if state.eq_ignore_ascii_case("ignore") {
+            Some(true)
+        } else if state.eq_ignore_ascii_case("keep") {
+            Some(false)
+        } else if state.eq_ignore_ascii_case("inherit") {
+            None
+        } else {
+            continue;
         };
-        match name.trim().to_ascii_lowercase().as_str() {
-            "origin" => modes.origin = state,
-            "accept-language" => modes.language = state,
-            _ => {}
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("origin") {
+            modes.origin = state;
+        } else if name.eq_ignore_ascii_case("accept-language") {
+            modes.language = state;
         }
     }
     modes
@@ -490,9 +515,9 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
         return true;
     }
     if let Some(prefix) = pattern.strip_suffix("/*") {
-        return path == prefix
-            || path.starts_with(&format!("{prefix}/"))
-            || path.starts_with(prefix);
+        // The final historical starts_with(prefix) branch already subsumes
+        // the equality and slash-child checks; avoid formatting a temp String.
+        return path.starts_with(prefix);
     }
     if let Some(prefix) = pattern.strip_suffix('*') {
         return path.starts_with(prefix);
@@ -543,7 +568,7 @@ fn parse_cache_control(value: &str) -> CacheControl {
 
 /// Multiple field lines are equivalent to one comma-separated field value
 /// (RFC 9110 §5.3). Cache-Control/Vary must not silently ignore the second line.
-fn joined_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<String> {
+fn joined_header_value(headers: &[(String, String)], name: &str) -> Option<String> {
     let values: Vec<&str> = headers
         .iter()
         .filter(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -668,18 +693,14 @@ fn vary_reject_reason(
     _ignore_cookie: bool,
     key_ignore: u8,
 ) -> Option<&'static str> {
-    let Some(v) = vary else {
-        return None;
-    };
+    let v = vary?;
     for field in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if field.eq_ignore_ascii_case("accept-encoding") {
             // Only the identity representation is fetched/stored, so it is
             // safe to serve it to any Accept-Encoding client.
             continue;
         }
-        if field.eq_ignore_ascii_case("accept-language")
-            || field.eq_ignore_ascii_case("origin")
-        {
+        if field.eq_ignore_ascii_case("accept-language") || field.eq_ignore_ascii_case("origin") {
             if cache_key_header_ignored(field, key_ignore) {
                 // The operator explicitly removed this header from the key.
                 // Treat the Vary field as ignored too, otherwise the response
@@ -715,8 +736,7 @@ fn vary_reject_reason(
 
 /// Header names removed from the cache key by edge configuration. Vary on any
 /// of these must make the response uncacheable instead of mixing variants.
-static CACHE_KEY_IGNORED_HEADERS: std::sync::OnceLock<Vec<String>> =
-    std::sync::OnceLock::new();
+static CACHE_KEY_IGNORED_HEADERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 pub fn configure_cache_key_ignored_headers(headers: Vec<String>) {
     let normalized: Vec<String> = headers
@@ -880,30 +900,46 @@ pub fn cache_key_for_request_with_mask(
     key_ignore: u8,
     ignore_headers: &[String],
 ) -> String {
+    let host = crate::config::registry::normalize_host(host);
+    cache_key_for_normalized_request(
+        method.as_str(),
+        &host,
+        path,
+        headers,
+        key_ignore,
+        ignore_headers,
+    )
+}
+
+/// Build a cache key when the caller already holds a normalized host and a
+/// canonical method string. This avoids re-normalizing the host and cloning a
+/// `Method` on every request.
+pub fn cache_key_for_normalized_request(
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &HeaderMap,
+    key_ignore: u8,
+    ignore_headers: &[String],
+) -> String {
     let ignored = |name: &str| {
         (key_ignore & key_ignore_mask_for_header(name)) != 0
             || ignore_headers
                 .iter()
                 .any(|entry| entry.eq_ignore_ascii_case(name))
     };
-    let mut key = cache_key_for(method, host, path);
+    let mut key = cache_key_for_normalized(method, host, path);
     if !ignored("accept-language") {
         if let Some(lang) = headers
             .get(header::ACCEPT_LANGUAGE)
             .and_then(|v| v.to_str().ok())
         {
-            let normalized = normalize_vary_value(lang);
-            if !normalized.is_empty() {
-                key.push_str(&format!("|lang={:x}", fnv1a64(normalized.as_bytes())));
-            }
+            append_normalized_vary_hash(&mut key, "lang", lang);
         }
     }
     if !ignored("origin") {
         if let Some(value) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-            let normalized = normalize_vary_value(value);
-            if !normalized.is_empty() {
-                key.push_str(&format!("|origin={:x}", fnv1a64(normalized.as_bytes())));
-            }
+            append_normalized_vary_hash(&mut key, "origin", value);
         }
     }
     // Access-Control-Request-* only exist on CORS preflight OPTIONS. They are
@@ -919,23 +955,57 @@ pub fn cache_key_for_request_with_mask(
                 continue;
             }
             if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
-                let normalized = normalize_vary_value(value);
-                if !normalized.is_empty() {
-                    key.push_str(&format!("|{label}={:x}", fnv1a64(normalized.as_bytes())));
-                }
+                append_normalized_vary_hash(&mut key, label, value);
             }
         }
     }
     key
 }
 
-fn normalize_vary_value(value: &str) -> String {
-    value
-        .split(',')
-        .map(|part| part.trim().to_ascii_lowercase())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(",")
+fn append_normalized_vary_hash(key: &mut String, label: &str, value: &str) {
+    let Some(hash) = fnv1a64_normalized_csv(value) else {
+        return;
+    };
+    key.push('|');
+    key.push_str(label);
+    key.push('=');
+    push_hex(hash, key);
+}
+
+fn fnv1a64_normalized_csv(value: &str) -> Option<u64> {
+    let mut hash = FNV_OFFSET_BASIS;
+    let mut found = false;
+    for part in value.split(',') {
+        let part = part.trim().as_bytes();
+        if part.is_empty() {
+            continue;
+        }
+        if found {
+            hash = fnv1a64_byte(hash, b',');
+        }
+        for byte in part {
+            hash = fnv1a64_byte(hash, byte.to_ascii_lowercase());
+        }
+        found = true;
+    }
+    found.then_some(hash)
+}
+
+fn push_hex(mut value: u64, out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buffer = [0_u8; 16];
+    let mut start = buffer.len();
+    loop {
+        start -= 1;
+        buffer[start] = HEX[(value & 0x0f) as usize];
+        value >>= 4;
+        if value == 0 {
+            break;
+        }
+    }
+    if let Ok(hex) = std::str::from_utf8(&buffer[start..]) {
+        out.push_str(hex);
+    }
 }
 
 /// Stable cache key: `METHOD:host:path[?query]`.
@@ -946,17 +1016,40 @@ fn normalize_vary_value(value: &str) -> String {
 /// key another domain could produce.
 pub fn cache_key_for(method: &Method, host: &str, path: &str) -> String {
     let host = crate::config::registry::normalize_host(host);
-    format!("{}:{}:{}", method.as_str(), host, path)
+    cache_key_for_normalized(method.as_str(), &host, path)
+}
+
+fn cache_key_for_normalized(method: &str, host: &str, path: &str) -> String {
+    let mut key = String::with_capacity(
+        method
+            .len()
+            .saturating_add(host.len())
+            .saturating_add(path.len())
+            .saturating_add(48),
+    );
+    key.push_str(method);
+    key.push(':');
+    key.push_str(host);
+    key.push(':');
+    key.push_str(path);
+    key
 }
 
 // ---- validators -----------------------------------------------------------
 
 /// FNV-1a 64-bit: stable across processes and Rust releases (unlike DefaultHasher).
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[inline]
+fn fnv1a64_byte(hash: u64, byte: u8) -> u64 {
+    (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+}
+
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hash = FNV_OFFSET_BASIS;
     for b in bytes {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash = fnv1a64_byte(hash, *b);
     }
     hash
 }
@@ -1051,7 +1144,9 @@ pub fn strip_response_headers(headers: &mut HeaderMap) {
         .keys()
         .filter(|k| {
             let n = k.as_str().to_ascii_lowercase();
-            is_hop_by_hop(&n) || n == "content-length" || n == "x-lagran-cache-reason"
+            is_hop_by_hop(&n)
+                || n == "content-length"
+                || n == "x-lagran-cache-reason"
                 || n == "x-lagran-validator-source"
         })
         .map(|k| k.as_str().to_string())
@@ -1141,6 +1236,27 @@ mod tests {
         assert!(!path_matches("/img*", "/other"));
         assert!(path_matches("/exact", "/exact"));
         assert!(!path_matches("/exact", "/exact2"));
+        // Preserve the old broad prefix behavior of a trailing `/*` rule.
+        assert!(path_matches("/static/*", "/static2/app.js"));
+    }
+
+    #[test]
+    fn case_insensitive_rule_search_matches_ascii_lowercase_semantics() {
+        for (haystack, needle) in [
+            ("DEBUG=1", "debug=1"),
+            ("application/JSON; charset=utf-8", "JSON"),
+            ("路径?值=Ä", "值=Ä"),
+            ("aBc", "BCd"),
+            ("abc", ""),
+        ] {
+            assert_eq!(
+                contains_ascii_case_insensitive(haystack, needle),
+                haystack
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase()),
+                "haystack={haystack:?}, needle={needle:?}"
+            );
+        }
     }
 
     #[test]
@@ -1308,8 +1424,10 @@ mod tests {
 
     #[test]
     fn explicit_rule_ttl_cannot_override_origin_no_cache() {
-        let mut policy = ResolvedPolicy::default();
-        policy.ttl_override = Some(604_800);
+        let policy = ResolvedPolicy {
+            ttl_override: Some(604_800),
+            ..Default::default()
+        };
         assert!(
             decide_storage(200, &hdrs(&[("cache-control", "no-cache")]), policy, 60).is_none(),
             "no-cache requires revalidation; a rule TTL must not create a fresh shared entry"
@@ -1418,15 +1536,11 @@ mod tests {
         assert!(!ignored.contains("|lang="));
         assert_ne!(no_ignore, ignored);
 
-        let mut policy = ResolvedPolicy::default();
-        policy.key_ignore = KEY_IGNORE_ORIGIN;
-        assert!(decide_storage(
-            200,
-            &hdrs(&[("vary", "origin")]),
-            policy,
-            60
-        )
-        .is_some());
+        let policy = ResolvedPolicy {
+            key_ignore: KEY_IGNORE_ORIGIN,
+            ..Default::default()
+        };
+        assert!(decide_storage(200, &hdrs(&[("vary", "origin")]), policy, 60).is_some());
     }
 
     #[test]
@@ -1456,7 +1570,10 @@ mod tests {
         rule.ignore_key_headers = Some("origin=ignore,accept-language=ignore".into());
         let mut policy = rule_policy(&rule);
         apply_key_ignore_default(&mut policy, "");
-        assert_eq!(policy.key_ignore, KEY_IGNORE_ORIGIN | KEY_IGNORE_ACCEPT_LANGUAGE);
+        assert_eq!(
+            policy.key_ignore,
+            KEY_IGNORE_ORIGIN | KEY_IGNORE_ACCEPT_LANGUAGE
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert("accept-language", "zh-CN,zh;q=0.9".parse().unwrap());
@@ -1474,22 +1591,41 @@ mod tests {
     #[test]
     fn preflight_headers_only_affect_options_keys() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "access-control-request-method",
-            "PUT".parse().unwrap(),
-        );
+        headers.insert("access-control-request-method", "PUT".parse().unwrap());
         headers.insert("origin", "https://a.example".parse().unwrap());
         let get = cache_key_for_request(&Method::GET, "cdn.test", "/api", &headers);
         let mut origin_only = HeaderMap::new();
         origin_only.insert("origin", "https://a.example".parse().unwrap());
-        let get_origin =
-            cache_key_for_request(&Method::GET, "cdn.test", "/api", &origin_only);
+        let get_origin = cache_key_for_request(&Method::GET, "cdn.test", "/api", &origin_only);
         assert!(!get.contains("|acrm="));
         assert_eq!(get, get_origin, "ACR* must not fragment GET keys");
 
         let options = cache_key_for_request(&Method::OPTIONS, "cdn.test", "/api", &headers);
         assert!(options.contains("|acrm="));
         assert_ne!(options, get);
+    }
+
+    #[test]
+    fn normalized_vary_hash_matches_joined_lowercase_value() {
+        for value in ["", " , ", "zh-CN, en;q=0.8", " A ,, B ", "路径,Ä"] {
+            let normalized = value
+                .split(',')
+                .map(|part| part.trim().to_ascii_lowercase())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            let expected = (!normalized.is_empty()).then(|| fnv1a64(normalized.as_bytes()));
+            assert_eq!(fnv1a64_normalized_csv(value), expected, "value={value:?}");
+        }
+    }
+
+    #[test]
+    fn hex_appending_matches_standard_formatting() {
+        for value in [0, 1, 15, 16, 0x1234_abcd, u64::MAX] {
+            let mut out = String::new();
+            push_hex(value, &mut out);
+            assert_eq!(out, format!("{value:x}"));
+        }
     }
 
     #[test]
@@ -1540,7 +1676,9 @@ mod tests {
 
     #[test]
     fn vary_star_is_rejected() {
-        assert!(decide_storage(200, &hdrs(&[("vary", "*")]), ResolvedPolicy::default(), 60).is_none());
+        assert!(
+            decide_storage(200, &hdrs(&[("vary", "*")]), ResolvedPolicy::default(), 60).is_none()
+        );
     }
 
     #[test]

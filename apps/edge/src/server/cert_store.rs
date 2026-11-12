@@ -1,5 +1,9 @@
 //! Hot-reloadable multi-cert store with SNI resolution + disk persistence
 
+use pingora::tls::{
+    pkey::{PKey, Private},
+    x509::X509,
+};
 use rustls::pki_types::CertificateDer;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -13,13 +17,16 @@ pub struct CertStore {
     dir: Option<PathBuf>,
 }
 
+type OpenSslKeyPair = (Arc<X509>, Arc<PKey<Private>>);
+
 #[derive(Default)]
 struct StoreInner {
     by_name: HashMap<String, Arc<CertifiedKey>>,
     default: Option<Arc<CertifiedKey>>,
-    /// Original PEM material for the Pingora/OpenSSL listener.
-    pem: HashMap<String, (Vec<u8>, Vec<u8>)>,
-    pem_default: Option<(Vec<u8>, Vec<u8>)>,
+    /// Parsed certificates for the Pingora/OpenSSL listener. Parsing PEM on
+    /// every handshake is expensive and needlessly blocks the TLS accept path.
+    openssl: HashMap<String, OpenSslKeyPair>,
+    openssl_default: Option<OpenSslKeyPair>,
 }
 
 impl CertStore {
@@ -133,15 +140,24 @@ impl CertStore {
         key_pem: &[u8],
     ) -> Result<(), String> {
         let ck = Arc::new(parse_certified_key(cert_pem, key_pem)?);
+        // Parse the OpenSSL representation once while the certificate is
+        // installed, never on the connection handshake path.
+        let tls_pair: OpenSslKeyPair = (
+            Arc::new(X509::from_pem(cert_pem).map_err(|e| format!("parse openssl cert: {e}"))?),
+            Arc::new(
+                PKey::private_key_from_pem(key_pem)
+                    .map_err(|e| format!("parse openssl key: {e}"))?,
+            ),
+        );
         let mut w = self.inner.write().map_err(|e| e.to_string())?;
         for n in names {
-            let key = n.to_lowercase();
+            let key = n.to_ascii_lowercase();
             w.by_name.insert(key.clone(), ck.clone());
-            w.pem.insert(key, (cert_pem.to_vec(), key_pem.to_vec()));
+            w.openssl.insert(key, tls_pair.clone());
         }
         if w.default.is_none() {
             w.default = Some(ck);
-            w.pem_default = Some((cert_pem.to_vec(), key_pem.to_vec()));
+            w.openssl_default = Some(tls_pair);
         }
         Ok(())
     }
@@ -163,20 +179,20 @@ impl CertStore {
         self.len() == 0
     }
 
-    /// Raw PEM certificate/key for the OpenSSL-based Pingora TLS listener.
+    /// Parsed certificate/key for the OpenSSL-based Pingora TLS listener.
     /// Exact SNI first, then `*.example.com`, then the first/default cert.
-    pub fn pem_for(&self, name: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    pub fn certificate_for(&self, name: &str) -> Option<OpenSslKeyPair> {
         let guard = self.inner.read().ok()?;
-        let key = name.trim().trim_end_matches('.').to_lowercase();
-        if let Some(v) = guard.pem.get(&key) {
+        let key = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        if let Some(v) = guard.openssl.get(&key) {
             return Some(v.clone());
         }
         if let Some((_, rest)) = key.split_once('.') {
-            if let Some(v) = guard.pem.get(&format!("*.{rest}")) {
+            if let Some(v) = guard.openssl.get(&format!("*.{rest}")) {
                 return Some(v.clone());
             }
         }
-        guard.pem_default.clone()
+        guard.openssl_default.clone()
     }
 
     pub fn resolver(self: &Arc<Self>) -> Arc<DynResolver> {
@@ -262,4 +278,52 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssl::asn1::Asn1Time;
+    use openssl::hash::MessageDigest;
+    use openssl::rsa::Rsa;
+    use openssl::x509::X509NameBuilder;
+
+    fn test_certificate() -> (Vec<u8>, Vec<u8>) {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "example.com").unwrap();
+        let name = name.build();
+
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        let cert = builder.build();
+        (
+            cert.to_pem().unwrap(),
+            key.private_key_to_pem_pkcs8().unwrap(),
+        )
+    }
+
+    #[test]
+    fn parsed_certificates_are_shared_across_handshakes() {
+        let store = CertStore::new();
+        let (cert_pem, key_pem) = test_certificate();
+        store
+            .upsert(&["*.example.com".to_string()], &cert_pem, &key_pem)
+            .unwrap();
+
+        let first = store.certificate_for("a.example.com").unwrap();
+        let second = store.certificate_for("b.example.com").unwrap();
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        assert!(Arc::ptr_eq(&first.1, &second.1));
+    }
 }

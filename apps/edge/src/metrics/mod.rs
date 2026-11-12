@@ -22,6 +22,7 @@ pub struct EdgeMetrics {
     stream_requests: AtomicU64,
     stream_bytes: AtomicU64,
     stream_errors: AtomicU64,
+    downstream_cancels: AtomicU64,
     datapath_pingora: AtomicU64,
     datapath_legacy: AtomicU64,
 }
@@ -33,6 +34,7 @@ pub struct GlobalSnapshot {
     pub stream_requests: u64,
     pub stream_bytes: u64,
     pub stream_errors: u64,
+    pub downstream_cancels: u64,
     pub datapath_pingora: u64,
     pub datapath_legacy: u64,
 }
@@ -111,6 +113,13 @@ impl EdgeMetrics {
         self.stream_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A client stopped reading before the edge finished the response body.
+    /// This is not an edge or origin failure; it is tracked separately so
+    /// cancellation noise cannot be mistaken for a 5xx regression.
+    pub fn record_downstream_cancel(&self) {
+        self.downstream_cancels.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_pingora_datapath(&self) {
         self.datapath_pingora.fetch_add(1, Ordering::Relaxed);
     }
@@ -126,6 +135,7 @@ impl EdgeMetrics {
             stream_requests: self.stream_requests.load(Ordering::Relaxed),
             stream_bytes: self.stream_bytes.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),
+            downstream_cancels: self.downstream_cancels.load(Ordering::Relaxed),
             datapath_pingora: self.datapath_pingora.load(Ordering::Relaxed),
             datapath_legacy: self.datapath_legacy.load(Ordering::Relaxed),
         }

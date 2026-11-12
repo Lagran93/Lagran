@@ -9,18 +9,16 @@
 //! * storage TTL comes from the matched rule, then origin `Cache-Control` /
 //!   `Expires`, then the domain/default TTL.
 
-use bytes::Bytes;
 use crate::agent::origin_health::OriginHealthMap;
 use crate::agent::{ControlClient, NodeControl};
+use crate::cache::flight::RedisFlight;
 use crate::cache::policy::{
-    compute_etag, decide_storage_reason, etag_matches,
-    is_uncacheable_header, request_method_cacheable, resolve_rule_policy,
-    resolve_rule_policy_for_response_with_domain, strip_response_headers, CacheDecision,
-    CacheRule,
-    CacheStatus, ResolvedPolicy, RuleAction, RuleSet, VALIDATOR_SOURCE_HEADER,
+    compute_etag, decide_storage_reason, etag_matches, is_uncacheable_header,
+    request_method_cacheable, resolve_rule_policy, resolve_rule_policy_for_response_with_domain,
+    strip_response_headers, CacheDecision, CacheRule, CacheStatus, ResolvedPolicy, RuleAction,
+    RuleSet, VALIDATOR_SOURCE_HEADER,
 };
 use crate::cache::{CacheEntry, CacheGetResult, LargeCache, SharedCache};
-use crate::cache::flight::RedisFlight;
 use crate::config::registry::{DomainEntry, DomainRegistry, OriginTarget};
 use crate::metrics::EdgeMetrics;
 use crate::origin::{OriginClient, OriginResponse};
@@ -35,6 +33,7 @@ use crate::server::host_util;
 use crate::server::inflight::{self, Inflight, Slot};
 use crate::server::pipeline::{facts_from_request, RequestPipeline};
 use crate::server::rate_limit::RateLimiter;
+use crate::server::response_headers::ResponseHeaderOverrides;
 use crate::server::waf_log::WafLog;
 use crate::server::websocket;
 use crate::waf::{evaluate as waf_evaluate, WafAction, WafMode, WafRequest};
@@ -44,6 +43,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -122,8 +122,7 @@ struct Effective {
     ignore_query: bool,
     key_ignore: u8,
     key_ignore_headers: String,
-    cors: String,
-    custom_headers: String,
+    response_headers: Arc<ResponseHeaderOverrides>,
     origin_auth_header: String,
     origin_auth_value: String,
     timeout_ms: u64,
@@ -230,13 +229,19 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     state.metrics.record_legacy_datapath();
     let is_ws = websocket::is_websocket_upgrade(req.headers());
     let is_cache_method = req.method() == Method::GET || req.method() == Method::HEAD;
+    // Expected fallbacks are observable in the access log. Log once per
+    // process instead of once per request: a high-QPS HEAD or revalidation
+    // workload made this line dominate the log by several orders of magnitude.
     if is_cache_method && !is_ws {
-        tracing::warn!(
-            host = %host_util::resolve_request_host(&req),
-            method = %req.method(),
-            path = %req.uri().path(),
-            "legacy GET/HEAD fallback reached"
-        );
+        static FALLBACK_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if FALLBACK_LOGGED.set(()).is_ok() {
+            tracing::debug!(
+                host = %host_util::resolve_request_host(&req),
+                method = %req.method(),
+                path = %req.uri().path(),
+                "legacy GET/HEAD fallback reached; later requests are summarized in the access log"
+            );
+        }
     }
     let mut response = proxy_handler_inner(State(state), req).await;
     response.headers_mut().insert(
@@ -246,10 +251,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     response
 }
 
-async fn proxy_handler_inner(
-    State(state): State<Arc<AppState>>,
-    req: Request<Body>,
-) -> Response {
+async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     let start = Instant::now();
     let method = req.method().clone();
     let path_and_query = req
@@ -271,9 +273,7 @@ async fn proxy_handler_inner(
     let identity = crate::security::trusted_proxy::resolve(
         &state.trusted_proxies,
         peer_addr,
-        headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok()),
+        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
         headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok()),
@@ -299,18 +299,15 @@ async fn proxy_handler_inner(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| uuid_like_request_id());
+        .unwrap_or_else(uuid_like_request_id);
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    if let Err(violation) = crate::security::header_guard::validate(
-        &headers,
-        req.uri(),
-        &method,
-        req.version(),
-    ) {
+    if let Err(violation) =
+        crate::security::header_guard::validate(&headers, req.uri(), &method, req.version())
+    {
         log_access(
             &state.access_log,
             &method,
@@ -351,7 +348,7 @@ async fn proxy_handler_inner(
         return default_page::node_disabled_page(&host);
     }
 
-    let domain_entry = state.domains.get(&host).await;
+    let (registry_empty, domain_entry) = state.domains.lookup(&host).await;
 
     // Signed-URL enforcement for the in-process data plane.
     //
@@ -393,14 +390,20 @@ async fn proxy_handler_inner(
     // whenever `trust_proxy_headers` was on let a direct client assert HTTPS.
     let is_https = identity.is_https;
 
-    let registry_empty = state.domains.is_empty().await;
-
     if domain_entry.is_none() && !registry_empty {
-        let display = if host.is_empty() {
-            "(empty Host/SNI)"
-        } else {
-            host.as_str()
-        };
+        // A request without any host source cannot be attributed to a tenant.
+        // Do not write an access-log row with an empty host: the console would
+        // show it as an anonymous `—` row and it could not be filtered or
+        // authorized per domain. Keep the rejection visible in the process log.
+        if host.is_empty() {
+            tracing::warn!(
+                client_ip = %client_ip,
+                method = %method,
+                path = %path_only,
+                "hostless request rejected; access-log row omitted"
+            );
+            return default_page::missing_host_page();
+        }
         tracing::info!(%host, "domain not onboarded");
         log_access(
             &state.access_log,
@@ -417,7 +420,7 @@ async fn proxy_handler_inner(
             &request_id,
         )
         .await;
-        return default_page::unknown_domain_page(display);
+        return default_page::unknown_domain_page(&host);
     }
 
     // Resolve the effective config once; rules stay per-domain so two hosted
@@ -441,8 +444,7 @@ async fn proxy_handler_inner(
                 ignore_query: policy.ignore_query.unwrap_or(e.ignore_query_string),
                 key_ignore: policy.key_ignore,
                 key_ignore_headers: e.cache_key_ignore_headers.clone(),
-                cors: e.cors_origins.clone(),
-                custom_headers: e.custom_headers.clone(),
+                response_headers: e.response_headers.clone(),
                 origin_auth_header: e.origin_auth_header.clone(),
                 origin_auth_value: e.origin_auth_value.clone(),
                 // Budget for the whole legacy request (WebSocket handshake,
@@ -471,8 +473,7 @@ async fn proxy_handler_inner(
                 rules: Vec::new(),
                 path: path_only.clone(),
                 method: method.clone(),
-                cors: String::new(),
-                custom_headers: String::new(),
+                response_headers: ResponseHeaderOverrides::empty_arc(),
                 origin_auth_header: String::new(),
                 origin_auth_value: String::new(),
                 timeout_ms: state.origin_read_timeout_ms,
@@ -615,9 +616,7 @@ async fn proxy_handler_inner(
                 let has_upstream_validator = match source {
                     "etag" | "last-modified" => true,
                     "computed" => false,
-                    _ => {
-                        entry.header("etag").is_some() || entry.header("last-modified").is_some()
-                    }
+                    _ => entry.header("etag").is_some() || entry.header("last-modified").is_some(),
                 };
                 if !has_upstream_validator {
                     tracing::debug!(key, "dropping cache entry without upstream validator");
@@ -647,7 +646,11 @@ async fn proxy_handler_inner(
             &referer,
             &request_id,
             start,
-            if strict_revalidation { Some(&key) } else { None },
+            if strict_revalidation {
+                Some(&key)
+            } else {
+                None
+            },
         )
         .await;
         set_cache_reason(&mut response, request_reason);
@@ -828,8 +831,7 @@ async fn proxy_handler_inner(
                         resp,
                         CacheStatus::Hit.as_str(),
                         &etag,
-                        &eff.cors,
-                        &eff.custom_headers,
+                        &eff.response_headers,
                         policy_browser_ttl(&eff.policy),
                     )
                 }
@@ -867,8 +869,7 @@ async fn proxy_handler_inner(
                         resp,
                         label.as_str(),
                         &etag,
-                        &eff.cors,
-                        &eff.custom_headers,
+                        &eff.response_headers,
                         if response_bypass {
                             None
                         } else {
@@ -979,7 +980,7 @@ async fn bypass_to_origin(
                 referer,
                 0,
                 label.as_str(),
-                &request_id,
+                request_id,
             )
             .await;
             return (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large").into_response();
@@ -1097,7 +1098,7 @@ async fn bypass_to_origin(
                     }
                 }
             }
-            let out = pass_through_response(resp, label.as_str(), &eff.cors, &eff.custom_headers);
+            let out = pass_through_response(resp, label.as_str(), &eff.response_headers);
             state.metrics.record_bypass(host, body_len);
             log_access(
                 &state.access_log,
@@ -1111,7 +1112,7 @@ async fn bypass_to_origin(
                 referer,
                 body_len,
                 label.as_str(),
-                &request_id,
+                request_id,
             )
             .await;
             out
@@ -1132,7 +1133,7 @@ async fn bypass_to_origin(
                 referer,
                 0,
                 failure.log_label(),
-                &request_id,
+                request_id,
             )
             .await;
             default_page::origin_error_page(host, path_only, failure)
@@ -1271,7 +1272,7 @@ async fn bypass_to_origin_streaming(
                 HeaderValue::from_static("lagran-edge"),
             );
             apply_security_headers(&mut out_headers);
-            apply_cors_and_custom(&mut out_headers, &eff.cors, &eff.custom_headers);
+            apply_cors_and_custom(&mut out_headers, &eff.response_headers);
 
             let mut body = resp.body;
             let stream_metrics = state.metrics.clone();
@@ -1299,8 +1300,7 @@ async fn bypass_to_origin_streaming(
                         }
                         Some(Err(e)) => {
                             stream_metrics.record_stream_error();
-                            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::other(
                                 format!("origin body error: {e}"),
                             ));
                             break;
@@ -1522,7 +1522,10 @@ async fn fetch_origin(
         if result.is_ok() {
             break;
         }
-        if matches!(result, Err(FetchError::Timeout) | Err(FetchError::Failed(_))) {
+        if matches!(
+            result,
+            Err(FetchError::Timeout) | Err(FetchError::Failed(_))
+        ) {
             // Fail over immediately: without this, a dead origin keeps being
             // selected until the scheduled prober flips it, and every fetch
             // waits out the full timeout.
@@ -1615,17 +1618,9 @@ async fn revalidate_cached_entry(
         }
     }
 
-    let origin_result = fetch_origin(
-        state,
-        eff,
-        host,
-        path_and_query,
-        &conditional,
-        &Method::GET,
-    )
-    .await;
-    match origin_result
-    {
+    let origin_result =
+        fetch_origin(state, eff, host, path_and_query, &conditional, &Method::GET).await;
+    match origin_result {
         Ok(resp) if resp.status == StatusCode::NOT_MODIFIED => {
             let mut refreshed = entry;
             merge_revalidation_headers(&mut refreshed, &resp.headers);
@@ -1786,8 +1781,7 @@ async fn revalidate_cached_entry(
                 content_type,
                 &eff.key_ignore_headers,
             );
-            if response_policy.action == RuleAction::Cache
-                && (200..300).contains(&status.as_u16())
+            if response_policy.action == RuleAction::Cache && (200..300).contains(&status.as_u16())
             {
                 if let Ok(decision) = decide_storage_reason(
                     status.as_u16(),
@@ -1826,8 +1820,7 @@ async fn revalidate_cached_entry(
                 resp,
                 CacheStatus::Revalidated.as_str(),
                 &etag,
-                &eff.cors,
-                &eff.custom_headers,
+                &eff.response_headers,
                 policy_browser_ttl(&response_policy),
             );
             set_cache_reason(&mut response, Some("origin-200"));
@@ -1875,7 +1868,9 @@ fn merge_revalidation_headers(entry: &mut CacheEntry, headers: &HeaderMap) {
         entry
             .headers
             .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name_str));
-        entry.headers.push((name_str.to_string(), value.to_string()));
+        entry
+            .headers
+            .push((name_str.to_string(), value.to_string()));
     }
 }
 
@@ -1909,8 +1904,7 @@ fn spawn_revalidation(
             ignore_query: false,
             key_ignore: 0,
             key_ignore_headers: String::new(),
-            cors: String::new(),
-            custom_headers: String::new(),
+            response_headers: ResponseHeaderOverrides::empty_arc(),
             origin_auth_header: String::new(),
             origin_auth_value: String::new(),
             timeout_ms,
@@ -2064,14 +2058,7 @@ async fn serve_range_entry(
         request_id,
     )
     .await;
-    entry_to_response(
-        entry,
-        label.as_str(),
-        &etag,
-        &eff.cors,
-        &eff.custom_headers,
-        None,
-    )
+    entry_to_response(entry, label.as_str(), &etag, &eff.response_headers, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2110,7 +2097,7 @@ async fn serve_cached(
                 referer,
                 0,
                 CacheStatus::Revalidated.as_str(),
-                &request_id,
+                request_id,
             )
             .await;
             return not_modified_response(&etag, &entry);
@@ -2131,15 +2118,14 @@ async fn serve_cached(
         referer,
         bytes,
         label.as_str(),
-        &request_id,
+        request_id,
     )
     .await;
     entry_to_response(
         entry,
         label.as_str(),
         &etag,
-        &eff.cors,
-        &eff.custom_headers,
+        &eff.response_headers,
         policy_browser_ttl(&eff.policy),
     )
 }
@@ -2200,7 +2186,7 @@ fn entry_response_bypass(eff: &Effective, entry: &CacheEntry) -> bool {
         content_type,
         &eff.key_ignore_headers,
     )
-        .action
+    .action
         != RuleAction::Cache
 }
 
@@ -2216,24 +2202,21 @@ fn clone_as_entry(resp: &OriginResponse) -> CacheEntry {
         .headers
         .retain(|(name, _)| !name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER));
     if has_etag {
-        entry.headers.push((
-            VALIDATOR_SOURCE_HEADER.to_string(),
-            "etag".to_string(),
-        ));
+        entry
+            .headers
+            .push((VALIDATOR_SOURCE_HEADER.to_string(), "etag".to_string()));
     } else if has_last_modified {
         entry.headers.push((
             VALIDATOR_SOURCE_HEADER.to_string(),
             "last-modified".to_string(),
         ));
     } else {
-        entry.headers.push((
-            "etag".to_string(),
-            compute_etag(&entry),
-        ));
-        entry.headers.push((
-            VALIDATOR_SOURCE_HEADER.to_string(),
-            "computed".to_string(),
-        ));
+        entry
+            .headers
+            .push(("etag".to_string(), compute_etag(&entry)));
+        entry
+            .headers
+            .push((VALIDATOR_SOURCE_HEADER.to_string(), "computed".to_string()));
     }
     entry
 }
@@ -2259,7 +2242,8 @@ async fn store_large_response(
     }
     // `large.begin` filters again, but this path also feeds the validator and
     // ETag computation below, which must not see a `Set-Cookie` either.
-    let mut headers = crate::cache::large::LargeCache::prune_uncacheable(&headers_vec(&resp.headers));
+    let mut headers =
+        crate::cache::large::LargeCache::prune_uncacheable(&headers_vec(&resp.headers));
     let has_etag = headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("etag"));
@@ -2268,10 +2252,7 @@ async fn store_large_response(
         .any(|(name, _)| name.eq_ignore_ascii_case("last-modified"));
     headers.retain(|(name, _)| !name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER));
     if has_etag {
-        headers.push((
-            VALIDATOR_SOURCE_HEADER.to_string(),
-            "etag".to_string(),
-        ));
+        headers.push((VALIDATOR_SOURCE_HEADER.to_string(), "etag".to_string()));
     } else if has_last_modified {
         headers.push((
             VALIDATOR_SOURCE_HEADER.to_string(),
@@ -2284,10 +2265,7 @@ async fn store_large_response(
             resp.body.clone(),
         ));
         headers.push(("etag".to_string(), etag));
-        headers.push((
-            VALIDATOR_SOURCE_HEADER.to_string(),
-            "computed".to_string(),
-        ));
+        headers.push((VALIDATOR_SOURCE_HEADER.to_string(), "computed".to_string()));
     }
     let Some(mut writer) = large
         .begin(
@@ -2804,7 +2782,11 @@ async fn signed_url_gate(domain: &DomainEntry, req: Request<Body>, host: &str) -
     ) {
         Ok(verified) => verified,
         Err(e) => {
-            tracing::debug!(reason = e.reason(), host, "signed url rejected (legacy path)");
+            tracing::debug!(
+                reason = e.reason(),
+                host,
+                "signed url rejected (legacy path)"
+            );
             return SignedUrlGate::Reject;
         }
     };
@@ -2844,7 +2826,10 @@ fn referer_host(referer: &str) -> Option<String> {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     // Strip userinfo so `https://example.com@evil.test/` cannot pass as
     // `example.com`: the real host is what follows the last `@`.
-    let authority = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
     if authority.is_empty() {
         return None;
     }
@@ -2897,16 +2882,14 @@ pub(crate) fn hotlink_allowed(allowed_list: &str, referer: &str) -> bool {
         return false;
     }
     // An explicit `*` allows any source, including a missing Referer.
-    if patterns.iter().any(|p| *p == "*") {
+    if patterns.contains(&"*") {
         return true;
     }
     let Some(host) = referer_host(referer) else {
         // No Referer (or an unusable one) never matches a host pattern.
         return false;
     };
-    patterns
-        .iter()
-        .any(|pattern| host_matches(pattern, &host))
+    patterns.iter().any(|pattern| host_matches(pattern, &host))
 }
 
 /// JS challenges require a top-level HTML document navigation. JSON/XHR
@@ -2921,7 +2904,6 @@ pub(crate) fn challenge_accepts_html(method: &Method, headers: &HeaderMap) -> bo
         .map(|v| v.to_ascii_lowercase().contains("text/html"))
         .unwrap_or(false)
 }
-
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn log_access(
@@ -2978,31 +2960,8 @@ pub(crate) fn apply_security_headers(headers: &mut HeaderMap) {
     );
 }
 
-pub(crate) fn apply_cors_and_custom(headers: &mut HeaderMap, cors: &str, custom: &str) {
-    if !cors.is_empty() {
-        let origin = if cors.trim() == "*" {
-            "*"
-        } else {
-            cors.split(',').next().map(str::trim).unwrap_or("*")
-        };
-        if let Ok(v) = HeaderValue::from_str(origin) {
-            headers.insert(HeaderName::from_static("access-control-allow-origin"), v);
-        }
-    }
-    for line in custom.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            if let (Ok(name), Ok(val)) = (
-                HeaderName::from_bytes(k.trim().as_bytes()),
-                HeaderValue::from_str(v.trim()),
-            ) {
-                headers.insert(name, val);
-            }
-        }
-    }
+pub(crate) fn apply_cors_and_custom(headers: &mut HeaderMap, overrides: &ResponseHeaderOverrides) {
+    overrides.apply(headers);
 }
 
 fn cache_status_headers(headers: &mut HeaderMap, label: &str) {
@@ -3016,8 +2975,7 @@ fn entry_to_response(
     entry: CacheEntry,
     cache_status: &str,
     etag: &str,
-    cors: &str,
-    custom: &str,
+    response_headers: &ResponseHeaderOverrides,
     browser_ttl: Option<u64>,
 ) -> Response {
     let status = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
@@ -3060,7 +3018,7 @@ fn entry_to_response(
     }
     apply_browser_ttl(&mut headers, browser_ttl);
     apply_security_headers(&mut headers);
-    apply_cors_and_custom(&mut headers, cors, custom);
+    apply_cors_and_custom(&mut headers, response_headers);
     let mut resp = Response::new(Body::from(entry.body));
     *resp.status_mut() = status;
     *resp.headers_mut() = headers;
@@ -3071,8 +3029,7 @@ fn origin_response(
     resp: OriginResponse,
     cache_status: &str,
     etag: &str,
-    cors: &str,
-    custom: &str,
+    response_headers: &ResponseHeaderOverrides,
     browser_ttl: Option<u64>,
 ) -> Response {
     let reason = resp.cache_reason;
@@ -3091,7 +3048,7 @@ fn origin_response(
     }
     apply_browser_ttl(&mut headers, browser_ttl);
     apply_security_headers(&mut headers);
-    apply_cors_and_custom(&mut headers, cors, custom);
+    apply_cors_and_custom(&mut headers, response_headers);
     let mut out = Response::new(Body::from(resp.body));
     *out.status_mut() = resp.status;
     *out.headers_mut() = headers;
@@ -3102,8 +3059,7 @@ fn origin_response(
 fn pass_through_response(
     resp: OriginResponse,
     cache_status: &str,
-    cors: &str,
-    custom: &str,
+    response_headers: &ResponseHeaderOverrides,
 ) -> Response {
     let reason = resp.cache_reason;
     let mut headers = resp.headers;
@@ -3115,7 +3071,7 @@ fn pass_through_response(
         HeaderValue::from_static("lagran-edge"),
     );
     apply_security_headers(&mut headers);
-    apply_cors_and_custom(&mut headers, cors, custom);
+    apply_cors_and_custom(&mut headers, response_headers);
     let mut out = Response::new(Body::from(resp.body));
     *out.status_mut() = resp.status;
     *out.headers_mut() = headers;
@@ -3286,17 +3242,17 @@ mod tests {
     /// counts.
     #[test]
     fn hotlink_requires_label_boundary() {
-        assert!(!hotlink_allowed("example.com", "https://evil-example.com/a"));
+        assert!(!hotlink_allowed(
+            "example.com",
+            "https://evil-example.com/a"
+        ));
         assert!(!hotlink_allowed(
             "example.com",
             "https://example.com.evil.test/a"
         ));
         assert!(!hotlink_allowed("example.com", "https://notexample.com/a"));
         // Real subdomains are allowed.
-        assert!(hotlink_allowed(
-            "example.com",
-            "https://www.example.com/a"
-        ));
+        assert!(hotlink_allowed("example.com", "https://www.example.com/a"));
         assert!(hotlink_allowed("example.com", "https://a.b.example.com/x"));
     }
 
@@ -3314,7 +3270,10 @@ mod tests {
     fn hotlink_wildcard_prefix_means_subdomains() {
         assert!(hotlink_allowed("*.example.com", "https://a.example.com/x"));
         assert!(!hotlink_allowed("*.example.com", "https://evil.test/x"));
-        assert!(!hotlink_allowed("*.example.com", "https://evilexample.com/x"));
+        assert!(!hotlink_allowed(
+            "*.example.com",
+            "https://evilexample.com/x"
+        ));
     }
 
     /// Only http(s) referers name a site; opaque schemes never grant access.
@@ -3439,7 +3398,13 @@ mod tests {
             ],
             Bytes::from_static(b"hi"),
         );
-        let resp = entry_to_response(entry, "HIT", "\"abc\"", "", "", None);
+        let resp = entry_to_response(
+            entry,
+            "HIT",
+            "\"abc\"",
+            &ResponseHeaderOverrides::default(),
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get("set-cookie").is_none());
         assert_eq!(resp.headers().get("age").unwrap(), "0");

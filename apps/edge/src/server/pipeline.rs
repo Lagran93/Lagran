@@ -6,7 +6,7 @@
 //! incrementally; the public entry points are stable.
 
 use crate::cache::policy::{
-    apply_key_ignore_default, cache_key_for_request_with_mask, request_bypass_reason_headers,
+    apply_key_ignore_default, cache_key_for_normalized_request, request_bypass_reason_headers,
     resolve_rule_policy, ResolvedPolicy, RuleAction,
 };
 use crate::config::registry::DomainEntry;
@@ -182,19 +182,19 @@ impl<'a> RequestPipeline<'a> {
         key_ignore: u8,
     ) -> String {
         let lookup_path = if ignore_query {
-            path_only.to_string()
+            path_only
         } else {
-            path_and_query.to_string()
+            path_and_query
         };
         let method = if *method == Method::HEAD {
-            Method::GET
+            Method::GET.as_str()
         } else {
-            method.clone()
+            method.as_str()
         };
-        cache_key_for_request_with_mask(
-            &method,
+        cache_key_for_normalized_request(
+            method,
             host,
-            &lookup_path,
+            lookup_path,
             headers,
             key_ignore,
             &self.state.cache_key_ignore_headers,

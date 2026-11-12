@@ -10,6 +10,22 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+type AccessLogInsertRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i32,
+    i64,
+    i32,
+    String,
+    String,
+    String,
+    String,
+);
+
 #[derive(Deserialize)]
 pub struct AccessEntryIn {
     pub ts: Option<String>,
@@ -63,19 +79,26 @@ pub struct AccessLogDto {
     pub referer: String,
 }
 
-pub async fn report(
-    State(state): State<AppState>,
-    _agent: AgentAuth,
-    Json(body): Json<ReportBody>,
-) -> Json<ReportAck> {
+/// Split an ingest batch into rows that belong to a domain and hostless rows.
+///
+/// Keeping this pure lets the ingest boundary have a regression test without a
+/// database: hostless rows are exactly what produced unattributed `—` entries
+/// in the console.
+fn partition_domain_rows(entries: Vec<AccessEntryIn>) -> (Vec<AccessLogInsertRow>, usize) {
     let mut rows = Vec::new();
-    for e in body.entries {
+    let mut rejected = 0usize;
+    for e in entries {
+        let host = e.host.unwrap_or_default();
+        if host.trim().is_empty() {
+            rejected += 1;
+            continue;
+        }
         rows.push((
             e.ts.unwrap_or_default(),
             e.node_id.unwrap_or_default(),
             e.client_ip.unwrap_or_default(),
             e.method.unwrap_or_default(),
-            e.host.unwrap_or_default(),
+            host,
             e.path.unwrap_or_default(),
             e.status.unwrap_or(0) as i32,
             e.bytes.unwrap_or(0) as i64,
@@ -86,7 +109,23 @@ pub async fn report(
             e.referer.unwrap_or_default(),
         ));
     }
+    (rows, rejected)
+}
+
+pub async fn report(
+    State(state): State<AppState>,
+    _agent: AgentAuth,
+    Json(body): Json<ReportBody>,
+) -> Json<ReportAck> {
+    let (rows, rejected) = partition_domain_rows(body.entries);
     let n = rows.len();
+    if rejected > 0 {
+        tracing::warn!(
+            rejected,
+            accepted = n,
+            "access-log report contained hostless entries; dropped"
+        );
+    }
     if let Err(e) = repository::insert_access_logs_batch(&state.pool, &rows).await {
         tracing::error!(error = %e, "insert access logs");
         return Json(ReportAck { accepted: 0 });
@@ -161,4 +200,41 @@ pub async fn list(
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(host: Option<&str>, path: &str) -> AccessEntryIn {
+        AccessEntryIn {
+            ts: None,
+            node_id: Some("edge-kr-01".into()),
+            client_ip: Some("203.0.113.9".into()),
+            method: Some("GET".into()),
+            host: host.map(str::to_string),
+            path: Some(path.into()),
+            status: Some(404),
+            bytes: Some(0),
+            latency_ms: Some(0),
+            cache_status: Some("NONE".into()),
+            action: Some(String::new()),
+            user_agent: Some("curl".into()),
+            referer: None,
+        }
+    }
+
+    #[test]
+    fn hostless_ingest_rows_are_rejected() {
+        let entries = vec![
+            entry(None, "/.env-signed"),
+            entry(Some("  "), "/mailjet.env"),
+            entry(Some("cdn.example.com"), "/asset.js"),
+        ];
+        let (rows, rejected) = partition_domain_rows(entries);
+        assert_eq!(rejected, 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].4, "cdn.example.com");
+        assert_eq!(rows[0].5, "/asset.js");
+    }
 }

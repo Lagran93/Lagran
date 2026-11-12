@@ -5,6 +5,7 @@
 
 use crate::cache::policy::CacheRule;
 use crate::server::cc::CcConfig;
+use crate::server::response_headers::ResponseHeaderOverrides;
 use crate::waf::WafConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,6 +56,9 @@ pub struct DomainEntry {
     /// compatibility with older config snapshots and health reporting.
     pub origins: Vec<OriginTarget>,
     pub rules: Vec<CacheRule>,
+    /// True when any rule depends on the response Content-Type. The response
+    /// path can then reuse the request policy without rescanning rules.
+    pub has_content_type_rules: bool,
     pub version: String,
     pub rate_limit_rps: u32,
     pub rate_limit_burst: u32,
@@ -62,6 +66,8 @@ pub struct DomainEntry {
     /// Comma-separated cache-key headers to ignore (origin, accept-language).
     pub cache_key_ignore_headers: String,
     pub cors_origins: String,
+    /// Parsed CORS and custom response headers, shared by all responses.
+    pub response_headers: Arc<ResponseHeaderOverrides>,
     pub hotlink_allow_referers: String,
     pub origin_timeout_ms: u32,
     pub custom_headers: String,
@@ -107,6 +113,14 @@ impl DomainRegistry {
         for mut e in entries {
             // Keep rules ordered by priority once, not per request.
             e.rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
+            e.has_content_type_rules = e
+                .rules
+                .iter()
+                .any(|rule| !rule.match_content_type.trim().is_empty());
+            e.response_headers = Arc::new(ResponseHeaderOverrides::parse(
+                &e.cors_origins,
+                &e.custom_headers,
+            ));
             let key = normalize_host(&e.domain);
             map.insert(key, Arc::new(e));
         }
@@ -114,7 +128,15 @@ impl DomainRegistry {
         *self.version.write().await = version;
     }
 
-    pub async fn upsert(&self, entry: DomainEntry) {
+    pub async fn upsert(&self, mut entry: DomainEntry) {
+        entry.has_content_type_rules = entry
+            .rules
+            .iter()
+            .any(|rule| !rule.match_content_type.trim().is_empty());
+        entry.response_headers = Arc::new(ResponseHeaderOverrides::parse(
+            &entry.cors_origins,
+            &entry.custom_headers,
+        ));
         let key = normalize_host(&entry.domain);
         self.inner.write().await.insert(key, Arc::new(entry));
     }
@@ -125,6 +147,27 @@ impl DomainRegistry {
             return None;
         }
         self.inner.read().await.get(&host).cloned()
+    }
+
+    /// Registry lookup that reports whether the registry is empty separately
+    /// from "this host is not configured".
+    ///
+    /// A legacy single-origin deployment deliberately serves only the
+    /// configured `EDGE_DOMAIN`; that mode is entered when the registry has no
+    /// entries. Checking `is_empty()` in a separate lock acquisition allowed a
+    /// snapshot swap between the two reads and made an unknown host briefly look
+    /// like legacy mode.
+    pub async fn lookup(&self, host: &str) -> (bool, Option<Arc<DomainEntry>>) {
+        let host = normalize_host(host);
+        let entries = self.inner.read().await;
+        (
+            entries.is_empty(),
+            if host.is_empty() {
+                None
+            } else {
+                entries.get(&host).cloned()
+            },
+        )
     }
 
     /// Domain name -> per-domain config version, for cache invalidation when a
@@ -243,12 +286,14 @@ mod tests {
                 CacheRule::simple("/*".into(), 60, 0),
                 CacheRule::simple("/api/*".into(), 0, prio),
             ],
+            has_content_type_rules: false,
             version: "v1".into(),
             rate_limit_rps: 0,
             rate_limit_burst: 0,
             ignore_query_string: false,
             cache_key_ignore_headers: String::new(),
             cors_origins: String::new(),
+            response_headers: Arc::default(),
             hotlink_allow_referers: String::new(),
             origin_timeout_ms: 10_000,
             custom_headers: String::new(),
@@ -283,6 +328,58 @@ mod tests {
         assert_eq!(reg.len().await, 2);
     }
 
+    #[tokio::test]
+    async fn lookup_reports_miss_and_empty_registry_atomically() {
+        let reg = DomainRegistry::new();
+        let (empty, found) = reg.lookup("cdn.test").await;
+        assert!(empty);
+        assert!(found.is_none());
+
+        reg.replace_all(vec![entry("cdn.test", 1)], "v1".into())
+            .await;
+        let (empty, found) = reg.lookup("CDN.TEST:443").await;
+        assert!(!empty);
+        assert_eq!(found.unwrap().domain, "cdn.test");
+        let (empty, found) = reg.lookup("unknown.test").await;
+        assert!(!empty);
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn domain_snapshot_compiles_response_header_overrides() {
+        let reg = DomainRegistry::new();
+        let mut domain = entry("cdn.test", 1);
+        domain.cors_origins = "https://cdn.test,https://other.test".into();
+        domain.custom_headers = "X-Edge: lagran".into();
+        reg.replace_all(vec![domain], "v1".into()).await;
+
+        let domain = reg.get("cdn.test").await.unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        domain.response_headers.apply(&mut headers);
+        assert_eq!(headers["access-control-allow-origin"], "https://cdn.test");
+        assert_eq!(headers["x-edge"], "lagran");
+    }
+
+    #[tokio::test]
+    async fn domain_snapshot_marks_content_type_rules() {
+        let reg = DomainRegistry::new();
+        let mut domain = entry("cdn.test", 1);
+        domain.rules[0].match_content_type = "text/html".into();
+        reg.replace_all(vec![domain], "v1".into()).await;
+        assert!(
+            reg.get("cdn.test").await.unwrap().has_content_type_rules,
+            "replace_all must precompute content-type rule metadata"
+        );
+
+        let mut domain = entry("cdn.test", 1);
+        domain.has_content_type_rules = true;
+        reg.upsert(domain).await;
+        assert!(
+            !reg.get("cdn.test").await.unwrap().has_content_type_rules,
+            "upsert must recompute stale metadata"
+        );
+    }
+
     #[test]
     fn host_normalization() {
         assert_eq!(normalize_host("Ex.COM:443"), "ex.com");
@@ -297,7 +394,10 @@ mod tests {
         assert_eq!(normalize_host("example.com.:443"), "example.com");
         // A non-numeric suffix is not a port and must not alias the bare host.
         assert_eq!(normalize_host("example.com:evil"), "example.com:evil");
-        assert_ne!(normalize_host("example.com:evil"), normalize_host("example.com"));
+        assert_ne!(
+            normalize_host("example.com:evil"),
+            normalize_host("example.com")
+        );
         assert_eq!(normalize_host(""), "");
         assert_eq!(normalize_host("   "), "");
         assert!(is_ip_host("127.0.0.1"));

@@ -1,6 +1,7 @@
 //! Origin client — HTTP/HTTPS via hyper-rustls, with request method/body
 //! forwarding and connection pooling.
 
+use crate::cache::policy::{compute_etag, VALIDATOR_SOURCE_HEADER};
 use anyhow::{anyhow, Context, Result};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use bytes::Bytes;
@@ -11,7 +12,6 @@ use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use crate::cache::policy::{compute_etag, VALIDATOR_SOURCE_HEADER};
 use lagran_cache::CacheEntry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -21,8 +21,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tower::Service;
 
-type DefaultHttpsClient =
-    Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+type DefaultHttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 /// Resolver for IP origins with a DNS certificate: connect to the configured
 /// IP while the HTTP/2 `:authority` remains the SNI hostname. This keeps
@@ -47,10 +46,8 @@ impl Service<Name> for FixedResolver {
     }
 }
 
-type SniHttpsClient = Client<
-    hyper_rustls::HttpsConnector<HttpConnector<FixedResolver>>,
-    Full<Bytes>,
->;
+type SniHttpsClient =
+    Client<hyper_rustls::HttpsConnector<HttpConnector<FixedResolver>>, Full<Bytes>>;
 
 /// Upstream response as returned by the origin.
 pub struct OriginResponse {
@@ -89,10 +86,9 @@ impl OriginResponse {
             .headers
             .retain(|(name, _)| !name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER));
         if has_etag {
-            entry.headers.push((
-                VALIDATOR_SOURCE_HEADER.to_string(),
-                "etag".to_string(),
-            ));
+            entry
+                .headers
+                .push((VALIDATOR_SOURCE_HEADER.to_string(), "etag".to_string()));
         } else if has_last_modified {
             entry.headers.push((
                 VALIDATOR_SOURCE_HEADER.to_string(),
@@ -102,10 +98,9 @@ impl OriginResponse {
             entry
                 .headers
                 .push(("etag".to_string(), compute_etag(&entry)));
-            entry.headers.push((
-                VALIDATOR_SOURCE_HEADER.to_string(),
-                "computed".to_string(),
-            ));
+            entry
+                .headers
+                .push((VALIDATOR_SOURCE_HEADER.to_string(), "computed".to_string()));
         }
         entry
     }
@@ -364,6 +359,9 @@ impl OriginClient {
         .await
     }
 
+    // Origin request dimensions are intentionally explicit here: callers
+    // independently control forwarding, body, and TLS identity.
+    #[allow(clippy::too_many_arguments)]
     async fn send_with_sni(
         &self,
         base_url: &str,
@@ -459,6 +457,7 @@ impl OriginClient {
         Ok((status, out_headers, resp.into_body()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_with_sni(
         &self,
         base_url: &str,
@@ -482,6 +481,7 @@ impl OriginClient {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_with_sni_limit(
         &self,
         base_url: &str,
@@ -517,6 +517,7 @@ impl OriginClient {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_stream_with_sni(
         &self,
         base_url: &str,

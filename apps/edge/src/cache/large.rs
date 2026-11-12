@@ -543,7 +543,8 @@ impl LargeCache {
             meta.headers.push((name.clone(), value.clone()));
         }
         // Also scrub anything already stored by an older build.
-        meta.headers.retain(|(name, _)| Self::cacheable_header(name));
+        meta.headers
+            .retain(|(name, _)| Self::cacheable_header(name));
         let now = now_unix();
         meta.fresh_until = now + fresh_secs.max(1);
         meta.stale_until = now + fresh_secs.max(1) + swr_secs;
@@ -556,14 +557,8 @@ impl LargeCache {
 
     pub async fn delete(&self, key: &str) -> bool {
         let (data_path, meta_path) = self.paths_for_key(key);
-        let data_len = fs::metadata(&data_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let meta_len = fs::metadata(&meta_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let data_len = fs::metadata(&data_path).await.map(|m| m.len()).unwrap_or(0);
+        let meta_len = fs::metadata(&meta_path).await.map(|m| m.len()).unwrap_or(0);
         let stored = fs::read(&meta_path)
             .await
             .ok()
@@ -656,6 +651,9 @@ impl LargeCache {
         })
     }
 
+    // These parameters describe the origin response and requested byte range;
+    // keeping them explicit avoids allocating an options struct on this path.
+    #[allow(clippy::too_many_arguments)]
     pub async fn begin_range(
         self: &Arc<Self>,
         key: &str,
@@ -820,6 +818,10 @@ impl LargeCache {
         self.entries.load(Ordering::Relaxed)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Evict least-recently-used objects until usage is back under 90% of the
     /// cap, examining at most [`EVICT_ENTRY_BUDGET`] directory entries.
     ///
@@ -889,9 +891,7 @@ impl LargeCache {
                         .ok()
                         .and_then(|bytes| serde_json::from_slice::<LargeMeta>(&bytes).ok())
                         .map(|row| row.stored_bytes())
-                        .unwrap_or_else(|| {
-                            std::fs::metadata(&data).map(|m| m.len()).unwrap_or(0)
-                        });
+                        .unwrap_or_else(|| std::fs::metadata(&data).map(|m| m.len()).unwrap_or(0));
                     candidates.push((mtime, stored + meta_stat.len(), data, path));
                 }
             }

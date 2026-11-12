@@ -347,6 +347,20 @@ pub fn unknown_domain_page(host: &str) -> Response {
     )
 }
 
+/// A client that omitted every host source cannot have a domain attribution.
+/// Return a small 400 instead of the "domain not onboarded" page, which would
+/// imply a concrete domain and encourage an invalid access-log row.
+pub fn missing_host_page() -> Response {
+    render_page(
+        StatusCode::BAD_REQUEST,
+        "Lagran CDN",
+        "缺少 Host",
+        "<p>请求未包含 <code>Host</code> 或 HTTP/2 <code>:authority</code>，无法确定要访问的加速域名。</p>",
+        "MISSING_HOST",
+        false,
+    )
+}
+
 fn render_page(
     status: StatusCode,
     badge: &str,
@@ -488,6 +502,20 @@ mod tests {
             "DOMAIN_NOT_ONBOARDED"
         );
         assert!(resp.headers().get("retry-after").is_none());
+    }
+
+    #[test]
+    fn missing_host_is_a_bad_request_not_an_unknown_domain() {
+        let resp = missing_host_page();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get("x-lagran-error").unwrap(),
+            "MISSING_HOST"
+        );
+        assert_eq!(
+            resp.headers().get("cache-control").unwrap(),
+            "no-store, no-cache, must-revalidate"
+        );
     }
 
     #[tokio::test]

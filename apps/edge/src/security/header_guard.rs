@@ -8,6 +8,8 @@
 use http::header::{CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
 use http::{HeaderMap, HeaderName, Method, Uri, Version};
 
+use crate::config::registry::normalize_host;
+
 pub const MAX_HEADERS: usize = 128;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HOST_LEN: usize = 255;
@@ -24,19 +26,16 @@ impl HeaderViolation {
 }
 
 fn bad_value(value: &str) -> bool {
-    value
-        .bytes()
-        .any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+    value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
 }
 
 fn valid_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= MAX_HOST_LEN
         && !host.chars().any(|c| c.is_whitespace() || c.is_control())
-        && host.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '.' | '-' | '_' | ':' | '[' | ']')
-        })
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
 }
 
 fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
@@ -79,7 +78,13 @@ pub fn validate(
 
     // HTTP/2 forbids connection-specific headers (RFC 9113 §8.2.2).
     if is_h2 {
-        for name in ["connection", "proxy-connection", "keep-alive", "upgrade", "transfer-encoding"] {
+        for name in [
+            "connection",
+            "proxy-connection",
+            "keep-alive",
+            "upgrade",
+            "transfer-encoding",
+        ] {
             if headers.contains_key(name) {
                 return Err(HeaderViolation::new("h2-connection-header"));
             }
@@ -103,9 +108,21 @@ pub fn validate(
     } else if host.is_none() {
         return Err(HeaderViolation::new("bad-host"));
     }
-    if let (Some(host), Some(authority)) = (host, uri.authority()) {
-        if !host.eq_ignore_ascii_case(authority.as_str()) {
-            return Err(HeaderViolation::new("host-authority-mismatch"));
+    if let Some(authority) = uri.authority() {
+        let authority = authority.as_str();
+        // `http::Uri` keeps userinfo in the authority string. Reject it before
+        // comparing Hosts; `valid_host` does not cover this H2 pseudo-header.
+        if authority.contains('@') || authority.chars().any(char::is_whitespace) {
+            return Err(HeaderViolation::new("bad-authority"));
+        }
+        if let Some(host) = host {
+            // HTTP/2 hosts and `:authority` may differ only by case or by an
+            // explicit numeric port (`hit.test` vs `hit.test:443`). Compare the
+            // same normalized form used for the domain registry and cache key;
+            // do not require byte equality on the pseudo-header.
+            if normalize_host(host) != normalize_host(authority) {
+                return Err(HeaderViolation::new("host-authority-mismatch"));
+            }
         }
     }
 
@@ -117,10 +134,8 @@ pub fn validate(
     }
 
     // Content-Length: exactly one value, digits only.
-    let content_lengths: Vec<&http::HeaderValue> =
-        headers.get_all(CONTENT_LENGTH).iter().collect();
-    let te_values: Vec<&http::HeaderValue> =
-        headers.get_all(TRANSFER_ENCODING).iter().collect();
+    let content_lengths: Vec<&http::HeaderValue> = headers.get_all(CONTENT_LENGTH).iter().collect();
+    let te_values: Vec<&http::HeaderValue> = headers.get_all(TRANSFER_ENCODING).iter().collect();
     if content_lengths.len() > 1 {
         return Err(HeaderViolation::new("multiple-content-length"));
     }
@@ -157,10 +172,8 @@ pub fn validate(
 
     // A proxy must not accept an absolute-form authority that disagrees with
     // the request target. `CONNECT` targets are authority-form; allow those.
-    if method == Method::CONNECT {
-        if uri.authority().is_none() {
-            return Err(HeaderViolation::new("connect-without-authority"));
-        }
+    if method == Method::CONNECT && uri.authority().is_none() {
+        return Err(HeaderViolation::new("connect-without-authority"));
     }
 
     Ok(())
@@ -187,6 +200,29 @@ mod tests {
     fn accepts_normal_request() {
         let h = headers();
         assert!(validate(&h, &"/x".parse().unwrap(), &Method::GET, Version::HTTP_11).is_ok());
+    }
+
+    #[test]
+    fn h2_authority_port_and_case_are_compatible_with_host() {
+        let mut h = HeaderMap::new();
+        h.insert(HOST, HeaderValue::from_static("HIT.test"));
+        let uri: Uri = "https://HIT.test:18443/small".parse().unwrap();
+        assert!(validate(&h, &uri, &Method::GET, Version::HTTP_2).is_ok());
+
+        let mut mismatched = HeaderMap::new();
+        mismatched.insert(HOST, HeaderValue::from_static("other.test"));
+        assert_eq!(
+            validate(&mismatched, &uri, &Method::GET, Version::HTTP_2)
+                .unwrap_err()
+                .reason,
+            "host-authority-mismatch"
+        );
+    }
+
+    #[test]
+    fn h2_authority_without_host_is_valid() {
+        let uri: Uri = "https://hit.test:18443/small".parse().unwrap();
+        assert!(validate(&HeaderMap::new(), &uri, &Method::GET, Version::HTTP_2).is_ok());
     }
 
     #[test]

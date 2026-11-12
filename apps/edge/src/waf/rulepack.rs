@@ -54,7 +54,8 @@ impl SignedRulepack {
         if self.payload.is_empty() || self.signature.is_empty() {
             return None;
         }
-        let expected = hex(ring::digest::digest(&ring::digest::SHA256, self.payload.as_bytes()).as_ref());
+        let expected =
+            hex(ring::digest::digest(&ring::digest::SHA256, self.payload.as_bytes()).as_ref());
         if !self.checksum.is_empty() && !constant_eq(&self.checksum, &expected) {
             tracing::warn!(version = %self.version, "WAF rulepack checksum mismatch");
             return None;
@@ -69,7 +70,9 @@ impl SignedRulepack {
             return None;
         }
         let package: Rulepack = serde_json::from_str(&self.payload).ok()?;
-        if !self.version.is_empty() && !package.version.is_empty() && self.version != package.version
+        if !self.version.is_empty()
+            && !package.version.is_empty()
+            && self.version != package.version
         {
             tracing::warn!(
                 envelope = %self.version,
@@ -135,12 +138,11 @@ fn hex(bytes: &[u8]) -> String {
 
 fn from_hex(input: &str) -> Option<Vec<u8>> {
     let input = input.trim();
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(input.len() / 2);
-    let mut chars = input.as_bytes().chunks(2);
-    while let Some(pair) = chars.next() {
+    for pair in input.as_bytes().chunks(2) {
         let s = std::str::from_utf8(pair).ok()?;
         out.push(u8::from_str_radix(s, 16).ok()?);
     }
@@ -154,7 +156,8 @@ mod tests {
     fn signed(payload: &str, secret: &str) -> SignedRulepack {
         let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
         let signature = hex(hmac::sign(&key, payload.as_bytes()).as_ref());
-        let checksum = hex(ring::digest::digest(&ring::digest::SHA256, payload.as_bytes()).as_ref());
+        let checksum =
+            hex(ring::digest::digest(&ring::digest::SHA256, payload.as_bytes()).as_ref());
         SignedRulepack {
             version: "1".into(),
             payload: payload.into(),
@@ -178,10 +181,7 @@ mod tests {
     fn writes_disk_cache() {
         let payload = r#"{"id":"lagran-waf-core","version":"1","rulesets":[]}"#;
         let good = signed(payload, "secret");
-        let dir = std::env::temp_dir().join(format!(
-            "lagran-waf-rulepack-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("lagran-waf-rulepack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(good
             .verify_and_cache("secret", dir.to_str().unwrap())

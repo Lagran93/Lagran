@@ -141,13 +141,7 @@ fn canonical_query(query: &str) -> String {
     pairs.join("&")
 }
 
-fn canonical(
-    method: &str,
-    host: &str,
-    path: &str,
-    query: &str,
-    expires: &str,
-) -> String {
+fn canonical(method: &str, host: &str, path: &str, query: &str, expires: &str) -> String {
     format!(
         "{}\n{}\n{}\n{}\n{}",
         method.to_ascii_uppercase(),
@@ -159,12 +153,12 @@ fn canonical(
 }
 
 fn hex_decode(input: &str) -> Option<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(input.len() / 2);
     let bytes = input.as_bytes();
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         let hi = (chunk[0] as char).to_digit(16)?;
         let lo = (chunk[1] as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);
@@ -223,9 +217,7 @@ pub fn verify(
     for (key, value) in &pairs {
         if key.eq_ignore_ascii_case(EXPIRES_PARAM) {
             expires_values.push(value.clone());
-        } else if key.eq_ignore_ascii_case(SIGNATURE_PARAM)
-            || key.eq_ignore_ascii_case(SIG_PARAM)
-        {
+        } else if key.eq_ignore_ascii_case(SIGNATURE_PARAM) || key.eq_ignore_ascii_case(SIG_PARAM) {
             signatures.push(value.clone());
         }
     }
@@ -255,8 +247,7 @@ pub fn verify(
     // outstanding links. Always run both checks to avoid leaking which key
     // matched through timing.
     let current_ok = verify_with(&domain.signed_url_secret, &canonical, &signature);
-    let previous_ok =
-        verify_with(&domain.signed_url_previous_secret, &canonical, &signature);
+    let previous_ok = verify_with(&domain.signed_url_previous_secret, &canonical, &signature);
     if !current_ok && !previous_ok {
         return Err(SignedUrlError::Invalid);
     }
@@ -296,9 +287,19 @@ mod tests {
         }
     }
 
-    fn sign(secret: &str, method: &str, host: &str, path: &str, query: &str, expires: &str) -> String {
+    fn sign(
+        secret: &str,
+        method: &str,
+        host: &str,
+        path: &str,
+        query: &str,
+        expires: &str,
+    ) -> String {
         let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
-        let tag = hmac::sign(&key, canonical(method, host, path, query, expires).as_bytes());
+        let tag = hmac::sign(
+            &key,
+            canonical(method, host, path, query, expires).as_bytes(),
+        );
         tag.as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
 
@@ -308,7 +309,9 @@ mod tests {
         let now = now_epoch_secs();
         let expires = (now + 60).to_string();
         let sig = sign("secret", "GET", "a.test", "/x", "b=2&a=1", &expires);
-        let uri: Uri = format!("/x?b=2&a=1&expires={expires}&sig={sig}").parse().unwrap();
+        let uri: Uri = format!("/x?b=2&a=1&expires={expires}&sig={sig}")
+            .parse()
+            .unwrap();
         let out = verify(&d, "GET", "a.test", &uri, now).unwrap();
         assert_eq!(out.uri.to_string(), "/x?b=2&a=1");
     }
@@ -328,7 +331,10 @@ mod tests {
         assert!(!path_protected(&d, "/private2/app.js"));
         assert!(path_protected(&d, "/private/app.js"));
         let public: Uri = "/public/app.js".parse().unwrap();
-        assert_eq!(verify(&d, "GET", "a.test", &public, now).unwrap().uri, public);
+        assert_eq!(
+            verify(&d, "GET", "a.test", &public, now).unwrap().uri,
+            public
+        );
         let private: Uri = "/private/app.js".parse().unwrap();
         assert_eq!(
             verify(&d, "GET", "a.test", &private, now).unwrap_err(),
@@ -363,6 +369,9 @@ mod tests {
         let expires = (now - 3600).to_string();
         let sig = sign("secret", "GET", "a.test", "/x", "", &expires);
         let uri: Uri = format!("/x?expires={expires}&sig={sig}").parse().unwrap();
-        assert_eq!(verify(&d, "GET", "a.test", &uri, now).unwrap_err(), SignedUrlError::Expired);
+        assert_eq!(
+            verify(&d, "GET", "a.test", &uri, now).unwrap_err(),
+            SignedUrlError::Expired
+        );
     }
 }

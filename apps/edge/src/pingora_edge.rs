@@ -7,44 +7,46 @@
 //! bypass/dynamic traffic, disk/hybrid cache, control endpoints and
 //! WebSocket) are handed to the in-process handler.
 
-use crate::cache::{CacheBackend, CacheSource};
-use crate::origin_dns::OriginDnsCache;
 use crate::cache::policy::{
     apply_key_ignore_default, compute_etag, decide_storage_reason, request_bypass_reason_headers,
-    resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
-    VALIDATOR_SOURCE_HEADER,
+    resolve_rule_policy_for_response, ResolvedPolicy, RuleAction, VALIDATOR_SOURCE_HEADER,
 };
+use crate::cache::{CacheBackend, CacheSource};
 use crate::config::registry::{DomainEntry, OriginTarget};
 use crate::config::EdgeConfig;
+use crate::origin_dns::OriginDnsCache;
+use crate::security::header_guard;
+use crate::security::origin_auth;
+use crate::security::signed_url;
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
 use crate::server::compression::{replay_chunk, should_compress, CompressionConfig, GzipEncoder};
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::handler::{
-    apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed,
-    log_access, policy_browser_ttl, proxy_handler, AppState,
+    apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed, log_access,
+    policy_browser_ttl, proxy_handler, AppState,
 };
-use crate::server::pipeline::{RequestFacts, RequestPipeline};
+use crate::server::host_util::normalized_authority_host;
 use crate::server::native_cache::{leak_storage_with_large, NativeStorage, META_HEADER};
+use crate::server::pipeline::{RequestFacts, RequestPipeline};
 use crate::server::purge;
-use crate::security::header_guard;
-use crate::security::origin_auth;
-use crate::security::signed_url;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version};
+use axum::http::{
+    header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version,
+};
 use axum::Json;
 use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
+use pingora::apps::HttpServerOptions;
 use pingora::http::ResponseHeader;
 use pingora::listeners::tls::TlsSettings;
 use pingora::listeners::{TlsAccept, TlsAcceptCallbacks};
 use pingora::protocols::tls::TlsRef;
-use pingora::apps::HttpServerOptions;
 use pingora::proxy::{FailToProxy, ProxyHttp, ProxyServiceBuilder, Session};
 use pingora::server::Server;
-use pingora::tls::{ext, pkey::PKey, ssl, x509::X509};
+use pingora::tls::{ext, ssl};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::Result;
 use pingora_cache::lock::CacheLock;
@@ -73,23 +75,9 @@ impl TlsAccept for CertCallback {
             .servername(ssl::NameType::HOST_NAME)
             .unwrap_or_default()
             .to_string();
-        let Some((cert_pem, key_pem)) = self.store.pem_for(&name) else {
+        let Some((cert, key)) = self.store.certificate_for(&name) else {
             tracing::warn!(sni = %name, "no certificate for TLS SNI");
             return;
-        };
-        let cert = match X509::from_pem(&cert_pem) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(sni = %name, error = %e, "parse certificate failed");
-                return;
-            }
-        };
-        let key = match PKey::private_key_from_pem(&key_pem) {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::error!(sni = %name, error = %e, "parse private key failed");
-                return;
-            }
         };
         if let Err(e) = ext::ssl_use_certificate(ssl, &cert) {
             tracing::error!(sni = %name, error = %e, "install certificate failed");
@@ -114,16 +102,12 @@ struct NativePlan {
     domain: Arc<DomainEntry>,
     key: String,
     origin_host: String,
-    origins: Vec<OriginTarget>,
-    backup_url: String,
     /// TCP connect timeout. Kept separate so an unreachable origin fails over
     /// quickly instead of consuming the response budget.
     connect_timeout_ms: u64,
     read_timeout_ms: u64,
     cache_reason: Option<&'static str>,
     policy: ResolvedPolicy,
-    cors: String,
-    custom: String,
     cacheable: bool,
     is_head: bool,
     is_websocket: bool,
@@ -133,6 +117,12 @@ struct NativePlan {
 struct RangeFill {
     key: String,
     raw_range: String,
+}
+
+#[derive(Clone)]
+struct ResponsePolicySlot {
+    content_type: Option<HeaderValue>,
+    policy: ResolvedPolicy,
 }
 
 enum RangeMsg {
@@ -174,6 +164,9 @@ struct ReqCtx {
     current_origin: String,
     current_host_header: String,
     response_bypass: bool,
+    /// Response policy computed by the cache filter, reused by the response
+    /// filter for the same Content-Type.
+    response_policy: Option<ResponsePolicySlot>,
     head_body: BytesMut,
     head_headers: Option<ResponseHeader>,
     head_status: u16,
@@ -216,6 +209,7 @@ impl Default for ReqCtx {
             current_origin: String::new(),
             current_host_header: String::new(),
             response_bypass: false,
+            response_policy: None,
             head_body: BytesMut::new(),
             head_headers: None,
             head_status: 0,
@@ -246,9 +240,75 @@ struct DataPlaneProxy {
     compression: CompressionConfig,
 }
 
+fn cached_response_policy(
+    slot: Option<&ResponsePolicySlot>,
+    content_type: Option<&HeaderValue>,
+) -> Option<ResolvedPolicy> {
+    slot.filter(|slot| slot.content_type.as_ref() == content_type)
+        .map(|slot| slot.policy)
+}
+
+/// A client closing/resetting a response stream is not an edge or origin
+/// failure. Pingora reports it as a downstream write/read error.
+fn is_downstream_disconnect(error: &pingora::Error) -> bool {
+    error.esource() == &pingora::ErrorSource::Downstream
+        && matches!(
+            error.etype(),
+            pingora::ErrorType::WriteError
+                | pingora::ErrorType::ReadError
+                | pingora::ErrorType::ConnectionClosed
+        )
+}
+
+fn resolve_response_policy(
+    plan: &NativePlan,
+    path: &str,
+    method: &str,
+    query: &str,
+    content_type: &str,
+) -> ResolvedPolicy {
+    let mut policy =
+        resolve_rule_policy_for_response(&plan.domain.rules, path, method, query, content_type);
+    apply_key_ignore_default(&mut policy, &plan.domain.cache_key_ignore_headers);
+    policy
+}
+
 #[async_trait]
 impl ProxyHttp for DataPlaneProxy {
     type CTX = ReqCtx;
+
+    /// Do not emit a process log for a client that stopped reading a cached
+    /// response. The stream is already unusable, and a load generator stopping
+    /// at its deadline otherwise produces one ERROR per in-flight stream. The
+    /// condition is counted separately for diagnostics.
+    fn suppress_error_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        error: &pingora::Error,
+    ) -> bool {
+        if is_downstream_disconnect(error) {
+            self.state.metrics.record_downstream_cancel();
+            return true;
+        }
+        false
+    }
+
+    /// Cache hits are written through Pingora's streaming path. When a client
+    /// resets exactly at that point Pingora reports a downstream WriteError,
+    /// which is expected cancellation rather than a cache failure.
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        error: &pingora::Error,
+        context: pingora::proxy::ProxyWarnLogContext,
+    ) -> bool {
+        matches!(
+            context,
+            pingora::proxy::ProxyWarnLogContext::DownstreamCache
+        ) && is_downstream_disconnect(error)
+    }
 
     fn new_ctx(&self) -> Self::CTX {
         ReqCtx::default()
@@ -258,7 +318,11 @@ impl ProxyHttp for DataPlaneProxy {
         prepare_proxy_headers(session, self.trust_proxy, &self.trusted_proxies)?;
 
         let req = session.req_header();
-        ctx.host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
+        let (authority, host) = (
+            req.uri.authority().map(|authority| authority.as_str()),
+            req.headers.get("host").and_then(|v| v.to_str().ok()),
+        );
+        ctx.host = normalized_authority_host(authority, host);
         ctx.path = req.uri.path().to_string();
         ctx.method = req.method.clone();
         // `prepare_proxy_headers` already replaced X-Forwarded-For with the
@@ -299,12 +363,9 @@ impl ProxyHttp for DataPlaneProxy {
             .unwrap_or("")
             .to_string();
 
-        if let Err(violation) = header_guard::validate(
-            &req.headers,
-            &req.uri,
-            &ctx.method,
-            req.version,
-        ) {
+        if let Err(violation) =
+            header_guard::validate(&req.headers, &req.uri, &ctx.method, req.version)
+        {
             ctx.cache_label = "BYPASS";
             ctx.cache_reason = Some(violation.reason);
             ctx.status = 400;
@@ -413,24 +474,23 @@ impl ProxyHttp for DataPlaneProxy {
                 .map(|ip| ip.is_loopback())
                 .unwrap_or(false);
         if internal_prefetch {
-            session
-                .req_header_mut()
-                .remove_header("x-lagran-prefetch");
+            session.req_header_mut().remove_header("x-lagran-prefetch");
         }
 
         // WebSocket is intentionally legacy-only: Pingora's HTTP proxy does
         // not tunnel upgraded connections on this path.
-        if let Some(domain) = self.state.domains.get(&ctx.host).await {
+        let (registry_empty, domain) = self.state.domains.lookup(&ctx.host).await;
+        if let Some(ref domain) = domain {
             let mut signed_verified = false;
-            let mode = signed_url::effective_mode(&domain);
+            let mode = signed_url::effective_mode(domain);
             if mode != "off" && !internal_prefetch {
                 let uri = session.req_header().uri.clone();
                 let protected = signed_url::normalize_path(uri.path())
-                    .map(|path| signed_url::path_protected(&domain, &path))
+                    .map(|path| signed_url::path_protected(domain, &path))
                     .unwrap_or(true);
                 if protected {
                     match signed_url::verify(
-                        &domain,
+                        domain,
                         ctx.method.as_str(),
                         &ctx.host,
                         &uri,
@@ -468,7 +528,7 @@ impl ProxyHttp for DataPlaneProxy {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 if !hotlink_allowed(&domain.hotlink_allow_referers, referer) {
-                    let mut auth = (*domain).clone();
+                    let mut auth = domain.as_ref().clone();
                     auth.signed_url_enabled = true;
                     auth.signed_url_mode = "all".to_string();
                     auth.signed_url_paths.clear();
@@ -500,10 +560,35 @@ impl ProxyHttp for DataPlaneProxy {
             return self.handle_in_process(session).await;
         }
 
-        if self.try_large_revalidation(session, ctx).await? {
+        let Some(domain) = domain else {
+            if ctx.host.is_empty() {
+                // No Host, `:authority`, or SNI: attribute this as a 400-level
+                // protocol error before the legacy handler, and do not create
+                // an access-log row that no tenant can own or filter.
+                ctx.cache_label = "BYPASS";
+                ctx.cache_reason = Some("missing-host");
+                ctx.status = 400;
+                write_axum_response(session, default_page::missing_host_page(), false).await;
+                return Ok(true);
+            }
+            if !registry_empty {
+                // A configured edge must not hand an unknown domain to the
+                // legacy single-origin path: that would proxy the request to
+                // the default origin under an empty logical host and log a
+                // 404 row the console cannot attribute to any domain.
+                ctx.cache_label = "NONE";
+                ctx.status = StatusCode::NOT_FOUND.as_u16();
+                let response = default_page::unknown_domain_page(&ctx.host);
+                write_axum_response(session, response, false).await;
+                return Ok(true);
+            }
+            ctx.skip_logging = true;
+            return self.handle_in_process(session).await;
+        };
+        if self.try_large_revalidation(session, ctx, &domain).await? {
             return Ok(true);
         }
-        if let Some(plan) = self.native_plan(session).await {
+        if let Some(plan) = self.native_plan(session, &ctx.host, &domain).await {
             self.state.metrics.record_pingora_datapath();
             let path_and_query = session
                 .req_header()
@@ -518,26 +603,29 @@ impl ProxyHttp for DataPlaneProxy {
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.eq_ignore_ascii_case("https"))
                 .unwrap_or(false);
-            let headers = session.req_header().headers.clone();
             let pipeline = RequestPipeline::new(&self.state);
-            let facts = RequestFacts {
-                method: &ctx.method,
-                host: &ctx.host,
-                path_only: &ctx.path,
-                path_and_query: &path_and_query,
-                headers: &headers,
-                client_ip: &ctx.client_ip,
-                is_https,
-                start: ctx.start,
+            let preflight = if internal_prefetch {
+                None
+            } else {
+                let headers = &session.req_header().headers;
+                let facts = RequestFacts {
+                    method: &ctx.method,
+                    host: &ctx.host,
+                    path_only: &ctx.path,
+                    path_and_query: &path_and_query,
+                    headers,
+                    client_ip: &ctx.client_ip,
+                    is_https,
+                    start: ctx.start,
+                };
+                pipeline.preflight(&plan.domain, &facts).await
             };
-            if !internal_prefetch {
-                if let Some(resp) = pipeline.preflight(&plan.domain, &facts).await {
-                    write_axum_response(session, resp, false).await;
-                    return Ok(true);
-                }
+            if let Some(resp) = preflight {
+                write_axum_response(session, resp, false).await;
+                return Ok(true);
             }
-            let small_range =
-                headers.contains_key("range") && range_is_small_bounded(&headers);
+            let small_range = session.req_header().headers.contains_key("range")
+                && range_is_small_bounded(&session.req_header().headers);
             if plan.cacheable && !self.state.cache.has_local(&plan.key).await {
                 // Only take the cross-node lock when L1 does not already have
                 // the object. A plain L1 hit must not issue Redis SET/EVAL
@@ -555,11 +643,17 @@ impl ProxyHttp for DataPlaneProxy {
             // SharedCache object, keeping range slices on the Pingora path.
             if plan.cache_reason == Some("range-bypass")
                 && small_range
-                && !headers.contains_key("if-range")
+                && !session.req_header().headers.contains_key("if-range")
                 && plan.policy.action == RuleAction::Cache
-                && request_bypass_reason_headers(&headers, plan.policy.ignore_cookie).is_none()
+                && request_bypass_reason_headers(
+                    &session.req_header().headers,
+                    plan.policy.ignore_cookie,
+                )
+                .is_none()
             {
-                let raw_range = headers
+                let raw_range = session
+                    .req_header()
+                    .headers
                     .get("range")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
@@ -595,12 +689,18 @@ impl ProxyHttp for DataPlaneProxy {
             // origin response and fill the partial object in the background.
             // If-Range is left to the origin to preserve validator semantics.
             if plan.cache_reason == Some("range-bypass")
-                && !headers.contains_key("if-range")
+                && !session.req_header().headers.contains_key("if-range")
                 && self.state.large_cache.is_some()
                 && plan.policy.action == RuleAction::Cache
-                && request_bypass_reason_headers(&headers, plan.policy.ignore_cookie).is_none()
+                && request_bypass_reason_headers(
+                    &session.req_header().headers,
+                    plan.policy.ignore_cookie,
+                )
+                .is_none()
             {
-                let raw_range = headers
+                let raw_range = session
+                    .req_header()
+                    .headers
                     .get("range")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
@@ -635,13 +735,8 @@ impl ProxyHttp for DataPlaneProxy {
                                         if cached_end < end
                                             && self
                                                 .serve_large_range_splice(
-                                                    session,
-                                                    &mut entry,
-                                                    start,
-                                                    cached_end,
-                                                    end,
-                                                    total,
-                                                    &plan,
+                                                    session, &mut entry, start, cached_end, end,
+                                                    total, &plan,
                                                 )
                                                 .await
                                         {
@@ -682,7 +777,11 @@ impl ProxyHttp for DataPlaneProxy {
             ctx.plan = Some(plan);
             return Ok(false);
         }
-
+        // A GET/HEAD that reached this point had a valid domain but could not
+        // use the native cache path (HEAD, strict revalidation, or a method
+        // that the in-process engine must handle). This is expected routing,
+        // not an error; leave diagnostics to the access log so a high-QPS
+        // workload cannot flood the process log.
         ctx.skip_logging = true;
         self.handle_in_process(session).await
     }
@@ -714,24 +813,25 @@ impl ProxyHttp for DataPlaneProxy {
         let Some(plan) = ctx.plan.as_ref() else {
             return Ok(None);
         };
-        let content_type = meta
-            .response_header()
-            .headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
+        let content_type_value = meta.response_header().headers.get("content-type");
+        let content_type = content_type_value
+            .and_then(|value| value.to_str().ok())
             .unwrap_or("");
+        let query = session.req_header().uri.query().unwrap_or("");
+        let response_policy = if content_type.is_empty() || !plan.domain.has_content_type_rules {
+            plan.policy
+        } else {
+            resolve_response_policy(plan, &ctx.path, ctx.method.as_str(), query, content_type)
+        };
+        if plan.domain.has_content_type_rules && !content_type.is_empty() {
+            ctx.response_policy = Some(ResponsePolicySlot {
+                content_type: content_type_value.cloned(),
+                policy: response_policy,
+            });
+        }
         if content_type.is_empty() {
             return Ok(None);
         }
-        let query = session.req_header().uri.query().unwrap_or("");
-        let mut response_policy = resolve_rule_policy_for_response(
-            &plan.domain.rules,
-            &ctx.path,
-            ctx.method.as_str(),
-            query,
-            content_type,
-        );
-        apply_key_ignore_default(&mut response_policy, &plan.domain.cache_key_ignore_headers);
         if response_policy.action != RuleAction::Cache {
             return Ok(Some(ForcedFreshness::ForceMiss));
         }
@@ -758,23 +858,30 @@ impl ProxyHttp for DataPlaneProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let plan = ctx
-            .plan
-            .clone()
-            .ok_or_else(|| pingora::Error::new_str("native plan missing"))?;
+        let (domain, connect_timeout_ms, read_timeout_ms) = {
+            let plan = ctx
+                .plan
+                .as_ref()
+                .ok_or_else(|| pingora::Error::new_str("native plan missing"))?;
+            (
+                Arc::clone(&plan.domain),
+                plan.connect_timeout_ms,
+                plan.read_timeout_ms,
+            )
+        };
         if ctx.origin_order.is_empty() {
-            let order = self.origin_order(&ctx.host, &plan).await;
+            let order = self.origin_order(&ctx.host, &domain).await;
             if order.is_empty() {
                 return Err(pingora::Error::new_str("no origin available"));
             }
-            ctx.origin_order = order.into_iter().map(|o| o.url).collect();
+            ctx.origin_order = order;
         }
 
         loop {
             let index = ctx.attempt.min(ctx.origin_order.len() - 1);
             let url = ctx.origin_order[index].clone();
             ctx.current_origin = url.clone();
-            let origin = plan.origins.iter().find(|o| o.url == url);
+            let origin = domain.origins.iter().find(|o| o.url == url);
             ctx.current_host_header = origin
                 .and_then(|o| o.host_header.clone())
                 .unwrap_or_default();
@@ -808,11 +915,11 @@ impl ProxyHttp for DataPlaneProxy {
                     addr,
                     &host,
                     tls,
-                    plan.connect_timeout_ms,
+                    connect_timeout_ms,
                     if session.req_header().headers.contains_key("range") {
                         self.state.origin_stream_read_timeout_ms
                     } else {
-                        plan.read_timeout_ms
+                        read_timeout_ms
                     },
                     if sni.is_empty() { None } else { Some(&sni) },
                 )
@@ -976,20 +1083,22 @@ impl ProxyHttp for DataPlaneProxy {
                 "set-cookie",
             )));
         }
-        let content_type = resp
-            .headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
+        let content_type_value = resp.headers.get("content-type");
+        let content_type = content_type_value
+            .and_then(|value| value.to_str().ok())
             .unwrap_or("");
         let query = session.req_header().uri.query().unwrap_or("");
-        let mut response_policy = resolve_rule_policy_for_response(
-            &plan.domain.rules,
-            &ctx.path,
-            ctx.method.as_str(),
-            query,
-            content_type,
-        );
-        apply_key_ignore_default(&mut response_policy, &plan.domain.cache_key_ignore_headers);
+        let response_policy = if plan.domain.has_content_type_rules {
+            resolve_response_policy(plan, &ctx.path, ctx.method.as_str(), query, content_type)
+        } else {
+            plan.policy
+        };
+        if plan.domain.has_content_type_rules {
+            ctx.response_policy = Some(ResponsePolicySlot {
+                content_type: content_type_value.cloned(),
+                policy: response_policy,
+            });
+        }
         if response_policy.action != RuleAction::Cache {
             ctx.response_bypass = true;
             ctx.cache_reason = Some("content-type-bypass");
@@ -1012,12 +1121,7 @@ impl ProxyHttp for DataPlaneProxy {
                 )));
             }
         };
-        ctx.identity_ttl_secs = Some(
-            decision
-                .ttl_secs
-                .saturating_add(decision.swr_secs)
-                .max(1),
-        );
+        ctx.identity_ttl_secs = Some(decision.ttl_secs.saturating_add(decision.swr_secs).max(1));
         let now = SystemTime::now();
         let meta = CacheMeta::new(
             now + Duration::from_secs(decision.ttl_secs),
@@ -1055,20 +1159,26 @@ impl ProxyHttp for DataPlaneProxy {
         // Bound idle HTTP/1.1 downstream connections. Without this Pingora
         // defaults to no keepalive request limit and no idle cap.
         session.set_keepalive(Some(self.state.downstream_keepalive_secs));
-        let content_type = response
-            .headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
+        let content_type_value = response.headers.get("content-type");
+        let content_type = content_type_value
+            .and_then(|value| value.to_str().ok())
             .unwrap_or("");
         let query = session.req_header().uri.query().unwrap_or("");
-        let mut response_policy = resolve_rule_policy_for_response(
-            &plan.domain.rules,
-            &ctx.path,
-            ctx.method.as_str(),
-            query,
-            content_type,
-        );
-        apply_key_ignore_default(&mut response_policy, &plan.domain.cache_key_ignore_headers);
+        let response_policy = if plan.domain.has_content_type_rules {
+            cached_response_policy(ctx.response_policy.as_ref(), content_type_value).unwrap_or_else(
+                || {
+                    resolve_response_policy(
+                        plan,
+                        &ctx.path,
+                        ctx.method.as_str(),
+                        query,
+                        content_type,
+                    )
+                },
+            )
+        } else {
+            plan.policy
+        };
         let mut label = if ctx.response_bypass {
             "BYPASS"
         } else if plan.is_websocket {
@@ -1130,23 +1240,16 @@ impl ProxyHttp for DataPlaneProxy {
             .to_string();
         response.insert_header("x-lagran-cache-source", cache_source)?;
         response.insert_header("x-lagran-cache-lookup-ms", lookup_ms.clone())?;
-        response.insert_header(
-            "server-timing",
-            format!("cache;dur={lookup_ms}"),
-        )?;
+        response.insert_header("server-timing", format!("cache;dur={lookup_ms}"))?;
 
-        let mut headers = response.headers.clone();
         if plan.cacheable || plan.is_head {
             let browser_ttl = (response_policy.action == RuleAction::Cache)
                 .then(|| policy_browser_ttl(&response_policy))
                 .flatten();
-            apply_browser_ttl(&mut headers, browser_ttl);
+            Self::apply_browser_ttl(response, browser_ttl);
         }
-        apply_security_headers(&mut headers);
-        apply_cors_and_custom(&mut headers, &plan.cors, &plan.custom);
-        for (name, value) in headers.iter() {
-            response.insert_header(name.clone(), value.clone())?;
-        }
+        Self::apply_security_headers(response);
+        Self::apply_cors_and_custom(response, &plan.domain.response_headers);
         // Compress here, not upstream: the cache has already stored the
         // identity body, so one object serves every Accept-Encoding.
         if !plan.is_head && !plan.is_websocket && ctx.gzip.is_none() && ctx.gzip_replay.is_none() {
@@ -1316,15 +1419,15 @@ impl ProxyHttp for DataPlaneProxy {
                                         queued,
                                     });
                                 } else {
-                                    ctx.cache_reason = Some(if fill_end
-                                        .saturating_sub(fill_start)
-                                        .saturating_add(1)
-                                        > large.max_object_bytes()
-                                    {
-                                        "range-too-large"
-                                    } else {
-                                        "range-fill-skipped"
-                                    });
+                                    ctx.cache_reason = Some(
+                                        if fill_end.saturating_sub(fill_start).saturating_add(1)
+                                            > large.max_object_bytes()
+                                        {
+                                            "range-too-large"
+                                        } else {
+                                            "range-fill-skipped"
+                                        },
+                                    );
                                 }
                             } else {
                                 ctx.cache_reason = Some("range-uncacheable");
@@ -1385,8 +1488,7 @@ impl ProxyHttp for DataPlaneProxy {
                         .identity_ttl_secs
                         .unwrap_or(self.compression.variant_ttl_secs)
                         .max(1);
-                    let entry =
-                        crate::cache::CacheEntry::new(200, Vec::new(), buffer.freeze());
+                    let entry = crate::cache::CacheEntry::new(200, Vec::new(), buffer.freeze());
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         let store = self.state.compressed.clone();
                         handle.spawn(async move {
@@ -1468,48 +1570,52 @@ impl ProxyHttp for DataPlaneProxy {
         let bytes = session.body_bytes_sent() as u64;
         let label = ctx.cache_label;
         if let Some(plan) = ctx.plan.as_ref() {
-        if plan.is_head && ctx.head_status == 200 && !ctx.head_body.is_empty() {
-            if let Some(headers) = ctx.head_headers.as_ref() {
-                let mut hdrs = header_vec(&headers.headers);
-                hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
-                hdrs.push((
-                    "content-length".to_string(),
-                    ctx.head_body.len().to_string(),
-                ));
-                if let Ok(decision) = decide_storage_reason(
-                    ctx.head_status,
-                    &hdrs,
-                    plan.policy,
-                    self.state.default_ttl_secs,
-                ) {
-                    if ctx.head_body.len() <= 8 * 1024 * 1024 {
-                        let now_epoch = SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let mut entry = crate::cache::CacheEntry {
-                            status: ctx.head_status,
-                            headers: hdrs,
-                            body: ctx.head_body.clone().freeze(),
-                            stored_at_epoch_secs: now_epoch,
-                            fresh_until_epoch_secs: now_epoch
-                                + decision.ttl_secs.max(1),
-                            stale_until_epoch_secs: now_epoch
-                                + decision.ttl_secs.max(1)
-                                + decision.swr_secs,
-                        };
-                        if entry.header("etag").is_none() {
-                            let etag = compute_etag(&entry);
-                            entry.headers.push(("etag".to_string(), etag));
+            if plan.is_head && ctx.head_status == 200 && !ctx.head_body.is_empty() {
+                if let Some(headers) = ctx.head_headers.as_ref() {
+                    let mut hdrs = header_vec(&headers.headers);
+                    hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+                    hdrs.push((
+                        "content-length".to_string(),
+                        ctx.head_body.len().to_string(),
+                    ));
+                    if let Ok(decision) = decide_storage_reason(
+                        ctx.head_status,
+                        &hdrs,
+                        plan.policy,
+                        self.state.default_ttl_secs,
+                    ) {
+                        if ctx.head_body.len() <= 8 * 1024 * 1024 {
+                            let now_epoch = SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let mut entry = crate::cache::CacheEntry {
+                                status: ctx.head_status,
+                                headers: hdrs,
+                                body: ctx.head_body.clone().freeze(),
+                                stored_at_epoch_secs: now_epoch,
+                                fresh_until_epoch_secs: now_epoch + decision.ttl_secs.max(1),
+                                stale_until_epoch_secs: now_epoch
+                                    + decision.ttl_secs.max(1)
+                                    + decision.swr_secs,
+                            };
+                            if entry.header("etag").is_none() {
+                                let etag = compute_etag(&entry);
+                                entry.headers.push(("etag".to_string(), etag));
+                            }
+                            self.state
+                                .cache
+                                .set_with_swr(
+                                    &plan.key,
+                                    entry,
+                                    decision.ttl_secs,
+                                    decision.swr_secs,
+                                )
+                                .await;
                         }
-                        self.state
-                            .cache
-                            .set_with_swr(&plan.key, entry, decision.ttl_secs, decision.swr_secs)
-                            .await;
                     }
                 }
             }
-        }
         }
         log_access(
             &self.state.access_log,
@@ -1567,6 +1673,45 @@ impl ProxyHttp for DataPlaneProxy {
 }
 
 impl DataPlaneProxy {
+    fn apply_browser_ttl(response: &mut ResponseHeader, ttl: Option<u64>) {
+        let Some(ttl) = ttl.filter(|ttl| *ttl > 0) else {
+            return;
+        };
+        if response.headers.contains_key(header::SET_COOKIE) {
+            return;
+        }
+        if let Some(cache_control) = response
+            .headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+        {
+            let cache_control = cache_control.to_ascii_lowercase();
+            if cache_control.contains("no-store") || cache_control.contains("private") {
+                return;
+            }
+        }
+        let value = format!("public, max-age={ttl}");
+        let _ = response.insert_header(header::CACHE_CONTROL, value);
+    }
+
+    fn apply_security_headers(response: &mut ResponseHeader) {
+        let _ = response.insert_header("x-content-type-options", "nosniff");
+        let _ = response.insert_header("x-frame-options", "SAMEORIGIN");
+        let _ = response.insert_header("referrer-policy", "strict-origin-when-cross-origin");
+    }
+
+    fn apply_cors_and_custom(
+        response: &mut ResponseHeader,
+        overrides: &crate::server::response_headers::ResponseHeaderOverrides,
+    ) {
+        if let Some(origin) = overrides.cors_origin() {
+            let _ = response.insert_header("access-control-allow-origin", origin.clone());
+        }
+        for (name, value) in overrides.custom() {
+            let _ = response.insert_header(name.clone(), value.clone());
+        }
+    }
+
     /// Large-object conditional revalidation. For strict requests, try a HEAD
     /// conditional request first. A 304 is served from the existing large file
     /// without touching its body; a 200 removes the stale object and lets the
@@ -1575,6 +1720,7 @@ impl DataPlaneProxy {
         &self,
         session: &mut Session,
         ctx: &mut ReqCtx,
+        domain: &Arc<DomainEntry>,
     ) -> Result<bool> {
         if session.req_header().method != Method::GET
             || session.req_header().headers.contains_key("range")
@@ -1607,7 +1753,7 @@ impl DataPlaneProxy {
         let pragma = session.req_header().headers.get("pragma").cloned();
         session.req_header_mut().remove_header("cache-control");
         session.req_header_mut().remove_header("pragma");
-        let plan = self.native_plan(session).await;
+        let plan = self.native_plan(session, &ctx.host, domain).await;
         let Some(plan) = plan else {
             if let Some(v) = cache_control {
                 let _ = session.req_header_mut().insert_header("cache-control", v);
@@ -1688,7 +1834,7 @@ impl DataPlaneProxy {
             return Ok(false);
         }
 
-        let target = match plan.origins.iter().find(|origin| origin.enabled) {
+        let target = match plan.domain.origins.iter().find(|origin| origin.enabled) {
             Some(target) => target.clone(),
             None => return Ok(false),
         };
@@ -1792,9 +1938,7 @@ impl DataPlaneProxy {
         plan: &NativePlan,
         entry: crate::cache::CacheEntry,
     ) -> Result<bool> {
-        let source = entry
-            .header(VALIDATOR_SOURCE_HEADER)
-            .unwrap_or("");
+        let source = entry.header(VALIDATOR_SOURCE_HEADER).unwrap_or("");
         let etag = entry.header("etag").map(str::to_string);
         let last_modified = entry.header("last-modified").map(str::to_string);
         if source == "computed" {
@@ -1812,7 +1956,7 @@ impl DataPlaneProxy {
             return Ok(false);
         }
 
-        let target = match plan.origins.iter().find(|origin| origin.enabled) {
+        let target = match plan.domain.origins.iter().find(|origin| origin.enabled) {
             Some(target) => target.clone(),
             None => return Ok(false),
         };
@@ -1929,9 +2073,10 @@ impl DataPlaneProxy {
             refreshed
                 .headers
                 .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name.as_str()));
-            refreshed
-                .headers
-                .push((name.as_str().to_string(), value.to_str().unwrap_or("").to_string()));
+            refreshed.headers.push((
+                name.as_str().to_string(),
+                value.to_str().unwrap_or("").to_string(),
+            ));
         }
         let decision = match decide_storage_reason(
             refreshed.status,
@@ -1968,6 +2113,9 @@ impl DataPlaneProxy {
         Ok(true)
     }
 
+    // These are the byte-range coordinates plus the session/cache context;
+    // grouping them would add wrapper types used only at these call sites.
+    #[allow(clippy::too_many_arguments)]
     async fn serve_normal_range(
         &self,
         session: &mut Session,
@@ -1982,10 +2130,9 @@ impl DataPlaneProxy {
         if len == 0 || end >= total {
             return false;
         }
-        let Ok(mut response) = ResponseHeader::build(
-            StatusCode::PARTIAL_CONTENT.as_u16(),
-            Some(len as usize),
-        ) else {
+        let Ok(mut response) =
+            ResponseHeader::build(StatusCode::PARTIAL_CONTENT.as_u16(), Some(len as usize))
+        else {
             return false;
         };
         for (name, value) in &entry.headers {
@@ -2021,12 +2168,8 @@ impl DataPlaneProxy {
         if let Some(ttl) = entry.ttl_secs() {
             let _ = response.insert_header("x-lagran-cache-ttl", ttl.to_string());
         }
-        let mut final_headers = response.headers.clone();
-        apply_security_headers(&mut final_headers);
-        apply_cors_and_custom(&mut final_headers, &plan.cors, &plan.custom);
-        for (name, value) in final_headers.iter() {
-            let _ = response.insert_header(name.clone(), value.clone());
-        }
+        Self::apply_security_headers(&mut response);
+        Self::apply_cors_and_custom(&mut response, &plan.domain.response_headers);
         if session
             .write_response_header(Box::new(response), false)
             .await
@@ -2037,10 +2180,7 @@ impl DataPlaneProxy {
         let body = entry
             .body
             .slice(start as usize..=(end as usize).min(entry.body.len().saturating_sub(1)));
-        session
-            .write_response_body(Some(body), true)
-            .await
-            .is_ok()
+        session.write_response_body(Some(body), true).await.is_ok()
     }
 
     async fn serve_normal_entry(
@@ -2051,21 +2191,19 @@ impl DataPlaneProxy {
         reason: &'static str,
     ) {
         let len = entry.body.len();
-        let client_match = entry
-            .header("etag")
-            .is_some_and(|etag| {
-                session
-                    .req_header()
-                    .headers
-                    .get("if-none-match")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|value| {
-                        value
-                            .split(',')
-                            .map(str::trim)
-                            .any(|candidate| candidate == etag || candidate == "*")
-                    })
-            });
+        let client_match = entry.header("etag").is_some_and(|etag| {
+            session
+                .req_header()
+                .headers
+                .get("if-none-match")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .any(|candidate| candidate == etag || candidate == "*")
+                })
+        });
         let status = StatusCode::OK;
         let mut response = match ResponseHeader::build(status.as_u16(), None) {
             Ok(response) => response,
@@ -2096,19 +2234,15 @@ impl DataPlaneProxy {
         if let Some(ttl) = entry.ttl_secs() {
             let _ = response.insert_header("x-lagran-cache-ttl", ttl.to_string());
         }
-        let mut final_headers = response.headers.clone();
-        apply_security_headers(&mut final_headers);
-        apply_cors_and_custom(&mut final_headers, &plan.cors, &plan.custom);
-        for (name, value) in final_headers.iter() {
-            let _ = response.insert_header(name.clone(), value.clone());
-        }
+        Self::apply_security_headers(&mut response);
+        Self::apply_cors_and_custom(&mut response, &plan.domain.response_headers);
 
         if client_match {
-            let mut not_modified = match ResponseHeader::build(StatusCode::NOT_MODIFIED.as_u16(), None)
-            {
-                Ok(response) => response,
-                Err(_) => return,
-            };
+            let mut not_modified =
+                match ResponseHeader::build(StatusCode::NOT_MODIFIED.as_u16(), None) {
+                    Ok(response) => response,
+                    Err(_) => return,
+                };
             for name in [
                 "cache-control",
                 "vary",
@@ -2145,9 +2279,7 @@ impl DataPlaneProxy {
         {
             return;
         }
-        let _ = session
-            .write_response_body(Some(entry.body), true)
-            .await;
+        let _ = session.write_response_body(Some(entry.body), true).await;
     }
 
     async fn serve_large_full(
@@ -2181,7 +2313,8 @@ impl DataPlaneProxy {
                         .any(|candidate| candidate == etag || candidate == "*")
                 });
             if client_match {
-                let Ok(mut response) = ResponseHeader::build(StatusCode::NOT_MODIFIED.as_u16(), None)
+                let Ok(mut response) =
+                    ResponseHeader::build(StatusCode::NOT_MODIFIED.as_u16(), None)
                 else {
                     return;
                 };
@@ -2206,14 +2339,15 @@ impl DataPlaneProxy {
                 let _ = response.insert_header("x-lagran-cache-reason", "origin-304");
                 let _ = response.insert_header("x-lagran-cache-ttl", cache_ttl.to_string());
                 let _ = response.insert_header("x-powered-by", "lagran-edge");
-        let _ = response.insert_header("x-lagran-datapath", "pingora");
-                let _ = session.write_response_header(Box::new(response), true).await;
+                let _ = response.insert_header("x-lagran-datapath", "pingora");
+                let _ = session
+                    .write_response_header(Box::new(response), true)
+                    .await;
                 return;
             }
         }
 
-        let Ok(mut response) =
-            ResponseHeader::build(StatusCode::OK.as_u16(), Some(total as usize))
+        let Ok(mut response) = ResponseHeader::build(StatusCode::OK.as_u16(), Some(total as usize))
         else {
             return;
         };
@@ -2242,12 +2376,8 @@ impl DataPlaneProxy {
         let _ = response.insert_header("x-lagran-datapath", "pingora");
         let _ = response.insert_header("age", "0");
         let _ = response.insert_header("x-lagran-cache-ttl", cache_ttl.to_string());
-        let mut final_headers = response.headers.clone();
-        apply_security_headers(&mut final_headers);
-        apply_cors_and_custom(&mut final_headers, &plan.cors, &plan.custom);
-        for (name, value) in final_headers.iter() {
-            let _ = response.insert_header(name.clone(), value.clone());
-        }
+        Self::apply_security_headers(&mut response);
+        Self::apply_cors_and_custom(&mut response, &plan.domain.response_headers);
         if session
             .write_response_header(Box::new(response), false)
             .await
@@ -2278,7 +2408,12 @@ impl DataPlaneProxy {
         }
     }
 
-    async fn native_plan(&self, session: &Session) -> Option<NativePlan> {
+    async fn native_plan(
+        &self,
+        session: &Session,
+        host: &str,
+        domain: &Arc<DomainEntry>,
+    ) -> Option<NativePlan> {
         if !self.native_cache || self.storage.is_none() {
             return None;
         }
@@ -2296,14 +2431,9 @@ impl DataPlaneProxy {
         // the complete object is already in the large-object cache, keep the
         // request on the Pingora path so it can be served directly from disk.
         // Open-ended ranges (`bytes=0-`) stay streaming as before.
-        let host = request_host(req.headers.get("host").and_then(|v| v.to_str().ok()));
-        if host.is_empty() {
-            return None;
-        }
         if !self.state.node_control.is_serving() {
             return None;
         }
-        let domain = self.state.domains.get(&host).await?;
         let path = req.uri.path().to_string();
         let path_and_query = req
             .uri
@@ -2311,12 +2441,7 @@ impl DataPlaneProxy {
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
         let pipeline = RequestPipeline::new(&self.state);
-        let policy = pipeline.policy_for(
-            &domain,
-            &req.method,
-            &path,
-            req.uri.query().unwrap_or(""),
-        );
+        let policy = pipeline.policy_for(domain, &req.method, &path, req.uri.query().unwrap_or(""));
         let class = pipeline.classify_request(&req.method, &req.headers, &policy);
         let request_reason = if has_range {
             // Range requests must stay streaming. Fetching a full video to
@@ -2351,9 +2476,9 @@ impl DataPlaneProxy {
         };
         let (origin_host, _, _) = parse_origin(&domain.origin_url)?;
         let key = pipeline.cache_key_for(
-            &domain,
+            domain,
             &req.method,
-            &host,
+            host,
             &path,
             &path_and_query,
             &req.headers,
@@ -2362,11 +2487,9 @@ impl DataPlaneProxy {
         // Ranges use native streaming unless a complete cached object covers
         // the slice above. This keeps every GET/HEAD request on Pingora.
         Some(NativePlan {
-            domain: domain.clone(),
+            domain: Arc::clone(domain),
             key,
             origin_host,
-            origins: domain.origins.clone(),
-            backup_url: domain.backup_origin_url.clone(),
             connect_timeout_ms: effective_connect_timeout_ms(
                 domain.origin_timeout_ms,
                 self.state.origin.connect_timeout_ms(),
@@ -2374,8 +2497,6 @@ impl DataPlaneProxy {
             read_timeout_ms: self.state.origin_read_timeout_ms,
             cache_reason: request_reason,
             policy,
-            cors: domain.cors_origins.clone(),
-            custom: domain.custom_headers.clone(),
             cacheable,
             is_head,
             is_websocket,
@@ -2383,6 +2504,7 @@ impl DataPlaneProxy {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn serve_large_range(
         &self,
         session: &mut Session,
@@ -2444,15 +2566,9 @@ impl DataPlaneProxy {
         {
             return false;
         }
-        let mut final_headers = response.headers.clone();
-        apply_security_headers(&mut final_headers);
-        apply_cors_and_custom(&mut final_headers, &plan.cors, &plan.custom);
-        let _ = final_headers.insert("x-powered-by", HeaderValue::from_static("lagran-edge"));
-        for (name, value) in final_headers.iter() {
-            if response.insert_header(name.clone(), value.clone()).is_err() {
-                return false;
-            }
-        }
+        Self::apply_security_headers(&mut response);
+        Self::apply_cors_and_custom(&mut response, &plan.domain.response_headers);
+        let _ = response.insert_header("x-powered-by", "lagran-edge");
         if entry.meta.stored_at > 0 {
             let age = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2539,6 +2655,7 @@ impl DataPlaneProxy {
             .unwrap_or_else(|| "/".to_string());
 
         let target = plan
+            .domain
             .origins
             .iter()
             .find(|origin| origin.enabled)
@@ -2682,21 +2799,16 @@ impl DataPlaneProxy {
         {
             return false;
         }
-        let mut final_headers = response.headers.clone();
-        apply_security_headers(&mut final_headers);
-        apply_cors_and_custom(&mut final_headers, &plan.cors, &plan.custom);
-        let _ = final_headers.insert("x-powered-by", HeaderValue::from_static("lagran-edge"));
-        for (name, value) in final_headers.iter() {
-            if response.insert_header(name.clone(), value.clone()).is_err() {
-                return false;
-            }
-        }
+        Self::apply_security_headers(&mut response);
+        Self::apply_cors_and_custom(&mut response, &plan.domain.response_headers);
+        let _ = response.insert_header("x-powered-by", "lagran-edge");
         if entry.meta.stored_at > 0 {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let _ = response.insert_header("age", now.saturating_sub(entry.meta.stored_at).to_string());
+            let _ =
+                response.insert_header("age", now.saturating_sub(entry.meta.stored_at).to_string());
             let _ = response.insert_header(
                 "x-lagran-cache-ttl",
                 entry.meta.fresh_until.saturating_sub(now).to_string(),
@@ -3117,7 +3229,7 @@ impl DataPlaneProxy {
         }
         apply_browser_ttl(&mut headers, policy_browser_ttl(&plan.policy));
         apply_security_headers(&mut headers);
-        apply_cors_and_custom(&mut headers, &plan.cors, &plan.custom);
+        apply_cors_and_custom(&mut headers, &plan.domain.response_headers);
         headers.insert(
             HeaderName::from_static("content-length"),
             HeaderValue::from_str(&len.to_string())
@@ -3183,19 +3295,20 @@ impl DataPlaneProxy {
         Self::advance_origin(ctx)
     }
 
-    async fn origin_order(&self, domain: &str, plan: &NativePlan) -> Vec<OriginTarget> {
-        let mut pool: Vec<OriginTarget> = if plan.origins.is_empty() {
-            let mut list = vec![OriginTarget {
-                url: plan.domain.origin_url.clone(),
+    async fn origin_order(&self, domain: &str, entry: &DomainEntry) -> Vec<String> {
+        let mut fallback = Vec::new();
+        if entry.origins.is_empty() {
+            fallback.push(OriginTarget {
+                url: entry.origin_url.clone(),
                 weight: 100,
                 priority: 0,
                 enabled: true,
                 host_header: None,
                 sni: None,
-            }];
-            if !plan.backup_url.is_empty() {
-                list.push(OriginTarget {
-                    url: plan.backup_url.clone(),
+            });
+            if !entry.backup_origin_url.is_empty() {
+                fallback.push(OriginTarget {
+                    url: entry.backup_origin_url.clone(),
                     weight: 100,
                     priority: 1,
                     enabled: true,
@@ -3203,11 +3316,16 @@ impl DataPlaneProxy {
                     sni: None,
                 });
             }
-            list
+        }
+        let pool: Vec<&OriginTarget> = if fallback.is_empty() {
+            entry
+                .origins
+                .iter()
+                .filter(|origin| origin.enabled)
+                .collect()
         } else {
-            plan.origins.clone()
+            fallback.iter().filter(|origin| origin.enabled).collect()
         };
-        pool.retain(|o| o.enabled);
         if pool.is_empty() {
             return Vec::new();
         }
@@ -3220,7 +3338,7 @@ impl DataPlaneProxy {
                 .is_origin_healthy(domain, &origin.url)
                 .await
             {
-                healthy.push(origin.clone());
+                healthy.push(*origin);
             }
         }
         let mut candidates = if healthy.is_empty() {
@@ -3234,18 +3352,34 @@ impl DataPlaneProxy {
         };
         let min_priority = candidates
             .iter()
-            .map(|o| o.priority)
+            .map(|origin| origin.priority)
             .min()
             .unwrap_or_default();
-        candidates.retain(|o| o.priority == min_priority);
+        candidates.retain(|origin| origin.priority == min_priority);
         if candidates.is_empty() {
             return Vec::new();
         }
 
+        let total: u64 = candidates
+            .iter()
+            .map(|origin| u64::from(origin.weight.max(1)))
+            .sum();
         let seed = self
             .origin_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        OriginTarget::weighted_order(candidates, seed)
+        let mut slot = seed % total.max(1);
+        let mut start = 0usize;
+        for (index, origin) in candidates.iter().enumerate() {
+            let weight = u64::from(origin.weight.max(1));
+            if slot < weight {
+                start = index;
+                break;
+            }
+            slot -= weight;
+        }
+        (0..candidates.len())
+            .map(|offset| candidates[(start + offset) % candidates.len()].url.clone())
+            .collect()
     }
 
     async fn peer_for(
@@ -3473,8 +3607,8 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
         }
     };
     let body_len = bytes.len();
-    let no_content = parts.status == StatusCode::NOT_MODIFIED
-        || parts.status == StatusCode::NO_CONTENT;
+    let no_content =
+        parts.status == StatusCode::NOT_MODIFIED || parts.status == StatusCode::NO_CONTENT;
     let head_content_length = if is_head {
         // HTTP/2 frames HEAD with END_STREAM and can safely carry the real
         // representation length. Pingora's H1 encoder cannot reliably do so
@@ -3698,17 +3832,6 @@ fn range_is_small_bounded(headers: &HeaderMap) -> bool {
     end >= start && end - start < MAX_SLICE
 }
 
-/// Resolve the request host for registry lookups.
-///
-/// Delegates to [`crate::config::registry::normalize_host`] so the Pingora path,
-/// the in-process handler and the registry itself cannot disagree. The previous
-/// local implementation split on `:` and kept the brackets on IPv6 literals,
-/// which produced a different key than the one the registry was populated with.
-fn request_host(raw: Option<&str>) -> String {
-    raw.map(crate::config::registry::normalize_host)
-        .unwrap_or_default()
-}
-
 fn parse_origin(url: &str) -> Option<(String, u16, bool)> {
     let uri: Uri = url.parse().ok()?;
     let scheme = uri.scheme_str()?;
@@ -3910,10 +4033,7 @@ fn prepare_proxy_headers(
     let identity =
         crate::security::trusted_proxy::resolve(trusted, peer.copied(), xff, xfp, is_https);
 
-    let client_ip = identity
-        .ip
-        .map(|ip| ip.to_string())
-        .unwrap_or_default();
+    let client_ip = identity.ip.map(|ip| ip.to_string()).unwrap_or_default();
     let req = session.req_header_mut();
 
     // Always restate X-Forwarded-For with the resolved client address. Dropping
@@ -3934,7 +4054,10 @@ fn prepare_proxy_headers(
         if identity.is_https { "https" } else { "http" },
     )?;
 
-    if !req.headers.contains_key("host") {
+    // HTTP/2 `:authority` is the authoritative host source. Synthesizing a
+    // `Host` from SNI first would turn an IP SNI into a conflicting header and
+    // make the authority guard reject a valid request.
+    if !req.headers.contains_key("host") && req.uri.authority().is_none() {
         if let Some(sni) = sni {
             req.insert_header("host", sni.as_str())?;
         }
@@ -4010,10 +4133,8 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
         Err(e) => anyhow::bail!("cannot bind EDGE_LISTEN {}: {e}", config.listen_addr),
     }
     let mut downstream_options = HttpServerOptions::default();
-    downstream_options.keepalive_request_limit =
-        Some(config.downstream_keepalive_requests);
-    downstream_options.h2_idle_timeout =
-        Some(Duration::from_secs(config.downstream_h2_idle_secs));
+    downstream_options.keepalive_request_limit = Some(config.downstream_keepalive_requests);
+    downstream_options.h2_idle_timeout = Some(Duration::from_secs(config.downstream_h2_idle_secs));
     let mut service = ProxyServiceBuilder::new(&server.configuration, proxy)
         .server_options(downstream_options)
         .build();
@@ -4045,10 +4166,13 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 #[cfg(test)]
 mod tests {
     use super::{
-        compressed_variant_key, effective_connect_timeout_ms, fill_window,
+        cached_response_policy, compressed_variant_key, effective_connect_timeout_ms, fill_window,
         head_content_length_for_protocol, parse_single_range, range_fill_is_candidate,
-        valid_release_tag, vary_on_accept_encoding, weaken_etag,
+        valid_release_tag, vary_on_accept_encoding, weaken_etag, DataPlaneProxy,
+        ResponsePolicySlot,
     };
+    use crate::cache::policy::ResolvedPolicy;
+    use crate::server::response_headers::ResponseHeaderOverrides;
     use pingora::http::ResponseHeader;
 
     fn header_values(response: &ResponseHeader, name: &str) -> Vec<String> {
@@ -4128,12 +4252,14 @@ mod tests {
 
     #[test]
     fn address_failure_retries_same_origin_before_failing_over() {
-        let mut ctx = super::ReqCtx::default();
-        ctx.origin_order = vec!["https://one.example".into(), "https://two.example".into()];
-        ctx.current_addresses = vec![
-            "192.0.2.1:443".parse().unwrap(),
-            "192.0.2.2:443".parse().unwrap(),
-        ];
+        let mut ctx = super::ReqCtx {
+            origin_order: vec!["https://one.example".into(), "https://two.example".into()],
+            current_addresses: vec![
+                "192.0.2.1:443".parse().unwrap(),
+                "192.0.2.2:443".parse().unwrap(),
+            ],
+            ..Default::default()
+        };
 
         assert!(super::DataPlaneProxy::advance_peer(&mut ctx));
         assert_eq!(ctx.attempt, 0);
@@ -4204,10 +4330,7 @@ mod tests {
             fill_window("bytes=0-33554432", 0, 33554432, total, max),
             None
         );
-        assert_eq!(
-            fill_window("bytes=0-", 0, max - 2, total, max),
-            None
-        );
+        assert_eq!(fill_window("bytes=0-", 0, max - 2, total, max), None);
     }
 
     #[test]
@@ -4220,5 +4343,63 @@ mod tests {
         assert_eq!(parse_single_range("bytes=5000-", 4096), None);
         assert_eq!(parse_single_range("bytes=-0", 4096), None);
         assert_eq!(parse_single_range("items=0-1", 4096), None);
+    }
+
+    #[test]
+    fn response_overrides_apply_in_place() {
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response.insert_header("x-origin", "keep").unwrap();
+        response
+            .insert_header("cache-control", "public, max-age=1")
+            .unwrap();
+        DataPlaneProxy::apply_browser_ttl(&mut response, Some(60));
+        DataPlaneProxy::apply_security_headers(&mut response);
+        DataPlaneProxy::apply_cors_and_custom(
+            &mut response,
+            &ResponseHeaderOverrides::parse("https://cdn.test", "X-Edge: lagran"),
+        );
+
+        assert_eq!(header_values(&response, "x-origin"), ["keep"]);
+        assert_eq!(
+            header_values(&response, "cache-control"),
+            ["public, max-age=60"]
+        );
+        assert_eq!(header_values(&response, "x-frame-options"), ["SAMEORIGIN"]);
+        assert_eq!(
+            header_values(&response, "access-control-allow-origin"),
+            ["https://cdn.test"]
+        );
+        assert_eq!(header_values(&response, "x-edge"), ["lagran"]);
+    }
+
+    #[test]
+    fn response_policy_reuses_only_matching_content_type() {
+        let policy = ResolvedPolicy {
+            ttl_override: Some(42),
+            ..Default::default()
+        };
+        let content_type = axum::http::HeaderValue::from_static("text/html; charset=utf-8");
+        let slot = Some(ResponsePolicySlot {
+            content_type: Some(content_type.clone()),
+            policy,
+        });
+        assert_eq!(
+            cached_response_policy(slot.as_ref(), Some(&content_type)),
+            Some(policy)
+        );
+        let json = axum::http::HeaderValue::from_static("application/json");
+        assert!(cached_response_policy(slot.as_ref(), Some(&json)).is_none());
+    }
+
+    #[test]
+    fn downstream_disconnects_are_classified_as_cancellations() {
+        let write =
+            pingora::Error::explain(pingora::ErrorType::WriteError, "while writing h2 response")
+                .into_down();
+        assert!(super::is_downstream_disconnect(&write));
+
+        let upstream =
+            pingora::Error::explain(pingora::ErrorType::ReadError, "origin reset").into_up();
+        assert!(!super::is_downstream_disconnect(&upstream));
     }
 }
