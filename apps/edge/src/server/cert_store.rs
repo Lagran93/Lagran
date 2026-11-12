@@ -151,7 +151,9 @@ impl CertStore {
         );
         let mut w = self.inner.write().map_err(|e| e.to_string())?;
         for n in names {
-            let key = n.to_ascii_lowercase();
+            // Same normalisation as `remove`/`retain_only`: a trailing-dot name
+            // written here under a different key could never be removed.
+            let key = normalize_cert_name(n);
             w.by_name.insert(key.clone(), ck.clone());
             w.openssl.insert(key, tls_pair.clone());
         }
@@ -169,6 +171,85 @@ impl CertStore {
             tracing::info!(server_name = %n.to_lowercase(), "cert upsert (SNI + disk)");
         }
         Ok(())
+    }
+
+    /// Remove one hostname from the in-memory store and from disk.
+    ///
+    /// Certificates had no removal path: once one reached an edge it stayed in
+    /// memory and on disk forever, so deleting or disabling it in the console
+    /// never took effect, and a restart simply reloaded the stale file.
+    pub fn remove(&self, name: &str) -> bool {
+        let key = normalize_cert_name(name);
+        let removed = match self.inner.write() {
+            Ok(mut w) => {
+                let existed = w.by_name.remove(&key).is_some();
+                w.openssl.remove(&key);
+                // Drop the default when it pointed at this entry, so a removed
+                // certificate is not still served to unmatched SNI.
+                if existed && w.by_name.is_empty() {
+                    w.default = None;
+                    w.openssl_default = None;
+                }
+                existed
+            }
+            Err(_) => false,
+        };
+        if removed {
+            self.delete_files(&key);
+            tracing::info!(server_name = %key, "cert removed (SNI + disk)");
+        }
+        removed
+    }
+
+    /// Keep only `keep`, removing everything else from memory and disk.
+    ///
+    /// Returns how many entries were removed. Used after a successful bulk sync:
+    /// the control plane's active set is authoritative, so anything absent from
+    /// it has been deleted or disabled.
+    pub fn retain_only(&self, keep: &[String]) -> usize {
+        let wanted: std::collections::HashSet<String> =
+            keep.iter().map(|n| normalize_cert_name(n)).collect();
+        let stale: Vec<String> = match self.inner.read() {
+            Ok(g) => g
+                .by_name
+                .keys()
+                .filter(|k| !wanted.contains(*k))
+                .cloned()
+                .collect(),
+            Err(_) => return 0,
+        };
+        let mut removed = 0;
+        for name in stale {
+            if self.remove(&name) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Hostnames currently installed, lowercased.
+    pub fn names(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .map(|g| g.by_name.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn delete_files(&self, name: &str) {
+        let Some(ref dir) = self.dir else {
+            return;
+        };
+        let stem = name.replace('*', "_star_");
+        for ext in ["crt", "key"] {
+            let path = dir.join(format!("{stem}.{ext}"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::debug!(path = %path.display(), "cert file removed"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "remove cert file failed")
+                }
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -254,6 +335,14 @@ impl Default for CertStore {
     }
 }
 
+/// Canonical hostname key used by lookups and removals.
+///
+/// `upsert` stores lowercased names; removal and retention must use the same
+/// form or they would silently miss the entry.
+fn normalize_cert_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// Write a file readable only by its owner (0600), replacing any existing mode.
 ///
 /// Uses `OpenOptions::mode` on Unix so the permissions apply at creation time:
@@ -325,5 +414,95 @@ mod tests {
         let second = store.certificate_for("b.example.com").unwrap();
         assert!(Arc::ptr_eq(&first.0, &second.0));
         assert!(Arc::ptr_eq(&first.1, &second.1));
+    }
+    /// Removing a certificate must drop it from memory and from disk.
+    ///
+    /// Before this existed the store only ever grew, so a certificate deleted or
+    /// disabled in the console stayed installed until the process restarted (and
+    /// a restart reloaded the stale file).
+    #[test]
+    fn remove_drops_the_certificate_from_memory_and_disk() {
+        let dir = std::env::temp_dir().join(format!("lagran-cert-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = CertStore::with_persist_dir(&dir);
+        let (cert, key) = test_certificate();
+        store
+            .upsert(&["gone.example".to_string()], &cert, &key)
+            .unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(dir.join("gone.example.crt").exists());
+
+        assert!(store.remove("gone.example"));
+        assert!(store.is_empty(), "memory entry must be dropped");
+        assert!(
+            !dir.join("gone.example.crt").exists(),
+            "cert file must be deleted"
+        );
+        assert!(
+            !dir.join("gone.example.key").exists(),
+            "key file must be deleted"
+        );
+
+        // Removing something absent is a no-op, not an error.
+        assert!(!store.remove("gone.example"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Name matching must be case- and trailing-dot-insensitive, matching how
+    /// upsert stores entries.
+    #[test]
+    fn remove_normalises_the_name() {
+        let store = CertStore::new();
+        let (cert, key) = test_certificate();
+        store
+            .upsert(&["MiXeD.Example.".to_string()], &cert, &key)
+            .unwrap();
+        assert!(store.remove("mixed.example"));
+        assert!(store.is_empty());
+    }
+
+    /// A bulk sync must prune everything outside the advertised active set.
+    #[test]
+    fn retain_only_keeps_the_active_set() {
+        let dir = std::env::temp_dir().join(format!("lagran-cert-retain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = CertStore::with_persist_dir(&dir);
+        let (cert, key) = test_certificate();
+        for name in ["a.example", "b.example", "c.example"] {
+            store.upsert(&[name.to_string()], &cert, &key).unwrap();
+        }
+        assert_eq!(store.len(), 3);
+
+        let removed = store.retain_only(&["a.example".to_string(), "c.example".to_string()]);
+        assert_eq!(removed, 1, "only b.example should go");
+        let mut names = store.names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["a.example".to_string(), "c.example".to_string()]
+        );
+        assert!(!dir.join("b.example.crt").exists());
+        assert!(dir.join("a.example.crt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Emptying the store must clear the default, or a removed certificate keeps
+    /// being served to clients whose SNI matches nothing.
+    #[test]
+    fn removing_the_last_certificate_clears_the_default() {
+        let store = CertStore::new();
+        let (cert, key) = test_certificate();
+        store
+            .upsert(&["only.example".to_string()], &cert, &key)
+            .unwrap();
+        assert!(store.certificate_for("unmatched.example").is_some());
+        store.remove("only.example");
+        assert!(
+            store.certificate_for("unmatched.example").is_none(),
+            "default must not outlive the certificate it pointed at"
+        );
     }
 }

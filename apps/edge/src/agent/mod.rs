@@ -65,6 +65,48 @@ fn default_enabled() -> bool {
     true
 }
 
+/// Run a background task, restarting it if its future panics.
+///
+/// A bare `tokio::spawn` that panics disappears silently: the edge keeps
+/// serving with whatever configuration it had at startup, heartbeats continue
+/// from their own task, and the node looks healthy while new domains and WAF
+/// rules never take effect. Supervision turns that into a logged, retried
+/// condition instead.
+pub fn spawn_supervised<F, Fut>(name: &'static str, build: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restarts: u64 = 0;
+        loop {
+            // The inner task is spawned so a panic is caught as a JoinError
+            // rather than unwinding this supervisor as well.
+            match tokio::spawn(build()).await {
+                Ok(()) => return,
+                Err(e) => {
+                    restarts = restarts.saturating_add(1);
+                    let backoff = std::time::Duration::from_secs((5 * restarts).min(60));
+                    if e.is_panic() {
+                        tracing::error!(
+                            task = name,
+                            restarts,
+                            "background task panicked; restarting"
+                        );
+                    } else {
+                        tracing::warn!(
+                            task = name,
+                            restarts,
+                            "background task was cancelled; restarting"
+                        );
+                    }
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    });
+}
+
 pub fn spawn_heartbeat(config: EdgeConfig, control: ControlClient, node_control: NodeControl) {
     tokio::spawn(async move {
         let interval = Duration::from_secs(config.heartbeat_interval_secs.max(5));
@@ -139,4 +181,65 @@ fn memory_usage() -> Option<f64> {
         return None;
     }
     Some(((((total - available) / total) * 100.0 * 10.0).round() / 10.0).clamp(0.0, 100.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// A panicking background task must be restarted, not silently lost.
+    ///
+    /// With a bare `tokio::spawn` the panic only surfaced as a dropped JoinHandle
+    /// and the loop disappeared; the edge then kept serving its startup config
+    /// while heartbeats continued, so the node looked healthy.
+    #[tokio::test]
+    async fn supervised_task_restarts_after_panic() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let counter = runs.clone();
+        spawn_supervised("test-panic", move || {
+            let counter = counter.clone();
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    panic!("first run panics");
+                }
+                // Second run returns normally, which stops the supervisor.
+            }
+        });
+
+        // The supervisor sleeps 5s before restarting; allow for that.
+        for _ in 0..100 {
+            if runs.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "task should run again after panicking"
+        );
+    }
+
+    /// A task that completes normally must not be restarted.
+    #[tokio::test]
+    async fn supervised_task_completing_does_not_restart() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let counter = runs.clone();
+        spawn_supervised("test-complete", move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "a finished task must not be re-run"
+        );
+    }
 }

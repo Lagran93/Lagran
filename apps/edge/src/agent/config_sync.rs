@@ -598,155 +598,167 @@ pub fn spawn_config_sync(
     cache: SharedCache,
     large_cache: Option<std::sync::Arc<LargeCache>>,
 ) {
-    tokio::spawn(async move {
-        tracing::info!(url = %control.endpoint("/api/v1/config"), "domain registry sync started");
-        let mut last_version = String::new();
-        let mut last_etag: Option<String> = None;
-        let mut last_reported: Option<String> = None;
+    // Supervised: if this loop panics, the edge would keep serving its startup
+    // configuration forever while still reporting healthy.
+    crate::agent::spawn_supervised("config-sync", move || {
+        let control = control.clone();
+        let config = config.clone();
+        let origin = origin.clone();
+        let rules = rules.clone();
+        let registry = registry.clone();
+        let cache = cache.clone();
+        let large_cache = large_cache.clone();
+        async move {
+            tracing::info!(url = %control.endpoint("/api/v1/config"), "domain registry sync started");
+            let mut last_version = String::new();
+            let mut last_etag: Option<String> = None;
+            let mut last_reported: Option<String> = None;
 
-        loop {
-            match control
-                .get_json_conditional::<AllConfig>("/api/v1/config", last_etag.as_deref())
-                .await
-            {
-                Ok(conditional) => {
-                    if let Some(etag) = conditional.etag {
-                        last_etag = Some(etag);
-                    }
-                    if let Some(cfg) = conditional.value {
-                        if cfg.version != last_version {
-                            let release_id = cfg.release_id.clone();
-                            let entries: Vec<DomainEntry> = cfg
-                                .domains
-                                .into_iter()
-                                .map(|d| d.into_entry(&config))
-                                .collect();
-                            let n = entries.len();
-
-                            // Any domain whose per-domain version changed must
-                            // drop its cache on every edge. This prevents old
-                            // TTL/rule/header objects from surviving a config
-                            // release or rollback on a subset of nodes.
-                            let old_versions = registry.version_map().await;
-                            // On first sync the registry is empty because the
-                            // process just started, not because every domain
-                            // changed. Purging here would wipe the shared L2
-                            // cache on every edge restart.
-                            let initial_sync = old_versions.is_empty();
-                            let mut new_versions = std::collections::HashMap::new();
-                            for entry in &entries {
-                                new_versions.insert(entry.domain.clone(), entry.version.clone());
-                            }
-                            let mut changed_domains: Vec<String> = if initial_sync {
-                                Vec::new()
-                            } else {
-                                new_versions
-                                    .iter()
-                                    .filter(|(domain, version)| {
-                                        old_versions.get(*domain) != Some(*version)
-                                    })
-                                    .map(|(domain, _)| domain.clone())
-                                    .collect()
-                            };
-                            if !initial_sync {
-                                for domain in old_versions.keys() {
-                                    if !new_versions.contains_key(domain) {
-                                        changed_domains.push(domain.clone());
-                                    }
-                                }
-                            }
-                            changed_domains.sort();
-                            changed_domains.dedup();
-
-                            registry
-                                .replace_all(entries.clone(), cfg.version.clone())
-                                .await;
-                            for domain in &changed_domains {
-                                let purged =
-                                    cache.purge_matching(std::slice::from_ref(domain)).await;
-                                let large_purged = if let Some(large) = large_cache.as_ref() {
-                                    large.purge_patterns(std::slice::from_ref(domain)).await
-                                } else {
-                                    0
-                                };
-                                if purged > 0 || large_purged > 0 {
-                                    tracing::info!(
-                                        domain = %domain,
-                                        purged,
-                                        large_purged,
-                                        "domain config changed; cache invalidated"
-                                    );
-                                }
-                            }
-                            // Global rule set is only a legacy single-domain fallback,
-                            // so keep the union but never use it for onboarded hosts.
-                            rules
-                                .replace(
-                                    entries
-                                        .iter()
-                                        .flat_map(|e| e.rules.iter().cloned())
-                                        .collect(),
-                                )
-                                .await;
-
-                            if !config.domain.is_empty() {
-                                if let Some(d) = registry.get(&config.domain).await {
-                                    origin.set_base_url(d.origin_url.clone()).await;
-                                }
-                            }
-
-                            tracing::info!(domains = n, version = %cfg.version, "domain registry updated");
-                            last_version = cfg.version;
-                            if let Some(release_id) = release_id {
-                                let key = format!("{release_id}:{}", last_version);
-                                if last_reported.as_deref() != Some(key.as_str()) {
-                                    let report = serde_json::json!({
-                                        "release_id": release_id,
-                                        "success": true,
-                                        "error": "",
-                                    });
-                                    match control
-                                        .post_json("/api/v1/config/apply-report", &report)
-                                        .await
-                                    {
-                                        Ok(_) => last_reported = Some(key),
-                                        Err(e) => tracing::warn!(
-                                            release = %release_id,
-                                            error = %e,
-                                            "config release apply report failed"
-                                        ),
-                                    }
-                                }
-                            }
-                            if last_etag.is_none() {
-                                last_etag = Some(format!("\"{}\"", last_version));
-                            }
+            loop {
+                match control
+                    .get_json_conditional::<AllConfig>("/api/v1/config", last_etag.as_deref())
+                    .await
+                {
+                    Ok(conditional) => {
+                        if let Some(etag) = conditional.etag {
+                            last_etag = Some(etag);
                         }
-                    } else {
-                        tracing::debug!("domain config not modified (304)");
+                        if let Some(cfg) = conditional.value {
+                            if cfg.version != last_version {
+                                let release_id = cfg.release_id.clone();
+                                let entries: Vec<DomainEntry> = cfg
+                                    .domains
+                                    .into_iter()
+                                    .map(|d| d.into_entry(&config))
+                                    .collect();
+                                let n = entries.len();
+
+                                // Any domain whose per-domain version changed must
+                                // drop its cache on every edge. This prevents old
+                                // TTL/rule/header objects from surviving a config
+                                // release or rollback on a subset of nodes.
+                                let old_versions = registry.version_map().await;
+                                // On first sync the registry is empty because the
+                                // process just started, not because every domain
+                                // changed. Purging here would wipe the shared L2
+                                // cache on every edge restart.
+                                let initial_sync = old_versions.is_empty();
+                                let mut new_versions = std::collections::HashMap::new();
+                                for entry in &entries {
+                                    new_versions
+                                        .insert(entry.domain.clone(), entry.version.clone());
+                                }
+                                let mut changed_domains: Vec<String> = if initial_sync {
+                                    Vec::new()
+                                } else {
+                                    new_versions
+                                        .iter()
+                                        .filter(|(domain, version)| {
+                                            old_versions.get(*domain) != Some(*version)
+                                        })
+                                        .map(|(domain, _)| domain.clone())
+                                        .collect()
+                                };
+                                if !initial_sync {
+                                    for domain in old_versions.keys() {
+                                        if !new_versions.contains_key(domain) {
+                                            changed_domains.push(domain.clone());
+                                        }
+                                    }
+                                }
+                                changed_domains.sort();
+                                changed_domains.dedup();
+
+                                registry
+                                    .replace_all(entries.clone(), cfg.version.clone())
+                                    .await;
+                                for domain in &changed_domains {
+                                    let purged =
+                                        cache.purge_matching(std::slice::from_ref(domain)).await;
+                                    let large_purged = if let Some(large) = large_cache.as_ref() {
+                                        large.purge_patterns(std::slice::from_ref(domain)).await
+                                    } else {
+                                        0
+                                    };
+                                    if purged > 0 || large_purged > 0 {
+                                        tracing::info!(
+                                            domain = %domain,
+                                            purged,
+                                            large_purged,
+                                            "domain config changed; cache invalidated"
+                                        );
+                                    }
+                                }
+                                // Global rule set is only a legacy single-domain fallback,
+                                // so keep the union but never use it for onboarded hosts.
+                                rules
+                                    .replace(
+                                        entries
+                                            .iter()
+                                            .flat_map(|e| e.rules.iter().cloned())
+                                            .collect(),
+                                    )
+                                    .await;
+
+                                if !config.domain.is_empty() {
+                                    if let Some(d) = registry.get(&config.domain).await {
+                                        origin.set_base_url(d.origin_url.clone()).await;
+                                    }
+                                }
+
+                                tracing::info!(domains = n, version = %cfg.version, "domain registry updated");
+                                last_version = cfg.version;
+                                if let Some(release_id) = release_id {
+                                    let key = format!("{release_id}:{}", last_version);
+                                    if last_reported.as_deref() != Some(key.as_str()) {
+                                        let report = serde_json::json!({
+                                            "release_id": release_id,
+                                            "success": true,
+                                            "error": "",
+                                        });
+                                        match control
+                                            .post_json("/api/v1/config/apply-report", &report)
+                                            .await
+                                        {
+                                            Ok(_) => last_reported = Some(key),
+                                            Err(e) => tracing::warn!(
+                                                release = %release_id,
+                                                error = %e,
+                                                "config release apply report failed"
+                                            ),
+                                        }
+                                    }
+                                }
+                                if last_etag.is_none() {
+                                    last_etag = Some(format!("\"{}\"", last_version));
+                                }
+                            }
+                        } else {
+                            tracing::debug!("domain config not modified (304)");
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "config sync failed"),
+                }
+
+                // Single-domain fallback if EDGE_DOMAIN is set and the registry is empty.
+                if !config.domain.is_empty() && registry.is_empty().await {
+                    let path = format!("/api/v1/config/{}", config.domain);
+                    match control.get_json::<DomainCfg>(&path).await {
+                        Ok(d) => {
+                            let entry = d.into_entry(&config);
+                            origin.set_base_url(entry.origin_url.clone()).await;
+                            rules.replace(entry.rules.clone()).await;
+                            registry.upsert(entry).await;
+                        }
+                        Err(e) => tracing::debug!(error = %e, "single-domain config fetch failed"),
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "config sync failed"),
-            }
 
-            // Single-domain fallback if EDGE_DOMAIN is set and the registry is empty.
-            if !config.domain.is_empty() && registry.is_empty().await {
-                let path = format!("/api/v1/config/{}", config.domain);
-                match control.get_json::<DomainCfg>(&path).await {
-                    Ok(d) => {
-                        let entry = d.into_entry(&config);
-                        origin.set_base_url(entry.origin_url.clone()).await;
-                        rules.replace(entry.rules.clone()).await;
-                        registry.upsert(entry).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(config.config_sync_interval_secs.max(5))) => {}
+                    _ = config_kick().notified() => {
+                        tracing::info!("config reload requested; pulling immediately");
                     }
-                    Err(e) => tracing::debug!(error = %e, "single-domain config fetch failed"),
-                }
-            }
-
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(config.config_sync_interval_secs.max(5))) => {}
-                _ = config_kick().notified() => {
-                    tracing::info!("config reload requested; pulling immediately");
                 }
             }
         }
