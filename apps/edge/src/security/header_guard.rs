@@ -12,6 +12,15 @@ use crate::config::registry::normalize_host;
 
 pub const MAX_HEADERS: usize = 128;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// Largest single header value this edge accepts.
+///
+/// The total cap alone let one header consume the entire budget: a single 64 KiB
+/// `Cookie`, `Referer` or custom header was accepted, copied into the access log,
+/// into the origin request, and into the cache key when a rule keyed on it. Legal
+/// values are far smaller — the largest a real client sends is a cookie or a long
+/// referer, both well under 8 KiB — so this bounds one header without rejecting
+/// anything real. `MAX_HEADER_BYTES` still bounds the sum.
+pub const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
 const MAX_HOST_LEN: usize = 255;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +140,9 @@ pub fn validate(
         total = total.saturating_add(name.as_str().len() + value.as_bytes().len());
         if total > MAX_HEADER_BYTES {
             return Err(HeaderViolation::new("header-bytes"));
+        }
+        if value.as_bytes().len() > MAX_HEADER_VALUE_BYTES {
+            return Err(HeaderViolation::new("header-value-bytes"));
         }
         if value.to_str().map(bad_value).unwrap_or(true) {
             return Err(HeaderViolation::new("bad-header-value"));
@@ -424,5 +436,58 @@ mod tests {
         assert_eq!(parse_authority_host("[::1]:8080"), Some("[::1]:8080"));
         assert_eq!(parse_authority_host("a.test:"), None);
         assert_eq!(parse_authority_host(""), None);
+    }
+    /// One header must not be able to consume the whole byte budget.
+    #[test]
+    fn rejects_an_oversized_single_header() {
+        let mut h = HeaderMap::new();
+        h.insert(HOST, HeaderValue::from_static("a.test"));
+        h.insert(
+            HeaderName::from_static("x-big"),
+            HeaderValue::from_str(&"a".repeat(MAX_HEADER_VALUE_BYTES + 1)).unwrap(),
+        );
+        let uri: Uri = "/x".parse().unwrap();
+        assert_eq!(
+            validate(&h, &uri, &Method::GET, Version::HTTP_11)
+                .unwrap_err()
+                .reason,
+            "header-value-bytes"
+        );
+    }
+
+    /// A large but legal header still passes.
+    #[test]
+    fn accepts_a_realistic_large_header() {
+        let mut h = HeaderMap::new();
+        h.insert(HOST, HeaderValue::from_static("a.test"));
+        // A long `Referer`/`Cookie` is the biggest a real client sends.
+        h.insert(
+            HeaderName::from_static("cookie"),
+            HeaderValue::from_str(&"k=v; ".repeat(600)).unwrap(),
+        );
+        let uri: Uri = "/x".parse().unwrap();
+        assert!(validate(&h, &uri, &Method::GET, Version::HTTP_11).is_ok());
+    }
+
+    /// Many small headers are still bounded by the total.
+    #[test]
+    fn total_header_bytes_still_bounded() {
+        let mut h = HeaderMap::new();
+        h.insert(HOST, HeaderValue::from_static("a.test"));
+        let chunk = "a".repeat(4000);
+        for i in 0..17 {
+            // Each is under the per-header cap; 17 x 4000 exceeds the 64 KiB total.
+            h.insert(
+                HeaderName::try_from(format!("x-{i}")).unwrap(),
+                HeaderValue::from_str(&chunk).unwrap(),
+            );
+        }
+        let uri: Uri = "/x".parse().unwrap();
+        assert_eq!(
+            validate(&h, &uri, &Method::GET, Version::HTTP_11)
+                .unwrap_err()
+                .reason,
+            "header-bytes"
+        );
     }
 }
