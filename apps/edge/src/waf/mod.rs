@@ -1441,7 +1441,12 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
             req.headers
                 .get(name)
                 .and_then(|value| value.to_str().ok())
-                .map(decode_lower)
+                // Twice, like path/query/ua/referer. A single pass left
+                // `%252Fadmin` as `/%2fadmin`, which a rule written as
+                // `x-probe contains "/admin"` does not match — the same payload in
+                // the path matched because the path is decoded twice. One payload
+                // must not be caught in one field and missed in another.
+                .map(decode_lower_twice)
         })
         .collect();
     let mut fields = RuleFields {
@@ -2553,5 +2558,114 @@ mod geo_policy_tests {
             headers: &h,
         };
         assert!(evaluate(&c, &request).is_none());
+    }
+    /// A custom DSL rule must see the same decoded path the managed rules do.
+    ///
+    /// `RuleFields` takes `path`/`query` from `decode_lower_twice`, so a rule
+    /// written as `path prefix "/admin"` should catch a request for `/ad%6din`.
+    #[test]
+    fn dsl_rules_see_percent_decoded_fields() {
+        let mut c = cfg();
+        c.rules = vec![WafRule {
+            name: "block admin".into(),
+            field: WafField::Path,
+            op: WafOp::Prefix,
+            value: "/admin".into(),
+            action: WafAction::Block,
+            priority: 0,
+            enabled: true,
+            expr: None,
+        }];
+        c.finalize();
+        let h = HeaderMap::new();
+        for (path, expect_blocked) in [
+            ("/admin/x", true),
+            ("/ad%6din/x", true),
+            ("/%61dmin/x", true),
+            ("/ADMIN/x", true),
+            ("/public/x", false),
+        ] {
+            let request = WafRequest {
+                method: "GET",
+                path,
+                query: "",
+                user_agent: "Mozilla/5.0 Chrome/131.0.0.0",
+                referer: "",
+                ip: Some("198.51.100.10".parse().unwrap()),
+                country: None,
+                asn: None,
+                headers: &h,
+            };
+            let blocked = evaluate(&c, &request).is_some();
+            assert_eq!(
+                blocked, expect_blocked,
+                "{path} blocked={blocked}, expected {expect_blocked}"
+            );
+        }
+    }
+
+    /// A header value must be decoded to the same depth as the other fields.
+    ///
+    /// `RuleFields` decodes `path`/`query`/`ua`/`referer` with
+    /// `decode_lower_twice` but header values with `decode_lower` (a single pass),
+    /// so a double-encoded payload such as `%252Fadmin` reaches a header rule as
+    /// `%2fadmin` instead of `/admin`.
+    #[test]
+    fn header_fields_decode_to_the_same_depth_as_path() {
+        // Managed rules would catch the double-encoded payload on their own and
+        // hide the difference, so every one of them is off for this probe.
+        let mut c = cfg();
+        c.managed = ManagedRules {
+            sqli: false,
+            xss: false,
+            traversal: false,
+            scanners: false,
+            rce: false,
+            ssrf: false,
+            xxe: false,
+            log4shell: false,
+            crlf: false,
+            ssti: false,
+            nosql: false,
+            ldap: false,
+            java: false,
+            webshell: false,
+            protocol: false,
+        };
+        c.rules = vec![WafRule {
+            name: "probe".into(),
+            field: WafField::Header("x-probe".into()),
+            op: WafOp::Contains,
+            value: "/admin".into(),
+            action: WafAction::Block,
+            priority: 0,
+            enabled: true,
+            expr: None,
+        }];
+        c.finalize();
+        let mut h = HeaderMap::new();
+        // `%252F` decodes to `%2F` after one pass and to `/` after two. A rule
+        // written as `contains "/admin"` only matches the second, so a value
+        // decoded once is a bypass.
+        h.insert(
+            http::header::HeaderName::from_static("x-probe"),
+            http::header::HeaderValue::from_static("/%252Fadmin"),
+        );
+        let request = WafRequest {
+            method: "GET",
+            path: "/safe",
+            query: "",
+            user_agent: "Mozilla/5.0",
+            referer: "",
+            ip: Some("198.51.100.10".parse().unwrap()),
+            country: None,
+            asn: None,
+            headers: &h,
+        };
+        assert_eq!(
+            evaluate(&c, &request).map(|v| v.rule_name),
+            Some("probe".to_string()),
+            "a double-encoded header value must be caught, not just a single-encoded one"
+        );
     }
 }
