@@ -431,34 +431,38 @@ pub async fn create_domain(
 }
 
 pub async fn delete_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
-    let _ =
-        sqlx::query("DELETE FROM cc_bans WHERE domain = (SELECT name FROM domains WHERE id = $1)")
-            .bind(id)
-            .execute(pool)
-            .await;
-    let _ = sqlx::query(
-        "DELETE FROM origin_health WHERE domain_name = (SELECT name FROM domains WHERE id = $1)",
-    )
-    .bind(id)
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
-        "DELETE FROM prefetch_schedules WHERE domain = (SELECT name FROM domains WHERE id = $1)",
-    )
-    .bind(id)
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
-        "DELETE FROM prefetch_tasks WHERE domain = (SELECT name FROM domains WHERE id = $1)",
-    )
-    .bind(id)
-    .execute(pool)
-    .await;
-    let r = sqlx::query("DELETE FROM domains WHERE id = $1")
+    // One transaction, no swallowed errors.
+    //
+    // These five statements used to run outside a transaction with `let _ =` on
+    // the first four. If the final `DELETE FROM domains` failed — a new foreign
+    // key, a permission change — the side tables had already been committed, so
+    // the domain survived with its CC bans, origin health history and prefetch
+    // schedule wiped. A failure now rolls the whole delete back, and a failure in
+    // a side table aborts instead of being ignored.
+    let mut tx = pool.begin().await?;
+    let name: Option<String> = sqlx::query_scalar("SELECT name FROM domains WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .fetch_optional(&mut *tx)
         .await?;
-    Ok(r.rows_affected())
+    let Some(name) = name else {
+        // Nothing to delete; report 0 affected without touching the side tables.
+        return Ok(0);
+    };
+    for statement in [
+        "DELETE FROM cc_bans WHERE domain = $1",
+        "DELETE FROM origin_health WHERE domain_name = $1",
+        "DELETE FROM prefetch_schedules WHERE domain = $1",
+        "DELETE FROM prefetch_tasks WHERE domain = $1",
+    ] {
+        sqlx::query(statement).bind(&name).execute(&mut *tx).await?;
+    }
+    let removed = sqlx::query("DELETE FROM domains WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(removed)
 }
 
 pub async fn list_nodes(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
@@ -1984,25 +1988,6 @@ pub async fn get_domain_settings(
     .await
 }
 
-type DomainSettingsPatchRow = (
-    bool,   // ignore_query_string
-    String, // cache_key_ignore_headers
-    String, // cors_origins
-    String, // hotlink_allow_referers
-    i32,    // origin_timeout_ms
-    String, // custom_headers
-    i32,    // rate_limit_rps
-    i32,    // rate_limit_burst
-    bool,   // cc_enabled
-    i32,    // cc_rps
-    i32,    // cc_burst
-    i32,    // cc_ban_after
-    i32,    // cc_ban_seconds
-    String, // cc_mode
-    String, // cc_allow_ips
-    String, // shield_url
-);
-
 #[allow(clippy::too_many_arguments)]
 pub async fn update_domain_settings(
     pool: &PgPool,
@@ -2024,61 +2009,54 @@ pub async fn update_domain_settings(
     shield_url: Option<&str>,
     cache_key_ignore_headers: Option<&str>,
 ) -> sqlx::Result<u64> {
-    // load existing then patch
-    let row: Option<DomainSettingsPatchRow> = sqlx::query_as(
-        r#"
-        SELECT ignore_query_string, cache_key_ignore_headers, cors_origins,
-               hotlink_allow_referers, origin_timeout_ms, custom_headers,
-               rate_limit_rps, rate_limit_burst,
-               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
-               COALESCE(shield_url, '') AS shield_url
-        FROM domains WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
-    let Some(e) = row else { return Ok(0) };
+    // Merge in the database, not in Rust.
+    //
+    // This used to SELECT the whole settings row, patch it in memory, then write
+    // every column back. Two concurrent edits therefore raced: each read the same
+    // pre-edit snapshot and the later write restored the earlier request's values
+    // for every field it had not meant to touch. `COALESCE($n, column)` updates
+    // only the fields the caller supplied, so a partially-specified PUT cannot
+    // clobber a concurrent one.
     let r = sqlx::query(
         r#"
         UPDATE domains SET
-          ignore_query_string = $2,
-          cors_origins = $3,
-          hotlink_allow_referers = $4,
-          origin_timeout_ms = $5,
-          custom_headers = $6,
-          rate_limit_rps = $7,
-          rate_limit_burst = $8,
-          cc_enabled = $9,
-          cc_rps = $10,
-          cc_burst = $11,
-          cc_ban_after = $12,
-          cc_ban_seconds = $13,
-          cc_mode = $14,
-          cc_allow_ips = $15,
-          shield_url = $16,
-          cache_key_ignore_headers = $17,
+          ignore_query_string = COALESCE($2, ignore_query_string),
+          cors_origins = COALESCE($3, cors_origins),
+          hotlink_allow_referers = COALESCE($4, hotlink_allow_referers),
+          origin_timeout_ms = COALESCE($5, origin_timeout_ms),
+          custom_headers = COALESCE($6, custom_headers),
+          rate_limit_rps = COALESCE($7, rate_limit_rps),
+          rate_limit_burst = COALESCE($8, rate_limit_burst),
+          cc_enabled = COALESCE($9, cc_enabled),
+          cc_rps = COALESCE($10, cc_rps),
+          cc_burst = COALESCE($11, cc_burst),
+          cc_ban_after = COALESCE($12, cc_ban_after),
+          cc_ban_seconds = COALESCE($13, cc_ban_seconds),
+          cc_mode = COALESCE($14, cc_mode),
+          cc_allow_ips = COALESCE($15, cc_allow_ips),
+          shield_url = COALESCE($16, shield_url),
+          cache_key_ignore_headers = COALESCE($17, cache_key_ignore_headers),
           updated_at = NOW()
         WHERE id = $1
         "#,
     )
     .bind(id)
-    .bind(ignore_query.unwrap_or(e.0))
-    .bind(cors.unwrap_or(&e.2))
-    .bind(hotlink.unwrap_or(&e.3))
-    .bind(timeout_ms.unwrap_or(e.4))
-    .bind(headers.unwrap_or(&e.5))
-    .bind(rps.unwrap_or(e.6))
-    .bind(burst.unwrap_or(e.7))
-    .bind(cc_enabled.unwrap_or(e.8))
-    .bind(cc_rps.unwrap_or(e.9))
-    .bind(cc_burst.unwrap_or(e.10))
-    .bind(cc_ban_after.unwrap_or(e.11))
-    .bind(cc_ban_seconds.unwrap_or(e.12))
-    .bind(cc_mode.unwrap_or(&e.13))
-    .bind(cc_allow_ips.unwrap_or(&e.14))
-    .bind(shield_url.unwrap_or(&e.15))
-    .bind(cache_key_ignore_headers.unwrap_or(&e.1))
+    .bind(ignore_query)
+    .bind(cors)
+    .bind(hotlink)
+    .bind(timeout_ms)
+    .bind(headers)
+    .bind(rps)
+    .bind(burst)
+    .bind(cc_enabled)
+    .bind(cc_rps)
+    .bind(cc_burst)
+    .bind(cc_ban_after)
+    .bind(cc_ban_seconds)
+    .bind(cc_mode)
+    .bind(cc_allow_ips)
+    .bind(shield_url)
+    .bind(cache_key_ignore_headers)
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
