@@ -43,10 +43,23 @@ export TEST_DATABASE_URL="postgres://lagran:pass@127.0.0.1:5432/lagran"
 cargo test -p control --test repository
 ```
 
-Falls back to `DATABASE_URL` when `TEST_DATABASE_URL` is unset. **With neither
-set the tests skip with a message and exit 0**, so `cargo test` still works on a
-machine without PostgreSQL — CI that must run them should fail if the variable is
-missing rather than rely on the skip.
+Falls back to `DATABASE_URL` when `TEST_DATABASE_URL` is unset.
+
+**With neither set the tests skip with a message and exit 0**, so `cargo test`
+still works on a machine without PostgreSQL. A skip that nobody notices is worse
+than a failure, so set `REQUIRE_TEST_DATABASE=1` wherever the tests must actually
+run — a missing or unusable database then fails the run:
+
+```bash
+TEST_DATABASE_URL="postgres://lagran:pass@127.0.0.1:5432/lagran_test" \
+REQUIRE_TEST_DATABASE=1 \
+cargo test -p control --test repository
+```
+
+CI does exactly this. The `backend` job in `.github/workflows/ci.yml` starts a
+`postgres:16` service container, points `TEST_DATABASE_URL` at it and sets
+`REQUIRE_TEST_DATABASE=1`, so the integration tests cannot be skipped silently
+there.
 
 The schema is dropped by an explicit `TestDb::close()` at the end of each test.
 Cleanup deliberately does not live in `Drop`: dropping a pool has to await, and a

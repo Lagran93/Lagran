@@ -17,6 +17,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Whether a missing test database must fail instead of skipping.
+fn require_database() -> bool {
+    matches!(
+        std::env::var("REQUIRE_TEST_DATABASE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// A migrated schema that is dropped when the value is dropped.
 pub struct TestDb {
     pub pool: PgPool,
@@ -38,7 +50,7 @@ impl TestDb {
                 }
             })
         else {
-            return Self::skip();
+            return Self::unavailable("neither TEST_DATABASE_URL nor DATABASE_URL is set");
         };
 
         let schema = format!(
@@ -51,16 +63,15 @@ impl TestDb {
         let admin = match PgPoolOptions::new().max_connections(1).connect(&base).await {
             Ok(pool) => pool,
             Err(e) => {
-                eprintln!("integration test: cannot connect to the test database: {e}");
-                return Self::skip();
+                return Self::unavailable(&format!("cannot connect to the test database: {e}"));
             }
         };
         if let Err(e) = admin
             .execute(format!("CREATE SCHEMA IF NOT EXISTS {schema}").as_str())
             .await
         {
-            eprintln!("integration test: cannot create schema {schema}: {e}");
-            return Self::skip();
+            let _ = admin.close().await;
+            return Self::unavailable(&format!("cannot create schema {schema}: {e}"));
         }
 
         // Every connection in the pool must resolve unqualified names to the
@@ -75,21 +86,21 @@ impl TestDb {
         {
             Ok(pool) => pool,
             Err(e) => {
-                eprintln!("integration test: cannot connect with search_path: {e}");
                 let _ = admin
                     .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
                     .await;
-                return Self::skip();
+                let _ = admin.close().await;
+                return Self::unavailable(&format!("cannot apply search_path: {e}"));
             }
         };
 
         if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
-            eprintln!("integration test: migrations failed: {e}");
             let _ = pool.close().await;
             let _ = admin
                 .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
                 .await;
-            return Self::skip();
+            let _ = admin.close().await;
+            return Self::unavailable(&format!("migrations failed: {e}"));
         }
 
         let _ = admin.close().await;
@@ -100,7 +111,18 @@ impl TestDb {
         }
     }
 
-    fn skip() -> Self {
+    /// No database is available.
+    ///
+    /// Skipping keeps `cargo test` usable on a machine without PostgreSQL, but a
+    /// silent skip in CI would report green while validating nothing. Setting
+    /// `REQUIRE_TEST_DATABASE=1` turns a missing database into a failure instead.
+    fn unavailable(reason: &str) -> Self {
+        if require_database() {
+            panic!(
+                "REQUIRE_TEST_DATABASE is set but the integration database is unusable: {reason}"
+            );
+        }
+        eprintln!("skipping integration test: {reason}");
         // A pool that is never used; tests check `skipped` before touching it.
         let pool = PgPoolOptions::new()
             .max_connections(1)
