@@ -27,6 +27,35 @@ npm install
 NUXT_PUBLIC_API_BASE=http://localhost:8080 npm run dev
 ```
 
+## Integration Tests (repository layer)
+
+`apps/control/tests/` holds integration tests that exercise the SQL directly —
+transactional atomicity, `COALESCE` merges, NULL-safe unique indexes and the
+targeted name queries. They need a real PostgreSQL instance; SQLite or a mock
+would not reproduce the constraint and locking behaviour under test.
+
+Each test creates its own schema, runs the full migration set into it and drops
+it afterwards, so cases run in parallel and cannot see each other's rows.
+
+```bash
+# Point at any database the user may create schemas in.
+export TEST_DATABASE_URL="postgres://lagran:pass@127.0.0.1:5432/lagran"
+cargo test -p control --test repository
+```
+
+Falls back to `DATABASE_URL` when `TEST_DATABASE_URL` is unset. **With neither
+set the tests skip with a message and exit 0**, so `cargo test` still works on a
+machine without PostgreSQL — CI that must run them should fail if the variable is
+missing rather than rely on the skip.
+
+The schema is dropped by an explicit `TestDb::close()` at the end of each test.
+Cleanup deliberately does not live in `Drop`: dropping a pool has to await, and a
+`Drop` impl that starts a thread and joins it deadlocks once the test runtime
+begins shutting down. A test that returns before `close()` leaves its schema
+behind; the next run ignores it, and
+`SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'lagran_test_%'`
+lists any leftovers.
+
 ## Auth
 
 - 登录 `POST /api/v1/auth/login` → JWT
