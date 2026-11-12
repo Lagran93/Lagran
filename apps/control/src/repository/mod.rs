@@ -10,7 +10,7 @@ pub use prefetch::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -349,6 +349,77 @@ pub async fn count_active_admins(pool: &PgPool) -> sqlx::Result<i64> {
             .fetch_one(pool)
             .await?;
     Ok(n)
+}
+
+/// Full domain rows for the given ids, filtered in SQL.
+///
+/// The list endpoint used to load every domain and drop the invisible ones in
+/// Rust, so a tenant with access to two projects still paid for the whole table —
+/// including each row's `origins` JSONB.
+pub async fn list_domains_by_ids(pool: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<DomainRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        SELECT id, project_id, name, origin_host, origin_port, origin_proto,
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(origins, '[]'::jsonb) AS origins,
+               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id
+        FROM domains
+        WHERE id = ANY($1)
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// `(id, name)` for every domain, for callers that only translate ids to names.
+///
+/// `list_domains` selects sixteen columns — including the `origins` JSONB — and
+/// sorts the whole table by `created_at`, which no index covers. Several handlers
+/// called it purely as an id-to-name map for a handful of ids, paying for the
+/// full row of every domain on every request.
+pub async fn domain_names(pool: &PgPool) -> sqlx::Result<HashMap<Uuid, String>> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, name FROM domains")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Names of the given domains only. Far cheaper than mapping the whole table
+/// when the caller already knows which ids it needs.
+pub async fn domain_names_by_ids(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> sqlx::Result<HashMap<Uuid, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM domains WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Whether every name in `names` exists, without loading the domain table.
+pub async fn domains_exist(pool: &PgPool, names: &[String]) -> sqlx::Result<HashSet<String>> {
+    if names.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM domains WHERE name = ANY($1)")
+        .bind(names)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
 }
 
 pub async fn list_domains(pool: &PgPool) -> sqlx::Result<Vec<DomainRow>> {

@@ -266,20 +266,18 @@ pub async fn list(
     State(state): State<AppState>,
     actor: Actor,
 ) -> Result<Json<Vec<DomainDto>>, (StatusCode, Json<ErrorBody>)> {
-    let rows = repository::list_domains(&state.pool).await.map_err(|e| {
+    // Filter in SQL rather than loading every domain and dropping the invisible
+    // ones in Rust.
+    let visible = actor.visible_domain_ids(&state).await;
+    let rows = match visible {
+        None => repository::list_domains(&state.pool).await,
+        Some(ids) => repository::list_domains_by_ids(&state.pool, &ids).await,
+    }
+    .map_err(|e| {
         tracing::error!(error = %e, "list domains");
         db_error()
     })?;
-    let visible = actor.visible_domain_ids(&state).await;
-    Ok(Json(
-        rows.into_iter()
-            .filter(|d| match &visible {
-                None => true,
-                Some(ids) => ids.contains(&d.id),
-            })
-            .map(to_dto)
-            .collect(),
-    ))
+    Ok(Json(rows.into_iter().map(to_dto).collect()))
 }
 
 pub async fn create(

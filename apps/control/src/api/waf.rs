@@ -311,9 +311,7 @@ pub async fn publish_rulepack(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| {
-            chrono::Utc::now().format("%Y.%m.%d-%H%M%S").to_string()
-        });
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y.%m.%d-%H%M%S").to_string());
     crate::waf_rulepack::validate_version(&version).map_err(bad_request)?;
     if let Some(rulesets) = req.rulesets.as_deref() {
         crate::waf_rulepack::validate_rulesets(rulesets).map_err(bad_request)?;
@@ -332,9 +330,7 @@ pub async fn publish_rulepack(
                 .parse_package()
                 .map(|p| crate::waf_rulepack::catalog_fingerprint(&p.rulesets))
                 .unwrap_or_default();
-            if !active_fingerprint.is_empty()
-                && active_fingerprint == candidate_fingerprint
-            {
+            if !active_fingerprint.is_empty() && active_fingerprint == candidate_fingerprint {
                 return Err((
                     StatusCode::CONFLICT,
                     Json(ErrorBody {
@@ -365,10 +361,10 @@ pub async fn publish_rulepack(
         &actor.email,
     )
     .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "publish waf rulepack");
-            db_error()
-        })?;
+    .map_err(|e| {
+        tracing::error!(error = %e, "publish waf rulepack");
+        db_error()
+    })?;
     let _ = repository::insert_audit(
         &state.pool,
         &actor.email,
@@ -390,13 +386,11 @@ pub async fn rollback_rulepack(
     }
     // Promote only if the target can actually be signed: a version that the
     // edges cannot verify is not a usable rollback target.
-    let Some(secret) = crate::waf_rulepack::signing_key(&state.config.waf_rulepack_secret)
-    else {
+    let Some(secret) = crate::waf_rulepack::signing_key(&state.config.waf_rulepack_secret) else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
-                error: "WAF_RULEPACK_SECRET is not configured; cannot re-sign the rulepack"
-                    .into(),
+                error: "WAF_RULEPACK_SECRET is not configured; cannot re-sign the rulepack".into(),
             }),
         ));
     };
@@ -470,10 +464,7 @@ pub async fn delete_rulepack(
         return Err((
             StatusCode::CONFLICT,
             Json(ErrorBody {
-                error: format!(
-                    "cannot delete {} rulepack; retire it first",
-                    row.slot
-                ),
+                error: format!("cannot delete {} rulepack; retire it first", row.slot),
             }),
         ));
     }
@@ -594,8 +585,7 @@ pub async fn put_settings(
     }
 
     let managed_rulesets = match req.managed_rulesets.as_deref() {
-        Some(ids) => crate::waf_rulesets::validate_ids(ids)
-            .map_err(bad_request)?,
+        Some(ids) => crate::waf_rulesets::validate_ids(ids).map_err(bad_request)?,
         None => current.managed_rulesets.clone(),
     };
     let managed_csv = managed_rulesets.join(",");
@@ -607,8 +597,7 @@ pub async fn put_settings(
         .trim()
         .to_string();
     if !waf_rulepack_version.is_empty() {
-        crate::waf_rulepack::validate_version(&waf_rulepack_version)
-            .map_err(bad_request)?;
+        crate::waf_rulepack::validate_version(&waf_rulepack_version).map_err(bad_request)?;
         if crate::waf_rulepack::get(&state.pool, &waf_rulepack_version)
             .await
             .map_err(|_| db_error())?
@@ -787,7 +776,10 @@ fn validate_rule(req: &WafRuleRequest) -> Result<ValidRule, (StatusCode, Json<Er
             )));
         }
         lagran_waf_dsl::validate(&expr).map_err(|e| {
-            bad_request(format!("invalid DSL at position {}: {}", e.position, e.message))
+            bad_request(format!(
+                "invalid DSL at position {}: {}",
+                e.position, e.message
+            ))
         })?;
     }
 
@@ -1186,15 +1178,9 @@ pub async fn update_ip(
     let Some(ip) = normalize_cidr(&req.ip) else {
         return Err(bad_request("ip must be an IP or CIDR".into()));
     };
-    if repository::waf_ip_exists_except(
-        &state.pool,
-        ip_id,
-        existing.domain_id,
-        &kind,
-        &ip,
-    )
-    .await
-    .map_err(|_| db_error())?
+    if repository::waf_ip_exists_except(&state.pool, ip_id, existing.domain_id, &kind, &ip)
+        .await
+        .map_err(|_| db_error())?
     {
         return Err(bad_request("this IP entry already exists".into()));
     }
@@ -1608,15 +1594,21 @@ pub async fn report_events(
     _agent: AgentAuth,
     Json(body): Json<EventsBody>,
 ) -> Json<ReportAck> {
-    // Resolve the set of known domains once per batch instead of per event.
-    let known: std::collections::HashSet<String> = repository::list_domains(&state.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|d| d.name.to_ascii_lowercase())
-                .collect()
-        })
-        .unwrap_or_default();
+    // Resolve only the reported domains, not the whole table. A batch is small and
+    // this used to select sixteen columns of every domain on the platform.
+    let reported: Vec<String> = body
+        .events
+        .iter()
+        .map(|e| e.domain.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
+    let known: std::collections::HashSet<String> =
+        repository::domains_exist(&state.pool, &reported)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
 
     let mut inputs = Vec::with_capacity(body.events.len().min(1000));
     let mut rejected_domain = 0usize;
@@ -1703,17 +1695,13 @@ pub async fn stats(
     let days = q.days.unwrap_or(7).clamp(1, 90);
     let visible: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
-        Some(ids) => {
-            let rows = repository::list_domains(&state.pool)
+        Some(ids) => Some(
+            repository::domain_names_by_ids(&state.pool, &ids)
                 .await
-                .unwrap_or_default();
-            Some(
-                rows.into_iter()
-                    .filter(|d| ids.contains(&d.id))
-                    .map(|d| d.name)
-                    .collect(),
-            )
-        }
+                .unwrap_or_default()
+                .into_values()
+                .collect(),
+        ),
     };
 
     let domain_filter = q.domain.as_deref().filter(|d| !d.is_empty());
@@ -1771,17 +1759,13 @@ pub async fn list_events(
 ) -> Result<Json<Vec<WafEventDto>>, (StatusCode, Json<ErrorBody>)> {
     let visible: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
-        Some(ids) => {
-            let rows = repository::list_domains(&state.pool)
+        Some(ids) => Some(
+            repository::domain_names_by_ids(&state.pool, &ids)
                 .await
-                .unwrap_or_default();
-            Some(
-                rows.into_iter()
-                    .filter(|d| ids.contains(&d.id))
-                    .map(|d| d.name)
-                    .collect(),
-            )
-        }
+                .unwrap_or_default()
+                .into_values()
+                .collect(),
+        ),
     };
 
     if let Some(ref d) = q.domain {
@@ -1904,7 +1888,10 @@ mod tests {
     #[test]
     fn clamp_event_bounds_utf8_safely() {
         let long = "a".repeat(5000);
-        assert_eq!(clamp_event(&long, MAX_EVENT_PATH).chars().count(), MAX_EVENT_PATH);
+        assert_eq!(
+            clamp_event(&long, MAX_EVENT_PATH).chars().count(),
+            MAX_EVENT_PATH
+        );
         // Multi-byte input is cut on a character boundary, never mid-sequence.
         let cjk = "中".repeat(1000);
         let cut = clamp_event(&cjk, 10);
@@ -1938,7 +1925,14 @@ mod tests {
 
     #[test]
     fn normalize_cidr_rejects_invalid_input() {
-        for bad in ["", "  ", "not-an-ip", "10.0.0.1/33", "::1/129", "10.0.0.1/x"] {
+        for bad in [
+            "",
+            "  ",
+            "not-an-ip",
+            "10.0.0.1/33",
+            "::1/129",
+            "10.0.0.1/x",
+        ] {
             assert!(normalize_cidr(bad).is_none(), "{bad:?} must be rejected");
         }
     }

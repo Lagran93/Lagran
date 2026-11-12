@@ -23,15 +23,17 @@ pub struct ErrorBody {
 
 /// Domain names the actor may see, or `None` for "all domains".
 async fn visible_names(state: &AppState, actor: &Actor) -> Vec<String> {
-    let rows = repository::list_domains(&state.pool)
-        .await
-        .unwrap_or_default();
+    // Only names are needed, so the sixteen-column domain row is not loaded.
     match actor.visible_domain_ids(state).await {
-        None => rows.into_iter().map(|d| d.name).collect(),
-        Some(ids) => rows
-            .into_iter()
-            .filter(|d| ids.contains(&d.id))
-            .map(|d| d.name)
+        None => repository::domain_names(&state.pool)
+            .await
+            .unwrap_or_default()
+            .into_values()
+            .collect(),
+        Some(ids) => repository::domain_names_by_ids(&state.pool, &ids)
+            .await
+            .unwrap_or_default()
+            .into_values()
             .collect(),
     }
 }
@@ -188,15 +190,13 @@ pub async fn realtime(
     let total_hits = totals.1 + totals.2;
     let mut domain_rows: Vec<RealtimeDomain> = domains
         .into_iter()
-        .map(
-            |(domain, (requests, hits, misses, bytes))| RealtimeDomain {
-                domain,
-                requests: requests as u64,
-                cache_hits: hits as u64,
-                cache_misses: misses as u64,
-                bytes_sent: bytes as u64,
-            },
-        )
+        .map(|(domain, (requests, hits, misses, bytes))| RealtimeDomain {
+            domain,
+            requests: requests as u64,
+            cache_hits: hits as u64,
+            cache_misses: misses as u64,
+            bytes_sent: bytes as u64,
+        })
         .collect();
     domain_rows.sort_by_key(|row| std::cmp::Reverse(row.requests));
     let domain_count = domain_rows.len();
@@ -270,25 +270,13 @@ pub async fn timeseries(
     } else {
         Some(visible_names(&state, &actor).await)
     };
-    let current = repository::metrics_timeseries(
-        &state.pool,
-        hosts.as_deref(),
-        hours,
-        0,
-        bucket,
-    )
-    .await
-    .unwrap_or_default();
-    let previous = if query.compare {
-        repository::metrics_timeseries(
-            &state.pool,
-            hosts.as_deref(),
-            hours * 2,
-            hours,
-            bucket,
-        )
+    let current = repository::metrics_timeseries(&state.pool, hosts.as_deref(), hours, 0, bucket)
         .await
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let previous = if query.compare {
+        repository::metrics_timeseries(&state.pool, hosts.as_deref(), hours * 2, hours, bucket)
+            .await
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -371,7 +359,6 @@ pub async fn by_domain(
             .collect(),
     )
 }
-
 
 #[derive(Deserialize)]
 pub struct NodeStatsQuery {

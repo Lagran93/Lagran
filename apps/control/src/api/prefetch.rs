@@ -102,17 +102,13 @@ pub async fn list(State(state): State<AppState>, actor: Actor) -> Json<Vec<Prefe
     let visible = actor.visible_domain_ids(&state).await;
     let visible_names: Option<std::collections::HashSet<String>> = match visible {
         None => None,
-        Some(ids) => {
-            let rows = repository::list_domains(&state.pool)
+        Some(ids) => Some(
+            repository::domain_names_by_ids(&state.pool, &ids)
                 .await
-                .unwrap_or_default();
-            Some(
-                rows.into_iter()
-                    .filter(|d| ids.contains(&d.id))
-                    .map(|d| d.name)
-                    .collect(),
-            )
-        }
+                .unwrap_or_default()
+                .into_values()
+                .collect(),
+        ),
     };
 
     Json(
@@ -225,17 +221,13 @@ pub async fn list_schedules(
     let visible = actor.visible_domain_ids(&state).await;
     let visible_names: Option<std::collections::HashSet<String>> = match visible {
         None => None,
-        Some(ids) => {
-            let rows = repository::list_domains(&state.pool)
+        Some(ids) => Some(
+            repository::domain_names_by_ids(&state.pool, &ids)
                 .await
-                .unwrap_or_default();
-            Some(
-                rows.into_iter()
-                    .filter(|d| ids.contains(&d.id))
-                    .map(|d| d.name)
-                    .collect(),
-            )
-        }
+                .unwrap_or_default()
+                .into_values()
+                .collect(),
+        ),
     };
     Json(
         rows.into_iter()
@@ -268,16 +260,17 @@ pub async fn create_schedule(
     }
     let interval = req.interval_minutes.clamp(5, 10_080) as i32;
     let headers = normalize_key_headers(req.headers);
-    let row = repository::create_prefetch_schedule(&state.pool, &domain, &paths, &headers, interval)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: "database error".into(),
-                }),
-            )
-        })?;
+    let row =
+        repository::create_prefetch_schedule(&state.pool, &domain, &paths, &headers, interval)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: "database error".into(),
+                    }),
+                )
+            })?;
     let _ = repository::insert_audit(
         &state.pool,
         &actor.email,
@@ -429,17 +422,13 @@ pub async fn list_tasks(State(state): State<AppState>, actor: Actor) -> Json<Vec
     let visible = actor.visible_domain_ids(&state).await;
     let visible_names: Option<std::collections::HashSet<String>> = match visible {
         None => None,
-        Some(ids) => {
-            let rows = repository::list_domains(&state.pool)
+        Some(ids) => Some(
+            repository::domain_names_by_ids(&state.pool, &ids)
                 .await
-                .unwrap_or_default();
-            Some(
-                rows.into_iter()
-                    .filter(|d| ids.contains(&d.id))
-                    .map(|d| d.name)
-                    .collect(),
-            )
-        }
+                .unwrap_or_default()
+                .into_values()
+                .collect(),
+        ),
     };
     Json(
         rows.into_iter()

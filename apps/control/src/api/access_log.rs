@@ -142,13 +142,11 @@ pub async fn list(
     let visible_hosts: Option<Vec<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
         Some(ids) => {
-            let rows = repository::list_domains(&state.pool)
-                .await
-                .unwrap_or_default();
             Some(
-                rows.into_iter()
-                    .filter(|d| ids.contains(&d.id))
-                    .map(|d| d.name)
+                repository::domain_names_by_ids(&state.pool, &ids)
+                    .await
+                    .unwrap_or_default()
+                    .into_values()
                     .collect(),
             )
         }

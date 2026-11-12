@@ -219,14 +219,15 @@ pub async fn list_history(
     } else {
         let visible = actor.visible_domain_ids(&state).await.unwrap_or_default();
         let visible: std::collections::HashSet<_> = visible.into_iter().collect();
-        let rows = repository::list_domains(&state.pool)
-            .await
-            .unwrap_or_default();
         Some(
-            rows.into_iter()
-                .filter(|d| visible.contains(&d.id))
-                .map(|d| d.name)
-                .collect::<Vec<_>>(),
+            repository::domain_names_by_ids(
+                &state.pool,
+                &visible.iter().copied().collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap_or_default()
+            .into_values()
+            .collect::<Vec<_>>(),
         )
     };
     let rows = repository::list_cc_ban_history(

@@ -1887,9 +1887,14 @@ impl DataPlaneProxy {
             large.delete(&plan.key).await;
             return Ok(false);
         }
-        let conditional_headers = header_vec(&conditional.headers);
+        // Build the merged list in one pass. `header_vec` used to materialise the
+        // conditional headers first and this loop copied them again; the vector is
+        // still needed below for `refresh_meta`, but it now comes from the merged
+        // list rather than being built twice.
         let mut merged_headers = entry.meta.headers.clone();
-        for (name, value) in &conditional_headers {
+        let mut conditional_headers: Vec<(String, String)> = Vec::new();
+        for (name, value) in &conditional.headers {
+            let name = name.as_str();
             if name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("transfer-encoding")
                 || name.eq_ignore_ascii_case("connection")
@@ -1897,8 +1902,12 @@ impl DataPlaneProxy {
             {
                 continue;
             }
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
             merged_headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
-            merged_headers.push((name.clone(), value.clone()));
+            merged_headers.push((name.to_string(), value.to_string()));
+            conditional_headers.push((name.to_string(), value.to_string()));
         }
         let decision = match decide_storage_reason(
             200,
