@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -34,6 +35,8 @@ pub struct AccessRecord {
 #[derive(Clone)]
 pub struct AccessLog {
     tx: mpsc::Sender<AccessRecord>,
+    /// Records dropped because the writer could not keep up.
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Recent entries for local query / batch report
     buffer: Arc<Mutex<VecDeque<AccessRecord>>>,
     buffer_cap: usize,
@@ -73,9 +76,7 @@ impl AccessLog {
 
         let buffer_cap = buffer_cap.clamp(100, 50_000);
         let buffer = Arc::new(Mutex::new(VecDeque::with_capacity(buffer_cap.min(10_000))));
-        let (tx, mut rx) = mpsc::channel::<AccessRecord>(
-            buffer_cap.clamp(1_000, 20_000),
-        );
+        let (tx, mut rx) = mpsc::channel::<AccessRecord>(buffer_cap.clamp(1_000, 20_000));
 
         {
             let buffer = buffer.clone();
@@ -141,6 +142,7 @@ impl AccessLog {
 
         Self {
             tx,
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             buffer,
             buffer_cap,
             node_id: node_id.to_string(),
@@ -150,15 +152,13 @@ impl AccessLog {
     #[allow(clippy::too_many_arguments)]
     fn split_status(label: &str) -> (&str, &str) {
         match label {
-            "HIT" | "MISS" | "EXPIRED" | "DYNAMIC" | "BYPASS" | "REVALIDATED"
-            | "STALE" | "UPDATING" | "NONE" | "UNKNOWN" => (label, ""),
+            "HIT" | "MISS" | "EXPIRED" | "DYNAMIC" | "BYPASS" | "REVALIDATED" | "STALE"
+            | "UPDATING" | "NONE" | "UNKNOWN" => (label, ""),
             "WS" => ("NONE", "WS"),
             "HTTPS_REDIRECT" => ("NONE", "HTTPS_REDIRECT"),
             "NODE_DISABLED" => ("NONE", "NODE_DISABLED"),
-            "WAF" | "CHALLENGE" | "CC" | "CC-BAN" | "CC-CHALLENGE"
-            | "BOT-CHALLENGE" | "ERROR" | "TIMEOUT" | "UNHEALTHY" => {
-                ("BYPASS", label)
-            }
+            "WAF" | "CHALLENGE" | "CC" | "CC-BAN" | "CC-CHALLENGE" | "BOT-CHALLENGE" | "ERROR"
+            | "TIMEOUT" | "UNHEALTHY" => ("BYPASS", label),
             other => ("UNKNOWN", other),
         }
     }
@@ -204,11 +204,25 @@ impl AccessLog {
     /// request path used to format the line here and the writer formatted it
     /// again, doubling the cost on the hottest path in the process.
     pub async fn write(&self, rec: AccessRecord) {
-        // Backpressure instead of dropping: a bounded queue keeps memory safe,
-        // and the request waits for the writer when the disk falls behind. This
-        // gives zero-loss access logging while the process is alive.
-        if self.tx.send(rec).await.is_err() {
-            tracing::warn!("access log writer stopped; record dropped");
+        // Never block the request path on the log writer.
+        //
+        // This used to `send().await`, so a slow disk made every request await a
+        // bounded channel whose only consumer writes to a file: one stalled
+        // write_all() backed up all in-flight requests. Losing a log line under
+        // overload is strictly better than stalling the data plane.
+        match self.tx.try_send(rec) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                // Log sparsely: the queue stays full for as long as the disk is
+                // behind, so reporting every drop would itself become the load.
+                if dropped % 1000 == 1 {
+                    tracing::warn!(dropped, "access log queue full; dropping records");
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("access log writer stopped; record dropped");
+            }
         }
     }
 
@@ -330,10 +344,7 @@ mod tests {
     fn security_labels_are_not_cache_statuses() {
         assert_eq!(AccessLog::split_status("WAF"), ("BYPASS", "WAF"));
         assert_eq!(AccessLog::split_status("WS"), ("NONE", "WS"));
-        assert_eq!(
-            AccessLog::split_status("REVALIDATED"),
-            ("REVALIDATED", "")
-        );
+        assert_eq!(AccessLog::split_status("REVALIDATED"), ("REVALIDATED", ""));
     }
 
     #[test]

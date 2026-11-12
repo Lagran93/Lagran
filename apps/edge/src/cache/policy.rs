@@ -582,7 +582,49 @@ fn joined_header_value(headers: &[(String, String)], name: &str) -> Option<Strin
     }
 }
 
-pub fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+/// `decide_storage_reason` for a live `HeaderMap`, without materialising it.
+///
+/// Response paths used to call `header_vec()` first, allocating two `String`s per
+/// header (20-40 headers, so ~40-80 allocations) just to answer four lookups and
+/// then drop the vector.
+pub fn decide_storage_reason_map(
+    status: u16,
+    headers: &http::HeaderMap,
+    policy: ResolvedPolicy,
+    default_ttl_secs: u64,
+) -> Result<CacheDecision, &'static str> {
+    decide_storage_with(
+        status,
+        &|name| headers.get(name).and_then(|v| v.to_str().ok()),
+        &|name| joined_map_value(headers, name),
+        policy,
+        default_ttl_secs,
+    )
+}
+
+/// Join repeated header values without allocating for the single-value case.
+fn joined_map_value(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next()?.to_str().ok()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    if values.next().is_none() {
+        return Some(first.to_string());
+    }
+    let mut out = String::from(first);
+    for value in headers.get_all(name).iter().skip(1) {
+        let value = value.to_str().ok().map(str::trim).unwrap_or("");
+        if value.is_empty() {
+            continue;
+        }
+        out.push_str(", ");
+        out.push_str(value);
+    }
+    Some(out)
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -594,19 +636,6 @@ pub fn status_is_cacheable(status: u16) -> bool {
     matches!(status, 200 | 203 | 204 | 300 | 301 | 308)
 }
 
-fn expires_ttl(headers: &[(String, String)]) -> Option<u64> {
-    let expires = httpdate::parse_http_date(header_value(headers, "expires")?).ok()?;
-    let now = header_value(headers, "date")
-        .and_then(|d| httpdate::parse_http_date(d).ok())
-        .unwrap_or_else(SystemTime::now);
-    Some(
-        expires
-            .duration_since(now)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    )
-}
-
 /// Decide the TTL for a response, or the operator-facing reason it cannot be
 /// stored.
 pub fn decide_storage_reason(
@@ -615,21 +644,43 @@ pub fn decide_storage_reason(
     policy: ResolvedPolicy,
     default_ttl_secs: u64,
 ) -> Result<CacheDecision, &'static str> {
+    decide_storage_with(
+        status,
+        &|name| header_value(headers, name),
+        &|name| joined_header_value(headers, name),
+        policy,
+        default_ttl_secs,
+    )
+}
+
+/// Shared decision logic over an abstract header source.
+///
+/// `get` returns the first value of a header, `joined` the comma-joined values,
+/// and `raw` the first value verbatim (used for HTTP dates). Callers backed by a
+/// `HeaderMap` avoid allocating; callers backed by cache metadata pass closures
+/// over their owned pairs.
+fn decide_storage_with<'a>(
+    status: u16,
+    get: &dyn Fn(&str) -> Option<&'a str>,
+    joined: &dyn Fn(&str) -> Option<String>,
+    policy: ResolvedPolicy,
+    default_ttl_secs: u64,
+) -> Result<CacheDecision, &'static str> {
     if !status_is_cacheable(status) {
         return Err("status");
     }
-    if header_value(headers, "set-cookie").is_some() {
+    if get("set-cookie").is_some() {
         return Err("set-cookie");
     }
     if let Some(field) = vary_reject_reason(
-        joined_header_value(headers, "vary").as_deref(),
+        joined("vary").as_deref(),
         policy.ignore_cookie,
         policy.key_ignore,
     ) {
         return Err(field);
     }
 
-    let cc = joined_header_value(headers, "cache-control")
+    let cc = joined("cache-control")
         .map(|v| parse_cache_control(&v))
         .unwrap_or_default();
     if cc.no_store {
@@ -645,7 +696,21 @@ pub fn decide_storage_reason(
         return Err("no-cache");
     }
 
-    let origin_ttl = cc.s_maxage.or(cc.max_age).or_else(|| expires_ttl(headers));
+    let origin_ttl = cc.s_maxage.or(cc.max_age).or_else(|| {
+        // Inline rather than calling `expires_ttl`: that takes a slice, and a
+        // closure returning a borrowed value cannot be passed through a trait
+        // object without a higher-ranked lifetime bound.
+        let expires = httpdate::parse_http_date(get("expires")?).ok()?;
+        let now = get("date")
+            .and_then(|d| httpdate::parse_http_date(d).ok())
+            .unwrap_or_else(SystemTime::now);
+        Some(
+            expires
+                .duration_since(now)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )
+    });
     // Explicit zero lifetime is an origin instruction, not an invitation for a
     // path rule to make the response fresh.
     if origin_ttl == Some(0) {
@@ -1842,5 +1907,72 @@ mod tests {
             .unwrap();
         assert_eq!(cache_key(&req), "GET:cdn.example:/a/b?x=1");
         assert_eq!(cache_key_opts(&req, true), "GET:cdn.example:/a/b");
+    }
+    /// The borrowed and owned entry points must agree.
+    ///
+    /// `decide_storage_reason_map` exists only to skip materialising a header
+    /// vector on the response path. If the two ever diverge, caching decisions
+    /// would depend on which data plane handled the request.
+    #[test]
+    fn map_and_slice_decisions_agree() {
+        let policy = ResolvedPolicy::default();
+        let cases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("cache-control", "max-age=600")],
+            &[("cache-control", "no-store")],
+            &[("cache-control", "private")],
+            &[("cache-control", "no-cache")],
+            &[("cache-control", "max-age=0")],
+            &[("set-cookie", "sid=1")],
+            &[("vary", "*")],
+            &[("cache-control", "s-maxage=120")],
+            &[("expires", "Thu, 01 Jan 2099 00:00:00 GMT")],
+            &[("cache-control", "max-age=60"), ("set-cookie", "a=1")],
+        ];
+        for case in cases {
+            let slice: Vec<(String, String)> = case
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let mut map = http::HeaderMap::new();
+            for (k, v) in case.iter() {
+                map.insert(
+                    http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    http::header::HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            let owned = decide_storage_reason(200, &slice, policy, 3600);
+            let borrowed = decide_storage_reason_map(200, &map, policy, 3600);
+            match (owned, borrowed) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.ttl_secs, b.ttl_secs, "ttl differs for {case:?}");
+                    assert_eq!(a.swr_secs, b.swr_secs, "swr differs for {case:?}");
+                }
+                (Err(a), Err(b)) => assert_eq!(a, b, "reject reason differs for {case:?}"),
+                (a, b) => panic!("diverged for {case:?}: {a:?} vs {b:?}"),
+            }
+        }
+    }
+
+    /// Repeated header values are joined identically on both paths.
+    #[test]
+    fn repeated_headers_join_the_same_way() {
+        let policy = ResolvedPolicy::default();
+        let slice = vec![
+            ("cache-control".to_string(), "max-age=60".to_string()),
+            ("cache-control".to_string(), "no-store".to_string()),
+        ];
+        let mut map = http::HeaderMap::new();
+        map.append(
+            http::header::CACHE_CONTROL,
+            http::header::HeaderValue::from_static("max-age=60"),
+        );
+        map.append(
+            http::header::CACHE_CONTROL,
+            http::header::HeaderValue::from_static("no-store"),
+        );
+        // `no-store` anywhere must reject on both paths.
+        assert!(decide_storage_reason(200, &slice, policy, 3600).is_err());
+        assert!(decide_storage_reason_map(200, &map, policy, 3600).is_err());
     }
 }

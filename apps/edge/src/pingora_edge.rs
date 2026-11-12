@@ -8,8 +8,9 @@
 //! WebSocket) are handed to the in-process handler.
 
 use crate::cache::policy::{
-    apply_key_ignore_default, compute_etag, decide_storage_reason, request_bypass_reason_headers,
-    resolve_rule_policy_for_response, ResolvedPolicy, RuleAction, VALIDATOR_SOURCE_HEADER,
+    apply_key_ignore_default, compute_etag, decide_storage_reason, decide_storage_reason_map,
+    request_bypass_reason_headers, resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
+    VALIDATOR_SOURCE_HEADER,
 };
 use crate::cache::{CacheBackend, CacheSource};
 use crate::config::registry::{DomainEntry, OriginTarget};
@@ -1106,10 +1107,11 @@ impl ProxyHttp for DataPlaneProxy {
                 "content-type rule",
             )));
         }
-        let headers = header_vec(&resp.headers);
-        let decision = match decide_storage_reason(
+        // Borrow the header map directly: materialising it cost two `String`s per
+        // header (20-40 of them) for four lookups, on every response.
+        let decision = match decide_storage_reason_map(
             resp.status.as_u16(),
-            &headers,
+            &resp.headers,
             response_policy,
             self.state.default_ttl_secs,
         ) {
@@ -1222,16 +1224,13 @@ impl ProxyHttp for DataPlaneProxy {
         if let Some(reason) = ctx.cache_reason {
             response.insert_header("x-lagran-cache-reason", reason)?;
         }
-        let cache_source = if matches!(label, "HIT" | "STALE" | "REVALIDATED") {
+        let cache_source = resolve_cache_source(
+            label,
             response
                 .headers
                 .get("x-lagran-cache-source")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("l1")
-                .to_string()
-        } else {
-            "origin".to_string()
-        };
+                .and_then(|v| v.to_str().ok()),
+        );
         let lookup_ms = response
             .headers
             .get("x-lagran-cache-lookup-ms")
@@ -3450,6 +3449,11 @@ impl DataPlaneProxy {
                 .extensions_mut()
                 .insert(crate::server::host_util::TlsTerminated);
         }
+        // The markers in this request were written by the filters above, so the
+        // in-process handler must not strip them again.
+        axum_req
+            .extensions_mut()
+            .insert(crate::server::host_util::FromPingora);
 
         let resp = proxy_handler(State(self.state.clone()), axum_req).await;
         write_axum_response(session, resp, is_head).await;
@@ -3830,6 +3834,22 @@ fn range_is_small_bounded(headers: &HeaderMap) -> bool {
         return false;
     };
     end >= start && end - start < MAX_SLICE
+}
+
+/// Decide the `x-lagran-cache-source` value for a finished response.
+///
+/// A hit labelled without a source must say "unknown", not "l1". The previous
+/// fallback claimed a local memory hit even when the storage layer was never
+/// consulted — for example when the request fell back to the in-process engine —
+/// which sent cache debugging down the wrong path.
+fn resolve_cache_source(label: &str, header: Option<&str>) -> String {
+    if matches!(label, "HIT" | "STALE" | "REVALIDATED") {
+        header
+            .map(str::to_string)
+            .unwrap_or_else(|| CacheSource::Unknown.as_str().to_string())
+    } else {
+        "origin".to_string()
+    }
 }
 
 fn parse_origin(url: &str) -> Option<(String, u16, bool)> {
@@ -4401,5 +4421,35 @@ mod tests {
         let upstream =
             pingora::Error::explain(pingora::ErrorType::ReadError, "origin reset").into_up();
         assert!(!super::is_downstream_disconnect(&upstream));
+    }
+    /// A hit with no recorded source must report `unknown`. The old fallback
+    /// claimed `l1`, which made a request that never consulted the storage layer
+    /// look like a local memory hit.
+    #[test]
+    fn cache_source_reports_unknown_when_unrecorded() {
+        assert_eq!(super::resolve_cache_source("HIT", None), "unknown");
+        assert_eq!(super::resolve_cache_source("STALE", None), "unknown");
+        assert_eq!(super::resolve_cache_source("REVALIDATED", None), "unknown");
+        // Never claim l1 implicitly.
+        assert_ne!(super::resolve_cache_source("HIT", None), "l1");
+    }
+
+    /// A recorded source is passed through untouched.
+    #[test]
+    fn cache_source_passes_through_recorded_value() {
+        assert_eq!(super::resolve_cache_source("HIT", Some("l1")), "l1");
+        assert_eq!(super::resolve_cache_source("HIT", Some("l2")), "l2");
+        assert_eq!(super::resolve_cache_source("HIT", Some("l3")), "l3");
+        assert_eq!(super::resolve_cache_source("STALE", Some("l2")), "l2");
+    }
+
+    /// Misses and bypasses are attributed to the origin regardless of any
+    /// leftover header.
+    #[test]
+    fn non_hit_labels_report_origin() {
+        for label in ["MISS", "BYPASS", "DYNAMIC", "NONE"] {
+            assert_eq!(super::resolve_cache_source(label, None), "origin");
+            assert_eq!(super::resolve_cache_source(label, Some("l2")), "origin");
+        }
     }
 }
