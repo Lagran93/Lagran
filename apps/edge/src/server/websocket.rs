@@ -69,6 +69,20 @@ pub fn origin_tcp_addr(origin_url: &str) -> Result<(String, u16, bool)> {
 }
 
 /// `Sec-WebSocket-Accept` for a client key (SHA-1 + base64, RFC 6455 §4.2.2).
+/// Check the origin's `Sec-WebSocket-Accept` against the value we expect.
+///
+/// RFC 6455 section 4.1 requires the server to echo the SHA-1 of the client key
+/// and the WebSocket GUID. Comparing it case-sensitively (base64 is) and
+/// requiring presence closes the case where a stray response was treated as an
+/// upgrade.
+fn verify_accept(expected: &str, got: Option<&str>) -> Result<(), &'static str> {
+    match got {
+        None => Err("origin omitted sec-websocket-accept"),
+        Some(value) if value.trim() == expected => Ok(()),
+        Some(_) => Err("origin sec-websocket-accept does not match the client key"),
+    }
+}
+
 pub fn accept_key(key: &str) -> String {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
     ctx.update(key.as_bytes());
@@ -323,12 +337,20 @@ pub async fn handle_upgrade(
             }
         };
 
-    let accept = reply
+    // Verify the origin accepted *our* key. The old code forwarded whatever
+    // `Sec-WebSocket-Accept` came back and invented one when it was missing, so a
+    // compromised or misconfigured origin could hand back any value and the edge
+    // still answered 101, opening a tunnel to something that is not a WebSocket.
+    // `origin_handshake` already rejects a non-101 status.
+    let accept = accept_key(&client_key);
+    let got = reply
         .headers
         .get("sec-websocket-accept")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| accept_key(&client_key));
+        .and_then(|v| v.to_str().ok());
+    if let Err(reason) = verify_accept(accept.as_str(), got) {
+        tracing::warn!(reason, "websocket origin handshake rejected");
+        return (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response();
+    }
 
     let mut out = Response::new(Body::empty());
     *out.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
@@ -433,5 +455,49 @@ mod tests {
         let buf = b"HTTP/1.1 101 OK\r\nA: b\r\n\r\nrest";
         let pos = find_subsequence(buf, b"\r\n\r\n").unwrap();
         assert_eq!(pos, buf.len() - 4 - 4);
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::*;
+
+    /// The RFC 6455 example key and the value a correct server echoes back.
+    const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+    const ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+    #[test]
+    fn accept_key_matches_the_rfc_example() {
+        assert_eq!(accept_key(KEY), ACCEPT);
+    }
+
+    /// A missing `Sec-WebSocket-Accept` must fail the handshake.
+    ///
+    /// The edge used to synthesise the value in this case, so an origin that
+    /// never upgraded still produced a 101 to the client.
+    #[test]
+    fn missing_accept_is_rejected() {
+        assert!(verify_accept(ACCEPT, None).is_err());
+    }
+
+    /// A value computed for a different key (or simply wrong) must be rejected.
+    #[test]
+    fn mismatched_accept_is_rejected() {
+        assert!(verify_accept(ACCEPT, Some("AAAAAAAAAAAAAAAAAAAAAAAAAAA=")).is_err());
+        // A value for another key.
+        let other = accept_key("another-key");
+        assert_ne!(other, ACCEPT);
+        assert!(verify_accept(ACCEPT, Some(other.as_str())).is_err());
+        // Empty header.
+        assert!(verify_accept(ACCEPT, Some("")).is_err());
+    }
+
+    /// The correct value is accepted, tolerating surrounding whitespace.
+    #[test]
+    fn matching_accept_is_accepted() {
+        assert!(verify_accept(ACCEPT, Some(ACCEPT)).is_ok());
+        assert!(verify_accept(ACCEPT, Some(" s3pPLMBiTxaQ9kYGzzhZRbK+xOo= ")).is_ok());
+        // base64 is case-sensitive, so a case-flipped value is a different value.
+        assert!(verify_accept(ACCEPT, Some(&ACCEPT.to_lowercase())).is_err());
     }
 }

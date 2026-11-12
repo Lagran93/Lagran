@@ -275,20 +275,37 @@ impl Queue {
         }
     }
     fn push(&self, item: (Vec<u8>, SocketAddr)) {
-        if let Ok(mut q) = self.items.lock() {
-            if q.len() < 20_000 {
-                q.push_back(item);
-                self.cv.notify_one();
-            }
+        let mut q = self
+            .items
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if q.len() < 20_000 {
+            q.push_back(item);
+            self.cv.notify_one();
         }
     }
     fn pop(&self) -> (Vec<u8>, SocketAddr) {
-        let mut q = self.items.lock().expect("queue lock");
+        // Recover from a poisoned mutex instead of panicking.
+        //
+        // `expect` here used to be the single most dangerous line in this
+        // service: one panic while the guard was held poisoned the lock, and then
+        // *every* worker panicked on its next `pop`. The process stayed up
+        // (the listener thread is separate) so the supervisor saw a healthy DNS
+        // process that answered nothing. The queue only holds query bytes and
+        // source addresses, which stay valid regardless of what the panicking
+        // worker did, so reusing the inner data is safe.
+        let mut q = self
+            .items
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
             if let Some(item) = q.pop_front() {
                 return item;
             }
-            q = self.cv.wait(q).expect("queue wait");
+            q = self
+                .cv
+                .wait(q)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 }
@@ -411,5 +428,63 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:9".parse().unwrap()
+    }
+
+    /// A poisoned queue must keep working.
+    ///
+    /// `pop` used to `expect` the lock. Once any worker panicked while holding it
+    /// the mutex was poisoned, so every worker panicked on its next pop, the queue
+    /// drained nothing, and DNS stopped answering while the process stayed up.
+    #[test]
+    fn poisoned_queue_still_pops() {
+        let queue = Arc::new(Queue::new());
+        queue.push((b"first".to_vec(), addr()));
+
+        // Poison the mutex by panicking while holding the guard.
+        let poisoner = queue.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.items.lock().unwrap();
+            panic!("poison the queue");
+        })
+        .join();
+
+        // Pushing and popping must both recover rather than panic.
+        queue.push((b"second".to_vec(), addr()));
+        let (first, _) = queue.pop();
+        let (second, _) = queue.pop();
+        assert_eq!(first, b"first".to_vec());
+        assert_eq!(second, b"second".to_vec());
+    }
+
+    /// The queue stays bounded so a flood cannot exhaust memory.
+    #[test]
+    fn queue_is_bounded() {
+        let queue = Queue::new();
+        for i in 0..20_010 {
+            queue.push((format!("q{i}").into_bytes(), addr()));
+        }
+        let mut popped = 0;
+        while let Ok(q) = queue.items.try_lock() {
+            if q.is_empty() {
+                break;
+            }
+            drop(q);
+            queue.pop();
+            popped += 1;
+            if popped > 20_010 {
+                break;
+            }
+        }
+        assert!(popped <= 20_000, "queue accepted {popped} items");
     }
 }

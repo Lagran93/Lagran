@@ -1,10 +1,17 @@
 //! Single-flight helper: collapse concurrent origin fetches for the same key.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 
+/// Key -> sender for the fetch currently leading that key.
+///
+/// A `std::sync::Mutex` rather than `tokio::sync::Mutex` on purpose: the guard is
+/// only ever held across a HashMap lookup or insert (no await), and a synchronous
+/// lock is what lets `Leader::drop` remove its own entry. With an async mutex the
+/// drop path could not await, so a cancelled leader left its key behind forever —
+/// and a signed download URL is unique, so no later request would ever reclaim it.
 #[derive(Clone, Default)]
 pub struct Inflight {
     inner: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
@@ -25,7 +32,7 @@ pub struct Leader {
 impl Inflight {
     /// Start (or join) the fetch for `key`.
     pub async fn begin(&self, key: &str) -> Slot {
-        let mut map = self.inner.lock().await;
+        let mut map = self.lock();
         // A completed/abandoned leader leaves its sender behind with `true`;
         // treat that as free so the next caller can lead again.
         let stale = map.get(key).map(|tx| *tx.borrow()).unwrap_or(false);
@@ -45,7 +52,16 @@ impl Inflight {
     }
 
     pub async fn in_flight(&self) -> usize {
-        self.inner.lock().await.len()
+        self.lock().len()
+    }
+
+    /// Lock the map, recovering from a poisoned mutex.
+    ///
+    /// A panic while the guard is held would otherwise poison the lock and turn
+    /// every later `begin` into a panic. The map only holds senders, which stay
+    /// valid whatever the panicking task did, so the data is safe to reuse.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -54,7 +70,7 @@ impl Leader {
     pub async fn finish(mut self) {
         self.finished = true;
         self.tx.send_replace(true);
-        self.inner.lock().await.remove(&self.key);
+        self.inner.lock().map(|mut m| m.remove(&self.key)).ok();
     }
 }
 
@@ -63,9 +79,14 @@ impl Drop for Leader {
         if self.finished {
             return;
         }
-        // Panic/cancel path: release waiters best-effort. `remove` is async, so
-        // only signal; followers re-check the cache and fall back to fetching.
+        // Cancel/panic path: wake followers and release the key. Followers then
+        // re-check the cache and fall back to fetching. Removing the entry here is
+        // what keeps the map bounded; signalling alone leaked one entry per
+        // cancelled request on a key that is never requested again.
         self.tx.send_replace(true);
+        if let Ok(mut map) = self.inner.lock() {
+            map.remove(&self.key);
+        }
     }
 }
 
@@ -124,5 +145,66 @@ mod tests {
             _ => panic!(),
         };
         assert!(!wait_for(&mut follower, Duration::from_millis(20)).await);
+    }
+    /// A cancelled (dropped) leader must release its key immediately.
+    ///
+    /// This is the normal path when a client disconnects mid-fetch. The entry used
+    /// to be removed only by a later request for the same key, so a unique URL
+    /// (a signed download) leaked one map entry per cancellation, forever.
+    #[tokio::test]
+    async fn dropped_leader_releases_its_key() {
+        let inflight = Inflight::new_for_test();
+        {
+            let _leader = match inflight.begin("cancelled").await {
+                Slot::Leader(l) => l,
+                _ => panic!("expected leader"),
+            };
+            assert_eq!(inflight.in_flight().await, 1);
+            // Dropped here without `finish`, as on a cancelled request.
+        }
+        assert_eq!(
+            inflight.in_flight().await,
+            0,
+            "a dropped leader must not leave its key behind"
+        );
+    }
+
+    /// Many cancelled fetches on distinct keys must not accumulate.
+    #[tokio::test]
+    async fn repeated_cancellation_does_not_accumulate() {
+        let inflight = Inflight::new_for_test();
+        for i in 0..50 {
+            let key = format!("signed-{i}");
+            let leader = match inflight.begin(&key).await {
+                Slot::Leader(l) => l,
+                _ => panic!("expected leader"),
+            };
+            drop(leader);
+        }
+        assert_eq!(
+            inflight.in_flight().await,
+            0,
+            "cancelled unique keys must not pile up"
+        );
+    }
+
+    /// A follower waiting on a leader that is dropped must be woken, not stranded.
+    #[tokio::test]
+    async fn dropping_the_leader_wakes_followers() {
+        let inflight = Inflight::new_for_test();
+        let leader = match inflight.begin("k").await {
+            Slot::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        let mut follower = match inflight.begin("k").await {
+            Slot::Follower(rx) => rx,
+            _ => panic!("expected follower"),
+        };
+        drop(leader);
+        assert!(
+            wait_for(&mut follower, Duration::from_secs(1)).await,
+            "followers must be released when the leader disappears"
+        );
+        assert_eq!(inflight.in_flight().await, 0);
     }
 }
