@@ -297,6 +297,11 @@ pub async fn insert_alert_event(
         INSERT INTO alert_events
             (rule_id, rule_name, fingerprint, severity, status, value, message, project_id)
         VALUES ($1, $2, $3, $4, 'firing', $5, $6, $7)
+        ON CONFLICT (COALESCE(rule_id, '00000000-0000-0000-0000-000000000000'::uuid), fingerprint)
+            WHERE status = 'firing'
+        DO UPDATE SET
+            value = EXCLUDED.value,
+            message = EXCLUDED.message
         RETURNING id, rule_id, rule_name, fingerprint, severity, status, value,
                   message, started_at, resolved_at, notified, project_id, created_at
         "#,
@@ -318,12 +323,18 @@ pub async fn refresh_alert_event(
     value: f64,
     message: &str,
 ) -> sqlx::Result<()> {
-    sqlx::query("UPDATE alert_events SET value = $2, message = $3 WHERE id = $1")
-        .bind(id)
-        .bind(value)
-        .bind(message)
-        .execute(pool)
-        .await?;
+    // Only refresh an event that is still firing. The caller reads the id from an
+    // `active_alert_events` snapshot; another replica may resolve that event
+    // before this UPDATE runs, and without the status guard the resolved row
+    // would be rewritten with a live value while staying `resolved`.
+    sqlx::query(
+        "UPDATE alert_events SET value = $2, message = $3 WHERE id = $1 AND status = 'firing'",
+    )
+    .bind(id)
+    .bind(value)
+    .bind(message)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

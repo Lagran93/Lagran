@@ -85,13 +85,31 @@ pub fn effective_mode(domain: &DomainEntry) -> &str {
     }
 }
 
+/// Match a protected-path pattern against a normalized request path.
+///
+/// The comparison is ASCII case-insensitive. It used to be case-sensitive, which
+/// made the protection depend on a property the origin controls: on a
+/// case-insensitive origin (IIS, macOS APFS, many Windows-hosted sites)
+/// `/Secret/report.pdf` and `/secret/report.pdf` are the same object, so an
+/// operator who protected one spelling left the other downloadable without a
+/// signature. Matching case-insensitively can only widen the protected set, never
+/// shrink it.
 fn pattern_matches(pattern: &str, path: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
         // Only `/prefix/*` is accepted; a bare `*` is rejected by control.
-        path.starts_with(prefix)
+        starts_with_ignore_ascii_case(path, prefix)
     } else {
-        path == pattern
+        path.eq_ignore_ascii_case(pattern)
     }
+}
+
+/// `str::starts_with` for ASCII-case-insensitive prefixes.
+///
+/// Written out rather than lowercasing both sides so the common path allocates
+/// nothing; this runs once per protected-path pattern per request.
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    haystack.len() >= prefix.len()
+        && haystack.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 pub fn path_protected(domain: &DomainEntry, path: &str) -> bool {
@@ -287,6 +305,18 @@ mod tests {
         }
     }
 
+    /// A domain with signed URLs in `paths` mode protecting the given patterns.
+    fn path_domain(patterns: &str) -> DomainEntry {
+        DomainEntry {
+            signed_url_enabled: true,
+            signed_url_mode: "paths".to_string(),
+            signed_url_paths: patterns.to_string(),
+            signed_url_secret: "secret".to_string(),
+            signed_url_ttl_secs: 3600,
+            ..Default::default()
+        }
+    }
+
     fn sign(
         secret: &str,
         method: &str,
@@ -373,5 +403,48 @@ mod tests {
             verify(&d, "GET", "a.test", &uri, now).unwrap_err(),
             SignedUrlError::Expired
         );
+    }
+    /// A protected path must be protected in every spelling.
+    ///
+    /// Origins are often case-insensitive, so `/Secret/report.pdf` and
+    /// `/secret/report.pdf` serve the same object. Exact matching meant an
+    /// operator who protected one spelling left the other open.
+    #[test]
+    fn protected_paths_match_case_insensitively() {
+        assert!(path_protected(
+            &path_domain("/secret/*"),
+            "/secret/report.pdf"
+        ));
+        assert!(path_protected(
+            &path_domain("/secret/*"),
+            "/SECRET/report.pdf"
+        ));
+        assert!(path_protected(
+            &path_domain("/secret/*"),
+            "/Secret/Report.PDF"
+        ));
+        assert!(path_protected(
+            &path_domain("/secret/file.pdf"),
+            "/SeCrEt/FiLe.PdF"
+        ));
+        // Unrelated paths stay open in either spelling.
+        assert!(!path_protected(
+            &path_domain("/secret/*"),
+            "/public/report.pdf"
+        ));
+        assert!(!path_protected(
+            &path_domain("/secret/file.pdf"),
+            "/secret/other.pdf"
+        ));
+    }
+
+    /// A prefix match must not spill into a sibling path that only shares part
+    /// of the name.
+    #[test]
+    fn prefix_match_respects_segment_boundaries() {
+        // `/secret/*` normalises to the prefix `/secret/`, so `/secretary/x` does
+        // not match it.
+        assert!(!path_protected(&path_domain("/secret/*"), "/secretary/x"));
+        assert!(path_protected(&path_domain("/secret/*"), "/secret/x"));
     }
 }

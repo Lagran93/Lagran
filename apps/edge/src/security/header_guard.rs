@@ -38,6 +38,67 @@ fn valid_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
 }
 
+/// Validate a `host[:port]` value and return the host part.
+///
+/// Accepts a DNS name (letters, digits, `-`, `_`, dots) or a bracketed IPv6
+/// literal, optionally followed by `:` and a numeric port in range. Returns
+/// `None` for anything else, including an unbalanced bracket, an empty label, a
+/// port with no digits, or a port above 65535.
+fn parse_authority_host(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // Bracketed IPv6: `[::1]` or `[::1]:8080`.
+    if let Some(rest) = value.strip_prefix('[') {
+        let (inside, tail) = rest.split_once(']')?;
+        if inside.is_empty() || inside.parse::<std::net::Ipv6Addr>().is_err() {
+            return None;
+        }
+        match tail {
+            "" => return Some(&value[..value.len()]),
+            _ => {
+                let port = tail.strip_prefix(':')?;
+                return valid_port(port).then(|| &value[..value.len()]);
+            }
+        }
+    }
+    // Unbracketed: at most one `:`, and only as a port separator. A bare IPv6
+    // literal has several colons and must be bracketed, which is why this split
+    // is unambiguous here.
+    let (host, port) = match value.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    };
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    // Labels must be non-empty and use the hostname character set.
+    if host
+        .split('.')
+        .any(|label| label.is_empty() || !label.chars().all(valid_host_char))
+    {
+        return None;
+    }
+    if let Some(port) = port {
+        if !valid_port(port) {
+            return None;
+        }
+    }
+    Some(host)
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+fn valid_host_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
+}
+
 fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
     let mut out = Vec::new();
     for value in headers.get_all(CONNECTION) {
@@ -123,6 +184,18 @@ pub fn validate(
             if normalize_host(host) != normalize_host(authority) {
                 return Err(HeaderViolation::new("host-authority-mismatch"));
             }
+        }
+    } else if let Some(host) = host {
+        // Origin-form: there is no authority to compare against, so `Host` is the
+        // only host source and must be structurally valid on its own. It used to
+        // be checked only by `valid_host`, which accepts any string built from a
+        // loose character set (`:` anywhere, unbalanced brackets, a non-numeric
+        // port). The absolute-form branch above rejects a malformed authority;
+        // origin-form must be at least as strict, otherwise the two request forms
+        // disagree about what a host is and the value flows into the registry
+        // lookup and cache key unvalidated.
+        if parse_authority_host(host).is_none() {
+            return Err(HeaderViolation::new("bad-host"));
         }
     }
 
@@ -284,5 +357,72 @@ mod tests {
                 .reason,
             "bad-transfer-encoding"
         );
+    }
+    /// Origin-form requests have no authority to cross-check, so `Host` itself
+    /// must be structurally valid. It used to pass on a loose character check,
+    /// which let a value the absolute-form branch would reject reach the domain
+    /// registry and the cache key.
+    #[test]
+    fn origin_form_rejects_malformed_host() {
+        for bad in [
+            "a.test:",
+            "a.test:abc",
+            "a.test:99999",
+            "a.test:80:90",
+            "a..test",
+            ".a.test",
+            "a.test.",
+            "[::1",
+            "[::1]x",
+            "[]",
+            "[not-ipv6]",
+            "host/evil",
+            "user@host",
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(HOST, HeaderValue::from_str(bad).unwrap());
+            let uri: Uri = "/x".parse().unwrap();
+            assert_eq!(
+                validate(&h, &uri, &Method::GET, Version::HTTP_11)
+                    .unwrap_err()
+                    .reason,
+                "bad-host",
+                "{bad:?} should be rejected in origin-form"
+            );
+        }
+    }
+
+    /// Ordinary origin-form hosts, with and without a port, still pass.
+    #[test]
+    fn origin_form_accepts_valid_host() {
+        for good in [
+            "a.test",
+            "A.TEST",
+            "a.test:80",
+            "a.test:18443",
+            "sub.domain.example.com",
+            "my_host.example",
+            "[::1]",
+            "[::1]:8080",
+            "[2001:db8::1]:443",
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(HOST, HeaderValue::from_str(good).unwrap());
+            let uri: Uri = "/x".parse().unwrap();
+            assert!(
+                validate(&h, &uri, &Method::GET, Version::HTTP_11).is_ok(),
+                "{good:?} should be accepted in origin-form"
+            );
+        }
+    }
+
+    /// `parse_authority_host` returns the host without the port.
+    #[test]
+    fn authority_host_parsing_strips_the_port() {
+        assert_eq!(parse_authority_host("a.test:8080"), Some("a.test"));
+        assert_eq!(parse_authority_host("a.test"), Some("a.test"));
+        assert_eq!(parse_authority_host("[::1]:8080"), Some("[::1]:8080"));
+        assert_eq!(parse_authority_host("a.test:"), None);
+        assert_eq!(parse_authority_host(""), None);
     }
 }
