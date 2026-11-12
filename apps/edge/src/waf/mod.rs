@@ -1084,8 +1084,18 @@ fn managed_verdict(
         hits |= matchers.full_joined_hits(parts, full_separators);
         hits |= matchers.url_joined_hits(url_parts, url_separators);
     }
+    // A sensitive path such as `/.git/config` matches no injection signature, so
+    // `hits` is zero. The `hits == 0` shortcut below returned before the scanner
+    // check ran, which made every path-only scanner rule dead on the finalised
+    // (production) path — the legacy path still caught them, which is why the
+    // unfinalised unit tests passed. Scanner detection is therefore evaluated
+    // here, but *after* the injection groups have had their chance, so a request
+    // that also carries an injection payload is still reported as the more
+    // severe category.
+    let scanner_hit = cfg.managed.scanners
+        && (matchers.scanner_ua.is_match(ua) || matchers.scanner_path.is_match(path));
     if hits == 0 {
-        return None;
+        return scanner_hit.then(|| verdict("恶意扫描器", "scanners"));
     }
 
     let enabled = |group: ManagedGroup| enabled_in_config(group) && hits & group.bit() != 0;
@@ -1099,9 +1109,7 @@ fn managed_verdict(
             return Some(group.verdict());
         }
     }
-    if cfg.managed.scanners
-        && (matchers.scanner_ua.is_match(ua) || matchers.scanner_path.is_match(path))
-    {
+    if scanner_hit {
         return Some(verdict("恶意扫描器", "scanners"));
     }
     for group in [
@@ -2404,5 +2412,146 @@ mod geo_policy_tests {
         assert_eq!(hit.map(|v| v.category), Some("sqli".to_string()));
         // A clean request must stay clean.
         assert!(evaluate(&c, &req(&h, None, None, "/products", "page=2")).is_none());
+    }
+    /// A sensitive path must be blocked on its own merits, with a browser
+    /// User-Agent.
+    ///
+    /// `detects_scanners_by_ua_and_path` uses the shared `req()` helper, whose
+    /// User-Agent is hard-coded to `curl` — a scanner signature. The path
+    /// assertions in it therefore pass through the UA branch and never exercise
+    /// the path matcher, which hid the fact that a path-only match was
+    /// unreachable: `managed_hits` returned early when no injection signature
+    /// matched, before the scanner check ran.
+    #[test]
+    fn blocks_sensitive_paths_with_a_browser_user_agent() {
+        let c = cfg();
+        let h = HeaderMap::new();
+        let browser = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                       (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+        for path in [
+            "/.git/config",
+            "/.env",
+            "/.svn/entries",
+            "/.aws/credentials",
+            "/wp-login.php",
+            "/phpmyadmin/index.php",
+            "/.ssh/id_rsa",
+            "/server-status",
+        ] {
+            // `req()` hard-codes the User-Agent, so build the request directly.
+            let request = WafRequest {
+                method: "GET",
+                path,
+                query: "",
+                user_agent: browser,
+                referer: "",
+                ip: Some("198.51.100.10".parse().unwrap()),
+                country: None,
+                asn: None,
+                headers: &h,
+            };
+            let verdict = evaluate(&c, &request);
+            assert_eq!(
+                verdict.as_ref().map(|v| v.category.as_str()),
+                Some("scanners"),
+                "{path} must be blocked by the path rule alone"
+            );
+        }
+        // An ordinary path with the same User-Agent stays open.
+        let clean = WafRequest {
+            method: "GET",
+            path: "/index.html",
+            query: "",
+            user_agent: browser,
+            referer: "",
+            ip: Some("198.51.100.10".parse().unwrap()),
+            country: None,
+            asn: None,
+            headers: &h,
+        };
+        assert!(evaluate(&c, &clean).is_none());
+    }
+
+    /// The same path rules must hold on the finalised path.
+    ///
+    /// `finalize` switches `managed_verdict` from the legacy scan to the
+    /// Aho-Corasick matchers, and that fast path returned early whenever no
+    /// injection signature matched. A sensitive path like `/.git/config` matches
+    /// no signature, so `hits` was zero and the request was allowed: every
+    /// path-only scanner rule was dead in production while the legacy path still
+    /// caught them, which is why the unit tests (all unfinalised) passed.
+    #[test]
+    fn blocks_sensitive_paths_on_the_finalised_path() {
+        let mut c = cfg();
+        c.finalize();
+        assert!(
+            c.compiled.managed.is_some(),
+            "finalize must install the managed matchers"
+        );
+        let h = HeaderMap::new();
+        let browser = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                       (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+        for path in [
+            "/.git/config",
+            "/.env",
+            "/.svn/entries",
+            "/.aws/credentials",
+            "/.ssh/id_rsa",
+            "/wp-login.php",
+            "/phpmyadmin/index.php",
+            "/server-status",
+            "/docker-compose.yml",
+        ] {
+            let request = WafRequest {
+                method: "GET",
+                path,
+                query: "",
+                user_agent: browser,
+                referer: "",
+                ip: Some("198.51.100.10".parse().unwrap()),
+                country: None,
+                asn: None,
+                headers: &h,
+            };
+            assert_eq!(
+                evaluate(&c, &request).map(|v| v.category),
+                Some("scanners".to_string()),
+                "{path} must be blocked on the finalised path"
+            );
+        }
+        // An ordinary path stays open, so the fix did not widen the rule.
+        let clean = WafRequest {
+            method: "GET",
+            path: "/index.html",
+            query: "",
+            user_agent: browser,
+            referer: "",
+            ip: Some("198.51.100.10".parse().unwrap()),
+            country: None,
+            asn: None,
+            headers: &h,
+        };
+        assert!(evaluate(&c, &clean).is_none());
+    }
+
+    /// Disabling the scanners ruleset must still disable the path rules.
+    #[test]
+    fn scanner_path_rules_respect_the_toggle() {
+        let mut c = cfg();
+        c.managed.scanners = false;
+        c.finalize();
+        let h = HeaderMap::new();
+        let request = WafRequest {
+            method: "GET",
+            path: "/.git/config",
+            query: "",
+            user_agent: "Mozilla/5.0 Chrome/131.0.0.0",
+            referer: "",
+            ip: Some("198.51.100.10".parse().unwrap()),
+            country: None,
+            asn: None,
+            headers: &h,
+        };
+        assert!(evaluate(&c, &request).is_none());
     }
 }
