@@ -101,10 +101,17 @@ impl WafLog {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
+    // Single pass, ASCII fast path. See the note on `access_log::truncate`: the
+    // two-pass form walked the string twice to learn a length it did not need.
+    if s.is_ascii() {
+        if s.len() <= max {
+            return s.to_string();
+        }
+        return s[..max].to_string();
+    }
+    match s.char_indices().nth(max) {
+        None => s.to_string(),
+        Some((cut, _)) => s[..cut].to_string(),
     }
 }
 
