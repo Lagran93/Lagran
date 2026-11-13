@@ -94,6 +94,8 @@ fn read_name(buf: &[u8], start: usize) -> Result<(String, usize), WireError> {
     let mut end = start;
     let mut jumped = false;
     let mut hops = 0usize;
+    // Accumulated length of the labels seen so far, including the joining dots.
+    let mut name_len = 0usize;
     loop {
         if pos >= buf.len() {
             return Err(WireError::BadName);
@@ -134,9 +136,19 @@ fn read_name(buf: &[u8], start: usize) -> Result<(String, usize), WireError> {
         let label = std::str::from_utf8(&buf[pos + 1..pos + 1 + l])
             .map_err(|_| WireError::BadName)?
             .to_ascii_lowercase();
+        // Bound the assembled name, not just the label count. 127 labels of 63
+        // bytes each is a legal-looking shape that no real name has: RFC 1035
+        // caps a name at 255 octets on the wire. Without this, one query could
+        // make the receive thread build multi-kilobyte strings per record (64
+        // records allowed, so hundreds of KiB of transient allocation per
+        // datagram), which is free amplification for an attacker.
+        name_len = name_len.saturating_add(l + 1);
+        if name_len > MAX_NAME_CHARS {
+            return Err(WireError::BadName);
+        }
         labels.push(label);
         pos += 1 + l;
-        if labels.len() > 127 {
+        if labels.len() > MAX_LABELS {
             return Err(WireError::BadName);
         }
     }
@@ -264,6 +276,20 @@ pub fn mask_addr(addr: IpAddr, prefix: u8) -> IpAddr {
 /// pins a worker thread. The server never sends more than a handful of
 /// records, so anything beyond this is malformed by definition.
 pub const MAX_RECORDS: usize = 64;
+
+/// Largest assembled domain name this parser will build, in bytes.
+///
+/// RFC 1035 §2.3.4 limits a name to 255 octets on the wire, so nothing longer is
+/// a name at all. The previous bounds (`hops > 32`, `labels > 127`) constrained
+/// the shape of the compression chain but not the size of the result, which is the
+/// quantity that decides how much memory one query can cost.
+pub const MAX_NAME_CHARS: usize = 255;
+
+/// Largest label count in one name.
+///
+/// 127 was reachable only with 63-byte labels; with `MAX_NAME_CHARS` in place this
+/// is a cheap backstop against a long chain of one-character labels.
+pub const MAX_LABELS: usize = 127;
 
 pub fn parse_query(buf: &[u8]) -> Result<Query, WireError> {
     if buf.len() < 12 {
@@ -633,5 +659,44 @@ mod tests {
                 "mask for {ip}/{prefix}"
             );
         }
+    }
+    /// A name assembled from many long labels must be rejected, not built.
+    ///
+    /// The old bounds limited label count (127) and pointer hops (32) but not the
+    /// size of the result: 127 labels of 63 bytes is a legal-looking shape that
+    /// yields an 8 KiB string per name, and a datagram may carry 64 records. That
+    /// is hundreds of KiB of transient allocation on the receive thread per
+    /// packet — free amplification.
+    #[test]
+    fn read_name_rejects_oversized_assembled_names() {
+        let label = "a".repeat(63);
+        let many = vec![label.as_str(); 127].join(".");
+        let mut buf = Vec::new();
+        put_name(&mut buf, &many);
+        let err = read_name(&buf, 0).expect_err("an 8 KiB name must be rejected");
+        assert!(matches!(err, WireError::BadName));
+    }
+
+    /// A name at the RFC 1035 limit still parses.
+    #[test]
+    fn read_name_accepts_names_within_the_limit() {
+        // 4 x 50 + 3 dots + root = 204 bytes, comfortably under 255.
+        let label = "b".repeat(50);
+        let ok = vec![label.as_str(); 4].join(".");
+        let mut buf = Vec::new();
+        put_name(&mut buf, &ok);
+        let (name, end) = read_name(&buf, 0).expect("a 204-byte name must parse");
+        assert_eq!(name, ok);
+        assert_eq!(end, buf.len());
+    }
+
+    /// Two hundred short labels exceed the label cap even though the total is
+    /// small.
+    #[test]
+    fn read_name_rejects_too_many_labels() {
+        let many = vec!["a"; 200].join(".");
+        let mut buf = Vec::new();
+        put_name(&mut buf, &many);
+        assert!(matches!(read_name(&buf, 0), Err(WireError::BadName)));
     }
 }
