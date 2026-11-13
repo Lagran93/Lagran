@@ -19,7 +19,16 @@ pub fn spawn(state: AppState, interval_secs: u64) {
                 {
                     Ok(Some(lock)) => Some(lock),
                     Ok(None) => continue,
-                    Err(()) => None,
+                    Err(()) => {
+                        // Fail closed: without the lock every replica would sweep the
+                        // same releases concurrently — finishing them as rolled back and
+                        // notifying edges more than once — and a duplicate publish is
+                        // not something a later round can undo.
+                        tracing::warn!(
+                            "Redis lock unavailable; skipping this config release sweep"
+                        );
+                        continue;
+                    }
                 };
                 if let Err(e) = sweep(&state).await {
                     tracing::warn!(error = %e, "config release sweep failed");

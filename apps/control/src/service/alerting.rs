@@ -19,39 +19,47 @@ struct Finding {
     message: String,
 }
 
-pub fn spawn(
-    pool: PgPool,
-    interval_secs: u64,
-    redis: Option<Arc<RedisService>>,
-) {
+pub fn spawn(pool: PgPool, interval_secs: u64, redis: Option<Arc<RedisService>>) {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_secs.clamp(5, 3600));
         tracing::info!(?interval, "alert evaluator started");
         loop {
             tokio::time::sleep(interval).await;
-            if let Some(redis) = redis.as_ref() {
-                let lock = match redis
-                    .try_lock("lagran:lock:alert-evaluator", Duration::from_secs(120))
-                    .await
-                {
-                    Ok(Some(lock)) => Some(lock),
-                    Ok(None) => {
-                        tracing::debug!("alert evaluator skipped; another replica holds the lock");
-                        continue;
+            let lock = match redis.as_ref() {
+                None => None,
+                Some(redis) => {
+                    match redis
+                        .try_lock("lagran:lock:alert-evaluator", Duration::from_secs(120))
+                        .await
+                    {
+                        Ok(Some(lock)) => Some(lock),
+                        Ok(None) => {
+                            tracing::debug!(
+                                "alert evaluator skipped; another replica holds the lock"
+                            );
+                            continue;
+                        }
+                        Err(()) => {
+                            // Fail closed. Evaluating without the lock means every
+                            // replica runs at once, and delivery has external side
+                            // effects: two replicas can both read `!event.notified`
+                            // before either calls `mark_alert_notified`, so the same
+                            // alert is paged twice. Skipping a round costs at most one
+                            // interval of latency; duplicate pages cost trust in the
+                            // alerts themselves.
+                            tracing::warn!(
+                                "Redis lock unavailable; skipping this alert evaluation round"
+                            );
+                            continue;
+                        }
                     }
-                    Err(()) => {
-                        tracing::warn!("Redis lock unavailable; running evaluator without lock");
-                        None
-                    }
-                };
-                if let Err(e) = run_once(&pool).await {
-                    tracing::warn!(error = %e, "alert evaluation failed");
                 }
-                if let Some(lock) = lock.as_ref() {
-                    redis.unlock(lock).await;
-                }
-            } else if let Err(e) = run_once(&pool).await {
+            };
+            if let Err(e) = run_once(&pool).await {
                 tracing::warn!(error = %e, "alert evaluation failed");
+            }
+            if let (Some(redis), Some(lock)) = (redis.as_ref(), lock.as_ref()) {
+                redis.unlock(lock).await;
             }
         }
     });
@@ -215,7 +223,11 @@ async fn release_findings(pool: &PgPool) -> Result<Vec<Finding>, sqlx::Error> {
             value: 1.0,
             message: format!(
                 "配置发布失败。\n发布 ID：{id}\n状态：{status}\n错误：{}",
-                if error.is_empty() { "未知错误" } else { &error }
+                if error.is_empty() {
+                    "未知错误"
+                } else {
+                    &error
+                }
             ),
         })
         .collect())

@@ -41,8 +41,11 @@ pub fn spawn(state: AppState, interval_secs: u64) {
                         continue;
                     }
                     Err(()) => {
-                        tracing::warn!("Redis lock unavailable; running prefetch without lock");
-                        None
+                        // Fail closed for the same reason as the others: two replicas
+                        // prefetching at once doubles origin traffic for no gain, and
+                        // the task bookkeeping assumes one worker.
+                        tracing::warn!("Redis lock unavailable; skipping this prefetch round");
+                        continue;
                     }
                 };
                 if let Err(e) = run_once(&state).await {
