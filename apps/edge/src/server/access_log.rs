@@ -13,6 +13,12 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 
+/// How many times one batch may be retried before it is dropped.
+///
+/// Re-queueing puts the records back at the head, so an unbounded retry count means
+/// every `drain` returns the same records for as long as the control plane is down.
+pub const MAX_REPORT_ATTEMPTS: u32 = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessRecord {
     pub ts: String,
@@ -262,6 +268,13 @@ impl AccessLog {
     }
 
     /// Put records back at the front after a failed report (oldest first).
+    ///
+    /// Only for a *bounded* number of attempts. Prepend means the next `drain`
+    /// returns the same records, so a control plane that stays down retries the
+    /// same batch forever while the rest of the buffer ages out behind it — the
+    /// buffer becomes a monument to 500 old lines and every new record is lost. The
+    /// reporter uses [`Self::requeue_bounded`] instead, which gives up after a few
+    /// attempts and says so.
     pub async fn requeue(&self, records: Vec<AccessRecord>) {
         if records.is_empty() {
             return;
@@ -274,6 +287,29 @@ impl AccessLog {
             }
             buf.push_front(r);
         }
+    }
+
+    /// Re-queue a failed batch, or drop it once `attempts` reaches the limit.
+    ///
+    /// Returns the number of records dropped (0 when they were re-queued).
+    ///
+    /// Re-queueing puts the records back at the head, so the next `drain` returns
+    /// the same batch. Left unbounded, a control plane that stays down pins the
+    /// buffer on 500 old records: the live tail ages out unread while
+    /// `/__lagran/access-logs` keeps showing the same lines. After
+    /// [`MAX_REPORT_ATTEMPTS`] the batch is dropped and counted instead, which keeps
+    /// recent logs flowing and makes the loss visible.
+    pub async fn requeue_bounded(&self, records: Vec<AccessRecord>, attempts: u32) -> usize {
+        if records.is_empty() {
+            return 0;
+        }
+        if attempts > MAX_REPORT_ATTEMPTS {
+            let dropped = records.len();
+            self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+            return dropped;
+        }
+        self.requeue(records).await;
+        0
     }
 
     pub fn capacity(&self) -> usize {
@@ -440,5 +476,76 @@ mod tests {
         let out = truncate(&long, 256);
         assert_eq!(out.chars().count(), 257, "256 characters plus the ellipsis");
         assert!(out.ends_with('…'));
+    }
+    fn record(path: &str) -> AccessRecord {
+        AccessRecord {
+            ts: "2026-11-13T00:00:00Z".into(),
+            node_id: "edge-001".into(),
+            client_ip: "203.0.113.9".into(),
+            method: "GET".into(),
+            host: "a.test".into(),
+            path: path.into(),
+            status: 200,
+            bytes: 1,
+            latency_ms: 1,
+            cache_status: "miss".into(),
+            action: String::new(),
+            user_agent: String::new(),
+            referer: String::new(),
+            request_id: String::new(),
+        }
+    }
+
+    /// A retried batch is dropped after the limit instead of looping forever.
+    ///
+    /// `requeue` prepends, so the next `drain` returns the same records. Unbounded,
+    /// a control plane outage pinned the buffer on 500 old lines while new requests
+    /// were silently lost behind them.
+    #[tokio::test]
+    async fn a_failed_batch_is_dropped_after_the_retry_limit() {
+        let log = AccessLog::open(None, "edge-001", 100, false).await;
+        let batch: Vec<AccessRecord> = (0..10).map(|i| record(&format!("/{i}"))).collect();
+
+        // Within the limit: records go back into the buffer.
+        for attempt in 1..=MAX_REPORT_ATTEMPTS {
+            let dropped = log.requeue_bounded(batch.clone(), attempt).await;
+            assert_eq!(dropped, 0, "attempt {attempt} must re-queue, not drop");
+            assert_eq!(log.drain(100).await.len(), 10, "still in the buffer");
+        }
+
+        // Past the limit: dropped and counted.
+        let dropped = log
+            .requeue_bounded(batch.clone(), MAX_REPORT_ATTEMPTS + 1)
+            .await;
+        assert_eq!(dropped, 10, "the batch must be dropped after the limit");
+        assert!(
+            log.drain(100).await.is_empty(),
+            "a dropped batch must not return to the buffer"
+        );
+    }
+
+    /// Dropping a batch keeps the live tail flowing.
+    ///
+    /// The point of the limit is that new records still get reported, rather than
+    /// the buffer being permanently occupied by an unretryable one.
+    #[tokio::test]
+    async fn new_records_survive_a_dropped_batch() {
+        let log = AccessLog::open(None, "edge-001", 100, false).await;
+        let stale: Vec<AccessRecord> = (0..10).map(|i| record(&format!("/old{i}"))).collect();
+        log.requeue_bounded(stale, MAX_REPORT_ATTEMPTS + 1).await;
+
+        log.write(record("/fresh")).await;
+        // `write` hands the record to the writer task, so it reaches the ring buffer
+        // asynchronously; poll rather than assume the task has run.
+        let mut drained = Vec::new();
+        for _ in 0..100 {
+            drained = log.drain(100).await;
+            if !drained.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(drained.len(), 1, "only the fresh record remains");
+        assert_eq!(drained[0].path, "/fresh");
     }
 }
