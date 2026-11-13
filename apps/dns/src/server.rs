@@ -310,6 +310,54 @@ impl Queue {
     }
 }
 
+/// Read granularity for TCP DNS messages.
+///
+/// The length prefix is honoured up to the protocol maximum, but memory grows with
+/// what actually arrives instead of with what was announced.
+const TCP_READ_CHUNK: usize = 4096;
+
+/// Read exactly `len` bytes without pre-allocating the announced size.
+///
+/// A client may announce 65535 bytes and then send nothing; committing that up
+/// front would hold the memory for the whole read timeout on every connection
+/// thread. Growth follows what actually arrives.
+fn read_framed_body(stream: &mut dyn Read, len: usize) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(len.min(TCP_READ_CHUNK));
+    let mut remaining = len;
+    let mut chunk = [0u8; TCP_READ_CHUNK];
+    while remaining > 0 {
+        let want = remaining.min(TCP_READ_CHUNK);
+        stream.read_exact(&mut chunk[..want]).ok()?;
+        buf.extend_from_slice(&chunk[..want]);
+        remaining -= want;
+    }
+    Some(buf)
+}
+
+/// Outcome of reading one TCP-framed DNS message.
+#[derive(Debug, PartialEq, Eq)]
+enum FramedRead {
+    /// A complete message of the announced length.
+    Body(Vec<u8>),
+    /// Nothing to answer: zero-length or a failed/short read.
+    Drop,
+}
+
+/// Read one length-prefixed message, applying the acceptance policy.
+///
+/// Kept separate from `handle_tcp` so the policy is testable: the previous
+/// version rejected anything over 4096 bytes here, which silently closed the
+/// connection for queries the protocol allows.
+fn read_framed_message(stream: &mut dyn Read, announced: usize) -> FramedRead {
+    if announced == 0 {
+        return FramedRead::Drop;
+    }
+    match read_framed_body(stream, announced) {
+        Some(body) => FramedRead::Body(body),
+        None => FramedRead::Drop,
+    }
+}
+
 fn handle_tcp(mut stream: TcpStream, service: Arc<Service>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -319,18 +367,39 @@ fn handle_tcp(mut stream: TcpStream, service: Arc<Service>) {
         return;
     }
     let len = u16::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > 4096 {
+    // A TCP DNS message is length-prefixed with a 16-bit field, and RFC 7766
+    // expects the server to read what the client announced. The previous 4096
+    // cap silently dropped larger queries: the connection was closed without a
+    // response, so the client saw a timeout rather than an error, and a resolver
+    // retrying over TCP (which is what a truncated UDP answer leads to) never got
+    // an answer at all. `Service::handle` already treats TCP as good for 65535
+    // bytes, so the two limits disagreed.
+    if len == 0 {
+        // Zero-length is not a message; nothing to answer with an ID.
         return;
     }
-    let mut buf = vec![0u8; len];
-    if stream.read_exact(&mut buf).is_err() {
-        return;
-    }
+    // Read into a fixed-size stack buffer in chunks rather than pre-allocating
+    // `len` up front: a client may announce 65535 bytes and then send nothing, and
+    // `vec![0u8; len]` would have committed that memory for the whole 5 s read
+    // timeout on every one of the (default 512) connection threads.
+    let buf = match read_framed_message(&mut stream, len) {
+        FramedRead::Body(body) => body,
+        FramedRead::Drop => return,
+    };
     let client_ip = peer
         .map(|p| p.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let resp = service.handle(&buf, client_ip, true);
     if resp.len() > 65_535 {
+        // The response cannot be framed in a 16-bit length field. Answer with
+        // FORMERR echoing the original ID instead of closing silently, so the
+        // client can distinguish "refused" from "server unreachable".
+        let id = &buf[..buf.len().min(2)];
+        let formerr = formerr(id);
+        let mut out = Vec::with_capacity(2 + formerr.len());
+        out.extend_from_slice(&(formerr.len() as u16).to_be_bytes());
+        out.extend_from_slice(&formerr);
+        let _ = stream.write_all(&out);
         return;
     }
     let mut out = Vec::with_capacity(2 + resp.len());
@@ -486,5 +555,59 @@ mod queue_tests {
             }
         }
         assert!(popped <= 20_000, "queue accepted {popped} items");
+    }
+    /// A query larger than the old 4096 cap must be accepted.
+    ///
+    /// The length prefix allows 65535 bytes and RFC 7766 expects the server to
+    /// read what was announced. The previous 4096 limit closed the connection
+    /// without a response, so a resolver retrying over TCP after a truncated UDP
+    /// answer got a timeout instead of an answer.
+    #[test]
+    fn tcp_reads_queries_larger_than_the_old_cap() {
+        for size in [4097usize, 8192, 65_535] {
+            let payload = vec![0xABu8; size];
+            let mut cursor = std::io::Cursor::new(payload.clone());
+            match read_framed_message(&mut cursor, size) {
+                FramedRead::Body(body) => assert_eq!(body.len(), size),
+                FramedRead::Drop => panic!("{size}-byte query must be read, not dropped"),
+            }
+        }
+    }
+
+    /// The announced size is not pre-allocated: a client that announces 65535 and
+    /// sends nothing must not cause a 64 KiB allocation.
+    #[test]
+    fn tcp_read_does_not_preallocate_the_announced_size() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        assert_eq!(
+            read_framed_message(&mut cursor, 65_535),
+            FramedRead::Drop,
+            "a short body must be dropped, not padded"
+        );
+    }
+
+    /// A body that stops mid-message is rejected rather than returned truncated.
+    #[test]
+    fn tcp_read_rejects_a_truncated_body() {
+        let mut cursor = std::io::Cursor::new(vec![1u8; 100]);
+        assert_eq!(read_framed_message(&mut cursor, 200), FramedRead::Drop);
+    }
+
+    /// A zero-length frame has no ID to answer, so it is dropped.
+    #[test]
+    fn tcp_read_drops_zero_length_frames() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        assert_eq!(read_framed_message(&mut cursor, 0), FramedRead::Drop);
+    }
+
+    /// Small bodies round-trip unchanged.
+    #[test]
+    fn tcp_read_handles_small_bodies() {
+        let payload = b"hello".to_vec();
+        let mut cursor = std::io::Cursor::new(payload.clone());
+        assert_eq!(
+            read_framed_message(&mut cursor, payload.len()),
+            FramedRead::Body(payload)
+        );
     }
 }
