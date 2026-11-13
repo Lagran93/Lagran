@@ -805,6 +805,23 @@ mod queue_tests {
             }
         }
         assert!(popped <= 20_000, "queue accepted {popped} items");
+        // The overflow count is what makes a stalled worker visible; the bound
+        // alone does not tell anyone the queue is full.
+        assert_eq!(
+            queue.dropped(),
+            10,
+            "10 pushes past the 20_000 cap must be counted as dropped"
+        );
+    }
+
+    /// A queue below the cap drops nothing.
+    #[test]
+    fn queue_below_cap_records_no_drops() {
+        let queue = Queue::new();
+        for i in 0..100 {
+            queue.push((format!("q{i}").into_bytes(), addr()));
+        }
+        assert_eq!(queue.dropped(), 0);
     }
     /// A query larger than the old 4096 cap must be accepted.
     ///
