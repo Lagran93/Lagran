@@ -600,6 +600,25 @@ fn client_ip(req: &ScheduleRequest) -> Option<IpAddr> {
     addr.parse::<IpAddr>().ok()
 }
 
+/// Client address for logs: the network part only.
+///
+/// A full client address in a per-query log line is personal data with no
+/// debugging value here — routing is decided by country/province/city/ISP, and the
+/// masked prefix is enough to reproduce which network a decision came from.
+fn mask_log_ip(ip: Option<std::net::IpAddr>) -> String {
+    match ip {
+        Some(std::net::IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            format!("{}.{}.0.0/16", o[0], o[1])
+        }
+        Some(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+        }
+        None => "-".to_string(),
+    }
+}
+
 fn resolve_geo(
     state: &AppState,
     req: &ScheduleRequest,
@@ -741,9 +760,14 @@ pub async fn resolve(
     };
     let top: Vec<Candidate> = candidates.into_iter().take(5).map(|(_, c)| c).collect();
 
-    tracing::info!(
+    // `debug`, not `info`. With a 5 s DNS cache this fires at roughly DNS QPS, and
+    // the fmt layer writes to stdout synchronously from the async runtime: at high
+    // query rates that both slowed scheduling and filled the journal, which in turn
+    // pushed DNS answers past their control timeout. The client IP is masked as well
+    // — the full address is not needed to debug a routing decision.
+    tracing::debug!(
         domain = %domain,
-        client_ip = ?_ip,
+        client_ip = %mask_log_ip(_ip),
         country = %client.country,
         province = %client.province,
         city = %client.city,
@@ -1016,5 +1040,24 @@ mod tests {
         apply_geo_overrides(&mut geo, &req);
         assert_eq!(geo.country, "CN");
         assert_eq!(geo.province, "Guangdong");
+    }
+    /// Logged client addresses keep only the network part.
+    ///
+    /// The scheduling decision log used to carry the full client address on every
+    /// DNS miss. Routing is decided by country/province/city/ISP, so the host part
+    /// adds nothing for debugging while being personal data.
+    #[test]
+    fn client_ip_is_masked_for_logs() {
+        assert_eq!(mask_log_ip(None), "-");
+        assert_eq!(
+            mask_log_ip(Some("203.0.113.77".parse().unwrap())),
+            "203.0.0.0/16"
+        );
+        assert_eq!(
+            mask_log_ip(Some("2001:db8:abcd:1234::1".parse().unwrap())),
+            "2001:db8:abcd::/48"
+        );
+        // The masked form must not contain the original host bits.
+        assert!(!mask_log_ip(Some("198.51.100.9".parse().unwrap())).contains("100.9"));
     }
 }
