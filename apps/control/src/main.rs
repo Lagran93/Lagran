@@ -213,7 +213,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    axum::serve(listener, app).await?;
+    // Serve until the OS asks us to stop, then finish in-flight requests instead of
+    // dropping their connections. `axum` closes the listener on the signal and waits
+    // for active handlers, so a restart no longer truncates a response mid-body.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(control::service::shutdown::wait_async())
+        .await?;
+    tracing::info!("control plane stopped accepting connections; flushing telemetry");
     if let Some(provider) = tracer_provider {
         let _ = provider.shutdown();
     }

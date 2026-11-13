@@ -613,12 +613,34 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
         tracing::info!(hits, misses, cache = size, "dns stats");
     });
 
+    // Shutdown flag set by the signal handler below. The receive loop is
+    // synchronous, so a read timeout is what makes `recv_from` interruptible;
+    // without it SIGTERM would sit in the queue until the next packet arrived.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        // The handler runs on its own thread for the life of the process; an error
+        // installing it means shutdown stays best-effort rather than failing startup.
+        if let Err(e) = ctrlc::set_handler(move || {
+            tracing::info!("shutdown signal received; stopping the DNS listener");
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }) {
+            tracing::warn!(error = %e, "cannot install shutdown handler");
+        }
+    }
+    // A short timeout keeps shutdown responsive without waking a core in a tight
+    // loop: 200 ms costs ~5 wakeups a second on an idle resolver.
+    let _ = udp.set_read_timeout(Some(Duration::from_millis(200)));
+
     // Rate limit at the receive edge so a flood never reaches the worker pool.
     // Loopback is exempt and a zero `per_source` disables the limiter.
     let mut limiter = crate::ratelimit::RateLimiter::new(cfg.rate_limit);
     let mut last_report = Instant::now();
     let mut buf = [0u8; 4096];
     loop {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         match udp.recv_from(&mut buf) {
             Ok((n, peer)) => {
                 if n >= 12 && limiter.allow(peer.ip(), Instant::now()) {
@@ -633,11 +655,29 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
                 }
             }
             Err(e) => {
+                // A read timeout is the normal idle case, not an error: it exists so
+                // the loop can check the shutdown flag.
+                //
+                // `Interrupted` is also normal — `ctrlc` interrupts the blocking
+                // `recv_from` when the signal lands, which is exactly how the loop
+                // learns to stop. Logging it as an error made every clean shutdown
+                // print a spurious WARN.
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) {
+                    continue;
+                }
                 tracing::warn!(error = %e, "udp recv error");
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
+
+    tracing::info!("DNS listener stopped; exiting");
+    Ok(())
 }
 
 #[cfg(test)]

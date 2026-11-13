@@ -289,10 +289,33 @@ async fn main() -> anyhow::Result<()> {
             }
         })?;
 
-    // Keep the Tokio runtime alive for background agents and the optional
-    // admin listener; Pingora runs its own runtime on the spawned thread.
-    std::future::pending::<()>().await;
-    Ok(())
+    // Keep the Tokio runtime alive for background agents and the optional admin
+    // listener; Pingora runs its own runtime on the spawned thread.
+    //
+    // Waits on SIGTERM/SIGINT instead of pending forever. A hard kill truncates
+    // streaming bodies against their own Content-Length and drops the access log
+    // writer's queued records, so the process now flushes what it can before
+    // exiting.
+    let shutdown = edge::server::shutdown::wait_async();
+    let sig = tokio::select! {
+        _ = shutdown => "signal",
+        _ = tokio::signal::ctrl_c() => "ctrl-c",
+    };
+    tracing::info!(trigger = sig, "edge shutting down");
+
+    // Flush the access log: records already accepted are on their way to the file,
+    // and the writer flushes it when the sender is dropped. Pingora's own listener
+    // runs on its own runtime and cannot be stopped cooperatively yet, so this is a
+    // bounded flush followed by exit rather than a full drain.
+    let remaining = state
+        .access_log
+        .flush(std::time::Duration::from_secs(5))
+        .await;
+    if remaining > 0 {
+        tracing::warn!(remaining, "exiting with unflushed access log records");
+    }
+    tracing::info!("edge stopped");
+    std::process::exit(0);
 }
 
 fn random_secret() -> String {

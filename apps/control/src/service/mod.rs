@@ -12,6 +12,7 @@ pub mod domain_service;
 pub mod edge_notify;
 pub mod node_service;
 pub mod purge_retry;
+pub mod shutdown;
 pub mod config_release;
 pub mod config_version;
 pub mod notify;

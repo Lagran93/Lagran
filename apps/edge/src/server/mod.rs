@@ -1,4 +1,5 @@
 pub mod access_log;
+pub mod shutdown;
 pub mod acme_challenge;
 pub mod agent_auth;
 pub mod bot_guard;

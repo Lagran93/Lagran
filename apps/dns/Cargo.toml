@@ -18,4 +18,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
 rustls = { workspace = true }
+ctrlc = { workspace = true }
 webpki-roots = { workspace = true }

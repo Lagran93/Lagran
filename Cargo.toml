@@ -50,6 +50,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# Signal handling for the DNS server, which runs synchronous sockets with no
+# Tokio runtime to reach `tokio::signal`.
+ctrlc = { version = "3.4", features = ["termination"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dotenvy = "0.15"
 dashmap = "5.5"

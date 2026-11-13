@@ -47,6 +47,12 @@ pub struct AccessLog {
     buffer: Arc<Mutex<VecDeque<AccessRecord>>>,
     buffer_cap: usize,
     node_id: String,
+    /// Records accepted by `write`, and records the writer finished.
+    ///
+    /// A shutdown waits for these to meet so the file is not left short of lines it
+    /// had already accepted.
+    enqueued: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    processed: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AccessLog {
@@ -82,10 +88,16 @@ impl AccessLog {
 
         let buffer_cap = buffer_cap.clamp(100, 50_000);
         let buffer = Arc::new(Mutex::new(VecDeque::with_capacity(buffer_cap.min(10_000))));
+        // Counters for a clean shutdown: `enqueued` is bumped by `write`,
+        // `processed` by the writer, so `flush` can wait for them to meet.
+        let enqueued = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let processed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let (tx, mut rx) = mpsc::channel::<AccessRecord>(buffer_cap.clamp(1_000, 20_000));
 
         {
             let buffer = buffer.clone();
+            let processed = processed.clone();
             // Not `spawn_supervised`: the writer owns the file handle and the
             // channel receiver, neither of which can be rebuilt, so restarting it
             // would silently lose the log file. Watch it instead — a panic would
@@ -136,6 +148,9 @@ impl AccessLog {
                                 buf.pop_front();
                             }
                             buf.push_back(rec);
+                            drop(buf);
+                            processed
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         _ = tick.tick() => {
                             if let Some(f) = file.as_mut() {
@@ -167,6 +182,8 @@ impl AccessLog {
             buffer,
             buffer_cap,
             node_id: node_id.to_string(),
+            enqueued,
+            processed,
         }
     }
 
@@ -232,7 +249,10 @@ impl AccessLog {
         // write_all() backed up all in-flight requests. Losing a log line under
         // overload is strictly better than stalling the data plane.
         match self.tx.try_send(rec) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.enqueued
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 // Log sparsely: the queue stays full for as long as the disk is
@@ -244,6 +264,31 @@ impl AccessLog {
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!("access log writer stopped; record dropped");
             }
+        }
+    }
+
+    /// Wait until the writer has processed everything queued, or `timeout` elapses.
+    ///
+    /// Tracks a counter the writer increments per record rather than inspecting the
+    /// ring buffer: the buffer keeps records after writing, so "is it empty" never
+    /// becomes true during normal operation.
+    ///
+    /// Returns the number of records still unprocessed when it gave up (0 on a clean
+    /// drain), so a shutdown can log what it might have lost.
+    pub async fn flush(&self, timeout: Duration) -> u64 {
+        let target = self.enqueued.load(Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let processed = self.processed.load(Ordering::SeqCst);
+            if processed >= target {
+                return 0;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let remaining = target.saturating_sub(processed);
+                tracing::warn!(remaining, "access log flush timed out; records may be lost");
+                return remaining;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -548,4 +593,31 @@ mod tests {
         assert_eq!(drained.len(), 1, "only the fresh record remains");
         assert_eq!(drained[0].path, "/fresh");
     }
+    /// `flush` waits for queued records and reports a clean drain.
+    ///
+    /// A shutdown relies on this to avoid losing lines the writer had already
+    /// accepted. Without it the buffered records die with the process.
+    #[tokio::test]
+    async fn flush_waits_for_queued_records() {
+        let log = AccessLog::open(None, "edge-001", 100, false).await;
+        for i in 0..20 {
+            log.write(record(&format!("/{i}"))).await;
+        }
+        let remaining = log.flush(Duration::from_secs(5)).await;
+        assert_eq!(remaining, 0, "the writer must drain everything queued");
+    }
+
+    /// A flush on an idle log returns immediately.
+    #[tokio::test]
+    async fn flush_returns_immediately_when_idle() {
+        let log = AccessLog::open(None, "edge-001", 100, false).await;
+        let started = std::time::Instant::now();
+        let remaining = log.flush(Duration::from_secs(5)).await;
+        assert_eq!(remaining, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an empty log must not wait"
+        );
+    }
+
 }
