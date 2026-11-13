@@ -796,7 +796,7 @@ RUST_LOG=edge=info,tower_http=warn
 | `WAF_REPORT_INTERVAL` | 否 | `5` | WAF 事件上报间隔（秒）。 |
 | `HEARTBEAT_INTERVAL` | 否 | `15` | 心跳间隔（秒）。控制面约 60 秒无心跳标记离线。 |
 | `CC_SYNC_INTERVAL` | 否 | `5` | 跨节点共享 CC 封禁拉取间隔（秒，最小 2）。 |
-| `RUST_LOG` | 否 | `info` | 日志级别。 |
+| `RUST_LOG` | 否 | `edge=debug,tower_http=info` | 日志级别。注意二进制自身的目标是 `lagran_edge`，只写 `edge=...` 会过滤掉它（启动摘要、CC 跨节点状态、优雅关闭都会消失，而 `edge::cache` 等库日志照常输出）。要看到全部，用 `lagran_edge=info,edge=info,tower_http=info`。 |
 
 ### 5.3 systemd
 

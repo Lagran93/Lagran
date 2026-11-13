@@ -149,15 +149,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cc = if config.redis_url.trim().is_empty() {
+        // Logged from the cc module, not here: `main`'s target is `lagran_edge`, which
+        // a `RUST_LOG=edge=...` filter does not match. Silence in that branch used to
+        // make "CC is per-node" indistinguishable from "CC failed".
+        edge::server::cc::log_shared_wiring(&edge::server::cc::SharedWiring::Local {
+            redis_url_present: false,
+        });
         edge::server::cc::CcProtector::new()
     } else {
         match edge::server::cc::RedisCc::connect(&config.redis_url).await {
             Ok(redis) => {
-                tracing::info!("CC distributed sliding-window counter enabled");
+                edge::server::cc::log_shared_wiring(&edge::server::cc::SharedWiring::Redis {
+                    budget_ms: edge::server::cc::REDIS_TIMEOUT_MS,
+                });
                 edge::server::cc::CcProtector::with_redis(Some(redis))
             }
             Err(e) => {
-                tracing::warn!(error = %e, "CC Redis unavailable; falling back to in-process counters");
+                edge::server::cc::log_shared_wiring(
+                    &edge::server::cc::SharedWiring::RedisUnavailable {
+                        error: e.to_string(),
+                    },
+                );
                 edge::server::cc::CcProtector::new()
             }
         }
@@ -184,17 +196,14 @@ async fn main() -> anyhow::Result<()> {
                 if ok == 0 && timeout == 0 && error == 0 {
                     continue;
                 }
-                if timeout > 0 || error > 0 {
-                    tracing::warn!(
-                        shared_ok = ok,
-                        shared_timeout = timeout,
-                        shared_error = error,
-                        budget_ms = edge::server::cc::REDIS_TIMEOUT_MS,
-                        "cross-node CC: some checks fell back to the per-process limit"
-                    );
-                } else {
-                    tracing::info!(shared_ok = ok, "cross-node CC: all checks used Redis");
-                }
+                // Also emitted from the cc module so the periodic answer survives a
+                // `RUST_LOG=edge=...` filter; a report nobody can see defeats the point.
+                edge::server::cc::log_shared_counters(
+                    ok,
+                    timeout,
+                    error,
+                    edge::server::cc::REDIS_TIMEOUT_MS,
+                );
             }
         });
     }
@@ -519,10 +528,17 @@ fn print_help() {
 fn init_tracing() {
     // RUST_LOG examples:
     //   RUST_LOG=debug
-    //   RUST_LOG=edge=debug,tower_http=info
+    //   RUST_LOG=lagran_edge=info,edge=info,tower_http=info
     //   RUST_LOG=info,edge::server=debug,edge::agent=debug
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("edge=debug,tower_http=info"));
+    //
+    // `lagran_edge` is this binary's own target (`main.rs`), distinct from the `edge`
+    // library crate. A filter listing only `edge=...` therefore drops every line
+    // written from `main` — startup summary, shutdown, the CC wiring decision — while
+    // `edge::cache` and friends keep printing, which reads like a missing log rather
+    // than a filter. The default covers both.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("lagran_edge=debug,edge=debug,tower_http=info")
+    });
     tracing_subscriber::registry()
         .with(filter)
         .with(

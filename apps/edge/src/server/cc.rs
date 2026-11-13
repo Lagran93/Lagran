@@ -191,6 +191,65 @@ fn ipv4_group(ip: Ipv4Addr) -> String {
     format!("{}.{}.{}.0/{IPV4_PREFIX}", o[0], o[1], o[2])
 }
 
+/// How the cross-node CC counter ended up wired at startup.
+///
+/// Logged from this module rather than from `main` on purpose. The binary's own
+/// target is `lagran_edge`, and a `RUST_LOG=edge=info` style filter does not match
+/// it -- so a line written from `main` vanishes exactly when an operator is trying to
+/// confirm whether the shared counter is working, while `edge::cache` and friends keep
+/// printing. Emitting under `edge::server::cc` keeps the answer visible under the
+/// filter an edge deployment is most likely to set.
+#[derive(Debug)]
+pub enum SharedWiring {
+    /// Connected; every check may consult Redis.
+    Redis { budget_ms: u64 },
+    /// `REDIS_URL` was set but the connection failed.
+    RedisUnavailable { error: String },
+    /// No usable `REDIS_URL`; counting is per process and nothing is shared.
+    Local { redis_url_present: bool },
+}
+
+/// Announce the wiring decided in `main`.
+pub fn log_shared_wiring(wiring: &SharedWiring) {
+    match wiring {
+        SharedWiring::Redis { budget_ms } => tracing::info!(
+            budget_ms,
+            "CC cross-node counter enabled (Redis); a round trip must fit the budget or the check falls back to local"
+        ),
+        SharedWiring::RedisUnavailable { error } => tracing::warn!(
+            error = %error,
+            "CC Redis unavailable; falling back to in-process counters"
+        ),
+        // Previously this branch logged nothing at all, so "CC is local" and "CC is
+        // broken" looked identical from the journal.
+        SharedWiring::Local {
+            redis_url_present: false,
+        } => tracing::info!(
+            "CC cross-node counter disabled: REDIS_URL is empty, every node keeps its own budget"
+        ),
+        SharedWiring::Local {
+            redis_url_present: true,
+        } => tracing::warn!(
+            "CC cross-node counter disabled despite REDIS_URL being set; the domain budget is per node"
+        ),
+    }
+}
+
+/// Report the shared/fallback tallies gathered since startup.
+pub fn log_shared_counters(ok: u64, timeout: u64, error: u64, budget_ms: u64) {
+    if timeout > 0 || error > 0 {
+        tracing::warn!(
+            shared_ok = ok,
+            shared_timeout = timeout,
+            shared_error = error,
+            budget_ms,
+            "cross-node CC: some checks fell back to the per-process limit"
+        );
+    } else {
+        tracing::info!(shared_ok = ok, "cross-node CC: all checks used Redis");
+    }
+}
+
 /// Optional Redis-backed sliding-window counter.
 ///
 /// A sorted set per `domain|client-group` stores request timestamps. The Lua
