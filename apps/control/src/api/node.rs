@@ -908,7 +908,10 @@ async fn apply_heartbeat(
             Json(HeartbeatResponse {
                 accepted: false,
                 message: e.to_string(),
-                enabled: true,
+                // A failed heartbeat says nothing about the admin's intent.
+                // Returning `true` used to re-enable a drained node during any
+                // database error; fail closed instead.
+                enabled: false,
                 status: "unknown".into(),
             })
         }

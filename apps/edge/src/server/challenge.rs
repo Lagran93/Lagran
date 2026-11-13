@@ -11,8 +11,9 @@
 //!    clearance cookie and redirects back to `next`.
 //!
 //! The nonce and cookie are HMAC-SHA256 signed with a process secret
-//! (`CHALLENGE_SECRET`, falling back to a random value), so no server-side
-//! state is required.
+//! (`CHALLENGE_SECRET`, falling back to a random value). A small in-process
+//! registry additionally makes each nonce single-use; cross-node replay would
+//! require a shared store.
 
 use crate::server::handler::AppState;
 use crate::server::host_util::{self, TlsSni};
@@ -78,6 +79,58 @@ pub fn pow_ok(nonce: &str, answer: &str, difficulty: u8) -> bool {
     let difficulty = difficulty.clamp(1, 6);
     let prefix = "0".repeat(difficulty as usize);
     sha256_hex(&format!("{nonce}:{answer}")).starts_with(&prefix)
+}
+
+/// One-shot registry of nonces that have already produced a clearance cookie.
+///
+/// A valid PoW solution used to be replayable for the whole nonce TTL to mint
+/// unlimited clearance cookies. Consuming it once per node closes that within a
+/// single edge; multi-node deployments still need a shared store.
+pub struct NonceStore {
+    used: dashmap::DashMap<String, u64>,
+    inserts: std::sync::atomic::AtomicU64,
+}
+
+impl Default for NonceStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NonceStore {
+    pub fn new() -> Self {
+        Self {
+            used: dashmap::DashMap::new(),
+            inserts: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Mark the nonce as used. Returns `false` when it was already consumed.
+    pub fn consume(&self, nonce: &str) -> bool {
+        let now = now_secs();
+        let expires = now.saturating_add(NONCE_TTL_SECS);
+        if self.used.insert(nonce.to_string(), expires).is_some() {
+            return false;
+        }
+        if self
+            .inserts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(1024)
+        {
+            self.used.retain(|_, deadline| *deadline > now);
+        }
+        true
+    }
+}
+
+fn nonce_store() -> &'static NonceStore {
+    static STORE: std::sync::OnceLock<NonceStore> = std::sync::OnceLock::new();
+    STORE.get_or_init(NonceStore::new)
+}
+
+/// Consume a verified challenge nonce. Replays return `false`.
+pub fn consume_nonce(nonce: &str) -> bool {
+    nonce_store().consume(nonce)
 }
 
 pub fn issue_nonce(host: &str, secret: &str) -> String {
@@ -308,6 +361,10 @@ pub async fn verify_direct(
     next: Option<&str>,
     secure: bool,
 ) -> Response {
+    // Bound the attacker-controlled strings before they reach HMAC/PoW work.
+    if n.len() > 512 || a.len() > 128 {
+        return error_page("验证未通过", "质询参数无效，请返回原页面刷新后重试。");
+    }
     let entry = state.domains.get(host).await;
     let (difficulty, ttl) = match entry {
         Some(entry) => (
@@ -321,6 +378,9 @@ pub async fn verify_direct(
     }
     if !pow_ok(n, a, difficulty) {
         return error_page("验证未通过", "工作量证明不正确，请返回原页面重试。");
+    }
+    if !consume_nonce(n) {
+        return error_page("验证已失效", "该质询已被使用，请返回原页面刷新后重试。");
     }
 
     let (value, ttl) = clearance_value(host, ttl, &state.challenge_secret);
@@ -495,6 +555,14 @@ const PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonce_solution_is_single_use() {
+        let store = NonceStore::new();
+        assert!(store.consume("n1"));
+        assert!(!store.consume("n1"));
+        assert!(store.consume("n2"));
+    }
 
     #[test]
     fn nonce_roundtrip_and_expiry() {

@@ -383,8 +383,15 @@ impl CacheBackend for DiskCache {
             let _ = fs::remove_file(&bin_path).await;
             return;
         }
+        // Replace, do not accumulate: the old files are gone after the write,
+        // so adding the new size on top of the already-counted old one made
+        // `used_bytes` drift upwards until eviction ran on every write.
+        let added = body_len.saturating_add(meta_bytes.len() as u64);
         self.used_bytes
-            .fetch_add(body_len + meta_bytes.len() as u64, Ordering::Relaxed);
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(replaced).saturating_add(added))
+            })
+            .ok();
         if replaced == 0 {
             self.entries.fetch_add(1, Ordering::Relaxed);
         }
@@ -617,6 +624,34 @@ impl CacheBackend for HybridCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn overwrite_keeps_used_bytes_exact() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-disk-overwrite-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = DiskCache::new(&dir, 64 * 1024 * 1024).await.unwrap();
+        let key = "GET:overwrite.test:/x";
+        let first = CacheEntry::new(200, vec![], Bytes::from(vec![1u8; 1000]));
+        cache.set_with_swr(key, first, 60, 0).await;
+        let after_first = cache.used_bytes.load(Ordering::Relaxed);
+        let second = CacheEntry::new(200, vec![], Bytes::from(vec![2u8; 2000]));
+        cache.set_with_swr(key, second, 60, 0).await;
+
+        let (meta, bin) = cache.paths_for_key(key);
+        let actual = std::fs::metadata(&meta).unwrap().len()
+            + std::fs::metadata(&bin).unwrap().len();
+        let used = cache.used_bytes.load(Ordering::Relaxed);
+        assert_eq!(used, actual, "used_bytes must equal the files on disk");
+        assert!(
+            used < after_first + 2001,
+            "overwrite must not add the new size on top of the old one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn persist_roundtrip_and_purge_by_prefix() {

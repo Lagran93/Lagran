@@ -76,6 +76,13 @@ struct HeartbeatReply {
     status: String,
 }
 
+/// Serving state to apply from a heartbeat: only an accepted reply may change
+/// it. A rejected reply (database error, unknown node) says nothing about the
+/// administrator's intent and must not re-enable a drained node.
+fn serving_update(reply: &HeartbeatReply) -> Option<bool> {
+    reply.accepted.then_some(reply.enabled)
+}
+
 /// Run a background task, restarting it if its future panics.
 ///
 /// A bare `tokio::spawn` that panics disappears silently: the edge keeps
@@ -151,20 +158,26 @@ pub fn spawn_heartbeat(config: EdgeConfig, control: ControlClient, node_control:
                     .await
                 {
                     Ok(reply) => {
-                        if !reply.accepted {
-                            tracing::warn!(message = %reply.message, "heartbeat rejected");
-                        }
-                        if node_control.set_serving(reply.enabled) {
-                            if reply.enabled {
-                                tracing::info!(
-                                    status = %reply.status,
-                                    "node enabled by control plane; serving traffic"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    status = %reply.status,
-                                    "node disabled by control plane; returning 503 until re-enabled"
-                                );
+                        match serving_update(&reply) {
+                            None => {
+                                // Rejected heartbeats (database error, unknown
+                                // node) must not change the serving state.
+                                tracing::warn!(message = %reply.message, "heartbeat rejected");
+                            }
+                            Some(enabled) => {
+                                if node_control.set_serving(enabled) {
+                                    if enabled {
+                                        tracing::info!(
+                                            status = %reply.status,
+                                            "node enabled by control plane; serving traffic"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            status = %reply.status,
+                                            "node disabled by control plane; returning 503 until re-enabled"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -211,6 +224,23 @@ async fn memory_usage() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reply(accepted: bool, enabled: bool) -> HeartbeatReply {
+        HeartbeatReply {
+            accepted,
+            message: String::new(),
+            enabled,
+            status: String::new(),
+        }
+    }
+
+    #[test]
+    fn rejected_heartbeat_never_changes_serving_state() {
+        assert_eq!(serving_update(&reply(false, true)), None);
+        assert_eq!(serving_update(&reply(false, false)), None);
+        assert_eq!(serving_update(&reply(true, true)), Some(true));
+        assert_eq!(serving_update(&reply(true, false)), Some(false));
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 

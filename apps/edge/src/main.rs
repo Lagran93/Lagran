@@ -109,15 +109,16 @@ async fn main() -> anyhow::Result<()> {
     let waf_log = edge::server::waf_log::WafLog::new(&config.node_id, 2000);
     let challenge_secret = if !config.challenge_secret.is_empty() {
         config.challenge_secret.clone()
-    } else if !config.agent_token.is_empty() {
-        format!("{}-challenge", config.agent_token)
     } else {
+        // Never derive a signing key from AGENT_TOKEN: that token is shared by
+        // every node and by the control plane, so anyone holding it could forge
+        // clearance cookies. A random per-process key is the safe fallback.
         random_secret()
     };
 
     if config.challenge_secret.is_empty() {
         tracing::warn!(
-            "CHALLENGE_SECRET is empty; clearance/nonce signatures fall back to AGENT_TOKEN or a random per-process secret. Multi-edge or restart-stable challenge requires an explicit shared CHALLENGE_SECRET."
+            "CHALLENGE_SECRET is empty; using a random per-process key. Clearance cookies and nonces will not survive a restart or work across nodes until an explicit shared CHALLENGE_SECRET is configured."
         );
     }
 

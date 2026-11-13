@@ -818,8 +818,12 @@ pub async fn node_token_exists(pool: &PgPool, token: &str) -> sqlx::Result<bool>
     if token.is_empty() {
         return Ok(false);
     }
-    let row: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM edge_nodes WHERE auth_token = $1 LIMIT 1")
+    // A disabled node must lose access immediately: otherwise draining it (or
+    // suspecting a compromise) still lets it pull every domain secret and TLS
+    // private key through the agent API.
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM edge_nodes WHERE auth_token = $1 AND status <> 'disabled' LIMIT 1",
+    )
             .bind(token)
             .fetch_optional(pool)
             .await?;
@@ -831,8 +835,9 @@ pub async fn node_name_for_token(pool: &PgPool, token: &str) -> sqlx::Result<Opt
     if token.is_empty() {
         return Ok(None);
     }
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT name FROM edge_nodes WHERE auth_token = $1 LIMIT 1")
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM edge_nodes WHERE auth_token = $1 AND status <> 'disabled' LIMIT 1",
+    )
             .bind(token)
             .fetch_optional(pool)
             .await?;
@@ -3804,6 +3809,25 @@ pub async fn permissions_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<
     Ok(permissions)
 }
 
+/// Permissions plus whether the user was ever restricted by a group.
+///
+/// The distinction matters: a user who never joined a group keeps the legacy
+/// unrestricted behaviour, while a restricted user with no grants must be
+/// denied. The flag is sticky on purpose — removing the last group must not
+/// silently hand every module back.
+pub async fn permissions_and_membership(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> sqlx::Result<(Vec<String>, bool)> {
+    let permissions = permissions_for_user(pool, user_id).await?;
+    let restricted: bool =
+        sqlx::query_scalar("SELECT permissions_restricted FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+    Ok((permissions, restricted))
+}
+
 pub async fn group_member_ids(pool: &PgPool, group_id: Uuid) -> sqlx::Result<Vec<Uuid>> {
     sqlx::query_scalar(
         "SELECT user_id FROM user_group_members WHERE group_id = $1 ORDER BY user_id",
@@ -3855,6 +3879,14 @@ pub async fn set_group_members(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    }
+    // Membership marks the user as restricted from now on, even if they are
+    // removed from every group later.
+    if !user_ids.is_empty() {
+        sqlx::query("UPDATE users SET permissions_restricted = TRUE WHERE id = ANY($1)")
+            .bind(user_ids)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await
 }

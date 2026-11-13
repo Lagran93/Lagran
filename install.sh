@@ -59,6 +59,7 @@ Environment:
   LAGRAN_JWT_SECRET=...          control: override generated JWT secret
   LAGRAN_AGENT_TOKEN=...         control: global DNS/agent token
   LAGRAN_WAF_RULEPACK_SECRET=... control+edge: sign WAF rulepacks (auto-generated)
+  CHALLENGE_SECRET=...           edge: shared challenge/clearance HMAC key (auto-generated)
   LAGRAN_REDIS_URL=...           control: optional Redis URL
   LAGRAN_SEED_DEMO=true|false    control: seed demo account (default false)
   LAGRAN_CONTROL_BIND=...        control: default 0.0.0.0:8080
@@ -450,6 +451,10 @@ write_edge_env() {
   local edge_listen="${EDGE_LISTEN:-0.0.0.0:8081}"
   local admin_listen="${EDGE_ADMIN_LISTEN:-127.0.0.1:8082}"
   local agent_url="${AGENT_URL:-http://127.0.0.1:8082}"
+  # Clearance cookies and challenge nonces must be signed with the same key on
+  # every edge. Generate one per install; multi-edge deployments should pass the
+  # same CHALLENGE_SECRET to each installer.
+  local challenge_secret="${CHALLENGE_SECRET:-$(rand_hex 32)}"
   # Signed WAF rulepacks need the same key as the control plane. Reuse the one
   # written to control.env when this host also runs the control plane.
   local waf_rulepack_secret="${WAF_RULEPACK_SECRET:-}"
@@ -483,7 +488,7 @@ LARGE_CACHE_DIR=${LARGE_CACHE_DIR:-${DATA_DIR}/large-cache}
 LARGE_CACHE_MIN_OBJECT_BYTES=${LARGE_CACHE_MIN_OBJECT_BYTES:-8388608}
 LARGE_CACHE_MAX_OBJECT_BYTES=${LARGE_CACHE_MAX_OBJECT_BYTES:-1073741824}
 LARGE_CACHE_MAX_BYTES=${LARGE_CACHE_MAX_BYTES:-21474836480}
-CHALLENGE_SECRET=${CHALLENGE_SECRET:-}
+CHALLENGE_SECRET=${challenge_secret}
 EDGE_UPDATE_HELPER=${BIN_DIR}/lagran-edge-update
 EDGE_UPDATE_REQUEST_PATH=${DATA_DIR}/edge-update.request
 EOF

@@ -30,6 +30,15 @@ struct CachedSession {
     token_version: i64,
     #[serde(default)]
     permissions: Vec<String>,
+    /// Whether the user's module access is restricted. Old cache entries lack
+    /// this field; default to `true` so a deploy does not silently grant an
+    /// unrestricted session for the remaining TTL.
+    #[serde(default = "default_restricted")]
+    restricted: bool,
+}
+
+fn default_restricted() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +47,10 @@ pub struct Actor {
     pub email: String,
     pub name: String,
     pub is_admin: bool,
-    pub permissions: Vec<String>,
+    /// `None` = the user has no groups (legacy project-role behaviour, all
+    /// modules allowed). `Some(list)` = restricted to exactly those grants;
+    /// an empty list grants nothing.
+    pub permissions: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -89,21 +101,23 @@ impl FromRequestParts<AppState> for Actor {
         } else {
             None
         };
-        let (role, is_active, token_version, permissions) = if let Some(cached) = cached {
+        let (role, is_active, token_version, permissions, restricted) = if let Some(cached) = cached
+        {
             (
                 cached.role,
                 cached.is_active,
                 cached.token_version,
                 cached.permissions,
+                cached.restricted,
             )
         } else {
             let fresh = repository::get_user_session(&state.pool, id)
                 .await
                 .map_err(|_| ActorError::internal())?
                 .ok_or_else(|| ActorError::unauthorized("user no longer exists"))?;
-            let permissions = repository::permissions_for_user(&state.pool, id)
+            let (permissions, restricted) = repository::permissions_and_membership(&state.pool, id)
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|_| (Vec::new(), true));
             if let Some(redis) = redis {
                 let _ = redis
                     .set_json(
@@ -113,12 +127,13 @@ impl FromRequestParts<AppState> for Actor {
                             is_active: fresh.1,
                             token_version: fresh.2,
                             permissions: permissions.clone(),
+                            restricted,
                         },
                         state.config.redis_session_ttl_secs,
                     )
                     .await;
             }
-            (fresh.0, fresh.1, fresh.2, permissions)
+            (fresh.0, fresh.1, fresh.2, permissions, restricted)
         };
         if !is_active {
             if let Some(redis) = redis {
@@ -137,7 +152,11 @@ impl FromRequestParts<AppState> for Actor {
             email: user.0.email.clone(),
             name: user.0.name.clone(),
             is_admin: role == "admin",
-            permissions,
+            permissions: if restricted {
+                Some(permissions)
+            } else {
+                None
+            },
         })
     }
 }
@@ -147,13 +166,19 @@ impl Actor {
         self.is_admin
     }
 
-    /// Module permission from user groups. Users without any group keep the
-    /// legacy project-role behaviour (empty set = unrestricted modules).
+    /// Module permission from user groups.
+    ///
+    /// Only users who were never restricted by a group keep the legacy
+    /// unrestricted behaviour. A restricted user with no grants is denied;
+    /// previously removing the last group *granted* every module.
     pub fn allows(&self, permission: &str) -> bool {
-        if self.is_admin || self.permissions.is_empty() {
+        if self.is_admin {
             return true;
         }
-        self.permissions.iter().any(|granted| {
+        let Some(granted_list) = self.permissions.as_ref() else {
+            return true;
+        };
+        granted_list.iter().any(|granted| {
             granted == permission
                 || granted == "*"
                 || granted
@@ -249,4 +274,39 @@ pub fn forbidden() -> (StatusCode, Json<serde_json::Value>) {
 
 pub fn not_found() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Actor;
+    use uuid::Uuid;
+
+    fn actor(permissions: Option<Vec<&str>>) -> Actor {
+        Actor {
+            id: Uuid::nil(),
+            email: "user@example.test".into(),
+            name: "user".into(),
+            is_admin: false,
+            permissions: permissions.map(|list| list.into_iter().map(str::to_string).collect()),
+        }
+    }
+
+    #[test]
+    fn no_group_membership_keeps_legacy_access() {
+        assert!(actor(None).allows("domain:read"));
+    }
+
+    #[test]
+    fn empty_group_permissions_grant_nothing() {
+        assert!(!actor(Some(vec![])).allows("domain:read"));
+    }
+
+    #[test]
+    fn explicit_permissions_and_wildcards_work() {
+        let a = actor(Some(vec!["domain:read", "cache:*"]));
+        assert!(a.allows("domain:read"));
+        assert!(!a.allows("domain:write"));
+        assert!(a.allows("cache:purge"));
+        assert!(actor(Some(vec!["*"])).allows("anything:at:all"));
+    }
 }

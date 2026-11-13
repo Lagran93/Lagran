@@ -712,6 +712,20 @@ impl LargeCache {
         }
         let new_entry = existing.is_none();
         if new_entry {
+            // The sidecar may exist but no longer qualify (different length or
+            // key). Release what it was accounted for before unlinking, or the
+            // byte counter drifts and eventually forces a permanent eviction
+            // loop.
+            if let Ok(bytes) = fs::read(&meta_path).await {
+                if let Ok(stale) = serde_json::from_slice::<LargeMeta>(&bytes) {
+                    self.release_bytes(stale.stored_bytes().saturating_add(bytes.len() as u64));
+                    self.entries
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                            Some(n.saturating_sub(1))
+                        })
+                        .ok();
+                }
+            }
             let _ = fs::remove_file(&data_path).await;
             let _ = fs::remove_file(&meta_path).await;
         }

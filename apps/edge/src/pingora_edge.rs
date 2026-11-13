@@ -560,10 +560,11 @@ impl ProxyHttp for DataPlaneProxy {
             }
         }
 
-        if is_websocket_upgrade(&session.req_header().headers) {
-            ctx.skip_logging = true;
-            return self.handle_in_process(session, false).await;
-        }
+        // Upgrade requests go through the native proxy path: Pingora 0.9
+        // validates matching H1 upgrade state on both legs and tunnels the
+        // connection after 101. Routing them to the in-process engine could
+        // never work (it has no `OnUpgrade` handle) and answered every
+        // WebSocket handshake with 400.
 
         let Some(domain) = domain else {
             if ctx.host.is_empty() {

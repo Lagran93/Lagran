@@ -2760,8 +2760,10 @@ pub(crate) async fn preflight_cacheable(
                     && mode_is_block
                     && challenge_capable
                     && !cleared;
-                let challenge_skipped =
-                    verdict.action == WafAction::Challenge && mode_is_block && !challenge_capable;
+                let challenge_skipped = verdict.action == WafAction::Challenge
+                    && mode_is_block
+                    && !challenge_capable
+                    && !cleared;
                 let blocked = mode_is_block && verdict.is_block();
 
                 if challenge_needed
@@ -2822,7 +2824,10 @@ pub(crate) async fn preflight_cacheable(
                         ));
                     }
 
-                    if blocked {
+                    // A challenge verdict the client cannot render (no
+                    // `Accept: text/html`, non-GET) used to fall through and
+                    // reach the origin. Treat it as a block instead of "skip".
+                    if blocked || challenge_skipped {
                         log_access(
                             &state.access_log,
                             method,

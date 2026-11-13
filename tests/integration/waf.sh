@@ -196,6 +196,13 @@ check "challenge rule returns interstitial" "$CODE" "403"
 contains "challenge page marker" "$(cat "$LOG_DIR/body")" "正在进行安全验证"
 contains "challenge response header" "$(cat "$LOG_DIR/headers")" "x-lagran-challenge:"
 
+# A client that cannot render the interstitial (no Accept: text/html) must be
+# blocked, not passed through to the origin.
+CODE=$(curl -s -o "$LOG_DIR/nonhtml_body" -w '%{http_code}' -H "Host: $DOMAIN" \
+  -H 'X-Forwarded-For: 198.51.100.3' "http://127.0.0.1:$EDGE_PORT/challenge-me")
+check "challenge without an HTML client is blocked" "$CODE" "403"
+contains "non-HTML challenge is a block page" "$(cat "$LOG_DIR/nonhtml_body")" "安全拦截"
+
 NONCE=$(grep -o 'var nonce = "[^"]*"' "$LOG_DIR/body" | head -1 | sed 's/.*"\(.*\)"/\1/')
 if [[ -n "$NONCE" ]]; then
   pass "challenge nonce extracted"
@@ -220,6 +227,12 @@ CODE=$(curl -s -o "$LOG_DIR/verify_body" -D "$LOG_DIR/verify_headers" -w '%{http
 check "verify endpoint redirects" "$CODE" "303"
 contains "clearance cookie issued" "$(cat "$LOG_DIR/verify_headers")" "lagran_clearance="
 contains "clearance cookie is HttpOnly" "$(cat "$LOG_DIR/verify_headers")" "HttpOnly"
+
+# A solved nonce is single-use: replaying it must not mint another cookie.
+CODE=$(curl -s -o "$LOG_DIR/replay_body" -w '%{http_code}' -H "Host: $DOMAIN" \
+  "http://127.0.0.1:$EDGE_PORT/__lagran/challenge/verify?n=$NONCE&a=$ANSWER&next=%2Fchallenge-me")
+check "nonce replay is rejected" "$CODE" "403"
+contains "replay shows the expired page" "$(cat "$LOG_DIR/replay_body")" "验证已失效"
 
 CODE=$(curl -s -o "$LOG_DIR/body" -b "$LOG_DIR/challenge.jar" -w '%{http_code}' \
   -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/challenge-me")

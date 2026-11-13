@@ -130,6 +130,23 @@ fn normalize_name(raw: &str) -> Result<String, (StatusCode, Json<ErrorBody>)> {
     Ok(name.to_string())
 }
 
+/// Drop cached sessions for users affected by a group change, so permission
+/// changes take effect on the next request instead of after the Redis TTL.
+async fn invalidate_sessions(
+    state: &AppState,
+    user_ids: impl IntoIterator<Item = uuid::Uuid>,
+) {
+    let Some(redis) = state.redis.as_deref() else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    for id in user_ids {
+        if seen.insert(id) {
+            redis.invalidate_session(id).await;
+        }
+    }
+}
+
 pub async fn list(
     State(state): State<AppState>,
     actor: Actor,
@@ -243,6 +260,9 @@ pub async fn update(
             }
         })?
         .ok_or_else(not_found)?;
+    if let Ok(members) = repository::group_member_ids(&state.pool, gid).await {
+        invalidate_sessions(&state, members).await;
+    }
     let _ = repository::insert_audit(
         &state.pool,
         &actor.email,
@@ -263,12 +283,16 @@ pub async fn delete(
         return Err(forbidden());
     }
     let gid = parse_uuid(&id)?;
+    let members = repository::group_member_ids(&state.pool, gid)
+        .await
+        .unwrap_or_default();
     let n = repository::delete_user_group(&state.pool, gid)
         .await
         .map_err(|_| db_error())?;
     if n == 0 {
         return Err(not_found());
     }
+    invalidate_sessions(&state, members).await;
     let _ = repository::insert_audit(&state.pool, &actor.email, "group.delete", &id, "").await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
@@ -302,9 +326,15 @@ pub async fn set_members(
     for raw in req.user_ids {
         ids.push(parse_uuid(&raw)?);
     }
+    let previous = repository::group_member_ids(&state.pool, gid)
+        .await
+        .unwrap_or_default();
     repository::set_group_members(&state.pool, gid, &ids)
         .await
         .map_err(|_| db_error())?;
+    // Both removed members (their grants disappear) and added members (they may
+    // have cached an unrestricted session) need a fresh permission load.
+    invalidate_sessions(&state, previous.into_iter().chain(ids.iter().copied())).await;
     let _ = repository::insert_audit(
         &state.pool,
         &actor.email,

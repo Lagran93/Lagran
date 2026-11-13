@@ -597,20 +597,14 @@ pub async fn get_domain_config(
 pub async fn list_all_configs(
     State(state): State<AppState>,
     headers: HeaderMap,
-    _agent: AgentAuth,
+    agent: AgentAuth,
 ) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
-    let node_id = headers
-        .get("x-lagran-node-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let active_release = if node_id.is_empty() {
-        None
-    } else {
-        repository::active_release_for_node(&state.pool, &node_id)
-            .await
-            .unwrap_or(None)
-    };
+    // The node identity comes from the authenticated token, never from a
+    // client-supplied header: otherwise any registered edge could ask for
+    // another node's canary release and apply a staged rollout it is not in.
+    let active_release = repository::active_release_for_node(&state.pool, &agent.node_name)
+        .await
+        .unwrap_or(None);
     // Nodes without a release share one document. Nodes pinned to the same
     // release share that release's document. This keeps the cache useful when
     // hundreds of edges poll on the same 15s interval.

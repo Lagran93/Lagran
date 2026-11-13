@@ -83,9 +83,20 @@ HEADER_RULE=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN
   | jq -r '.id')
 [[ -n "$HEADER_RULE" ]] || { echo "header rule creation failed"; exit 1; }
 
+# The edge must authenticate with a per-node token; the global AGENT_TOKEN is
+# not accepted by the agent API.
+echo "== register node =="
+NODE_NAME="waf-adv-edge-$$"
+NODE=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"$NODE_NAME\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
+NODE_TOKEN=$(printf '%s' "$NODE" | jq -r '.token // empty')
+[[ -n "$NODE_TOKEN" ]] || { echo "node creation failed: $NODE"; exit 1; }
+
 echo "== start edge =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
-NODE_ID="waf-adv-edge-$$" \
+NODE_ID="$NODE_NAME" \
+AGENT_TOKEN="$NODE_TOKEN" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
 ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
 WAF_REPORT_INTERVAL=2 \

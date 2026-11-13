@@ -32,6 +32,9 @@ pub struct AppConfig {
     pub agent_token: String,
     /// HMAC secret for signed WAF rulepacks (empty = AGENT_TOKEN fallback).
     pub waf_rulepack_secret: String,
+    /// Optional bearer token for `/metrics`. Falls back to `AGENT_TOKEN`, then
+    /// to an open endpoint when neither is configured (local development).
+    pub metrics_token: String,
     /// Public base URL of the control plane (used in node install commands).
     /// Empty = derive from the incoming request Host header.
     pub public_url: String,
@@ -123,6 +126,7 @@ impl Default for AppConfig {
                 .or_else(|| env_nonempty("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
             waf_rulepack_secret: env_nonempty("WAF_RULEPACK_SECRET").unwrap_or_default(),
+            metrics_token: env_nonempty("METRICS_TOKEN").unwrap_or_default(),
             public_url: normalize_public_url(
                 &std::env::var("CONTROL_PUBLIC_URL").unwrap_or_default(),
             ),

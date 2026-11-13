@@ -1,7 +1,12 @@
 //! Health and readiness endpoints
 
 use crate::state::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{header, HeaderMap, StatusCode},
+    response::Response,
+    Json,
+};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -46,7 +51,49 @@ use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 
 /// Prometheus text exposition for the control plane.
-pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+/// Constant-time byte comparison (no early return on the first mismatch).
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Constant-time bearer/token check for the metrics endpoint.
+fn metrics_token_ok(expected: &str, headers: &HeaderMap) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    let presented = headers
+        .get("x-lagran-metrics-token")
+        .or_else(|| headers.get("x-lagran-agent-token"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer ").map(str::to_string))
+        });
+    presented.is_some_and(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()))
+}
+
+pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // `/metrics` exposes every tenant's domain names, origin URLs and node
+    // inventory; leaving it unauthenticated turned a scrape endpoint into an
+    // anonymous enumberation API. Prefer METRICS_TOKEN, fall back to AGENT_TOKEN.
+    let expected = if state.config.metrics_token.is_empty() {
+        state.config.agent_token.as_str()
+    } else {
+        state.config.metrics_token.as_str()
+    };
+    if !metrics_token_ok(expected, &headers) {
+        return (StatusCode::UNAUTHORIZED, "metrics token required").into_response();
+    }
     let db_up = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.pool)
         .await
@@ -180,6 +227,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         out,
     )
+        .into_response()
 }
 
 fn escape_label(value: &str) -> String {
@@ -187,4 +235,25 @@ fn escape_label(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::metrics_token_ok;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn metrics_token_is_enforced_when_configured() {
+        assert!(metrics_token_ok("", &HeaderMap::new()));
+        assert!(!metrics_token_ok("secret", &HeaderMap::new()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lagran-metrics-token", HeaderValue::from_static("secret"));
+        assert!(metrics_token_ok("secret", &headers));
+        assert!(!metrics_token_ok("other", &headers));
+
+        let mut bearer = HeaderMap::new();
+        bearer.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        assert!(metrics_token_ok("secret", &bearer));
+    }
 }
