@@ -57,9 +57,28 @@ impl ConfigCache {
         let Ok(mut entries) = self.entries.write() else {
             return;
         };
-        entries.retain(|_, entry| entry.expires > now);
+        // Evict expired entries only when the map is actually near its cap, and then
+        // only enough to make room — the old code ran a full `retain` on **every**
+        // insert and then threw the whole map away at 256 entries, which also discards
+        // entries that were still valid. A config release purges this cache on every
+        // sweep, so "everything vanished" was a normal thing to observe.
         if entries.len() >= MAX_ENTRIES {
-            entries.clear();
+            entries.retain(|_, entry| entry.expires > now);
+            // Still full after dropping the expired ones: evict the entry closest to
+            // expiry. That is the cheapest approximation of LRU available without
+            // extra bookkeeping, and the cache is small enough to scan when we do.
+            while entries.len() >= MAX_ENTRIES {
+                let oldest = entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires)
+                    .map(|(key, _)| key.clone());
+                match oldest {
+                    Some(key) => {
+                        entries.remove(&key);
+                    }
+                    None => break,
+                }
+            }
         }
         entries.insert(
             key,

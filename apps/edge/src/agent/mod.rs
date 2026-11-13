@@ -33,12 +33,19 @@ impl NodeControl {
     }
 
     pub fn is_serving(&self) -> bool {
-        self.serving.load(Ordering::Relaxed)
+        // `Acquire` pairs with the `Release` in `set_serving`.
+        //
+        // Today the flag carries no payload, so `Relaxed` would still be correct —
+        // the ordering exists so that a request thread which observes
+        // `serving == false` is guaranteed to see whatever the setter did before
+        // flipping it (cache clears, connection teardown). Cheap insurance against a
+        // future change that looks obviously safe at the call site.
+        self.serving.load(Ordering::Acquire)
     }
 
     /// Returns true when the state actually changed.
     pub fn set_serving(&self, enabled: bool) -> bool {
-        let previous = self.serving.swap(enabled, Ordering::Relaxed);
+        let previous = self.serving.swap(enabled, Ordering::Release);
         previous != enabled
     }
 }

@@ -109,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
         let pool = pool.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                // `Delay`, not the default `Burst`: a tick that overran (a slow
+                // query, a stalled connection) must not be followed by an immediate
+                // catch-up run. `purge_old_telemetry` below would otherwise run
+                // back-to-back after a long retention pass.
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 match control::repository::mark_stale_nodes_offline(&pool, 60).await {
@@ -126,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         let days = config.log_retention_days;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 match control::repository::purge_old_telemetry(&pool, days).await {
@@ -192,6 +198,9 @@ async fn main() -> anyhow::Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                // ACME renewal: a burst here could fire two orders for the same
+                // certificate.
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 let renewed = control::acme::renew_due(&state).await;

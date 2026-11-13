@@ -203,6 +203,10 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         cache,
         flight,
+        // 128 concurrent background revalidations: enough to refresh a large
+        // deployment quickly, far below the request concurrency that would exhaust
+        // the origin pool.
+        revalidate_permits: Arc::new(tokio::sync::Semaphore::new(128)),
         large_cache,
         origin,
         default_ttl_secs: config.default_ttl_secs,

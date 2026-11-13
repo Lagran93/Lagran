@@ -3845,6 +3845,19 @@ pub async fn enqueue_purge_retry(
     Ok(())
 }
 
+/// Delete purge retries that have used up their attempts.
+///
+/// `due_purge_retries` only selects `attempts < 10`, so a row that reached 10 was
+/// invisible to the loop and its `DELETE` was never issued — a node offline long
+/// enough left a row behind forever. Sweeping by the same threshold the SELECT uses
+/// keeps the two in step: whatever cannot be selected cannot accumulate.
+pub async fn purge_exhausted_retries(pool: &PgPool) -> sqlx::Result<u64> {
+    let result = sqlx::query("DELETE FROM purge_retries WHERE attempts >= 10")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn due_purge_retries(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<PurgeRetryRow>> {
     sqlx::query_as::<_, PurgeRetryRow>(
         r#"

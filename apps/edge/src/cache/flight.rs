@@ -52,6 +52,17 @@ pub struct RedisFlight {
     seq: AtomicU64,
 }
 
+impl std::fmt::Debug for RedisFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ConnectionManager` has no `Debug`; the prefix identifies the instance
+        // without exposing connection details.
+        f.debug_struct("RedisFlight")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
 pub struct FlightGuard {
     flight: Arc<RedisFlight>,
     key: String,
@@ -189,18 +200,55 @@ impl RedisFlight {
     }
 }
 
-/// Try to become the cross-node leader. `None` means another node holds the
-/// lock, or Redis is unavailable and the caller should proceed locally.
+/// What `acquire` decided for this request.
+///
+/// The old signature returned `Option<FlightGuard>`, where `None` meant either "a
+/// follower that already read the leader's result" or "Redis is unavailable" — two
+/// very different situations collapsed into one value. Callers could not tell a
+/// degraded path from a healthy one, so a Redis outage was invisible: no metric, no
+/// log, and an extra L2 read on every request.
+#[derive(Debug)]
+pub enum FlightOutcome {
+    /// This request owns the fetch.
+    Leader(FlightGuard),
+    /// Another node is fetching; the caller should read the cache or fetch itself.
+    Follower,
+    /// The lock could not be taken because Redis failed. The caller proceeds as if
+    /// it were alone; coalescing is not happening.
+    Degraded,
+}
+
+impl FlightOutcome {
+    /// The guard, if this request is the leader.
+    pub fn into_guard(self) -> Option<FlightGuard> {
+        match self {
+            FlightOutcome::Leader(guard) => Some(guard),
+            _ => None,
+        }
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        matches!(self, FlightOutcome::Degraded)
+    }
+}
+
+/// Try to become the cross-node leader.
 pub async fn acquire(
     flight: &Arc<RedisFlight>,
     key: &str,
     origin_timeout_ms: u64,
     cache: &dyn lagran_cache::CacheBackend,
-) -> Option<FlightGuard> {
+) -> FlightOutcome {
     let ttl_ms = lock_ttl_ms(origin_timeout_ms);
     match flight.try_lock(key, ttl_ms).await {
-        Ok(Some(guard)) => return Some(guard),
-        Err(_) => return None,
+        Ok(Some(guard)) => return FlightOutcome::Leader(guard),
+        Err(_) => {
+            tracing::warn!(
+                key,
+                "flight lock unavailable; proceeding without cross-node coalescing"
+            );
+            return FlightOutcome::Degraded;
+        }
         Ok(None) => {}
     }
     // Follower: wait for the leader to populate shared L2. The window is derived
@@ -216,7 +264,7 @@ pub async fn acquire(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    None
+    FlightOutcome::Follower
 }
 
 #[cfg(test)]
@@ -238,12 +286,20 @@ mod tests {
             };
         let cache = MemoryCache::new(10);
         let key = "GET:flight.test:/a";
-        let guard = acquire(&flight, key, 10_000, &cache).await;
+        let guard = acquire(&flight, key, 10_000, &cache).await.into_guard();
         assert!(guard.is_some());
-        assert!(acquire(&flight, key, 10_000, &cache).await.is_none());
+        let second = acquire(&flight, key, 10_000, &cache).await;
+        assert!(
+            !matches!(second, FlightOutcome::Leader(_)),
+            "a second node must not lead while the lock is held"
+        );
+        assert!(!second.is_degraded(), "Redis is up; this is a follower");
         drop(guard);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(acquire(&flight, key, 10_000, &cache).await.is_some());
+        assert!(acquire(&flight, key, 10_000, &cache)
+            .await
+            .into_guard()
+            .is_some());
     }
 
     /// The lock must outlive the fetch it protects.
@@ -293,5 +349,18 @@ mod tests {
     fn lock_ttl_has_a_floor() {
         assert_eq!(lock_ttl_ms(0), LOCK_TTL_MIN_MS);
         assert!(lock_ttl_ms(200) >= LOCK_TTL_MIN_MS);
+    }
+    /// A Redis failure is reported as degraded, not as a follower.
+    ///
+    /// Both used to be `None`, so a Redis outage looked identical to "another node
+    /// is fetching": no metric, no log, and an extra L2 read per request.
+    #[test]
+    fn degraded_is_distinguishable_from_follower() {
+        assert!(!FlightOutcome::Follower.is_degraded());
+        assert!(FlightOutcome::Degraded.is_degraded());
+        assert!(
+            FlightOutcome::Follower.into_guard().is_none(),
+            "only a leader carries a guard"
+        );
     }
 }

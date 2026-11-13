@@ -632,14 +632,19 @@ impl ProxyHttp for DataPlaneProxy {
                 // the object. A plain L1 hit must not issue Redis SET/EVAL
                 // commands on every request.
                 if let Some(flight) = self.state.flight.as_ref() {
-                    if let Some(guard) = crate::cache::flight::acquire(
+                    let outcome = crate::cache::flight::acquire(
                         flight,
                         &plan.key,
                         plan.read_timeout_ms,
                         self.state.cache.as_ref(),
                     )
-                    .await
-                    {
+                    .await;
+                    if outcome.is_degraded() {
+                        // Redis is down: this request is not coalescing with the
+                        // other nodes. Counted so the state is visible.
+                        self.state.metrics.record_flight_degraded();
+                    }
+                    if let Some(guard) = outcome.into_guard() {
                         ctx.flight_guard = Some(guard);
                     }
                 }

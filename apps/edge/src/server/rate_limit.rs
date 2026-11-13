@@ -10,8 +10,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const REDIS_TIMEOUT: Duration = Duration::from_millis(10);
+/// Timeout for one Redis rate-limit round trip.
+///
+/// 10 ms was too tight for a cross-host Redis: ordinary latency jitter looked like
+/// an outage, the limiter tripped its cooldown, and every node fell back to its own
+/// local bucket — which multiplies the effective limit by the number of nodes. An
+/// attacker at high QPS could push the shared limiter into that state on purpose.
+const REDIS_TIMEOUT: Duration = Duration::from_millis(75);
+
+/// How long to stay in the degraded (local-bucket) path after a failure.
 const REDIS_FAILURE_COOLDOWN_MS: u64 = 5_000;
+
+/// Extra random delay added to the cooldown, so replicas that tripped at the same
+/// moment do not all probe Redis again on the same millisecond.
+const REDIS_RECOVERY_JITTER_MS: u64 = 1_000;
 
 #[derive(Clone, Default)]
 pub struct RateLimiter {
@@ -39,6 +51,11 @@ pub struct RedisRateLimiter {
     /// After a timeout/error, skip Redis for a short cooldown so a degraded
     /// Redis cannot add the timeout to every request.
     fail_until_ms: Arc<AtomicU64>,
+    /// Times the shared limiter was bypassed because Redis failed.
+    ///
+    /// Non-zero means limiting is per-node rather than fleet-wide, which raises the
+    /// effective limit by the node count — worth being able to see.
+    degraded: Arc<AtomicU64>,
 }
 
 impl RedisRateLimiter {
@@ -57,6 +74,7 @@ impl RedisRateLimiter {
             conn,
             prefix,
             fail_until_ms: Arc::new(AtomicU64::new(0)),
+            degraded: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -67,9 +85,26 @@ impl RedisRateLimiter {
             .unwrap_or(0)
     }
 
+    /// Times the shared limiter was bypassed due to a Redis failure.
+    pub fn degraded(&self) -> u64 {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
     fn mark_failed(&self) {
-        self.fail_until_ms
-            .store(Self::now_ms() + REDIS_FAILURE_COOLDOWN_MS, Ordering::Relaxed);
+        // Jitter the recovery point so a fleet that tripped together does not come
+        // back together and stampede Redis on the first millisecond past the cooldown.
+        let jitter = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0);
+            nanos % REDIS_RECOVERY_JITTER_MS
+        };
+        self.fail_until_ms.store(
+            Self::now_ms() + REDIS_FAILURE_COOLDOWN_MS + jitter,
+            Ordering::Release,
+        );
+        self.degraded.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns `None` when Redis is unavailable or timed out, so the caller can
@@ -78,7 +113,7 @@ impl RedisRateLimiter {
         if rps == 0 {
             return Some(true);
         }
-        if Self::now_ms() < self.fail_until_ms.load(Ordering::Relaxed) {
+        if Self::now_ms() < self.fail_until_ms.load(Ordering::Acquire) {
             return None;
         }
         let burst = burst.max(1);

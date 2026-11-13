@@ -39,6 +39,14 @@ pub fn client() -> &'static EdgeClient {
     })
 }
 
+/// Whether the failure was the attempt deadline rather than a transport fault.
+///
+/// `send_once_timeout` tags its own timeout; anything else (connection refused,
+/// reset, DNS) may still succeed on a fresh attempt.
+fn is_timeout(err: &str) -> bool {
+    err.starts_with("callback timeout after")
+}
+
 async fn send_once(
     method: &str,
     url: &str,
@@ -92,6 +100,11 @@ pub async fn request_ok<B: Serialize>(
                 last = format!("HTTP {status}: {}", preview(&body));
             }
             Ok((status, body)) => return Err(format!("HTTP {status}: {}", preview(&body))),
+            // A timeout already consumed the full attempt budget; spending it again
+            // is not a retry, it is paying twice. This matters in `purge_retry`, which
+            // walks rows serially: 5s + 0.1s + 5s per unreachable node turned a 15 s
+            // cycle into minutes of continuous work.
+            Err(e) if is_timeout(&e) => return Err(e),
             Err(e) if attempt + 1 < ATTEMPTS => last = e,
             Err(e) => return Err(e),
         }
@@ -131,6 +144,11 @@ pub async fn request_json<T: DeserializeOwned, B: Serialize>(
                 last = format!("HTTP {status}: {}", preview(&body));
             }
             Ok((status, body)) => return Err(format!("HTTP {status}: {}", preview(&body))),
+            // A timeout already consumed the full attempt budget; spending it again
+            // is not a retry, it is paying twice. This matters in `purge_retry`, which
+            // walks rows serially: 5s + 0.1s + 5s per unreachable node turned a 15 s
+            // cycle into minutes of continuous work.
+            Err(e) if is_timeout(&e) => return Err(e),
             Err(e) if attempt + 1 < ATTEMPTS => last = e,
             Err(e) => return Err(e),
         }

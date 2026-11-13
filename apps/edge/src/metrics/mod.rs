@@ -19,6 +19,10 @@ pub struct EdgeMetrics {
     by_domain: DashMap<String, Arc<Counters>>,
     origin_timeouts: AtomicU64,
     origin_errors: AtomicU64,
+    /// Requests that could not take the cross-node flight lock because Redis was
+    /// unavailable. Non-zero means coalescing is off and origin load is higher than
+    /// the topology implies.
+    flight_degraded: AtomicU64,
     stream_requests: AtomicU64,
     stream_bytes: AtomicU64,
     stream_errors: AtomicU64,
@@ -91,6 +95,15 @@ impl EdgeMetrics {
         let c = self.bucket(domain);
         c.requests.fetch_add(1, Ordering::Relaxed);
         c.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Count a request that ran without the cross-node flight lock.
+    pub fn record_flight_degraded(&self) {
+        self.flight_degraded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn flight_degraded(&self) -> u64 {
+        self.flight_degraded.load(Ordering::Relaxed)
     }
 
     pub fn record_origin_timeout(&self) {

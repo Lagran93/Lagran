@@ -21,6 +21,14 @@ pub fn spawn(pool: PgPool, fallback_token: String) {
 }
 
 async fn run_once(pool: &PgPool, fallback_token: &str) -> Result<(), sqlx::Error> {
+    // Clear rows that already used up their attempts. They are excluded by the
+    // SELECT's `attempts < 10` below, so without this sweep they would never be
+    // deleted — a long-offline node would leave one behind permanently.
+    match repository::purge_exhausted_retries(pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(dropped = n, "dropped exhausted purge retries"),
+        Err(e) => tracing::warn!(error = %e, "purge retry sweep failed"),
+    }
     let rows = repository::due_purge_retries(pool, 50).await?;
     for row in rows {
         if row.attempts >= 9 {

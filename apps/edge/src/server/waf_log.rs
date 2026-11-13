@@ -26,6 +26,8 @@ pub struct WafLog {
     inner: Arc<Mutex<VecDeque<WafEvent>>>,
     cap: usize,
     node_id: String,
+    /// Events dropped by overflow, so the loss is visible instead of silent.
+    dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WafLog {
@@ -34,6 +36,7 @@ impl WafLog {
             inner: Arc::new(Mutex::new(VecDeque::with_capacity(cap.min(10_000)))),
             cap: cap.clamp(100, 20_000),
             node_id: node_id.to_string(),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -52,6 +55,8 @@ impl WafLog {
         let mut buf = self.inner.lock().await;
         if buf.len() >= self.cap {
             buf.pop_front();
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         buf.push_back(WafEvent {
             domain: domain.to_string(),
@@ -78,17 +83,37 @@ impl WafLog {
         out
     }
 
-    pub async fn requeue(&self, events: Vec<WafEvent>) {
+    /// Put a failed batch back at the front.
+    ///
+    /// Eviction is oldest-first, matching `push`: this used to `pop_back()` here
+    /// while `push` did `pop_front()`, so a full buffer dropped the newest events on
+    /// one path and the oldest on the other. Dropping the oldest is the consistent
+    /// choice — the newest events describe what is happening now.
+    ///
+    /// Returns how many events were dropped to make room.
+    pub async fn requeue(&self, events: Vec<WafEvent>) -> u64 {
         if events.is_empty() {
-            return;
+            return 0;
         }
         let mut buf = self.inner.lock().await;
+        let mut dropped = 0u64;
         for ev in events.into_iter().rev() {
             if buf.len() >= self.cap {
-                buf.pop_back();
+                buf.pop_front();
+                dropped += 1;
             }
             buf.push_front(ev);
         }
+        if dropped > 0 {
+            self.dropped
+                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+        }
+        dropped
+    }
+
+    /// Total events dropped by overflow since start.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn len(&self) -> usize {

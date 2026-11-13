@@ -115,6 +115,32 @@ impl Service {
             .collect()
     }
 
+    /// Evict up to `budget` expired entries with a single bounded pass.
+    ///
+    /// HashMap iteration order is arbitrary but stable while nothing is inserted,
+    /// which is enough here: the goal is to keep the table near the cap, not to
+    /// sweep it exactly. Anything still live that this pass misses is caught on the
+    /// next insert.
+    fn evict_expired(
+        cache: &mut HashMap<String, CacheEntry>,
+        now: Instant,
+        stale_secs: u64,
+        budget: usize,
+    ) {
+        let mut expired: Vec<String> = Vec::new();
+        for (key, entry) in cache.iter() {
+            if expired.len() >= budget {
+                break;
+            }
+            if now.duration_since(entry.at).as_secs() > stale_secs {
+                expired.push(key.clone());
+            }
+        }
+        for key in expired {
+            cache.remove(&key);
+        }
+    }
+
     fn fallback_ip(&self) -> Option<IpAddr> {
         self.cfg
             .fallback_ip
@@ -219,10 +245,15 @@ impl Service {
                             at: now,
                         },
                     );
+                    // Bound the table without a full sweep under the write lock.
+                    //
+                    // The old `retain` walked every entry the moment the map passed
+                    // 20k — a millisecond-scale stall on the worker thread, repeated
+                    // every time a random-subdomain flood refilled the table. Here a
+                    // bounded number of expired entries is evicted per insert
+                    // instead, so no single query pays for the whole map.
                     if cache.len() > 20_000 {
-                        cache.retain(|_, e| {
-                            now.duration_since(e.at).as_secs() <= self.cfg.stale_secs
-                        });
+                        Self::evict_expired(&mut cache, now, self.cfg.stale_secs, 256);
                     }
                 }
                 ip.map(|ip| (ip, reply.ttl))

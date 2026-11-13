@@ -49,6 +49,10 @@ async fn sync_once(
     etag: &mut Option<String>,
 ) -> Result<(), String> {
     let mut applied = 0u32;
+    // Whether the bulk set already carried the configured EDGE_DOMAIN. The fallback
+    // below used to run every round regardless, adding a steady background request
+    // per node even when the answer was already in hand.
+    let mut covered_configured = false;
 
     // 1) Bulk active certs
     match control
@@ -78,6 +82,11 @@ async fn sync_once(
                     ) {
                         Ok(()) => {
                             applied += 1;
+                            if !config.domain.is_empty()
+                                && cert.domain.eq_ignore_ascii_case(&config.domain)
+                            {
+                                covered_configured = true;
+                            }
                             active_domains.push(cert.domain.clone());
                             tracing::debug!(domain = %cert.domain, "cert applied from edge-sync");
                         }
@@ -111,8 +120,12 @@ async fn sync_once(
         }
     }
 
-    // 2) Fallback: EDGE_DOMAIN single fetch
-    if !config.domain.is_empty() {
+    // 2) Fallback: EDGE_DOMAIN single fetch.
+    //
+    // Skipped when the bulk response already contained that domain: re-fetching it
+    // would ask the control plane for an answer it just gave us, once per node per
+    // poll, forever.
+    if !config.domain.is_empty() && !covered_configured {
         let path = format!("/api/v1/certs/by-domain/{}", config.domain);
         if let Ok(cert) = control.get_json::<EdgeCertResponse>(&path).await {
             if (cert.status == "active" || cert.status.is_empty())

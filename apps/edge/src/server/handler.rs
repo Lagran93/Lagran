@@ -79,6 +79,14 @@ pub struct AppState {
     pub cache: SharedCache,
     /// Cross-node cold-miss coalescing; None when Redis L2 is disabled.
     pub flight: Option<Arc<RedisFlight>>,
+    /// Caps concurrent background revalidations.
+    ///
+    /// A stale hit spawns a detached origin fetch. When a whole cache expires at
+    /// once — a config release purges everything — that is one spawn per request,
+    /// each holding an origin connection for its full timeout, which starves normal
+    /// traffic and can trip the origin health check. Overflow requests keep being
+    /// served stale instead.
+    pub revalidate_permits: Arc<tokio::sync::Semaphore>,
     /// Separate streaming disk cache for large objects; disabled when None.
     pub large_cache: Option<Arc<LargeCache>>,
     pub origin: OriginClient,
@@ -1408,6 +1416,7 @@ async fn fetch_with_single_flight(
             let flight_guard = if let Some(flight) = state.flight.as_ref() {
                 crate::cache::flight::acquire(flight, key, eff.timeout_ms, state.cache.as_ref())
                     .await
+                    .into_guard()
             } else {
                 None
             };
@@ -1923,7 +1932,15 @@ fn spawn_revalidation(
     origin_auth_header: String,
     origin_auth_value: String,
 ) {
+    // Take a permit before spawning. `try_acquire_owned` is deliberate: queueing
+    // thousands of background fetches would just move the overload later, and the
+    // caller is already being served a stale copy.
+    let Ok(permit) = state.revalidate_permits.clone().try_acquire_owned() else {
+        tracing::debug!(key, "revalidation skipped; concurrency cap reached");
+        return;
+    };
     tokio::spawn(async move {
+        let _permit = permit;
         let Slot::Leader(leader) = state.inflight.begin(&key).await else {
             return;
         };

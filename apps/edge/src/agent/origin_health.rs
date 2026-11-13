@@ -60,15 +60,6 @@ impl OriginHealthMap {
         }
     }
 
-    pub async fn is_healthy(&self, domain: &str) -> bool {
-        self.inner
-            .read()
-            .await
-            .get(&domain.to_lowercase())
-            .map(|s| s.healthy)
-            .unwrap_or(true)
-    }
-
     pub async fn is_origin_healthy(&self, domain: &str, origin_url: &str) -> bool {
         let map = self.inner.read().await;
         let key = origin_key(domain, origin_url);
