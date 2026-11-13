@@ -16,6 +16,12 @@ pub const EXPIRES_PARAM: &str = "expires";
 pub const SIGNATURE_PARAM: &str = "signature";
 pub const SIG_PARAM: &str = "sig";
 pub const HOTLINK_OK_HEADER: &str = "x-lagran-hotlink-ok";
+/// Longest accepted `expires` value.
+///
+/// Ten digits covers every epoch second until the year 2286; twenty leaves room
+/// without letting a pathological string through.
+const MAX_EXPIRES_DIGITS: usize = 20;
+
 const CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_TTL_SECS: u64 = 3600;
 
@@ -247,6 +253,23 @@ pub fn verify(
         });
     }
     let expires_raw = &expires_values[0];
+    // Require plain ASCII digits.
+    //
+    // `i64::from_str` also accepts a sign and leading zeros, so `+1700000000`,
+    // `-0` and `007` all parsed to a timestamp. None of these bypasses the check —
+    // the signature covers `expires_raw`, so a client would have to sign the odd
+    // form itself — but one instant having several accepted spellings makes test
+    // vectors and incident triage ambiguous. Rejecting them keeps the format
+    // single-valued.
+    if expires_raw.is_empty()
+        || expires_raw.len() > MAX_EXPIRES_DIGITS
+        || !expires_raw.bytes().all(|b| b.is_ascii_digit())
+        // `0100` and `100` are the same instant; only the canonical spelling (no
+        // leading zero) is accepted, except for the value zero itself.
+        || (expires_raw.len() > 1 && expires_raw.starts_with('0'))
+    {
+        return Err(SignedUrlError::Invalid);
+    }
     let expires: i64 = expires_raw.parse().map_err(|_| SignedUrlError::Invalid)?;
     if expires < now - CLOCK_SKEW_SECS {
         return Err(SignedUrlError::Expired);
@@ -446,5 +469,50 @@ mod tests {
         // not match it.
         assert!(!path_protected(&path_domain("/secret/*"), "/secretary/x"));
         assert!(path_protected(&path_domain("/secret/*"), "/secret/x"));
+    }
+    /// `expires` must be plain ASCII digits.
+    ///
+    /// `i64::from_str` also accepted `+1700000000`, `-0` and `007`. None of those
+    /// bypasses the signature — it covers the raw string, so the client would have
+    /// to sign the odd spelling itself — but one instant having several accepted
+    /// forms makes test vectors and incident triage ambiguous.
+    #[test]
+    fn expires_must_be_plain_digits() {
+        let d = domain("secret");
+        let now = now_epoch_secs();
+        let good = (now + 60).to_string();
+
+        // `(raw value as it reaches the query, what the URL carries)`. The URL form
+        // is percent-encoded where needed so the URI parses; the signature is over
+        // the decoded value, which is what `verify` sees after `query_pairs`.
+        let cases: &[(String, String)] = &[
+            (format!("+{good}"), format!("%2B{good}")),
+            (format!("-{good}"), format!("-{good}")),
+            (format!("00{good}"), format!("00{good}")),
+            ("-0".to_string(), "-0".to_string()),
+            (" 1700000000".to_string(), "%201700000000".to_string()),
+            ("1700000000 ".to_string(), "1700000000%20".to_string()),
+            ("1700000000.0".to_string(), "1700000000.0".to_string()),
+            ("1_700_000_000".to_string(), "1_700_000_000".to_string()),
+            (String::new(), String::new()),
+            (
+                "1".repeat(MAX_EXPIRES_DIGITS + 1),
+                "1".repeat(MAX_EXPIRES_DIGITS + 1),
+            ),
+        ];
+        for (raw, encoded) in cases {
+            let sig = sign("secret", "GET", "a.test", "/x", "", raw);
+            let uri: Uri = format!("/x?expires={encoded}&sig={sig}").parse().unwrap();
+            assert_eq!(
+                verify(&d, "GET", "a.test", &uri, now).unwrap_err(),
+                SignedUrlError::Invalid,
+                "expires={raw:?} must be rejected"
+            );
+        }
+
+        // The canonical form still works.
+        let sig = sign("secret", "GET", "a.test", "/x", "", &good);
+        let uri: Uri = format!("/x?expires={good}&sig={sig}").parse().unwrap();
+        assert!(verify(&d, "GET", "a.test", &uri, now).is_ok());
     }
 }
