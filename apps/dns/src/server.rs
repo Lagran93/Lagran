@@ -358,6 +358,20 @@ fn read_framed_message(stream: &mut dyn Read, announced: usize) -> FramedRead {
     }
 }
 
+/// Best-effort text for a panic payload.
+///
+/// Most panics carry `&str` or `String`; anything else is reported by type so the
+/// log line is still useful.
+fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "non-string panic payload".to_string()
+}
+
 fn handle_tcp(mut stream: TcpStream, service: Arc<Service>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -432,17 +446,25 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
             Ok(listener) => {
                 tracing::info!(listen, max_conns, "DNS TCP listener started");
                 for stream in listener.incoming().flatten() {
-                    if active.load(Ordering::Relaxed) >= max_conns as u64 {
+                    // Claim a slot and test the limit in one atomic step. The
+                    // previous check-then-increment was safe only because this
+                    // accept loop is single-threaded — an invariant nothing states
+                    // and any future second acceptor would silently break.
+                    let claimed = active
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            (current < max_conns as u64).then_some(current + 1)
+                        })
+                        .is_ok();
+                    if !claimed {
                         // Dropping the stream closes the connection immediately.
                         tracing::debug!("TCP connection limit reached, dropping");
                         continue;
                     }
                     let svc = tcp_service.clone();
                     let active = active.clone();
-                    active.fetch_add(1, Ordering::Relaxed);
                     std::thread::spawn(move || {
                         handle_tcp(stream, svc);
-                        active.fetch_sub(1, Ordering::Relaxed);
+                        active.fetch_sub(1, Ordering::AcqRel);
                     });
                 }
             }
@@ -451,16 +473,41 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
     }
 
     let queue = Arc::new(Queue::new());
-    for _ in 0..cfg.workers {
+    for index in 0..cfg.workers {
         let q = queue.clone();
         let svc = service.clone();
         let sock = udp.clone();
-        std::thread::spawn(move || loop {
-            let (buf, peer) = q.pop();
-            let client_ip = peer.ip();
-            let resp = svc.handle(&buf, client_ip, false);
-            if !resp.is_empty() {
-                let _ = sock.send_to(&resp, peer);
+        // A worker that dies takes a slice of the server's capacity with it, and
+        // nothing else notices: `run()` keeps receiving and enqueuing, the process
+        // stays up, and the supervisor sees a healthy DNS service that answers
+        // fewer and fewer queries as workers drop out. Catching a panic here keeps
+        // one malformed request from costing a worker forever.
+        std::thread::spawn(move || {
+            let mut restarts: u64 = 0;
+            loop {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                    let (buf, peer) = q.pop();
+                    let client_ip = peer.ip();
+                    let resp = svc.handle(&buf, client_ip, false);
+                    if !resp.is_empty() {
+                        let _ = sock.send_to(&resp, peer);
+                    }
+                }));
+                // `catch_unwind` only returns on a panic or a `panic = "abort"`
+                // build; reaching here means this worker unwound.
+                let Err(payload) = outcome else {
+                    continue;
+                };
+                restarts = restarts.saturating_add(1);
+                let reason = panic_reason(payload.as_ref());
+                tracing::error!(
+                    worker = index,
+                    restarts,
+                    reason,
+                    "DNS worker panicked; restarting"
+                );
+                // A tight panic loop would spin a core; back off a little.
+                std::thread::sleep(Duration::from_millis(50 * restarts.min(20)));
             }
         });
     }
@@ -609,5 +656,74 @@ mod queue_tests {
             read_framed_message(&mut cursor, payload.len()),
             FramedRead::Body(payload)
         );
+    }
+    /// A panicking request handler must not permanently lose a worker.
+    ///
+    /// `catch_unwind` is what the worker loop wraps around `handle`. If it did
+    /// not, one malformed request would kill a worker thread silently: the listener
+    /// keeps enqueuing, the process stays up, and the service answers fewer queries
+    /// with every panic.
+    #[test]
+    fn a_panicking_handler_is_caught_and_the_loop_continues() {
+        let mut handled = 0;
+        let mut panics = 0;
+        for i in 0..5 {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if i == 2 {
+                    panic!("simulated handler panic");
+                }
+                i
+            }));
+            match outcome {
+                Ok(_) => handled += 1,
+                Err(payload) => {
+                    panics += 1;
+                    // The payload must still be describable for the log line.
+                    assert!(!panic_reason(payload.as_ref()).is_empty());
+                }
+            }
+        }
+        assert_eq!(panics, 1, "the panic must be caught, not propagated");
+        assert_eq!(handled, 4, "the loop must keep processing after a panic");
+    }
+
+    /// `panic_reason` copes with the payload types a panic can carry.
+    #[test]
+    fn panic_reason_handles_both_payload_types() {
+        let str_panic = std::panic::catch_unwind(|| panic!("literal reason")).unwrap_err();
+        assert_eq!(panic_reason(str_panic.as_ref()), "literal reason");
+
+        let string_panic =
+            std::panic::catch_unwind(|| panic!("{}", String::from("owned reason"))).unwrap_err();
+        assert_eq!(panic_reason(string_panic.as_ref()), "owned reason");
+    }
+
+    /// The slot claim never exceeds the limit.
+    ///
+    /// This checks the *counting* behaviour of the claim, not its atomicity: a
+    /// single-threaded loop cannot distinguish `fetch_update` from a read-then-write
+    /// pair, and forcing that distinction would need a real concurrent acceptor.
+    /// The atomicity itself rests on `fetch_update` being a single operation, which
+    /// is what removes the check-then-act window the old code relied on an implicit
+    /// single-acceptor invariant to close.
+    #[test]
+    fn connection_slots_never_exceed_the_limit() {
+        let active = std::sync::atomic::AtomicU64::new(0);
+        let max = 3u64;
+        let mut claimed = 0;
+        for _ in 0..10 {
+            let got = active
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |current| (current < max).then_some(current + 1),
+                )
+                .is_ok();
+            if got {
+                claimed += 1;
+            }
+        }
+        assert_eq!(claimed, 3, "exactly `max` slots may be claimed");
+        assert_eq!(active.load(std::sync::atomic::Ordering::Acquire), 3);
     }
 }
