@@ -50,7 +50,9 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Same pin as rust-toolchain.toml: sqlx 0.7.4 does not build on newer
+        # stable (rust-lang/rust#148922). Bump both together when sqlx is upgraded.
+        uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt
           targets: x86_64-unknown-linux-musl
@@ -62,12 +64,12 @@ jobs:
         with:
           key: musl-x86_64
       - name: Unit and integration tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: Release build (static musl)
         env:
           LAGRAN_GIT_HASH: ${{ github.sha }}
           LAGRAN_BUILD_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
-        run: cargo build --release --target x86_64-unknown-linux-musl -p control -p edge -p lagran-dns
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p control -p edge -p lagran-dns
       - name: Verify static binaries
         run: |
           set -euo pipefail

@@ -1,7 +1,10 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed on purpose: this workspace builds binaries, so the
+# resolved dependency set is part of the build. Leaving it out let a transitive
+# release decide whether CI compiled, which is how a sqlx 0.7.4 / newer-rustc
+# incompatibility first surfaced as a red build instead of a reproducible one.
 
 # Node / Frontend
 node_modules/

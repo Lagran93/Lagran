@@ -1,4 +1,11 @@
 [toolchain]
-channel = "stable"
+# Pinned, not "stable".
+#
+# sqlx-postgres 0.7.4 fails to compile on newer stable releases: a type-inference
+# change (rust-lang/rust#148922) leaves `let _ = stream.recv_expect(...)` unable to
+# infer the message type, and sqlx's own call sites then fail with `Decode` not
+# implemented for `!`. The crate has to be upgraded to drop this pin; until then a
+# floating channel means the build breaks whenever CI pulls a newer stable.
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 profile = "default"
