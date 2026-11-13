@@ -77,6 +77,10 @@ pub struct RateLimiter {
     sources: HashMap<IpAddr, Bucket>,
     prefixes: HashMap<String, Bucket>,
     last_sweep: Instant,
+    /// Where the incremental sweep stopped last time, so the next call resumes
+    /// instead of always starting from the beginning.
+    sweep_cursor_sources: Option<IpAddr>,
+    sweep_cursor_prefixes: Option<String>,
     rejected: u64,
 }
 
@@ -87,6 +91,8 @@ impl RateLimiter {
             sources: HashMap::new(),
             prefixes: HashMap::new(),
             last_sweep: Instant::now(),
+            sweep_cursor_sources: None,
+            sweep_cursor_prefixes: None,
             rejected: 0,
         }
     }
@@ -163,20 +169,77 @@ impl RateLimiter {
             .try_take(capacity, now)
     }
 
-    /// Drop buckets that have been idle for a full window.
+    /// Drop idle buckets incrementally.
     ///
-    /// Runs at most once per second so the hot path stays cheap, and it is what
-    /// keeps the table from growing without bound across normal operation.
+    /// This used to be a full `retain` over both tables once per second, on the
+    /// thread that receives packets. At `max_tracked` (50k each) that is a ~600 µs
+    /// stall once a second — small on average, but a latency spike on the hot path
+    /// exactly when the table is largest, which is when queries are already under
+    /// pressure.
+    ///
+    /// Instead a bounded number of entries is examined per call, walking the map
+    /// from where the previous call stopped. The work is spread across normal
+    /// traffic, so no single query pays for the whole table. Removing entries only
+    /// ever adds free space, so a resize cannot invalidate the cursor in a harmful
+    /// way — it is reset whenever the map has shrunk below it.
     fn sweep(&mut self, now: Instant) {
-        if now.duration_since(self.last_sweep) < WINDOW {
+        if now.duration_since(self.last_sweep) < SWEEP_INTERVAL {
             return;
         }
         self.last_sweep = now;
-        self.sources
-            .retain(|_, b| now.duration_since(b.window_start) < WINDOW * 4);
-        self.prefixes
-            .retain(|_, b| now.duration_since(b.window_start) < WINDOW * 4);
+        sweep_incremental(&mut self.sources, &mut self.sweep_cursor_sources, now);
+        sweep_incremental(&mut self.prefixes, &mut self.sweep_cursor_prefixes, now);
     }
+}
+
+/// How many map entries one sweep call examines at most.
+///
+/// 256 entries is a few microseconds even in the worst case, and at typical query
+/// rates it clears a full 50k-entry table well within the 4 s idle horizon the
+/// entries are kept for.
+const SWEEP_BATCH: usize = 256;
+
+/// Minimum gap between sweep batches.
+const SWEEP_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Examine the next [`SWEEP_BATCH`] entries, dropping idle ones.
+///
+/// The map is walked in an arbitrary but repeatable order; deleting entries never
+/// adds keys, so resuming from a remembered key cannot skip live entries. If the
+/// remembered key is gone, the walk restarts from the beginning.
+fn sweep_incremental<K: std::hash::Hash + Eq + Clone>(
+    map: &mut std::collections::HashMap<K, Bucket>,
+    cursor: &mut Option<K>,
+    now: Instant,
+) {
+    let horizon = WINDOW * 4;
+    let mut expired: Vec<K> = Vec::new();
+    let mut seen = 0usize;
+    let mut last = None;
+    let mut past_cursor = cursor.is_none();
+
+    for (ip, bucket) in map.iter() {
+        if seen >= SWEEP_BATCH {
+            break;
+        }
+        if !past_cursor {
+            if Some(ip) == cursor.as_ref() {
+                past_cursor = true;
+            }
+            continue;
+        }
+        seen += 1;
+        last = Some(ip.clone());
+        if now.duration_since(bucket.window_start) >= horizon {
+            expired.push(ip.clone());
+        }
+    }
+
+    for ip in expired {
+        map.remove(&ip);
+    }
+    // Restart on the next call if this pass reached the end, so cycles stay fair.
+    *cursor = if seen < SWEEP_BATCH { None } else { last };
 }
 
 fn is_loopback(ip: IpAddr) -> bool {
@@ -294,10 +357,7 @@ mod tests {
         }
         assert_eq!(rl.sources.len(), 5);
         // A later query from another source triggers the sweep.
-        rl.allow(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            start + WINDOW * 10,
-        );
+        rl.allow(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), start + WINDOW * 10);
         assert!(
             rl.sources.len() < 5,
             "stale buckets should have been dropped"
@@ -320,5 +380,74 @@ mod tests {
     fn ipv6_loopback_detected() {
         assert!(is_loopback(ip("::1")));
         assert!(!is_loopback(ip("2001:db8::1")));
+    }
+    /// The incremental sweep must eventually remove every idle bucket.
+    ///
+    /// It examines a bounded number of entries per call, so correctness is "all
+    /// expired entries are gone after enough batches", not "gone after one".
+    #[test]
+    fn incremental_sweep_clears_the_whole_table() {
+        let mut map: HashMap<IpAddr, Bucket> = HashMap::new();
+        let start = Instant::now();
+        for i in 0..5_000u32 {
+            map.insert(
+                IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + i)),
+                Bucket::new(10, start),
+            );
+        }
+        let mut cursor = None;
+        // Past the 4-window horizon.
+        let now = start + WINDOW * 8;
+        // 5000 / 256 rounded up, with room for the cursor restart.
+        for _ in 0..64 {
+            sweep_incremental(&mut map, &mut cursor, now);
+        }
+        assert!(
+            map.is_empty(),
+            "expected every idle bucket to be removed, {} left",
+            map.len()
+        );
+    }
+
+    /// Live buckets survive the sweep.
+    #[test]
+    fn incremental_sweep_keeps_live_buckets() {
+        let mut map: HashMap<IpAddr, Bucket> = HashMap::new();
+        let start = Instant::now();
+        for i in 0..1_000u32 {
+            map.insert(
+                IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + i)),
+                Bucket::new(10, start),
+            );
+        }
+        let mut cursor = None;
+        // Within the 4-window horizon, so nothing is idle.
+        let now = start + WINDOW * 2;
+        for _ in 0..16 {
+            sweep_incremental(&mut map, &mut cursor, now);
+        }
+        assert_eq!(map.len(), 1_000, "live buckets must not be swept");
+    }
+
+    /// A sweep call examines a bounded number of entries, not the whole table.
+    #[test]
+    fn one_sweep_call_is_bounded() {
+        let mut map: HashMap<IpAddr, Bucket> = HashMap::new();
+        let start = Instant::now();
+        for i in 0..10_000u32 {
+            map.insert(
+                IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + i)),
+                Bucket::new(10, start),
+            );
+        }
+        let mut cursor = None;
+        let now = start + WINDOW * 8;
+        sweep_incremental(&mut map, &mut cursor, now);
+        let removed = 10_000 - map.len();
+        assert!(
+            removed <= SWEEP_BATCH,
+            "one call removed {removed}, more than the {SWEEP_BATCH} batch size"
+        );
+        assert!(removed > 0, "an expired table must lose at least one entry");
     }
 }
