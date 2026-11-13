@@ -33,6 +33,13 @@ pub struct EdgeConfig {
     pub cache_max_bytes: u64,
     /// Redis L2 cache endpoint (falls back to REDIS_URL when empty).
     pub cache_redis_url: String,
+    /// Timeout for one cross-node flight-lock round trip, in milliseconds.
+    ///
+    /// Covers the `SET NX` that takes the lock, the `EXISTS` poll while waiting and
+    /// the `EVAL` that releases it. Raise it when Redis is not on the same host: at
+    /// the old hardcoded 250 ms a cross-rack link turns ordinary latency into
+    /// "flight lock unavailable", which silently disables coalescing.
+    pub cache_flight_timeout_ms: u64,
     pub cache_redis_prefix: String,
     /// Maximum serialized body written to Redis L2.
     pub cache_l2_max_body: usize,
@@ -212,6 +219,11 @@ impl Default for EdgeConfig {
                 .unwrap_or(512 * 1024 * 1024)
                 .clamp(16 * 1024 * 1024, 8 * 1024 * 1024 * 1024),
             cache_redis_url: env_nonempty("CACHE_REDIS_URL").unwrap_or_default(),
+            cache_flight_timeout_ms: std::env::var("CACHE_FLIGHT_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(250)
+                .clamp(50, 5_000),
             cache_redis_prefix: std::env::var("CACHE_REDIS_PREFIX")
                 .ok()
                 .map(|v| v.trim().to_string())
@@ -457,4 +469,37 @@ mod tests {
         );
         assert_eq!(normalize_control_url("   "), "http://127.0.0.1:8080");
     }
+    /// The flight timeout is configurable and clamped.
+    ///
+    /// 250 ms was hardcoded; a Redis that is not on the same host turns ordinary
+    /// latency into "flight lock unavailable", which silently disables coalescing.
+    /// Env parsing has to round-trip a raised value and reject nonsense.
+    #[test]
+    fn flight_timeout_is_configurable_and_clamped() {
+        // Serialised access: these read process-wide environment variables.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::remove_var("CACHE_FLIGHT_TIMEOUT_MS");
+        let default = EdgeConfig::load().cache_flight_timeout_ms;
+        assert_eq!(default, 250);
+
+        std::env::set_var("CACHE_FLIGHT_TIMEOUT_MS", "1200");
+        assert_eq!(EdgeConfig::load().cache_flight_timeout_ms, 1200);
+
+        // Clamped into a range where the value is still meaningful: below 50 ms no
+        // Redis call can complete, and above 5 s a stalled lock path would hold the
+        // request far past the origin timeout it is supposed to guard.
+        std::env::set_var("CACHE_FLIGHT_TIMEOUT_MS", "1");
+        assert_eq!(EdgeConfig::load().cache_flight_timeout_ms, 50);
+        std::env::set_var("CACHE_FLIGHT_TIMEOUT_MS", "999999");
+        assert_eq!(EdgeConfig::load().cache_flight_timeout_ms, 5_000);
+
+        // Garbage falls back to the default rather than disabling the lock path.
+        std::env::set_var("CACHE_FLIGHT_TIMEOUT_MS", "not-a-number");
+        assert_eq!(EdgeConfig::load().cache_flight_timeout_ms, 250);
+
+        std::env::remove_var("CACHE_FLIGHT_TIMEOUT_MS");
+    }
+
 }

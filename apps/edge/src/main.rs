@@ -175,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
             match edge::cache::flight::RedisFlight::connect(
                 &url,
                 format!("{}:flight", config.cache_redis_prefix),
+                std::time::Duration::from_millis(config.cache_flight_timeout_ms),
             )
             .await
             {

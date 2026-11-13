@@ -788,6 +788,7 @@ RUST_LOG=edge=info,tower_http=warn
 | `DISK_CACHE_MAX_BYTES` | 否 | 1 GiB | 磁盘缓存上限；超出按 mtime 淘汰。 |
 | `CERT_DIR` | 否 | `./data/certs` | 证书持久化目录；边缘从控制面 `/certs/edge-sync` 拉取并落盘。 |
 | `TRUST_PROXY_HEADERS` | 否 | `false` | 是否信任前置可信代理的 `X-Forwarded-For` / `X-Forwarded-Proto`。为 `false` 时 Pingora 用真实对端 IP 覆盖客户端伪造值；只有边缘前面还有 SLB/Cloudflare 时才开启。 |
+| `CACHE_FLIGHT_TIMEOUT_MS` | 否 | `250` | 跨节点请求合并的单次 Redis 往返超时（毫秒），涵盖抢锁 `SET NX`、等锁 `EXISTS`、释放 `EVAL`。钳制 50–5000。Redis 不在本机时应调大；超时后降级为各节点独立回源并打印 `flight lock unavailable` 的 WARN。 |
 | `GEOIP_COUNTRY_DB` | Geo/ASN 名单必填 | `./data/maxmind/GeoLite2-Country.mmdb` | WAF 国家/地区名单使用的 MaxMind GeoLite2-Country 文件。需自行下载并定期更新；缺失时黑名单不生效、白名单 fail-closed（拦截全部流量）。启动时加载，更新后需重启 Edge。 |
 | `GEOIP_ASN_DB` | Geo/ASN 名单必填 | `./data/maxmind/GeoLite2-ASN.mmdb` | WAF ASN 名单使用的 GeoLite2-ASN 文件，行为同上。分发需遵守 MaxMind GeoLite2 EULA。 |
 | `CHALLENGE_SECRET` | 多节点必填 | 空 | WAF 质询 nonce/免质询 Cookie 的 HMAC 密钥。多节点必须一致；为空时用 `AGENT_TOKEN` 派生或进程随机（重启失效）。 |

@@ -50,6 +50,13 @@ pub struct RedisFlight {
     conn: redis::aio::ConnectionManager,
     prefix: String,
     seq: AtomicU64,
+    /// Timeout for one lock round trip (`SET NX`, `EXISTS`, release `EVAL`).
+    ///
+    /// 250 ms was hardcoded and is tight for a Redis that is not on the same host:
+    /// ordinary latency spikes surface as "flight lock unavailable" and the edge
+    /// silently stops coalescing. Configurable so a cross-rack deployment can raise
+    /// it instead of living with the warning.
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for RedisFlight {
@@ -105,7 +112,11 @@ impl FlightGuard {
 }
 
 impl RedisFlight {
-    pub async fn connect(url: &str, prefix: String) -> Result<Arc<Self>, String> {
+    pub async fn connect(
+        url: &str,
+        prefix: String,
+        timeout: Duration,
+    ) -> Result<Arc<Self>, String> {
         let client =
             redis::Client::open(url).map_err(|e| format!("invalid flight redis url: {e}"))?;
         let conn = tokio::time::timeout(Duration::from_secs(2), client.get_connection_manager())
@@ -116,6 +127,7 @@ impl RedisFlight {
             conn,
             prefix,
             seq: AtomicU64::new(0),
+            timeout,
         }))
     }
 
@@ -135,7 +147,7 @@ impl RedisFlight {
         );
         let mut conn = self.conn.clone();
         let result: Option<String> = tokio::time::timeout(
-            Duration::from_millis(250),
+            self.timeout,
             redis::cmd("SET")
                 .arg(self.key(key))
                 .arg(&token)
@@ -162,7 +174,7 @@ impl RedisFlight {
         let mut conn = self.conn.clone();
         while tokio::time::Instant::now() < deadline {
             let exists = match tokio::time::timeout(
-                Duration::from_millis(250),
+                self.timeout,
                 redis::cmd("EXISTS")
                     .arg(self.key(key))
                     .query_async::<i64>(&mut conn),
@@ -192,7 +204,7 @@ impl RedisFlight {
             "#,
         );
         let _: Result<i64, _> = tokio::time::timeout(
-            Duration::from_millis(250),
+            self.timeout,
             script.key(self.key(key)).arg(token).invoke_async(&mut conn),
         )
         .await
@@ -277,13 +289,16 @@ mod tests {
         let url = std::env::var("CACHE_REDIS_URL")
             .or_else(|_| std::env::var("REDIS_URL"))
             .unwrap_or_else(|_| "redis://127.0.0.1/".into());
-        let flight =
-            match RedisFlight::connect(&url, format!("lagran:test:flight:{}", std::process::id()))
-                .await
-            {
-                Ok(f) => f,
-                Err(_) => return,
-            };
+        let flight = match RedisFlight::connect(
+            &url,
+            format!("lagran:test:flight:{}", std::process::id()),
+            Duration::from_millis(250),
+        )
+        .await
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
         let cache = MemoryCache::new(10);
         let key = "GET:flight.test:/a";
         let guard = acquire(&flight, key, 10_000, &cache).await.into_guard();
