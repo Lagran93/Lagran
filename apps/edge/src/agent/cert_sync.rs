@@ -99,7 +99,15 @@ async fn sync_once(
             }
         }
         Err(e) => {
-            tracing::debug!(error = %e, "edge-sync unavailable, try single domain");
+            // Clear the validator. The control plane may have rotated a certificate
+            // while it was erroring, and a later poll that still presents the old ETag
+            // would be answered 304 — so the edge would keep serving the old
+            // certificate indefinitely, with only a debug line to show for it.
+            *etag = None;
+            tracing::warn!(
+                error = %e,
+                "edge-sync unavailable, trying the single-domain fallback; next round will fetch in full"
+            );
         }
     }
 

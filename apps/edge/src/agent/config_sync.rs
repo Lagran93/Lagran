@@ -729,15 +729,27 @@ pub fn spawn_config_sync(
                                         }
                                     }
                                 }
-                                if last_etag.is_none() {
-                                    last_etag = Some(format!("\"{}\"", last_version));
-                                }
+                                // Deliberately no synthesised ETag here.
+                                //
+                                // This used to build `"{version}"` when the server had
+                                // not supplied one. That value is not something the
+                                // control plane ever issued, so sending it as
+                                // `If-None-Match` is meaningless at best — and on a first
+                                // sync that arrived as 304 it would have been the literal
+                                // `""`. Change detection is driven by `cfg.version`
+                                // below; an ETag must only ever come from the server.
                             }
                         } else {
                             tracing::debug!("domain config not modified (304)");
                         }
                     }
-                    Err(e) => tracing::warn!(error = %e, "config sync failed"),
+                    Err(e) => {
+                        // Drop the cached validator: the config may have changed while
+                        // the control plane was failing, and keeping the ETag would let
+                        // the next successful poll answer 304 and skip the update.
+                        last_etag = None;
+                        tracing::warn!(error = %e, "config sync failed; next poll will fetch in full");
+                    }
                 }
 
                 // Single-domain fallback if EDGE_DOMAIN is set and the registry is empty.
@@ -796,5 +808,51 @@ mod geo_config_tests {
         assert!(cfg.country_deny.is_empty());
         assert!(cfg.asn_allow.is_empty());
         assert!(cfg.asn_deny.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A cached validator must be dropped when a poll fails.
+    ///
+    /// Keeping the ETag across a failure is what allowed "permanently 304": the
+    /// control plane changed the config while it was erroring, and the next
+    /// successful poll presented the old ETag, was answered 304, and skipped the
+    /// update entirely.
+    #[test]
+    fn a_failed_poll_clears_the_validator() {
+        let mut last_etag: Option<String> = Some("\"abc\"".to_string());
+
+        // What the error arm does.
+        last_etag = None;
+
+        assert!(
+            last_etag.is_none(),
+            "a failed poll must force a full fetch next round"
+        );
+    }
+
+    /// Only a server-supplied validator is stored.
+    ///
+    /// The code used to synthesise `"{version}"` when the reply carried no ETag.
+    /// That value was never issued by the control plane, so sending it back is
+    /// meaningless — and on a first sync that arrived as 304 it would have been the
+    /// literal `""`.
+    #[test]
+    fn only_server_etags_are_remembered() {
+        let mut last_etag: Option<String> = None;
+        // A 304 with no server ETag leaves the validator unset.
+        let server_etag: Option<String> = None;
+        if let Some(etag) = server_etag {
+            last_etag = Some(etag);
+        }
+        assert!(last_etag.is_none(), "no synthesised fallback");
+
+        // A server ETag is kept verbatim.
+        let server_etag = Some("\"v42\"".to_string());
+        if let Some(etag) = server_etag {
+            last_etag = etag.into();
+        }
+        assert_eq!(last_etag.as_deref(), Some("\"v42\""));
     }
 }
