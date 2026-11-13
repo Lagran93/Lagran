@@ -139,7 +139,7 @@ impl RedisFlight {
         self: &Arc<Self>,
         key: &str,
         ttl_ms: u64,
-    ) -> Result<Option<FlightGuard>, ()> {
+    ) -> Result<Option<FlightGuard>, FlightError> {
         let token = format!(
             "{}:{}",
             std::process::id(),
@@ -157,8 +157,8 @@ impl RedisFlight {
                 .query_async(&mut conn),
         )
         .await
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+        .map_err(|_| FlightError::Timeout(self.timeout))?
+        .map_err(|e: redis::RedisError| FlightError::Redis(e.to_string()))?;
         Ok(result.map(|_| FlightGuard {
             flight: self.clone(),
             key: key.to_string(),
@@ -244,6 +244,36 @@ impl FlightOutcome {
     }
 }
 
+/// Why a flight-lock round trip failed.
+///
+/// The two cases need different fixes: a timeout means the round trip did not fit in
+/// the budget (raise `CACHE_FLIGHT_TIMEOUT_MS` if the link is long, or investigate a
+/// slow Redis if it is not), while a Redis error means the command itself failed —
+/// connection dropped, auth rejected, server error. Collapsing both into `()` left the
+/// warn! with nothing to act on.
+#[derive(Debug)]
+pub enum FlightError {
+    /// The attempt exceeded the configured round-trip budget.
+    Timeout(Duration),
+    /// Redis rejected or could not process the command.
+    Redis(String),
+}
+
+impl std::fmt::Display for FlightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlightError::Timeout(budget) => {
+                write!(
+                    f,
+                    "timed out after {}ms (CACHE_FLIGHT_TIMEOUT_MS)",
+                    budget.as_millis()
+                )
+            }
+            FlightError::Redis(e) => write!(f, "redis error: {e}"),
+        }
+    }
+}
+
 /// Try to become the cross-node leader.
 pub async fn acquire(
     flight: &Arc<RedisFlight>,
@@ -254,9 +284,13 @@ pub async fn acquire(
     let ttl_ms = lock_ttl_ms(origin_timeout_ms);
     match flight.try_lock(key, ttl_ms).await {
         Ok(Some(guard)) => return FlightOutcome::Leader(guard),
-        Err(_) => {
+        Err(e) => {
+            // Carry the reason: a timeout and a Redis fault need opposite responses,
+            // and the original collapsed both into `()`, so every occurrence read the
+            // same no matter the cause.
             tracing::warn!(
                 key,
+                error = %e,
                 "flight lock unavailable; proceeding without cross-node coalescing"
             );
             return FlightOutcome::Degraded;
@@ -377,5 +411,34 @@ mod tests {
             FlightOutcome::Follower.into_guard().is_none(),
             "only a leader carries a guard"
         );
+    }
+    /// The two failure modes must stay distinguishable in the log line.
+    ///
+    /// They need different responses: a timeout argues for a larger
+    /// `CACHE_FLIGHT_TIMEOUT_MS` (or a faster Redis), a Redis error argues for looking
+    /// at the connection. Collapsing them back into one opaque value would put us back
+    /// where every warning read identically.
+    #[test]
+    fn flight_errors_distinguish_timeout_from_redis_failure() {
+        let timeout = FlightError::Timeout(Duration::from_millis(250));
+        let rendered = timeout.to_string();
+        assert!(rendered.contains("timed out"), "got {rendered}");
+        assert!(
+            rendered.contains("250"),
+            "the budget belongs in the message: {rendered}"
+        );
+        assert!(
+            rendered.contains("CACHE_FLIGHT_TIMEOUT_MS"),
+            "tell the operator which knob controls this: {rendered}"
+        );
+
+        let redis = FlightError::Redis("connection reset by peer".into());
+        let rendered = redis.to_string();
+        assert!(rendered.contains("redis error"), "got {rendered}");
+        assert!(
+            rendered.contains("connection reset"),
+            "the underlying cause must survive: {rendered}"
+        );
+        assert!(!rendered.contains("timed out"));
     }
 }
