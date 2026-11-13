@@ -46,8 +46,21 @@ pub fn origin_tcp_addr(origin_url: &str) -> Result<(String, u16, bool)> {
     } else {
         ("http", url)
     };
-    let hostport = rest.split('/').next().unwrap_or(rest);
+    // Strip userinfo before looking at the host. `http://user:pass@origin.test`
+    // would otherwise yield the host `user` (the `:` split below takes the first
+    // colon), and `http://user@origin.test` would put the credentials straight
+    // into the `Host` header sent upstream. Credentials are not meaningful for a
+    // WebSocket origin here: authentication is configured separately and travels
+    // as a header.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, after)| after)
+        .unwrap_or(authority);
     let default_port = if scheme == "https" { 443 } else { 80 };
+    if hostport.is_empty() {
+        bail!("origin url has no host: {origin_url}");
+    }
     let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
         // IPv6 literal: [::1]:8080
         match rest.split_once(']') {
@@ -439,6 +452,34 @@ mod tests {
             origin_tcp_addr("https://[::1]:8443").unwrap(),
             ("::1".into(), 8443, true)
         );
+    }
+
+    /// Userinfo in the origin URL must never reach the host or the `Host` header.
+    ///
+    /// `http://user:pass@origin.test` used to yield the host `user` — the `:`
+    /// split takes the first colon — so the connection went to a machine called
+    /// `user`. With an explicit port the whole `user:pass@origin.test` became the
+    /// host, which then went out in the `Host` header, credentials included.
+    #[test]
+    fn origin_addr_strips_userinfo() {
+        assert_eq!(
+            origin_tcp_addr("http://user:pass@origin.test").unwrap(),
+            ("origin.test".into(), 80, false)
+        );
+        assert_eq!(
+            origin_tcp_addr("http://user:pass@origin.test:8080").unwrap(),
+            ("origin.test".into(), 8080, false)
+        );
+        assert_eq!(
+            origin_tcp_addr("https://user@origin.test/ws").unwrap(),
+            ("origin.test".into(), 443, true)
+        );
+        assert_eq!(
+            origin_tcp_addr("https://user:pass@[::1]:8443").unwrap(),
+            ("::1".into(), 8443, true)
+        );
+        // A URL whose authority is only userinfo has no host at all.
+        assert!(origin_tcp_addr("http://user:pass@").is_err());
     }
 
     #[test]
