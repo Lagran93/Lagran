@@ -1387,7 +1387,8 @@ async fn fetch_with_single_flight(
     match state.inflight.begin(key).await {
         Slot::Leader(leader) => {
             let flight_guard = if let Some(flight) = state.flight.as_ref() {
-                crate::cache::flight::acquire(flight, key, state.cache.as_ref()).await
+                crate::cache::flight::acquire(flight, key, eff.timeout_ms, state.cache.as_ref())
+                    .await
             } else {
                 None
             };

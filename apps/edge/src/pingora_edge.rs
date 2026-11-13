@@ -632,9 +632,13 @@ impl ProxyHttp for DataPlaneProxy {
                 // the object. A plain L1 hit must not issue Redis SET/EVAL
                 // commands on every request.
                 if let Some(flight) = self.state.flight.as_ref() {
-                    if let Some(guard) =
-                        crate::cache::flight::acquire(flight, &plan.key, self.state.cache.as_ref())
-                            .await
+                    if let Some(guard) = crate::cache::flight::acquire(
+                        flight,
+                        &plan.key,
+                        plan.read_timeout_ms,
+                        self.state.cache.as_ref(),
+                    )
+                    .await
                     {
                         ctx.flight_guard = Some(guard);
                     }
@@ -1767,13 +1771,18 @@ impl DataPlaneProxy {
         // path performs a single streaming fill. This keeps strict no-cache
         // GETs out of the legacy data plane.
         let _revalidation_guard = if let Some(flight) = self.state.flight.as_ref() {
-            match flight.try_lock(&plan.key).await {
+            // Same derivation as `acquire`: the lock must outlive the fetch it
+            // protects, and the wait must fit inside the lock.
+            let ttl_ms = crate::cache::flight::lock_ttl_ms(plan.read_timeout_ms);
+            match flight.try_lock(&plan.key, ttl_ms).await {
                 Ok(Some(guard)) => Some(guard),
                 Ok(None) => {
                     // Another node is validating this key. Wait for its
                     // conditional request to finish, then use the refreshed
                     // shared entry instead of firing a duplicate origin check.
-                    flight.wait_unlocked(&plan.key).await;
+                    flight
+                        .wait_unlocked(&plan.key, crate::cache::flight::lock_wait(ttl_ms))
+                        .await;
                     None
                 }
                 Err(_) => None,
