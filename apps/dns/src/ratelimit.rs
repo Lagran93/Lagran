@@ -38,9 +38,29 @@ impl Default for RateLimitConfig {
 }
 
 impl RateLimitConfig {
-    /// A zero `per_source` disables limiting entirely.
+    /// Whether both limits are off, so nothing is ever rejected.
+    ///
+    /// This used to be `per_source == 0` alone, and `allow` short-circuits on it.
+    /// An operator who set `DNS_RATE_LIMIT_PER_SOURCE=0` intending "no per-client
+    /// cap, just the per-prefix one" therefore turned off *all* limiting, including
+    /// the aggregate bucket that protects against a distributed flood — while the
+    /// config comment only warned that zero was "for use behind a scrubber".
+    /// `allow` already guards the prefix check with `per_prefix > 0`, so a zero on
+    /// one axis now means exactly that axis is off.
     pub fn is_disabled(&self) -> bool {
-        self.per_source == 0
+        self.per_source == 0 && self.per_prefix == 0
+    }
+
+    /// Which limits are inactive, for the startup warning.
+    pub fn disabled_axes(&self) -> Vec<&'static str> {
+        let mut off = Vec::new();
+        if self.per_source == 0 {
+            off.push("per-source");
+        }
+        if self.per_prefix == 0 {
+            off.push("per-prefix");
+        }
+        off
     }
 }
 
@@ -131,9 +151,10 @@ impl RateLimiter {
         }
         self.sweep(now);
 
-        // Capacity of 0 would block everything, which is never intended; treat
-        // it as "no aggregate limit" and rely on the per-source bucket.
-        if !self.take_source(ip, now) {
+        // Each axis is honoured independently: a zero on one means that axis is
+        // off, not that limiting is off. `is_disabled` above already covers the
+        // both-zero case.
+        if self.cfg.per_source > 0 && !self.take_source(ip, now) {
             self.rejected += 1;
             return false;
         }
@@ -325,7 +346,12 @@ mod tests {
 
     #[test]
     fn zero_per_source_disables_limiting() {
-        let mut rl = RateLimiter::new(cfg(0, 1));
+        // This used to run against `cfg(0, 1)` and expect 100 allows, i.e. it
+        // encoded the old rule that a zero per-source cap disabled *everything*.
+        // That rule was the bug: it silently turned off the per-prefix bucket too.
+        // Disabling both axes is now what disables limiting, so the fixture has to
+        // say so.
+        let mut rl = RateLimiter::new(cfg(0, 0));
         let now = Instant::now();
         for _ in 0..100 {
             assert!(rl.allow(ip("203.0.113.9"), now));
@@ -449,5 +475,76 @@ mod tests {
             "one call removed {removed}, more than the {SWEEP_BATCH} batch size"
         );
         assert!(removed > 0, "an expired table must lose at least one entry");
+    }
+    /// A zero on one axis must not disable the other.
+    ///
+    /// `is_disabled` used to test `per_source == 0` alone and `allow`
+    /// short-circuits on it, so an operator who set `per_source = 0` meaning "no
+    /// per-client cap, keep the aggregate one" turned off every check — including
+    /// the per-prefix bucket that guards against a distributed flood.
+    #[test]
+    fn disabling_one_axis_keeps_the_other_active() {
+        // per_source off, per_prefix on: the aggregate limit still applies.
+        let cfg = RateLimitConfig {
+            per_source: 0,
+            per_prefix: 10,
+            max_tracked: 1_000,
+        };
+        assert!(!cfg.is_disabled());
+        assert_eq!(cfg.disabled_axes(), vec!["per-source"]);
+
+        let mut rl = RateLimiter::new(cfg);
+        let start = Instant::now();
+        // One /24, many distinct sources: only the prefix bucket can stop them.
+        let mut allowed = 0;
+        for i in 0..50u32 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + i));
+            if rl.allow(ip, start) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 10, "the per-prefix limit must still apply");
+    }
+
+    /// The mirror case: per_prefix off, per_source on.
+    #[test]
+    fn disabling_the_prefix_axis_keeps_the_source_axis() {
+        let cfg = RateLimitConfig {
+            per_source: 3,
+            per_prefix: 0,
+            max_tracked: 1_000,
+        };
+        assert!(!cfg.is_disabled());
+        assert_eq!(cfg.disabled_axes(), vec!["per-prefix"]);
+
+        let mut rl = RateLimiter::new(cfg);
+        let start = Instant::now();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(rl.allow(ip, start));
+        assert!(rl.allow(ip, start));
+        assert!(rl.allow(ip, start));
+        assert!(
+            !rl.allow(ip, start),
+            "the per-source limit must still apply"
+        );
+    }
+
+    /// Both zero is the only case that disables everything.
+    #[test]
+    fn both_axes_zero_disables_everything() {
+        let cfg = RateLimitConfig {
+            per_source: 0,
+            per_prefix: 0,
+            max_tracked: 1_000,
+        };
+        assert!(cfg.is_disabled());
+        assert_eq!(cfg.disabled_axes().len(), 2);
+
+        let mut rl = RateLimiter::new(cfg);
+        let start = Instant::now();
+        for i in 0..1_000u32 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + i));
+            assert!(rl.allow(ip, start), "nothing may be rejected");
+        }
     }
 }

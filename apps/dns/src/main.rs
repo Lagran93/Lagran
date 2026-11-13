@@ -42,6 +42,28 @@ fn main() {
         git_hash = version::GIT_HASH,
         "lagran-dns starting"
     );
+
+    // Say plainly which protection is off. A zero on one axis used to disable
+    // both, and the only hint was a comment in the example config; an operator who
+    // meant "no per-client cap, keep the aggregate one" lost both silently.
+    let off = cfg.rate_limit.disabled_axes();
+    if off.len() == 2 {
+        tracing::warn!(
+            "rate limiting is fully disabled (DNS_RATE_LIMIT_PER_SOURCE and \
+             DNS_RATE_LIMIT_PER_PREFIX are both 0); only do this behind a scrubber"
+        );
+    } else if let Some(axis) = off.first() {
+        tracing::warn!(
+            axis,
+            "the {axis} rate limit is disabled; the other axis still applies"
+        );
+    } else {
+        tracing::info!(
+            per_source = cfg.rate_limit.per_source,
+            per_prefix = cfg.rate_limit.per_prefix,
+            "rate limiting active"
+        );
+    }
     if let Err(e) = server::run(cfg) {
         // Logging may be filtered by the caller; always surface fatal errors.
         tracing::error!(error = %e, "dns server failed");
@@ -101,11 +123,28 @@ fn check_config(cfg: &DnsConfig) -> Result<(), String> {
     println!("zone: {}", cfg.zone);
     println!("ttl: {}", cfg.ttl);
     println!("ns_names: {}", cfg.ns_names.join(","));
-    println!("ns_ips: {}", cfg.ns_ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
-    println!("control_url: {}", if cfg.control_url.is_empty() { "(disabled)" } else { &cfg.control_url });
+    println!(
+        "ns_ips: {}",
+        cfg.ns_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
+        "control_url: {}",
+        if cfg.control_url.is_empty() {
+            "(disabled)"
+        } else {
+            &cfg.control_url
+        }
+    );
     println!("workers: {}", cfg.workers);
     println!("tcp: {}", cfg.tcp_enabled);
-    println!("fallback_ip: {}", cfg.fallback_ip.as_deref().unwrap_or("(none)"));
+    println!(
+        "fallback_ip: {}",
+        cfg.fallback_ip.as_deref().unwrap_or("(none)")
+    );
     println!("cache_secs: {}", cfg.cache_secs);
     println!("stale_secs: {}", cfg.stale_secs);
     Ok(())
