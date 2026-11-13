@@ -10,7 +10,12 @@ use uuid::Uuid;
 pub async fn backfill_missing(pool: &PgPool) {
     let domains = match crate::repository::list_domains(pool).await {
         Ok(domains) => domains,
-        Err(_) => return,
+        Err(e) => {
+            // Without this the task failed silently and the missing config versions
+            // were only noticed when an edge asked for one.
+            tracing::warn!(error = %e, "config version backfill failed; will retry on next start");
+            return;
+        }
     };
     for domain in domains {
         if let Ok(None) = crate::repository::latest_version(pool, domain.id).await {

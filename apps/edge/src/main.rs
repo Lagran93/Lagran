@@ -273,6 +273,17 @@ async fn main() -> anyhow::Result<()> {
     // stays on the data listener for backward compatibility.
     if let Some(admin) = admin_listen {
         let admin_addr: SocketAddr = admin.parse()?;
+        // Probe the socket before spawning the server. A management listener that
+        // cannot bind leaves purge, cert reload and config reload unreachable while
+        // the process keeps serving traffic — the control plane's purge then fails
+        // silently and only shows up as purge_retry rows. Refusing to start is the
+        // honest outcome.
+        match std::net::TcpListener::bind(admin_addr) {
+            Ok(probe) => drop(probe),
+            Err(e) => {
+                anyhow::bail!("cannot bind EDGE_ADMIN_LISTEN {admin_addr}: {e}");
+            }
+        }
         let admin_app = listener::create_admin_router(state.clone());
         tracing::info!(admin = %admin_addr, "edge management listener started");
         // Not supervised: the listener owns a bound socket, so a restart would

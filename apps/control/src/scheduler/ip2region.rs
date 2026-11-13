@@ -137,6 +137,9 @@ impl Ip2RegionDb {
             return None;
         }
 
+        // `end_ptr` is the offset of the last segment in this bucket, not one past
+        // it (a single-entry bucket has start == end), so the entry count is
+        // `(end - start) / size + 1` and the last valid index is `(end - start) / size`.
         let mut low = 0_i64;
         let mut high = ((end_ptr - start_ptr) / self.segment_index_size) as i64;
         while low <= high {
@@ -181,6 +184,9 @@ impl Ip2RegionDb {
             return None;
         }
 
+        // `end_ptr` is the offset of the last segment in this bucket, not one past
+        // it (a single-entry bucket has start == end), so the entry count is
+        // `(end - start) / size + 1` and the last valid index is `(end - start) / size`.
         let mut low = 0_i64;
         let mut high = ((end_ptr - start_ptr) / self.segment_index_size) as i64;
         while low <= high {

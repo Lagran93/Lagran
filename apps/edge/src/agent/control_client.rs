@@ -109,13 +109,10 @@ impl ControlClient {
                 .map_err(|e| e.to_string())?
                 .to_bytes();
             if status != StatusCode::NOT_MODIFIED && !status.is_success() {
-                return Err(format!(
-                    "HTTP {status}: {}",
-                    String::from_utf8_lossy(&bytes)
-                        .chars()
-                        .take(200)
-                        .collect::<String>()
-                ));
+                // Status and size only. Callers pass this straight into `warn!`, and a
+                // control-plane error body can echo the request — which for the config
+                // and cert endpoints is the domain's own configuration.
+                return Err(format!("HTTP {status} ({} body bytes)", bytes.len()));
             }
             Ok((status, headers, bytes))
         };

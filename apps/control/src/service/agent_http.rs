@@ -34,7 +34,10 @@ pub fn client() -> &'static EdgeClient {
             .wrap_connector(http);
         Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(16)
+            // One shared client serves every edge. At 16 idle sockets, a fleet of
+            // hundreds of nodes rebuilt connections constantly; 64 keeps the steady
+            // state warm without holding an unbounded number open.
+            .pool_max_idle_per_host(64)
             .build(https)
     })
 }

@@ -29,6 +29,11 @@ const REDIS_RECOVERY_JITTER_MS: u64 = 1_000;
 pub struct RateLimiter {
     /// Sharded: one lock per bucket shard instead of a process-wide lock on
     /// every request.
+    ///
+    /// Never pruned — which is safe only because the key is a domain name, and the
+    /// domain set is bounded by the registry. If this ever keys on client IP or path
+    /// it becomes an unbounded map that grows with traffic; add eviction at the same
+    /// time as that change, not after.
     inner: Arc<DashMap<String, Bucket>>,
     /// Global default RPS (0 = off)
     default_rps: u32,

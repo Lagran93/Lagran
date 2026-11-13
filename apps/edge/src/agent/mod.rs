@@ -143,8 +143,8 @@ pub fn spawn_heartbeat(config: EdgeConfig, control: ControlClient, node_control:
                     "agent_url": config.agent_url,
                     "public_ip": config.public_ip,
                     "version": crate::version::VERSION,
-                    "cpu_usage": cpu_usage(),
-                    "memory_usage": memory_usage(),
+                    "cpu_usage": cpu_usage().await,
+                    "memory_usage": memory_usage().await,
                 });
                 match control
                     .post_json_for::<_, HeartbeatReply>("/api/v1/nodes/heartbeat", &body)
@@ -176,8 +176,14 @@ pub fn spawn_heartbeat(config: EdgeConfig, control: ControlClient, node_control:
     });
 }
 
-fn cpu_usage() -> Option<f64> {
-    let load = std::fs::read_to_string("/proc/loadavg").ok()?;
+/// Read `/proc` without blocking the async worker.
+///
+/// These were `std::fs::read_to_string` inside the heartbeat task. The files are
+/// tiny and already in the page cache so it was harmless in practice, but a
+/// synchronous read on an async thread parks a worker for however long the
+/// filesystem takes — and the whole point of the heartbeat is to stay responsive.
+async fn cpu_usage() -> Option<f64> {
+    let load = tokio::fs::read_to_string("/proc/loadavg").await.ok()?;
     let first = load.split_whitespace().next()?.parse::<f64>().ok()?;
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -185,8 +191,8 @@ fn cpu_usage() -> Option<f64> {
     Some((((first / cpus) * 100.0 * 10.0).round() / 10.0).clamp(0.0, 100.0))
 }
 
-fn memory_usage() -> Option<f64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+async fn memory_usage() -> Option<f64> {
+    let text = tokio::fs::read_to_string("/proc/meminfo").await.ok()?;
     let mut total = 0f64;
     let mut available = 0f64;
     for line in text.lines() {

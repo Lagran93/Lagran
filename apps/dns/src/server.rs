@@ -389,6 +389,9 @@ fn formerr(id: &[u8]) -> Vec<u8> {
 struct Queue {
     items: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
     cv: Condvar,
+    /// Queries dropped because the queue was full. Non-zero means the workers are
+    /// not draining fast enough and clients are getting silence.
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 impl Queue {
@@ -396,6 +399,7 @@ impl Queue {
         Self {
             items: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
+            dropped: std::sync::atomic::AtomicU64::new(0),
         }
     }
     fn push(&self, item: (Vec<u8>, SocketAddr)) {
@@ -406,8 +410,18 @@ impl Queue {
         if q.len() < 20_000 {
             q.push_back(item);
             self.cv.notify_one();
+        } else {
+            // A full queue means the workers are not keeping up — a stalled worker
+            // or a burst above capacity. Dropping silently made that invisible.
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    /// Queries dropped since start.
+    fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn pop(&self) -> (Vec<u8>, SocketAddr) {
         // Recover from a poisoned mutex instead of panicking.
         //
@@ -638,11 +652,36 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
 
     // Periodic stats + cache hygiene.
     let stats_service = service.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(60));
-        let (hits, misses, size) = stats_service.stats();
-        tracing::info!(hits, misses, cache = size, "dns stats");
-    });
+    let stats_queue = queue.clone();
+    // Named so a panic here shows up as "dns-stats" rather than an unnamed thread,
+    // and so the process listing makes it obvious the reporter is alive.
+    std::thread::Builder::new()
+        .name("dns-stats".into())
+        .spawn(move || {
+            let mut last_dropped = 0_u64;
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+                let (hits, misses, size) = stats_service.stats();
+                // A healthy second is unremarkable, so it stays at debug. Only drops —
+                // which mean clients are getting silence — are worth a warn, and then
+                // only when the count moved since the last report.
+                let dropped = stats_queue.dropped();
+                if dropped > last_dropped {
+                    tracing::warn!(
+                        hits,
+                        misses,
+                        cache = size,
+                        dropped,
+                        since_last = dropped - last_dropped,
+                        "dns stats: queries dropped, queue full"
+                    );
+                    last_dropped = dropped;
+                } else {
+                    tracing::debug!(hits, misses, cache = size, "dns stats");
+                }
+            }
+        })
+        .ok();
 
     // Shutdown flag set by the signal handler below. The receive loop is
     // synchronous, so a read timeout is what makes `recv_from` interruptible;
