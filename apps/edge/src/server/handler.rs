@@ -519,18 +519,26 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
     // Single preflight implementation shared with the Pingora native path:
     // HTTPS redirect, CC, rate-limit, WAF and hotlink.
     if let Some(domain) = domain_entry.as_ref() {
-        let pipeline = RequestPipeline::new(&state);
-        let facts = facts_from_request(
-            &req,
-            &host,
-            &path_only,
-            &path_and_query,
-            &client_ip,
-            is_https,
-            start,
-        );
-        if let Some(resp) = pipeline.preflight(domain, &facts).await {
-            return resp;
+        // Pingora already ran this exact preflight before handing the request
+        // over; running it again would charge CC / rate-limit budget twice.
+        if req
+            .extensions()
+            .get::<host_util::PreflightDone>()
+            .is_none()
+        {
+            let pipeline = RequestPipeline::new(&state);
+            let facts = facts_from_request(
+                &req,
+                &host,
+                &path_only,
+                &path_and_query,
+                &client_ip,
+                is_https,
+                start,
+            );
+            if let Some(resp) = pipeline.preflight(domain, &facts).await {
+                return resp;
+            }
         }
         // The marker written by the Pingora filter must survive: the hotlink
         // check later in this function reads it to honour a URL that already
@@ -904,7 +912,18 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                     } else {
                         CacheStatus::Miss
                     };
-                    let out = origin_response(
+                    // HEAD has no body to re-measure, and `origin_response`
+                    // strips Content-Length for GET responses. Keep the value
+                    // the origin reported so the client sees the real size.
+                    let head_length = if method == Method::HEAD {
+                        resp.headers
+                            .get(header::CONTENT_LENGTH)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    };
+                    let mut out = origin_response(
                         resp,
                         label.as_str(),
                         &etag,
@@ -915,6 +934,12 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                             policy_browser_ttl(&response_policy)
                         },
                     );
+                    if let Some(length) = head_length {
+                        if let Ok(value) = HeaderValue::from_str(&length) {
+                            out.headers_mut()
+                                .insert(header::CONTENT_LENGTH, value);
+                        }
+                    }
                     log_access(
                         &state.access_log,
                         &method,
@@ -1411,6 +1436,16 @@ async fn fetch_with_single_flight(
     method: &Method,
     host: &str,
 ) -> Result<(Fetched, bool), FetchError> {
+    // HEAD only needs the representation metadata. This used to be turned into
+    // a full GET so the shared GET entry could be warmed, but the body was then
+    // read with `MAX_CACHEABLE_BODY`: any object above it answered 502 and the
+    // origin was recorded as failed. Ask the origin for HEAD and do not store
+    // the empty body (it would poison the GET cache entry).
+    if method == Method::HEAD {
+        return fetch_head_origin(state, eff, host, path_and_query, headers)
+            .await
+            .map(|r| (Fetched::FromOrigin(r), true));
+    }
     match state.inflight.begin(key).await {
         Slot::Leader(leader) => {
             let flight_guard = if let Some(flight) = state.flight.as_ref() {
@@ -1430,16 +1465,8 @@ async fn fetch_with_single_flight(
                 }
             }
             let _flight_guard = flight_guard;
-            // HEAD must fetch and cache the full GET representation; otherwise
-            // the empty HEAD body is stored under the shared GET key and later
-            // GETs are poisoned with an empty response.
-            let origin_method = if method == Method::HEAD {
-                Method::GET
-            } else {
-                method.clone()
-            };
             let mut result =
-                fetch_origin(state, eff, host, path_and_query, headers, &origin_method).await;
+                fetch_origin(state, eff, host, path_and_query, headers, method).await;
             if let Ok(resp) = &mut result {
                 let content_type = resp
                     .headers
@@ -1580,6 +1607,65 @@ async fn fetch_origin(
                 .await;
         }
         tracing::warn!(origin = %target.url, "origin failed, trying next origin");
+    }
+    result
+}
+
+/// Metadata-only origin fetch for HEAD: no body is read, no cache entry is
+/// written, and the origin's `Content-Length` is preserved for the client.
+async fn fetch_head_origin(
+    state: &AppState,
+    eff: &Effective,
+    host: &str,
+    path_and_query: &str,
+    headers: &HeaderMap,
+) -> Result<OriginResponse, FetchError> {
+    let sequence = origin_sequence(state, host, eff).await;
+    if sequence.is_empty() {
+        return Err(FetchError::Unhealthy);
+    }
+    let timeout = Duration::from_millis(eff.timeout_ms);
+    let mut result = Err(FetchError::Unhealthy);
+    for target in sequence {
+        let mut attempt_headers = headers.clone();
+        if let Some(host_header) = target.host_header.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(host_header) {
+                attempt_headers.insert(header::HOST, value);
+            }
+        }
+        let attempt = tokio::time::timeout(
+            timeout,
+            state.origin.request_with_sni(
+                &target.url,
+                &Method::HEAD,
+                path_and_query,
+                &attempt_headers,
+                None,
+                false,
+                target.sni.as_deref(),
+            ),
+        )
+        .await;
+        result = match attempt {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(FetchError::Failed(e.to_string())),
+            Err(_) => Err(FetchError::Timeout),
+        };
+        if result.is_ok() {
+            break;
+        }
+        if matches!(result, Err(FetchError::Timeout) | Err(FetchError::Failed(_))) {
+            let reason = result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            state
+                .origin_health
+                .record_origin_failure(host, &target.url, &reason)
+                .await;
+        }
+        tracing::warn!(origin = %target.url, "HEAD origin failed, trying next origin");
     }
     result
 }

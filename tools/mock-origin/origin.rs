@@ -187,6 +187,17 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ("Cache-Control", "public, max-age=60".into()),
                 ],
             ),
+            // Larger than MAX_CACHEABLE_BODY: a HEAD request must not buffer
+            // the body, must report the real length and must not mark the
+            // origin unhealthy.
+            "/big" => (
+                200,
+                vec![b'x'; 16 * 1024 * 1024],
+                vec![
+                    ("Content-Type", "application/octet-stream".into()),
+                    ("Cache-Control", "public, max-age=60".into()),
+                ],
+            ),
             "/cached" => (
                 200,
                 b"hello from origin".to_vec(),
@@ -251,6 +262,16 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
             ),
             // No cache headers at all: the domain default (CACHE_TTL) applies.
             "/ttl/default" => (200, b"ttl default".to_vec(), vec![]),
+            // A lifetime larger than u64::MAX seconds must be clamped, never
+            // overflow a SystemTime/Instant deadline (P0-2 regression).
+            "/ttl/overflow" => (
+                200,
+                b"ttl overflow".to_vec(),
+                vec![(
+                    "Cache-Control",
+                    "public, max-age=18446744073709551615".into(),
+                )],
+            ),
             "/slow" if slow => {
                 thread::sleep(Duration::from_secs(3));
                 (200, b"slow origin".to_vec(), vec![])

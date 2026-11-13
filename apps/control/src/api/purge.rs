@@ -61,7 +61,11 @@ pub async fn purge(
     Json(req): Json<PurgeRequest>,
 ) -> Result<Json<PurgeResponse>, (StatusCode, Json<ErrorBody>)> {
     // Purging affects one tenant's cache: require write access to that domain.
-    // A global `purge_all` without a domain is admin-only.
+    // `purge_all` clears every tenant's objects, so owning one domain is not
+    // enough; without this check any tenant could flush the whole platform.
+    if req.purge_all.unwrap_or(false) && !actor.admin() {
+        return Err(forbidden());
+    }
     if req.domain.trim().is_empty() {
         if !actor.admin() {
             return Err(forbidden());

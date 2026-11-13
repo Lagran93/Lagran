@@ -8,6 +8,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Upper bound on any freshness or stale-while-revalidate lifetime.
+///
+/// TTLs come from cache rules and origin `Cache-Control` headers, both outside
+/// the process's trust boundary. A value such as
+/// `max-age=18446744073709551615` used to flow unchanged into
+/// `SystemTime + Duration` inside the Pingora response filter and panic, killing
+/// the worker thread. 400 days is the cap browsers apply to persisted HTTP cache
+/// entries; longer lifetimes are meaningless for a CDN and only turn arithmetic
+/// bugs into outages.
+pub const MAX_TTL_SECS: u64 = 400 * 24 * 60 * 60;
+
+/// Clamp a lifetime derived from configuration or an origin header.
+pub fn clamp_ttl_secs(secs: u64) -> u64 {
+    secs.min(MAX_TTL_SECS)
+}
+
+/// Add `secs` to an `Instant`, falling back to the maximum lifetime instead of
+/// panicking on overflow.
+fn instant_add(now: Instant, secs: u64) -> Instant {
+    // Fall back to the clamp value and finally to `now`: adding anything to an
+    // instant that is already close to `Instant::MAX` can fail too, and a
+    // deadline in the past is a safe (if useless) outcome.
+    now.checked_add(Duration::from_secs(secs))
+        .or_else(|| now.checked_add(Duration::from_secs(MAX_TTL_SECS)))
+        .unwrap_or(now)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheSource {
     /// Local process memory cache.
@@ -28,6 +55,101 @@ impl CacheSource {
             CacheSource::Unknown => "unknown",
         }
     }
+}
+
+/// A structured cache-purge target.
+///
+/// Purge used to be a raw `key.contains(pattern)` check, so refreshing one URL
+/// (or the domain appended to every pattern) deleted whole domains, and a
+/// domain string matched other tenants whose names merely contained it. Targets
+/// are scoped to one host and match the key structure `METHOD:host:path`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PurgeTarget {
+    pub host: String,
+    /// `path` or `path?query`, exactly as it appears in the cache key.
+    pub path: String,
+    /// When true, match every path under `path` at a path boundary.
+    pub prefix: bool,
+}
+
+impl PurgeTarget {
+    /// Build a target from an owning domain and a path (or `path?query`).
+    pub fn new(host: &str, path: &str, prefix: bool) -> Option<Self> {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() || !path.starts_with('/') {
+            return None;
+        }
+        Some(Self {
+            host,
+            path: path.to_string(),
+            prefix,
+        })
+    }
+
+    /// Target that matches every cached object of a domain (config change).
+    pub fn for_domain(host: &str) -> Option<Self> {
+        Self::new(host, "/", true)
+    }
+}
+
+/// Whether a cache key (`METHOD:host:path[?query][|vary=hash]`) matches.
+pub fn cache_key_matches(key: &str, target: &PurgeTarget) -> bool {
+    let Some((host, path)) = split_cache_key(key) else {
+        return false;
+    };
+    if !host.eq_ignore_ascii_case(&target.host) {
+        return false;
+    }
+    if target.prefix {
+        path_matches_prefix(path, &target.path)
+    } else {
+        path == target.path
+    }
+}
+
+/// Host portion of a cache key, for tag purges.
+pub fn cache_key_host(key: &str) -> Option<&str> {
+    split_cache_key(key).map(|(host, _)| host)
+}
+
+fn split_cache_key(key: &str) -> Option<(&str, &str)> {
+    let (_, rest) = key.split_once(':')?;
+    let slash = rest.find('/')?;
+    if slash == 0 || rest.as_bytes().get(slash - 1) != Some(&b':') {
+        return None;
+    }
+    let host = &rest[..slash - 1];
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, strip_vary(&rest[slash..])))
+}
+
+/// Drop trailing `|label=<16 hex chars>` vary components from the path.
+fn strip_vary(path: &str) -> &str {
+    let mut end = path.len();
+    while let Some(pos) = path[..end].rfind('|') {
+        let suffix = &path[pos + 1..end];
+        let Some((label, hash)) = suffix.split_once('=') else {
+            break;
+        };
+        if label.len() <= 16 && hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            end = pos;
+        } else {
+            break;
+        }
+    }
+    &path[..end]
+}
+
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    if path == prefix {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix(prefix) else {
+        return false;
+    };
+    prefix.ends_with('/') || rest.starts_with('/') || rest.starts_with('?')
 }
 
 #[async_trait]
@@ -53,7 +175,7 @@ pub trait CacheBackend: Send + Sync {
     async fn set_with_swr(&self, key: &str, entry: CacheEntry, fresh_secs: u64, swr_secs: u64);
     async fn delete(&self, key: &str);
     async fn clear(&self);
-    async fn purge_matching(&self, patterns: &[String]) -> u64;
+    async fn purge_matching(&self, targets: &[PurgeTarget]) -> u64;
     /// Purge entries whose `Surrogate-Key` / `Cache-Tag` response header
     /// contains any of the requested tags.
     async fn purge_tags(&self, _tags: &[String], _domain: &str) -> u64 {
@@ -460,12 +582,16 @@ impl CacheBackend for MemoryCache {
 
     async fn set_with_swr(&self, key: &str, mut entry: CacheEntry, fresh_secs: u64, swr_secs: u64) {
         let now = Instant::now();
-        let fresh = Duration::from_secs(fresh_secs.max(1));
-        let swr = Duration::from_secs(swr_secs);
-        let fresh_secs = fresh_secs.max(1);
+        // Clamp here as well as in the policy layer: this is the last point
+        // before the values become `Instant`/epoch deadlines, and a caller that
+        // bypasses `decide_storage` must not be able to overflow them.
+        let fresh_secs = clamp_ttl_secs(fresh_secs).max(1);
+        let swr_secs = clamp_ttl_secs(swr_secs);
         let now_epoch = now_epoch_secs();
-        entry.fresh_until_epoch_secs = now_epoch + fresh_secs;
-        entry.stale_until_epoch_secs = now_epoch + fresh_secs + swr_secs;
+        entry.fresh_until_epoch_secs = now_epoch.saturating_add(fresh_secs);
+        entry.stale_until_epoch_secs = now_epoch
+            .saturating_add(fresh_secs)
+            .saturating_add(swr_secs);
         entry.stored_at_epoch_secs = now_epoch;
         // Account for the replacement atomically per key.
         //
@@ -478,8 +604,8 @@ impl CacheBackend for MemoryCache {
         // counter consistent regardless of interleaving.
         let new_entry = TimedEntry {
             entry,
-            fresh_until: now + fresh,
-            stale_until: now + fresh + swr,
+            fresh_until: instant_add(now, fresh_secs),
+            stale_until: instant_add(instant_add(now, fresh_secs), swr_secs),
         };
         let size = new_entry.entry.memory_size();
         // `DashMap::insert` returns the replaced value under the shard lock, so
@@ -516,20 +642,14 @@ impl CacheBackend for MemoryCache {
         }
     }
 
-    async fn purge_matching(&self, patterns: &[String]) -> u64 {
-        if patterns.is_empty() {
-            let n = self.inner.len() as u64;
-            self.clear().await;
-            return n;
+    async fn purge_matching(&self, targets: &[PurgeTarget]) -> u64 {
+        if targets.is_empty() {
+            return 0;
         }
         let keys: Vec<String> = self
             .inner
             .iter()
-            .filter(|e| {
-                patterns
-                    .iter()
-                    .any(|p| !p.is_empty() && e.key().contains(p))
-            })
+            .filter(|e| targets.iter().any(|t| cache_key_matches(e.key(), t)))
             .map(|e| e.key().clone())
             .collect();
         let mut removed = 0u64;
@@ -546,12 +666,13 @@ impl CacheBackend for MemoryCache {
         if wanted.is_empty() {
             return 0;
         }
-        let domain = domain.to_ascii_lowercase();
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let keys: Vec<String> = self
             .inner
             .iter()
             .filter(|e| {
-                (domain.is_empty() || e.key().to_ascii_lowercase().contains(&domain))
+                (domain.is_empty()
+                    || cache_key_host(e.key()).is_some_and(|h| h.eq_ignore_ascii_case(&domain)))
                     && e.value()
                         .entry
                         .tags()
@@ -605,6 +726,23 @@ mod tests {
         c.set_with_swr("k", entry("a"), 1, 60).await;
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(matches!(c.get_result("k").await, CacheGetResult::Stale(_)));
+    }
+
+    #[tokio::test]
+    async fn oversized_ttl_is_clamped() {
+        let c = MemoryCache::new(10);
+        c.set_with_swr("k", entry("a"), u64::MAX, u64::MAX).await;
+        let CacheGetResult::Hit(e) = c.get_result("k").await else {
+            panic!("expected hit");
+        };
+        let now = now_epoch_secs();
+        assert!(e.fresh_until_epoch_secs > now, "deadline must be in the future");
+        assert!(
+            e.fresh_until_epoch_secs <= now + MAX_TTL_SECS,
+            "deadline escaped the clamp: {}",
+            e.fresh_until_epoch_secs
+        );
+        assert!(e.stale_until_epoch_secs >= e.fresh_until_epoch_secs);
     }
 
     #[tokio::test]
@@ -728,10 +866,39 @@ mod tests {
     #[tokio::test]
     async fn purge_matching_removes_keys() {
         let c = MemoryCache::new(10);
-        c.set("GET:a.example/x", entry("a"), 60).await;
-        c.set("GET:b.example/x", entry("b"), 60).await;
-        assert_eq!(c.purge_matching(&["a.example".into()]).await, 1);
+        c.set("GET:a.example:/x", entry("a"), 60).await;
+        c.set("GET:b.example:/x", entry("b"), 60).await;
+        let target = PurgeTarget::new("a.example", "/x", false).unwrap();
+        assert_eq!(c.purge_matching(&[target]).await, 1);
         assert_eq!(c.len().await, 1);
+    }
+
+    #[test]
+    fn purge_target_is_host_and_path_scoped() {
+        let key = "GET:example.com:/small";
+        let exact = PurgeTarget::new("example.com", "/small", false).unwrap();
+        assert!(cache_key_matches(key, &exact));
+        // Query strings identify a different representation.
+        assert!(!cache_key_matches("GET:example.com:/small?q=1", &exact));
+        // A different tenant whose name merely contains the host must not match.
+        assert!(!cache_key_matches("GET:myexample.com:/small", &exact));
+        // Prefixes stop at a path boundary.
+        let prefix = PurgeTarget::new("example.com", "/small", true).unwrap();
+        assert!(cache_key_matches(key, &prefix));
+        assert!(cache_key_matches("GET:example.com:/small/a", &prefix));
+        assert!(!cache_key_matches("GET:example.com:/smaller", &prefix));
+        // Vary suffixes belong to the same representation.
+        assert!(cache_key_matches(
+            "GET:example.com:/small|lang=0123456789abcdef",
+            &exact
+        ));
+        // Domain-wide targets used on config changes cover every path.
+        let domain = PurgeTarget::for_domain("example.com").unwrap();
+        assert!(cache_key_matches("GET:example.com:/anything?x=1", &domain));
+        assert!(!cache_key_matches("GET:other.com:/anything", &domain));
+        // A bare "/" URL must not become a cross-tenant purge.
+        let root = PurgeTarget::new("example.com", "/", false).unwrap();
+        assert!(!cache_key_matches("GET:other.com:/", &root));
     }
 
     #[tokio::test]

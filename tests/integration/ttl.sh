@@ -86,7 +86,7 @@ NODE_TOKEN=$(printf '%s' "$NODE_RESP" | jq -r '.token // empty')
 # Re-runs may already have the domain: force this run's mock origin onto it.
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID" -H "$AUTH" \
   -H 'content-type: application/json' \
-  -d "{\"origin_host\":\"127.0.0.1\",\"origin_port\":$ORIGIN_PORT,\"origin_proto\":\"http\"}" >/dev/null
+  -d "{\"origin_host\":\"127.0.0.1\",\"origin_port\":$ORIGIN_PORT,\"origin_proto\":\"http\",\"ssl_enabled\":false}" >/dev/null
 
 for id in $(curl -s -H "$AUTH" "http://127.0.0.1:$CONTROL_PORT/api/v1/rules" \
   | jq -r --arg d "$DOMAIN_ID" '.[] | select(.domain_id == $d) | .id'); do
@@ -170,7 +170,26 @@ else
   pass "/ttl/default expired after ~${DEFAULT_TTL}s as expected"
 fi
 
-echo "== 6. origin down: fresh cache still served, expired cache shows page =="
+echo "== 6. oversized max-age is clamped, not a panic =="
+H=$(req "/ttl/overflow")
+contains "overflow: stored (MISS)" "$H" "x-cache: MISS"
+H=$(req "/ttl/overflow")
+contains "overflow: served from cache (HIT)" "$H" "x-cache: HIT"
+TTL=$(printf '%s\n' "$H" | awk 'tolower($1) == "x-lagran-cache-ttl:" {gsub("\r", "", $2); print $2; exit}')
+if [[ -n "$TTL" && "$TTL" -le 34560000 ]]; then
+  pass "clamped TTL reported ($TTL s <= 400 days)"
+else
+  fail "clamped TTL header (got '$TTL')"
+fi
+sleep 1
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" \
+  "http://127.0.0.1:$EDGE_PORT/ttl/overflow")
+[[ "$CODE" == "200" ]] && pass "edge still serves after oversized TTL" \
+  || fail "edge unhealthy after oversized TTL ($CODE)"
+grep -qi 'panicked' "$LOG_DIR/edge.log" \
+  && fail "edge log contains a panic" || pass "no panic in edge log"
+
+echo "== 7. origin down: fresh cache still served, expired cache shows page =="
 # Warm a long-TTL object (/cached: max-age=120) and the 1s rule object.
 req "/cached" >/dev/null
 req "/cached" >/dev/null

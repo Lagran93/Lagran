@@ -738,8 +738,10 @@ fn decide_storage_with<'a>(
     };
 
     Ok(CacheDecision {
-        ttl_secs: ttl,
-        swr_secs: swr,
+        // Clamp before these values become deadlines: `parse::<u64>()` accepts
+        // values that overflow every `SystemTime`/`Instant` addition downstream.
+        ttl_secs: lagran_cache::clamp_ttl_secs(ttl),
+        swr_secs: lagran_cache::clamp_ttl_secs(swr),
     })
 }
 
@@ -1427,6 +1429,41 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn oversized_ttl_and_swr_are_clamped() {
+        let d = decide_storage(
+            200,
+            &hdrs(&[("cache-control", "max-age=18446744073709551615")]),
+            ResolvedPolicy::default(),
+            60,
+        )
+        .unwrap();
+        assert_eq!(d.ttl_secs, lagran_cache::MAX_TTL_SECS);
+
+        let d = decide_storage(
+            200,
+            &hdrs(&[(
+                "cache-control",
+                "max-age=60, stale-while-revalidate=18446744073709551615",
+            )]),
+            ResolvedPolicy::default(),
+            60,
+        )
+        .unwrap();
+        assert_eq!(d.ttl_secs, 60);
+        assert_eq!(d.swr_secs, lagran_cache::MAX_TTL_SECS);
+
+        // A rule may carry the same out-of-range value; it is clamped too.
+        let policy = ResolvedPolicy {
+            ttl_override: Some(u64::MAX),
+            swr_secs: u64::MAX,
+            ..ResolvedPolicy::default()
+        };
+        let d = decide_storage(200, &hdrs(&[("cache-control", "max-age=60")]), policy, 60).unwrap();
+        assert_eq!(d.ttl_secs, lagran_cache::MAX_TTL_SECS);
+        assert_eq!(d.swr_secs, lagran_cache::MAX_TTL_SECS);
     }
 
     #[test]

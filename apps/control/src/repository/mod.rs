@@ -1505,7 +1505,33 @@ pub async fn create_cert(
         None
     };
 
-    sqlx::query_as::<_, CertRow>(
+    // Serialise "replace the active certificate" per domain. Two concurrent
+    // uploads used to leave two `active` rows, and `get_cert_by_domain` picks
+    // the newest by `updated_at`, so whichever landed last silently shadowed
+    // the other. Superseding the old row in the same transaction guarantees at
+    // most one active certificate per domain name.
+    let mut tx = pool.begin().await?;
+    if let Some(id) = domain_id {
+        sqlx::query("SELECT 1 FROM domains WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(domain_name)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if status == "active" {
+        sqlx::query(
+            "UPDATE certificates SET status = 'superseded'
+             WHERE lower(domain_name) = lower($1) AND status = 'active'",
+        )
+        .bind(domain_name)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let row = sqlx::query_as::<_, CertRow>(
         r#"
         INSERT INTO certificates
             (domain_id, domain_name, cert_pem, key_pem, issuer, not_before, not_after, status, auto_renew)
@@ -1523,8 +1549,10 @@ pub async fn create_cert(
     .bind(not_after)
     .bind(status)
     .bind(auto_renew)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 pub async fn delete_cert(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {

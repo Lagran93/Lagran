@@ -79,6 +79,40 @@ fn forbidden() -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+fn bad_request(message: &str) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: message.into(),
+        }),
+    )
+}
+
+/// Parse the uploaded PEM pair and verify the private key belongs to the
+/// certificate. Without this, any `BEGIN ...` blob was accepted as an "active"
+/// certificate and pushed to every edge.
+fn validate_cert_pair(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    use rustls::pki_types::CertificateDer;
+
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .map_err(|e| format!("invalid certificate PEM: {e}"))?;
+    if certs.is_empty() {
+        return Err("certificate PEM contains no certificate".into());
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .map_err(|e| format!("invalid private key PEM: {e}"))?
+        .ok_or_else(|| "private key PEM contains no key".to_string())?;
+    let provider = rustls::crypto::ring::default_provider();
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|e| format!("unsupported private key: {e}"))?;
+    rustls::sign::CertifiedKey::new(certs, signing_key)
+        .keys_match()
+        .map_err(|e| format!("certificate and private key do not match: {e}"))
+}
+
 /// Read access to a certificate follows its domain.
 async fn can_read(state: &AppState, actor: &Actor, cert: &repository::CertRow) -> bool {
     if actor.admin() {
@@ -130,44 +164,45 @@ pub async fn create(
     actor: Actor,
     Json(req): Json<CreateCertRequest>,
 ) -> Result<(StatusCode, Json<CertDto>), (StatusCode, Json<ErrorBody>)> {
-    if req.domain_name.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody {
-                error: "domain_name required".into(),
-            }),
+    // Resolve the domain first and authorise against the row that was resolved.
+    // The previous code authorised `domain_id` but stored the client-supplied
+    // `domain_name`, so a user could upload a certificate (and private key) for
+    // any host they did not own, shadowing the real certificate on every edge.
+    let domain = match req.domain_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            let id = Uuid::parse_str(raw).map_err(|_| bad_request("invalid domain_id"))?;
+            repository::get_domain(&state.pool, id)
+                .await
+                .map_err(|_| db_error())?
+        }
+        None if !req.domain_name.trim().is_empty() => {
+            repository::get_domain_by_name(&state.pool, req.domain_name.trim())
+                .await
+                .map_err(|_| db_error())?
+        }
+        None => None,
+    };
+    let Some(domain) = domain else {
+        return Err(bad_request(
+            "unknown domain; create the domain before uploading its certificate",
         ));
-    }
-    let domain_id = match req.domain_id.as_deref().filter(|s| !s.is_empty()) {
-        Some(s) => Some(Uuid::parse_str(s).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorBody {
-                    error: "invalid domain_id".into(),
-                }),
-            )
-        })?),
-        None => repository::get_domain_by_name(&state.pool, &req.domain_name)
-            .await
-            .ok()
-            .flatten()
-            .map(|d| d.id),
     };
-
-    let allowed = match domain_id {
-        Some(did) => actor.can_write_domain(&state, did).await,
-        None => actor.can_write_domain_name(&state, &req.domain_name).await,
-    };
-    if !allowed {
+    if !actor.can_write_domain(&state, domain.id).await {
         return Err(forbidden());
     }
+    let cert_pem = req.cert_pem.as_deref().unwrap_or("");
+    let key_pem = req.key_pem.as_deref().unwrap_or("");
+    if cert_pem.is_empty() || key_pem.is_empty() {
+        return Err(bad_request("cert_pem and key_pem are required"));
+    }
+    validate_cert_pair(cert_pem, key_pem).map_err(|e| bad_request(&e))?;
 
     let row = repository::create_cert(
         &state.pool,
-        domain_id,
-        req.domain_name.trim(),
-        req.cert_pem.as_deref().unwrap_or(""),
-        req.key_pem.as_deref().unwrap_or(""),
+        Some(domain.id),
+        &domain.name,
+        cert_pem,
+        key_pem,
         req.issuer.as_deref().unwrap_or("manual"),
         req.auto_renew.unwrap_or(false),
     )
@@ -375,4 +410,36 @@ fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
                 part == etag || part.strip_prefix("W/") == Some(etag)
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_cert_pair;
+
+    fn self_signed() -> (String, String) {
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["example.test".to_string()]).unwrap();
+        (generated.cert.pem(), generated.key_pair.serialize_pem())
+    }
+
+    #[test]
+    fn valid_certificate_key_pair_is_accepted() {
+        let (cert, key) = self_signed();
+        validate_cert_pair(&cert, &key).expect("generated pair must validate");
+    }
+
+    #[test]
+    fn mismatched_private_key_is_rejected() {
+        let (cert, _) = self_signed();
+        let (_, other_key) = self_signed();
+        let err = validate_cert_pair(&cert, &other_key).unwrap_err();
+        assert!(err.contains("do not match"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn garbage_pem_is_rejected() {
+        assert!(validate_cert_pair("not a cert", "not a key").is_err());
+        let (cert, _) = self_signed();
+        assert!(validate_cert_pair(&cert, "not a key").is_err());
+    }
 }

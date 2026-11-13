@@ -44,31 +44,45 @@ pub async fn purge_handler(
         });
     }
 
-    let mut patterns: Vec<String> = Vec::new();
-    let mut had_pattern = false;
+    let domain = req.domain.trim();
+    if domain.is_empty() {
+        return Json(EdgePurgeResponse {
+            success: false,
+            purged_count: 0,
+            message: "domain is required unless purge_all is set".into(),
+        });
+    }
+
+    // Targets are host-and-path scoped. Appending the domain (the old
+    // behaviour) turned every URL purge into a domain-wide purge, and a
+    // substring match also hit other tenants.
+    let mut targets: Vec<lagran_cache::PurgeTarget> = Vec::new();
     if let Some(urls) = req.urls {
         for u in urls {
-            if u.trim().is_empty() {
+            let raw = u.trim();
+            if raw.is_empty() {
                 continue;
             }
-            had_pattern = true;
-            // extract path from URL if absolute
-            if let Ok(parsed) = u.parse::<http::Uri>() {
-                if let Some(pq) = parsed.path_and_query() {
-                    patterns.push(pq.as_str().to_string());
-                } else {
-                    patterns.push(u);
-                }
-            } else {
-                patterns.push(u);
+            let path = match raw.parse::<http::Uri>() {
+                Ok(parsed) => parsed
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| raw.to_string()),
+                Err(_) => raw.to_string(),
+            };
+            if let Some(target) = lagran_cache::PurgeTarget::new(domain, &path, false) {
+                targets.push(target);
             }
         }
     }
     if let Some(prefixes) = req.prefixes {
         for prefix in prefixes {
-            if !prefix.trim().is_empty() {
-                had_pattern = true;
-                patterns.push(prefix);
+            let raw = prefix.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            if let Some(target) = lagran_cache::PurgeTarget::new(domain, raw, true) {
+                targets.push(target);
             }
         }
     }
@@ -80,23 +94,17 @@ pub async fn purge_handler(
         .filter(|t| !t.is_empty())
         .collect();
 
-    // Also match domain host in cache keys (key format: METHOD:host:path).
-    // Do not turn a tag-only purge into a domain-wide purge.
-    if had_pattern && !req.domain.is_empty() {
-        patterns.push(req.domain.clone());
-    }
-
     let mut n = 0u64;
-    if !patterns.is_empty() {
-        n += state.cache.purge_matching(&patterns).await;
+    if !targets.is_empty() {
+        n += state.cache.purge_matching(&targets).await;
         if let Some(large) = state.large_cache.as_ref() {
-            n += large.purge_patterns(&patterns).await;
+            n += large.purge_targets(&targets).await;
         }
     }
     if !tags.is_empty() {
         n += state.cache.purge_tags(&tags, &req.domain).await;
     }
-    tracing::info!(domain = %req.domain, purged = n, patterns = ?patterns, tags = ?tags, "purge applied");
+    tracing::info!(domain = %domain, purged = n, targets = ?targets, tags = ?tags, "purge applied");
 
     Json(EdgePurgeResponse {
         success: true,

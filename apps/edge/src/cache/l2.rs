@@ -11,7 +11,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult, CacheSource, SharedCache};
+use lagran_cache::{
+    CacheBackend, CacheEntry, CacheGetResult, CacheSource, PurgeTarget, SharedCache,
+};
 use redis::AsyncCommands;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -492,8 +494,10 @@ impl CacheBackend for RedisL2Cache {
             headers: entry.headers,
             body: entry.body,
             stored_at: now,
-            fresh_until: now + fresh_secs.max(1),
-            stale_until: now + fresh_secs.max(1) + swr_secs,
+            fresh_until: now.saturating_add(fresh_secs.max(1)),
+            stale_until: now
+                .saturating_add(fresh_secs.max(1))
+                .saturating_add(swr_secs),
         };
         self.redis_write(key, &l2, &tags).await;
     }
@@ -516,21 +520,34 @@ impl CacheBackend for RedisL2Cache {
                 .unwrap_or(Ok(0));
     }
 
-    async fn purge_matching(&self, patterns: &[String]) -> u64 {
-        let mut removed = self.local.purge_matching(patterns).await;
-        for pattern in patterns {
-            let keys = self
-                .redis_scan_keys(&format!("*{}*", Self::glob_escape(pattern)))
-                .await;
-            if keys.is_empty() {
-                continue;
+    async fn purge_matching(&self, targets: &[PurgeTarget]) -> u64 {
+        let mut removed = self.local.purge_matching(targets).await;
+        if targets.is_empty() {
+            return removed;
+        }
+        let namespace = self.namespace();
+        let mut victims: HashSet<String> = HashSet::new();
+        for target in targets {
+            // Scan a host-scoped glob, then filter structurally: a substring
+            // glob would treat `myexample.com` as a match for `example.com`.
+            let pattern = format!("*:{}:*", Self::glob_escape(&target.host));
+            for full in self.redis_scan_keys(&pattern).await {
+                if let Some(raw) = full.strip_prefix(&namespace) {
+                    if lagran_cache::cache_key_matches(raw, target) {
+                        victims.insert(full);
+                    }
+                }
             }
-            let mut conn = self.conn.clone();
-            if let Ok(Ok(n)) =
-                tokio::time::timeout(REDIS_ADMIN_TIMEOUT, conn.del::<_, usize>(keys)).await
-            {
-                removed += n as u64;
-            }
+        }
+        if victims.is_empty() {
+            return removed;
+        }
+        let mut conn = self.conn.clone();
+        let keys: Vec<String> = victims.into_iter().collect();
+        if let Ok(Ok(n)) =
+            tokio::time::timeout(REDIS_ADMIN_TIMEOUT, conn.del::<_, usize>(keys)).await
+        {
+            removed += n as u64;
         }
         removed
     }
@@ -553,13 +570,13 @@ impl CacheBackend for RedisL2Cache {
             }
         }
         // Entries written before the tag index existed have no members yet.
-        // Fall back to a domain scan only in that case.
-        if candidates.is_empty() {
+        // Fall back to a host-scoped scan only in that case.
+        if candidates.is_empty() && !domain.is_empty() {
             // `redis_scan_keys` returns fully qualified Redis keys, while the
             // rest of this function works with bare cache keys.
             let namespace = self.namespace();
             for full in self
-                .redis_scan_keys(&format!("*{}*", Self::glob_escape(domain)))
+                .redis_scan_keys(&format!("*:{}:*", Self::glob_escape(domain)))
                 .await
             {
                 if let Some(raw) = full.strip_prefix(&namespace) {
@@ -568,8 +585,12 @@ impl CacheBackend for RedisL2Cache {
             }
         }
         let mut victims = Vec::new();
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         for key in candidates {
-            if !key.contains(domain) {
+            if !domain.is_empty()
+                && !lagran_cache::cache_key_host(&key)
+                    .is_some_and(|host| host.eq_ignore_ascii_case(&domain))
+            {
                 continue;
             }
             let Ok(Ok(Some(raw))) = tokio::time::timeout(

@@ -673,10 +673,13 @@ pub fn spawn_config_sync(
                                     .replace_all(entries.clone(), cfg.version.clone())
                                     .await;
                                 for domain in &changed_domains {
-                                    let purged =
-                                        cache.purge_matching(std::slice::from_ref(domain)).await;
+                                    let targets: Vec<_> =
+                                        lagran_cache::PurgeTarget::for_domain(domain)
+                                            .into_iter()
+                                            .collect();
+                                    let purged = cache.purge_matching(&targets).await;
                                     let large_purged = if let Some(large) = large_cache.as_ref() {
-                                        large.purge_patterns(std::slice::from_ref(domain)).await
+                                        large.purge_targets(&targets).await
                                     } else {
                                         0
                                     };

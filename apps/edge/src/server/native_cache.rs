@@ -226,8 +226,10 @@ impl HandleMiss for EntryMiss {
             headers,
             body: self.body.freeze(),
             stored_at_epoch_secs: now,
-            fresh_until_epoch_secs: now + self.fresh_secs.max(1),
-            stale_until_epoch_secs: now + self.fresh_secs.max(1) + self.swr_secs,
+            fresh_until_epoch_secs: now.saturating_add(self.fresh_secs.max(1)),
+            stale_until_epoch_secs: now
+                .saturating_add(self.fresh_secs.max(1))
+                .saturating_add(self.swr_secs),
         };
         entry
             .headers

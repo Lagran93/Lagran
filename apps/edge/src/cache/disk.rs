@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult};
+use lagran_cache::{CacheBackend, CacheEntry, CacheGetResult, PurgeTarget};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -365,8 +365,8 @@ impl CacheBackend for DiskCache {
             key: key.to_string(),
             status: entry.status,
             headers: entry.headers.clone(),
-            fresh_until: now + fresh,
-            stale_until: now + fresh + swr_secs,
+            fresh_until: now.saturating_add(fresh),
+            stale_until: now.saturating_add(fresh).saturating_add(swr_secs),
             stored_at: entry.stored_at_epoch_secs.max(now),
         };
         let meta_bytes = match serde_json::to_vec(&meta) {
@@ -404,20 +404,9 @@ impl CacheBackend for DiskCache {
         self.entries.store(0, Ordering::Relaxed);
     }
 
-    /// Remove entries whose cache key contains any of the patterns.
-    /// An empty pattern list clears the cache.
-    async fn purge_matching(&self, patterns: &[String]) -> u64 {
-        if patterns.is_empty() {
-            let n = self.len().await as u64;
-            self.clear().await;
-            return n;
-        }
-        let patterns: Vec<&str> = patterns
-            .iter()
-            .map(|p| p.as_str())
-            .filter(|p| !p.is_empty())
-            .collect();
-        if patterns.is_empty() {
+    /// Remove entries matching any structured purge target.
+    async fn purge_matching(&self, targets: &[PurgeTarget]) -> u64 {
+        if targets.is_empty() {
             return 0;
         }
 
@@ -449,7 +438,10 @@ impl CacheBackend for DiskCache {
                 if meta.key.is_empty() {
                     continue;
                 }
-                if patterns.iter().any(|p| meta.key.contains(p)) {
+                if targets
+                    .iter()
+                    .any(|target| lagran_cache::cache_key_matches(&meta.key, target))
+                {
                     let bin = path.with_extension("bin");
                     victims.push((path, bin, bytes.len() as u64));
                 }
@@ -496,7 +488,10 @@ impl CacheBackend for DiskCache {
                 let Ok(meta) = serde_json::from_slice::<DiskMeta>(&bytes) else {
                     continue;
                 };
-                if !domain.is_empty() && !meta.key.to_ascii_lowercase().contains(&domain) {
+                if !domain.is_empty()
+                    && !lagran_cache::cache_key_host(&meta.key)
+                        .is_some_and(|host| host.eq_ignore_ascii_case(&domain))
+                {
                     continue;
                 }
                 let matched = meta.headers.iter().any(|(name, value)| {
@@ -602,9 +597,9 @@ impl CacheBackend for HybridCache {
         self.disk.clear().await;
     }
 
-    async fn purge_matching(&self, patterns: &[String]) -> u64 {
-        let a = self.mem.purge_matching(patterns).await;
-        let b = self.disk.purge_matching(patterns).await;
+    async fn purge_matching(&self, targets: &[PurgeTarget]) -> u64 {
+        let a = self.mem.purge_matching(targets).await;
+        let b = self.disk.purge_matching(targets).await;
         a + b
     }
 
@@ -633,20 +628,21 @@ mod tests {
             Bytes::from_static(b"body"),
         );
         cache
-            .set_with_swr("GET:a.test/x", entry.clone(), 60, 30)
+            .set_with_swr("GET:a.test:/x", entry.clone(), 60, 30)
             .await;
-        cache.set_with_swr("GET:b.test/y", entry, 60, 30).await;
+        cache.set_with_swr("GET:b.test:/y", entry, 60, 30).await;
         assert_eq!(cache.len().await, 2);
 
-        match cache.get_result("GET:a.test/x").await {
+        match cache.get_result("GET:a.test:/x").await {
             CacheGetResult::Hit(e) => assert_eq!(&e.body[..], b"body"),
             other => panic!("expected hit, got {other:?}"),
         }
 
-        assert_eq!(cache.purge_matching(&["a.test".into()]).await, 1);
+        let target = lagran_cache::PurgeTarget::new("a.test", "/x", false).unwrap();
+        assert_eq!(cache.purge_matching(&[target]).await, 1);
         assert_eq!(cache.len().await, 1);
         assert!(matches!(
-            cache.get_result("GET:b.test/y").await,
+            cache.get_result("GET:b.test:/y").await,
             CacheGetResult::Hit(_)
         ));
         let _ = tokio::fs::remove_dir_all(&dir).await;

@@ -552,8 +552,10 @@ impl LargeCache {
         meta.headers
             .retain(|(name, _)| Self::cacheable_header(name));
         let now = now_unix();
-        meta.fresh_until = now + fresh_secs.max(1);
-        meta.stale_until = now + fresh_secs.max(1) + swr_secs;
+        meta.fresh_until = now.saturating_add(fresh_secs.max(1));
+        meta.stale_until = now
+            .saturating_add(fresh_secs.max(1))
+            .saturating_add(swr_secs);
         meta.stored_at = now;
         let Ok(meta_bytes) = serde_json::to_vec(&meta) else {
             return false;
@@ -636,8 +638,8 @@ impl LargeCache {
             status,
             headers,
             content_length,
-            fresh_until: now + fresh,
-            stale_until: now + fresh + swr_secs,
+            fresh_until: now.saturating_add(fresh),
+            stale_until: now.saturating_add(fresh).saturating_add(swr_secs),
             stored_at: 0,
             complete: false,
             segments: Vec::new(),
@@ -733,8 +735,8 @@ impl LargeCache {
             status,
             headers,
             content_length,
-            fresh_until: now + fresh,
-            stale_until: now + fresh + swr_secs,
+            fresh_until: now.saturating_add(fresh),
+            stale_until: now.saturating_add(fresh).saturating_add(swr_secs),
             stored_at: 0,
             complete: false,
             segments: Vec::new(),
@@ -757,8 +759,8 @@ impl LargeCache {
         })
     }
 
-    pub async fn purge_patterns(&self, patterns: &[String]) -> u64 {
-        if patterns.is_empty() {
+    pub async fn purge_targets(&self, targets: &[lagran_cache::PurgeTarget]) -> u64 {
+        if targets.is_empty() {
             return 0;
         }
         let mut victims = Vec::new();
@@ -785,7 +787,11 @@ impl LargeCache {
                     let Ok(meta) = serde_json::from_slice::<LargeMeta>(&bytes) else {
                         continue;
                     };
-                    if meta.key.is_empty() || !patterns.iter().any(|p| meta.key.contains(p)) {
+                    if meta.key.is_empty()
+                        || !targets.iter().any(|target| {
+                            lagran_cache::cache_key_matches(&meta.key, target)
+                        })
+                    {
                         continue;
                     }
                     let base = path
@@ -1144,7 +1150,8 @@ mod tests {
             .unwrap();
         assert_eq!(tail.len(), 1024);
 
-        assert_eq!(cache.purge_patterns(&["large.test".into()]).await, 1);
+        let target = lagran_cache::PurgeTarget::new("large.test", "/movie.bin", false).unwrap();
+        assert_eq!(cache.purge_targets(&[target]).await, 1);
         assert!(cache.get(key).await.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

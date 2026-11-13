@@ -184,6 +184,9 @@ struct ReqCtx {
     flight_guard: Option<crate::cache::flight::FlightGuard>,
     /// Set when the in-process handler already wrote its own access log.
     skip_logging: bool,
+    /// Set once the shared preflight has run for this request, so the
+    /// in-process fallback does not charge CC / rate limits a second time.
+    preflight_done: bool,
 }
 
 impl Default for ReqCtx {
@@ -222,6 +225,7 @@ impl Default for ReqCtx {
             identity_ttl_secs: None,
             flight_guard: None,
             skip_logging: false,
+            preflight_done: false,
         }
     }
 }
@@ -558,7 +562,7 @@ impl ProxyHttp for DataPlaneProxy {
 
         if is_websocket_upgrade(&session.req_header().headers) {
             ctx.skip_logging = true;
-            return self.handle_in_process(session).await;
+            return self.handle_in_process(session, false).await;
         }
 
         let Some(domain) = domain else {
@@ -590,30 +594,30 @@ impl ProxyHttp for DataPlaneProxy {
                 return Ok(true);
             }
             ctx.skip_logging = true;
-            return self.handle_in_process(session).await;
+            return self.handle_in_process(session, false).await;
         };
-        if self.try_large_revalidation(session, ctx, &domain).await? {
-            return Ok(true);
-        }
-        if let Some(plan) = self.native_plan(session, &ctx.host, &domain).await {
-            self.state.metrics.record_pingora_datapath();
-            let path_and_query = session
-                .req_header()
-                .uri
-                .path_and_query()
-                .map(|p| p.as_str().to_string())
-                .unwrap_or_else(|| "/".to_string());
-            let is_https = session
-                .req_header()
-                .headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.eq_ignore_ascii_case("https"))
-                .unwrap_or(false);
+        // Run the shared preflight (HTTPS redirect, bot challenge, CC, rate
+        // limit, WAF, hotlink) before ANY cache revalidation. This used to live
+        // inside the native-plan branch below, while `try_large_revalidation`
+        // ran first and answered a cached object directly — so a client sending
+        // `Cache-Control: no-cache` skipped every L7 protection for that
+        // request (WAF, CC, rate limit, hotlink, HTTPS redirect).
+        let path_and_query = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let is_https = session
+            .req_header()
+            .headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("https"))
+            .unwrap_or(false);
+        if !internal_prefetch {
             let pipeline = RequestPipeline::new(&self.state);
-            let preflight = if internal_prefetch {
-                None
-            } else {
+            let preflight = {
                 let headers = &session.req_header().headers;
                 let facts = RequestFacts {
                     method: &ctx.method,
@@ -625,12 +629,22 @@ impl ProxyHttp for DataPlaneProxy {
                     is_https,
                     start: ctx.start,
                 };
-                pipeline.preflight(&plan.domain, &facts).await
+                pipeline.preflight(&domain, &facts).await
             };
             if let Some(resp) = preflight {
-                write_axum_response(session, resp, false, Some(&self.compression)).await;
+                let is_head = ctx.method == Method::HEAD;
+                write_axum_response(session, resp, is_head, Some(&self.compression)).await;
                 return Ok(true);
             }
+            // Mark it so the in-process fallback does not run CC / rate limits
+            // a second time for this client request.
+            ctx.preflight_done = true;
+        }
+        if self.try_large_revalidation(session, ctx, &domain).await? {
+            return Ok(true);
+        }
+        if let Some(plan) = self.native_plan(session, &ctx.host, &domain).await {
+            self.state.metrics.record_pingora_datapath();
             let small_range = session.req_header().headers.contains_key("range")
                 && range_is_small_bounded(&session.req_header().headers);
             if plan.cacheable && !self.state.cache.has_local(&plan.key).await {
@@ -799,7 +813,7 @@ impl ProxyHttp for DataPlaneProxy {
         // not an error; leave diagnostics to the access log so a high-QPS
         // workload cannot flood the process log.
         ctx.skip_logging = true;
-        self.handle_in_process(session).await
+        self.handle_in_process(session, ctx.preflight_done).await
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
@@ -1140,8 +1154,13 @@ impl ProxyHttp for DataPlaneProxy {
         };
         ctx.identity_ttl_secs = Some(decision.ttl_secs.saturating_add(decision.swr_secs).max(1));
         let now = SystemTime::now();
+        // Never let an origin header overflow the clock: this exact addition
+        // used to panic and kill a Pingora worker thread.
+        let fresh_until = now
+            .checked_add(Duration::from_secs(decision.ttl_secs))
+            .unwrap_or(now);
         let meta = CacheMeta::new(
-            now + Duration::from_secs(decision.ttl_secs),
+            fresh_until,
             now,
             decision.swr_secs.min(u32::MAX as u64) as u32,
             0,
@@ -1608,10 +1627,11 @@ impl ProxyHttp for DataPlaneProxy {
                                 headers: hdrs,
                                 body: ctx.head_body.clone().freeze(),
                                 stored_at_epoch_secs: now_epoch,
-                                fresh_until_epoch_secs: now_epoch + decision.ttl_secs.max(1),
+                                fresh_until_epoch_secs: now_epoch
+                                    .saturating_add(decision.ttl_secs.max(1)),
                                 stale_until_epoch_secs: now_epoch
-                                    + decision.ttl_secs.max(1)
-                                    + decision.swr_secs,
+                                    .saturating_add(decision.ttl_secs.max(1))
+                                    .saturating_add(decision.swr_secs),
                             };
                             if entry.header("etag").is_none() {
                                 let etag = compute_etag(&entry);
@@ -1773,16 +1793,39 @@ impl DataPlaneProxy {
         let pragma = session.req_header().headers.get("pragma").cloned();
         session.req_header_mut().remove_header("cache-control");
         session.req_header_mut().remove_header("pragma");
+        let result = self.revalidate_strict(session, ctx, domain).await;
+        // Restore the client's strict-revalidation intent whenever this helper
+        // did not serve the response. The caller rebuilds its plan afterwards;
+        // if `Cache-Control: no-cache` were left stripped, that plan would look
+        // like an ordinary cacheable GET and Pingora would serve a stale HIT the
+        // client explicitly asked not to get. Restoring after a served response
+        // is harmless — the request is already finished.
+        if let Some(v) = cache_control {
+            let _ = session.req_header_mut().insert_header("cache-control", v);
+        }
+        if let Some(v) = pragma {
+            let _ = session.req_header_mut().insert_header("pragma", v);
+        }
+        result
+    }
+
+    /// Body of [`Self::try_large_revalidation`] after the strict-revalidation
+    /// headers were removed, so the plan it builds is cacheable.
+    async fn revalidate_strict(
+        &self,
+        session: &mut Session,
+        ctx: &mut ReqCtx,
+        domain: &Arc<DomainEntry>,
+    ) -> Result<bool> {
         let plan = self.native_plan(session, &ctx.host, domain).await;
         let Some(plan) = plan else {
-            if let Some(v) = cache_control {
-                let _ = session.req_header_mut().insert_header("cache-control", v);
-            }
-            if let Some(v) = pragma {
-                let _ = session.req_header_mut().insert_header("pragma", v);
-            }
             return Ok(false);
         };
+        if !plan.cacheable {
+            // Authorization / Cookie / rule-bypass requests must not be served
+            // from the shared cache, even when they ask for revalidation.
+            return Ok(false);
+        }
         // Normal-object conditional revalidation. On 304 the cached body is
         // served here; on a changed origin the entry is dropped and the native
         // path performs a single streaming fill. This keeps strict no-cache
@@ -2129,8 +2172,10 @@ impl DataPlaneProxy {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         refreshed.stored_at_epoch_secs = now;
-        refreshed.fresh_until_epoch_secs = now + decision.ttl_secs.max(1);
-        refreshed.stale_until_epoch_secs = now + decision.ttl_secs.max(1) + decision.swr_secs;
+        refreshed.fresh_until_epoch_secs = now.saturating_add(decision.ttl_secs.max(1));
+        refreshed.stale_until_epoch_secs = now
+            .saturating_add(decision.ttl_secs.max(1))
+            .saturating_add(decision.swr_secs);
         self.state
             .cache
             .set_with_swr(
@@ -3433,7 +3478,11 @@ impl DataPlaneProxy {
         Ok(Box::new(peer))
     }
 
-    async fn handle_in_process(&self, session: &mut Session) -> Result<bool> {
+    async fn handle_in_process(
+        &self,
+        session: &mut Session,
+        preflight_done: bool,
+    ) -> Result<bool> {
         let req_header = session.req_header();
         let method: Method = req_header.method.clone();
         let is_head = method == Method::HEAD;
@@ -3489,6 +3538,11 @@ impl DataPlaneProxy {
         axum_req
             .extensions_mut()
             .insert(crate::server::host_util::FromPingora);
+        if preflight_done {
+            axum_req
+                .extensions_mut()
+                .insert(crate::server::host_util::PreflightDone);
+        }
 
         let resp = proxy_handler(State(self.state.clone()), axum_req).await;
         write_axum_response(session, resp, is_head, Some(&self.compression)).await;
@@ -3618,12 +3672,8 @@ fn query_param(query: &str, name: &str) -> Option<String> {
     })
 }
 
-fn head_content_length_for_protocol(is_h2: bool, body_len: usize) -> String {
-    if is_h2 {
-        body_len.to_string()
-    } else {
-        "0".to_string()
-    }
+fn head_content_length_for_protocol(_is_h2: bool, body_len: usize) -> String {
+    body_len.to_string()
 }
 
 /// Write an engine (axum) response straight to the downstream session.
@@ -3721,13 +3771,20 @@ async fn write_axum_response(
         }
     }
     let body_len = bytes.len();
+    // HEAD carries the length of the representation a GET would return. The
+    // origin HEAD response already has it as a header; a cached GET response
+    // stores it too. Only fall back to the buffered body length when the header
+    // is absent.
+    let representation_len = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(body_len);
     let no_content =
         parts.status == StatusCode::NOT_MODIFIED || parts.status == StatusCode::NO_CONTENT;
     let head_content_length = if is_head {
-        // HTTP/2 frames HEAD with END_STREAM and can safely carry the real
-        // representation length. Pingora's H1 encoder cannot reliably do so
-        // without waiting for a body, so H1 keeps the 0 workaround.
-        head_content_length_for_protocol(is_h2, body_len)
+        head_content_length_for_protocol(is_h2, representation_len)
     } else {
         "0".to_string()
     };
@@ -4415,9 +4472,9 @@ mod tests {
     }
 
     #[test]
-    fn head_length_is_http2_only() {
+    fn head_length_is_reported_for_both_protocols() {
         assert_eq!(head_content_length_for_protocol(true, 1234), "1234");
-        assert_eq!(head_content_length_for_protocol(false, 1234), "0");
+        assert_eq!(head_content_length_for_protocol(false, 1234), "1234");
         assert_eq!(head_content_length_for_protocol(true, 0), "0");
     }
 

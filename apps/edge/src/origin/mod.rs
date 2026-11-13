@@ -442,6 +442,20 @@ impl OriginClient {
             .map_err(|e| anyhow!("invalid status: {e}"))?;
 
         let mut out_headers = HeaderMap::new();
+        // A HEAD response has no body: its Content-Length describes the
+        // representation rather than the framing, so it must survive the
+        // hop-by-hop filter. The caller reports it to the client (and the
+        // generic filter would otherwise turn every HEAD into length 0).
+        if method == Method::HEAD {
+            if let Some(value) = resp.headers().get(header::CONTENT_LENGTH) {
+                if let (Ok(name), Ok(val)) = (
+                    HeaderName::from_bytes(header::CONTENT_LENGTH.as_str().as_bytes()),
+                    HeaderValue::from_bytes(value.as_bytes()),
+                ) {
+                    out_headers.insert(name, val);
+                }
+            }
+        }
         for (k, v) in resp.headers().iter() {
             if is_hop_by_hop(k.as_str()) {
                 continue;

@@ -103,6 +103,16 @@ pub struct TlsTerminated;
 #[derive(Clone, Copy, Debug)]
 pub struct FromPingora;
 
+/// Set when the Pingora data plane already ran the shared preflight
+/// (WAF / CC / rate limit / hotlink / HTTPS redirect) for this request.
+///
+/// The in-process fallback shares `proxy_handler` with the direct path, and
+/// that function runs preflight itself. Without this marker every HEAD request
+/// or native-plan fallback would be checked twice, charging CC and rate-limit
+/// budget twice for one client request.
+#[derive(Clone, Copy, Debug)]
+pub struct PreflightDone;
+
 /// Whether this request arrived over TLS, from either data plane.
 pub fn request_is_tls<B>(req: &Request<B>) -> bool {
     req.extensions().get::<TlsSni>().is_some() || req.extensions().get::<TlsTerminated>().is_some()

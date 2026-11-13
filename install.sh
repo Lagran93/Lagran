@@ -58,8 +58,9 @@ Environment:
   LAGRAN_DB_USER=lagran          control: role name
   LAGRAN_JWT_SECRET=...          control: override generated JWT secret
   LAGRAN_AGENT_TOKEN=...         control: global DNS/agent token
+  LAGRAN_WAF_RULEPACK_SECRET=... control+edge: sign WAF rulepacks (auto-generated)
   LAGRAN_REDIS_URL=...           control: optional Redis URL
-  LAGRAN_SEED_DEMO=true|false    control: seed demo account (default true)
+  LAGRAN_SEED_DEMO=true|false    control: seed demo account (default false)
   LAGRAN_CONTROL_BIND=...        control: default 0.0.0.0:8080
   LAGRAN_CONTROL_PUBLIC_URL=...  control: public HTTPS URL (alias: CONTROL_PUBLIC_URL)
 
@@ -279,7 +280,13 @@ write_control_env() {
   local jwt_secret="${LAGRAN_JWT_SECRET:-$(rand_hex 32)}"
   local agent_token="${LAGRAN_AGENT_TOKEN:-$(rand_hex 24)}"
   local bind="${LAGRAN_CONTROL_BIND:-0.0.0.0:8080}"
-  local seed_demo="${LAGRAN_SEED_DEMO:-true}"
+  # Never create the well-known demo account by default: it is incompatible
+  # with REQUIRE_SECURE_SECRETS=true below, so the service would refuse to boot.
+  local seed_demo="${LAGRAN_SEED_DEMO:-false}"
+  # Shared HMAC key for signed WAF rulepacks. Required by both the control plane
+  # and every edge; a fresh install must generate it or the control plane
+  # exits with "WAF_RULEPACK_SECRET is not set".
+  local waf_rulepack_secret="${LAGRAN_WAF_RULEPACK_SECRET:-$(rand_hex 32)}"
   local public_url="${LAGRAN_CONTROL_PUBLIC_URL:-${CONTROL_PUBLIC_URL:-}}"
   umask 077
   cat > "$env_file" <<EOF
@@ -291,6 +298,7 @@ DATABASE_MIN_CONNECTIONS=2
 DATABASE_ACQUIRE_TIMEOUT_SECS=5
 JWT_SECRET=${jwt_secret}
 REQUIRE_SECURE_SECRETS=true
+WAF_RULEPACK_SECRET=${waf_rulepack_secret}
 AGENT_TOKEN=${agent_token}
 SEED_DEMO=${seed_demo}
 ALLOW_REGISTER=false
@@ -442,6 +450,13 @@ write_edge_env() {
   local edge_listen="${EDGE_LISTEN:-0.0.0.0:8081}"
   local admin_listen="${EDGE_ADMIN_LISTEN:-127.0.0.1:8082}"
   local agent_url="${AGENT_URL:-http://127.0.0.1:8082}"
+  # Signed WAF rulepacks need the same key as the control plane. Reuse the one
+  # written to control.env when this host also runs the control plane.
+  local waf_rulepack_secret="${WAF_RULEPACK_SECRET:-}"
+  if [[ -z "$waf_rulepack_secret" && -f "$CONF_DIR/control.env" ]]; then
+    waf_rulepack_secret="$(sed -n 's/^WAF_RULEPACK_SECRET=//p' "$CONF_DIR/control.env" | tail -1)"
+  fi
+  [[ -n "$waf_rulepack_secret" ]] || warn "WAF_RULEPACK_SECRET is empty; edges will reject signed WAF rulepacks"
   umask 077
   cat > "$env_file" <<EOF
 EDGE_LISTEN=${edge_listen}
@@ -452,6 +467,7 @@ PUBLIC_IP=${PUBLIC_IP:-}
 CONTROL_URL=${control_url}
 AGENT_URL=${agent_url}
 AGENT_TOKEN=${AGENT_TOKEN}
+WAF_RULEPACK_SECRET=${waf_rulepack_secret}
 CACHE_BACKEND=memory
 CACHE_TTL=60
 REDIS_URL=${REDIS_URL:-}
@@ -658,7 +674,8 @@ main_control() {
       if curl -fsS "http://127.0.0.1:${control_port}/health" >/dev/null 2>&1; then break; fi
       sleep 1
     done
-    curl -fsS "http://127.0.0.1:${control_port}/health" || warn "control health check failed; see journalctl -u lagran-control"
+    curl -fsS "http://127.0.0.1:${control_port}/health" \
+      || die "control health check failed; see: journalctl -u lagran-control -n 50 --no-pager"
   fi
   cat <<EOF
 
