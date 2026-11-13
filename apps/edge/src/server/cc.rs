@@ -16,7 +16,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WINDOW: Duration = Duration::from_secs(1);
 const STATE_TTL: Duration = Duration::from_secs(600);
-const REDIS_TIMEOUT: Duration = Duration::from_millis(15);
+/// Budget for one shared-budget Redis round trip.
+///
+/// Small on purpose: this sits on the request path. It is also why a cross-region
+/// Redis never works here — a 137 ms link cannot answer within 15 ms, so every check
+/// falls back to the per-process counter and the fleet-wide limit silently becomes a
+/// per-node limit. `shared_counters()` and the periodic report exist to make that
+/// visible instead of leaving it as a silent degradation.
+pub const REDIS_TIMEOUT_MS: u64 = 15;
+
+const REDIS_TIMEOUT: Duration = Duration::from_millis(REDIS_TIMEOUT_MS);
 const IPV4_PREFIX: u8 = 24;
 const IPV6_PREFIX: u8 = 64;
 
@@ -193,6 +202,21 @@ pub struct RedisCc {
     conn: redis::aio::ConnectionManager,
     prefix: String,
     seq: Arc<AtomicU64>,
+    /// Times a shared-budget check actually completed against Redis.
+    ///
+    /// Counted separately from the failures because "is cross-node CC working at all"
+    /// is a question the logs could not answer: every failure was swallowed by
+    /// `ok()?`, so a deployment whose Redis round trip exceeded `REDIS_TIMEOUT` looked
+    /// exactly like one with no CC traffic.
+    shared_ok: Arc<AtomicU64>,
+    /// Times the check fell back to the per-process budget because Redis did not
+    /// answer within `REDIS_TIMEOUT`.
+    shared_timeout: Arc<AtomicU64>,
+    /// Times the check fell back because Redis returned an error.
+    shared_error: Arc<AtomicU64>,
+    /// Last time a failure was logged, so a cross-ocean outage does not flood the
+    /// journal with one line per request.
+    last_failure_log: Arc<AtomicU64>,
 }
 
 impl RedisCc {
@@ -211,6 +235,10 @@ impl RedisCc {
             conn,
             prefix,
             seq: Arc::new(AtomicU64::new(0)),
+            shared_ok: Arc::new(AtomicU64::new(0)),
+            shared_timeout: Arc::new(AtomicU64::new(0)),
+            shared_error: Arc::new(AtomicU64::new(0)),
+            last_failure_log: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -241,19 +269,83 @@ impl RedisCc {
             "#,
         );
         let redis_key = format!("{}:win:{}", self.prefix, key);
-        let result: i64 = tokio::time::timeout(
+        let attempt = tokio::time::timeout(
             REDIS_TIMEOUT,
             script
                 .key(redis_key)
                 .arg(window_ms as i64)
                 .arg(i64::from(limit))
                 .arg(member)
-                .invoke_async(&mut conn),
+                .invoke_async::<i64>(&mut conn),
         )
-        .await
-        .ok()?
-        .ok()?;
-        Some(result != 0)
+        .await;
+        match attempt {
+            Ok(Ok(result)) => {
+                self.shared_ok.fetch_add(1, Ordering::Relaxed);
+                Some(result != 0)
+            }
+            // The two failure modes are separated because they call for different
+            // fixes: a timeout at this budget usually means the Redis round trip is
+            // simply longer than `REDIS_TIMEOUT` (a cross-region link), while an error
+            // means Redis itself is unhappy.
+            Ok(Err(e)) => {
+                self.shared_error.fetch_add(1, Ordering::Relaxed);
+                self.log_failure_once("redis_error", &format!("{e}"));
+                None
+            }
+            Err(_) => {
+                self.shared_timeout.fetch_add(1, Ordering::Relaxed);
+                self.log_failure_once(
+                    "timeout",
+                    &format!(
+                        "no reply within {}ms; per-process budget only",
+                        REDIS_TIMEOUT.as_millis()
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// Log a shared-budget failure at most once every 30 seconds.
+    ///
+    /// Every request that trips the limiter comes through here, so an unthrottled
+    /// `warn!` would bury the journal. The counters carry the real frequency; this
+    /// line exists to make the cause visible when someone looks.
+    fn log_failure_once(&self, kind: &'static str, detail: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.last_failure_log.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 30 {
+            return;
+        }
+        // Lost race just means another thread logged a moment ago.
+        if self
+            .last_failure_log
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        tracing::warn!(
+            kind,
+            detail,
+            shared_ok = self.shared_ok.load(Ordering::Relaxed),
+            shared_timeout = self.shared_timeout.load(Ordering::Relaxed),
+            shared_error = self.shared_error.load(Ordering::Relaxed),
+            "cross-node CC budget unavailable; falling back to the per-process limit"
+        );
+    }
+
+    /// Shared-versus-local tallies, for a startup or periodic report.
+    pub fn counters(&self) -> (u64, u64, u64) {
+        (
+            self.shared_ok.load(Ordering::Relaxed),
+            self.shared_timeout.load(Ordering::Relaxed),
+            self.shared_error.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -379,6 +471,16 @@ pub struct CcProtector {
 impl CcProtector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Shared/ timeout / error tallies from the cross-node counter.
+    ///
+    /// `None` when CC is running without Redis. The first value being zero over a
+    /// long run with traffic means the shared path never completed a single round
+    /// trip — which is exactly the situation a cross-region Redis produces and which
+    /// was previously indistinguishable from "no CC traffic at all".
+    pub fn shared_counters(&self) -> Option<(u64, u64, u64)> {
+        self.redis.as_ref().map(|r| r.counters())
     }
 
     pub fn with_redis(redis: Option<RedisCc>) -> Self {
@@ -1071,5 +1173,54 @@ mod tests {
             cc.check("a.test", "/assets/app.js", ip, &cfg, false).await,
             CcDecision::Limit { .. }
         ));
+    }
+    /// The counters must separate success from the two failure modes.
+    ///
+    /// This is the whole point of the instrumentation: with a cross-region Redis and
+    /// a 15 ms budget, every check times out, and before these counters existed that
+    /// was indistinguishable from "no CC traffic" — the deployment looked healthy.
+    #[tokio::test]
+    async fn shared_counters_track_ok_and_failures_separately() {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
+        let Ok(redis) = RedisCc::connect(&url).await else {
+            return; // no Redis here; the unit-shaped assertions below still apply
+        };
+
+        // A reachable Redis records successes and no failures.
+        let _ = redis.over_limit("counters:ok", 100, 1000).await;
+        let (ok, timeout, error) = redis.counters();
+        assert!(ok >= 1, "a completed round trip must be counted: {ok}");
+        assert_eq!(timeout, 0, "a healthy Redis must not record timeouts");
+        assert_eq!(error, 0, "a healthy Redis must not record errors");
+    }
+
+    /// A backend that refuses the connection records failure, never success.
+    ///
+    /// Scope note: refusal surfaces as `Err(join/timeout)` on the connection manager,
+    /// not as a `redis::RedisError`, so this covers the timeout path. The
+    /// `Ok(Err(_))` path needs a reachable server that returns an error reply, which
+    /// would mean standing up a fake Redis in the test — not done here.
+    #[tokio::test]
+    async fn unreachable_redis_records_failures_not_successes() {
+        // Port 1 refuses immediately; the budget never completes a round trip.
+        let Ok(redis) = RedisCc::connect("redis://127.0.0.1:1/").await else {
+            return;
+        };
+        let result = redis.over_limit("counters:down", 100, 1000).await;
+        assert_eq!(result, None, "a failed check yields no shared answer");
+
+        let (ok, timeout, error) = redis.counters();
+        // Both assertions are separate on purpose: "ok == 0" catches a failure being
+        // miscounted as a success, and "timeout + error > 0" catches a failure being
+        // dropped entirely. Combining them into one expression let the first slip
+        // through, because a connection refusal also increments `timeout`.
+        assert_eq!(
+            ok, 0,
+            "a backend that never answered must not be counted as a successful check"
+        );
+        assert!(
+            timeout + error > 0,
+            "the failure must be recorded somewhere (timeout={timeout}, error={error})"
+        );
     }
 }

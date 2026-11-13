@@ -163,6 +163,42 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Periodic report on whether the cross-node CC budget is actually reaching Redis.
+    //
+    // Reported rather than logged per request: the counters answer "did any shared
+    // round trip ever complete", which is the question a cross-region deployment
+    // cannot answer from request logs alone. A rising `ok` means the shared limiter
+    // works; a rising `timeout` with a flat `ok` means the link is too slow for
+    // REDIS_TIMEOUT and every request is silently using the per-process budget.
+    if cc.shared_counters().is_some() {
+        let cc = cc.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let Some((ok, timeout, error)) = cc.shared_counters() else {
+                    return;
+                };
+                if ok == 0 && timeout == 0 && error == 0 {
+                    continue;
+                }
+                if timeout > 0 || error > 0 {
+                    tracing::warn!(
+                        shared_ok = ok,
+                        shared_timeout = timeout,
+                        shared_error = error,
+                        budget_ms = edge::server::cc::REDIS_TIMEOUT_MS,
+                        "cross-node CC: some checks fell back to the per-process limit"
+                    );
+                } else {
+                    tracing::info!(shared_ok = ok, "cross-node CC: all checks used Redis");
+                }
+            }
+        });
+    }
+
     let flight = if matches!(config.cache_backend.as_str(), "redis" | "l2") {
         let url = if config.cache_redis_url.trim().is_empty() {
             config.redis_url.clone()
