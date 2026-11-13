@@ -436,7 +436,7 @@ impl ProxyHttp for DataPlaneProxy {
                 is_https,
             )
             .await;
-            write_axum_response(session, resp, false).await;
+            write_axum_response(session, resp, false, Some(&self.compression)).await;
             return Ok(true);
         }
 
@@ -569,7 +569,13 @@ impl ProxyHttp for DataPlaneProxy {
                 ctx.cache_label = "BYPASS";
                 ctx.cache_reason = Some("missing-host");
                 ctx.status = 400;
-                write_axum_response(session, default_page::missing_host_page(), false).await;
+                write_axum_response(
+                    session,
+                    default_page::missing_host_page(),
+                    false,
+                    Some(&self.compression),
+                )
+                .await;
                 return Ok(true);
             }
             if !registry_empty {
@@ -580,7 +586,7 @@ impl ProxyHttp for DataPlaneProxy {
                 ctx.cache_label = "NONE";
                 ctx.status = StatusCode::NOT_FOUND.as_u16();
                 let response = default_page::unknown_domain_page(&ctx.host);
-                write_axum_response(session, response, false).await;
+                write_axum_response(session, response, false, Some(&self.compression)).await;
                 return Ok(true);
             }
             ctx.skip_logging = true;
@@ -622,7 +628,7 @@ impl ProxyHttp for DataPlaneProxy {
                 pipeline.preflight(&plan.domain, &facts).await
             };
             if let Some(resp) = preflight {
-                write_axum_response(session, resp, false).await;
+                write_axum_response(session, resp, false, Some(&self.compression)).await;
                 return Ok(true);
             }
             let small_range = session.req_header().headers.contains_key("range")
@@ -1668,7 +1674,13 @@ impl ProxyHttp for DataPlaneProxy {
         let code = if ctx.plan.is_some() {
             let status = failure.status().as_u16();
             let page = default_page::origin_error_page(&ctx.host, &ctx.path, failure);
-            write_axum_response(session, page, ctx.method == Method::HEAD).await;
+            write_axum_response(
+                session,
+                page,
+                ctx.method == Method::HEAD,
+                Some(&self.compression),
+            )
+            .await;
             status
         } else {
             502
@@ -3479,7 +3491,7 @@ impl DataPlaneProxy {
             .insert(crate::server::host_util::FromPingora);
 
         let resp = proxy_handler(State(self.state.clone()), axum_req).await;
-        write_axum_response(session, resp, is_head).await;
+        write_axum_response(session, resp, is_head, Some(&self.compression)).await;
         Ok(true)
     }
 }
@@ -3614,7 +3626,50 @@ fn head_content_length_for_protocol(is_h2: bool, body_len: usize) -> String {
     }
 }
 
-async fn write_axum_response(session: &mut Session, resp: axum::response::Response, is_head: bool) {
+/// Write an engine (axum) response straight to the downstream session.
+///
+/// `compression` is what makes the engine path honour `EDGE_COMPRESSION`. The
+/// engine builds the response itself and never reaches `response_filter`, so
+/// without this every request that falls back to the engine — an unregistered
+/// domain, a rejected host, an error page — was served uncompressed no matter how
+/// the edge was configured.
+/// gzip a finished engine response body, or `None` to send it as-is.
+///
+/// Separated from `write_axum_response` so the decision *and* the encoding are
+/// testable without a live `Session`. The engine path bypasses `response_filter`,
+/// so this is the only place compression can happen for it.
+#[allow(clippy::too_many_arguments)]
+fn gzip_engine_body(
+    cfg: &CompressionConfig,
+    is_head: bool,
+    version: http::Version,
+    method: &http::Method,
+    status: u16,
+    response_headers: &http::HeaderMap,
+    request_headers: &http::HeaderMap,
+    body: &Bytes,
+) -> Option<Bytes> {
+    if is_head || body.is_empty() {
+        return None;
+    }
+    if !should_compress(cfg, version, method, status, response_headers, request_headers) {
+        return None;
+    }
+    let mut encoder = GzipEncoder::new(cfg.level);
+    let head = encoder.write(body);
+    let tail = encoder.finish();
+    let mut out = BytesMut::with_capacity(head.len() + tail.len());
+    out.extend_from_slice(&head);
+    out.extend_from_slice(&tail);
+    Some(out.freeze())
+}
+
+async fn write_axum_response(
+    session: &mut Session,
+    resp: axum::response::Response,
+    is_head: bool,
+    compression: Option<&CompressionConfig>,
+) {
     let is_h2 = session.downstream_session.is_http2();
     let (mut parts, body) = resp.into_parts();
     if !parts.headers.contains_key("x-lagran-datapath") {
@@ -3623,7 +3678,7 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
             HeaderValue::from_static("pingora"),
         );
     }
-    let bytes = match body.collect().await {
+    let mut bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             tracing::warn!(error = %e, "collect engine response failed");
@@ -3633,6 +3688,38 @@ async fn write_axum_response(session: &mut Session, resp: axum::response::Respon
             return;
         }
     };
+    // gzip in the engine path. `should_compress` applies the same rules the
+    // Pingora path uses (status, content type, size floor, Accept-Encoding), so the
+    // two data planes agree on what gets compressed.
+    if let Some(cfg) = compression {
+        let request_version = session.req_header().version;
+        let request_method = session.req_header().method.clone();
+        let request_headers = session.req_header().headers.clone();
+        if let Some(compressed) = gzip_engine_body(
+            cfg,
+            is_head,
+            request_version,
+            &request_method,
+            parts.status.as_u16(),
+            &parts.headers,
+            &request_headers,
+            &bytes,
+        ) {
+            bytes = compressed;
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            parts.headers.insert(
+                axum::http::header::CONTENT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+            // Caches must key on the encoding they were served.
+            if !parts.headers.contains_key(axum::http::header::VARY) {
+                parts.headers.insert(
+                    axum::http::header::VARY,
+                    HeaderValue::from_static("Accept-Encoding"),
+                );
+            }
+        }
+    }
     let body_len = bytes.len();
     let no_content =
         parts.status == StatusCode::NOT_MODIFIED || parts.status == StatusCode::NO_CONTENT;
@@ -4210,10 +4297,11 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 mod tests {
     use super::{
         cached_response_policy, compressed_variant_key, effective_connect_timeout_ms, fill_window,
-        head_content_length_for_protocol, parse_single_range, range_fill_is_candidate,
-        valid_release_tag, vary_on_accept_encoding, weaken_etag, DataPlaneProxy,
-        ResponsePolicySlot,
+        gzip_engine_body, head_content_length_for_protocol, parse_single_range,
+        range_fill_is_candidate, valid_release_tag, vary_on_accept_encoding, weaken_etag,
+        DataPlaneProxy, ResponsePolicySlot,
     };
+    use bytes::Bytes;
     use crate::cache::policy::ResolvedPolicy;
     use crate::server::response_headers::ResponseHeaderOverrides;
     use pingora::http::ResponseHeader;
@@ -4475,4 +4563,90 @@ mod tests {
             assert_eq!(super::resolve_cache_source(label, Some("l2")), "origin");
         }
     }
+    /// The engine path must actually produce gzip bytes, not just decide to.
+    ///
+    /// `write_axum_response` builds its own response and never reaches
+    /// `response_filter`, so compression had to be applied there explicitly — and
+    /// was missed, leaving every engine-served response uncompressed regardless of
+    /// `EDGE_COMPRESSION`. This exercises the real entry point rather than the
+    /// predicate, so deleting the call fails the test.
+    #[test]
+    fn engine_path_actually_gzips_eligible_bodies() {
+        use crate::server::compression::CompressionConfig;
+
+        let cfg = CompressionConfig {
+            enabled: true,
+            min_bytes: 100,
+            level: 4,
+            variant_max_object_bytes: 0,
+            variant_ttl_secs: 0,
+        };
+        let body = Bytes::from(vec![b'x'; 8192]);
+
+        let mut resp = http::HeaderMap::new();
+        resp.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        resp.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("8192"),
+        );
+        let mut req = http::HeaderMap::new();
+        req.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("gzip"),
+        );
+
+        let out = gzip_engine_body(
+            &cfg,
+            false,
+            http::Version::HTTP_11,
+            &http::Method::GET,
+            200,
+            &resp,
+            &req,
+            &body,
+        )
+        .expect("an eligible engine response must be gzipped");
+        assert!(
+            out.len() < body.len() / 10,
+            "8192 repeated bytes should compress hard, got {}",
+            out.len()
+        );
+        // gzip magic: 1f 8b
+        assert_eq!(&out[..2], &[0x1f, 0x8b], "output must be a gzip stream");
+
+        // A client without gzip gets the identity body.
+        assert!(
+            gzip_engine_body(
+                &cfg,
+                false,
+                http::Version::HTTP_11,
+                &http::Method::GET,
+                200,
+                &resp,
+                &http::HeaderMap::new(),
+                &body
+            )
+            .is_none(),
+            "no Accept-Encoding means no compression"
+        );
+
+        // HEAD has no body to compress.
+        assert!(
+            gzip_engine_body(
+                &cfg,
+                true,
+                http::Version::HTTP_11,
+                &http::Method::HEAD,
+                200,
+                &resp,
+                &req,
+                &body
+            )
+            .is_none()
+        );
+    }
+
 }
