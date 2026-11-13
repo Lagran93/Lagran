@@ -35,6 +35,7 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 hyper-rustls = { workspace = true }
 rustls = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 lagran-waf-dsl = { path = "../../crates/lagran-waf-dsl" }

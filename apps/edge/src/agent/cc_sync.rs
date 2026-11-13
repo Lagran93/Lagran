@@ -20,8 +20,36 @@ struct BanList {
 struct Ban {
     domain: String,
     ip: String,
+    /// Seconds left, as measured by the *control plane* when it built the reply.
+    ///
+    /// Relative, so the edge cannot tell how long the reply sat in flight or in a
+    /// retry: applying it late bans for longer than intended. Kept as a fallback for
+    /// a control plane that predates `expires_at`.
     #[serde(default)]
     remaining_secs: u64,
+    /// Absolute expiry (RFC 3339). Preferred: it is immune to transfer delay.
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+impl Ban {
+    /// Seconds of ban still to apply, measured from now.
+    ///
+    /// `expires_at` is authoritative when present; the relative field is only used
+    /// when it is missing or unparseable, and even then it is clamped so a stale
+    /// value cannot extend a ban indefinitely.
+    fn remaining_now(&self) -> u64 {
+        if let Some(deadline) = self
+            .expires_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        {
+            let now = chrono::Utc::now();
+            let secs = (deadline.with_timezone(&chrono::Utc) - now).num_seconds();
+            return secs.max(0) as u64;
+        }
+        self.remaining_secs
+    }
 }
 
 pub fn spawn_cc_sync(config: EdgeConfig, control: ControlClient, cc: CcProtector) {
@@ -39,26 +67,80 @@ pub fn spawn_cc_sync(config: EdgeConfig, control: ControlClient, cc: CcProtector
                         let bans = list
                             .bans
                             .into_iter()
-                            .filter(|b| b.remaining_secs > 0)
                             .map(|b| {
+                                let remaining = b.remaining_now();
                                 (
                                     format!(
                                         "{}|{}",
                                         b.domain.trim_end_matches('.').to_ascii_lowercase(),
                                         b.ip
                                     ),
-                                    b.remaining_secs,
+                                    remaining,
                                 )
                             })
+                            // Expiry is recomputed here, so a ban that elapsed during
+                            // the transfer drops out instead of being applied for its
+                            // full original duration.
+                            .filter(|(_, remaining)| *remaining > 0)
                             .collect();
                         cc.replace_shared(bans).await;
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "shared CC ban sync failed");
+                        // The local list keeps its previous contents. Entries carry
+                        // their own `banned_until`, so they still expire locally; the
+                        // gap only affects bans the control plane added or removed
+                        // during the outage, and those converge on the next success.
+                        tracing::warn!(error = %e, "shared CC ban sync failed; keeping the local list until the next attempt");
                     }
                 }
                 tokio::time::sleep(interval).await;
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ban;
+
+    fn ban(remaining_secs: u64, expires_at: Option<&str>) -> Ban {
+        Ban {
+            domain: "a.test".into(),
+            ip: "203.0.113.9".into(),
+            remaining_secs,
+            expires_at: expires_at.map(str::to_string),
+        }
+    }
+
+    /// An absolute expiry is used in preference to the relative field.
+    ///
+    /// The relative value was measured when the control plane built the reply, so
+    /// a slow transfer or a retry meant the edge banned for longer than intended —
+    /// an hour of ban could become an hour plus however long the response took.
+    #[test]
+    fn absolute_expiry_wins_over_the_relative_field() {
+        // 10 seconds from now, while the stale relative field claims an hour.
+        let deadline = (chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc3339();
+        let b = ban(3600, Some(&deadline));
+        let remaining = b.remaining_now();
+        assert!(
+            (0..=10).contains(&remaining),
+            "expected the absolute expiry (~10s) to win, got {remaining}s"
+        );
+    }
+
+    /// An already-expired absolute timestamp yields zero, so the ban is dropped.
+    #[test]
+    fn an_elapsed_ban_reports_zero() {
+        let deadline = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        assert_eq!(ban(3600, Some(&deadline)).remaining_now(), 0);
+    }
+
+    /// Without a usable `expires_at` the relative field is still honoured, so an
+    /// older control plane keeps working.
+    #[test]
+    fn the_relative_field_is_the_fallback() {
+        assert_eq!(ban(120, None).remaining_now(), 120);
+        assert_eq!(ban(120, Some("not-a-timestamp")).remaining_now(), 120);
+    }
 }
