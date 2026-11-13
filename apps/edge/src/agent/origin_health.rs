@@ -10,6 +10,7 @@ use axum::http::{header, HeaderMap, HeaderValue};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -187,6 +188,47 @@ pub fn origin_key(domain: &str, origin_url: &str) -> String {
     )
 }
 
+/// Drain probe results and post them to the control plane.
+///
+/// Runs as its own task so the probe round never waits on the control plane. A
+/// failure is logged at `warn` with a running count: it used to be a `debug!`, so a
+/// control plane that was refusing reports left the health table stale while the
+/// logs showed nothing, and the `origin_unhealthy` alert — which reads that table —
+/// could not fire for an origin that was actually down.
+async fn reporter_loop(
+    control: &ControlClient,
+    reports: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
+    dropped: &std::sync::atomic::AtomicU64,
+) {
+    let mut failures: u64 = 0;
+    while let Some(body) = reports.recv().await {
+        match control
+            .post_json("/api/v1/origin-health/report", &body)
+            .await
+        {
+            Ok(()) => {
+                if failures > 0 {
+                    tracing::info!(failures, "origin health reporting recovered");
+                    failures = 0;
+                }
+            }
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                // Log the first failure and then every 100th, so a control plane
+                // outage does not flood the log at one line per target per round.
+                if failures == 1 || failures % 100 == 0 {
+                    tracing::warn!(
+                        error = %e,
+                        failures,
+                        queued_dropped = dropped.load(Ordering::Relaxed),
+                        "origin health report failed; the control plane's health table is not being updated"
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub fn spawn_origin_health(
     control: ControlClient,
     registry: DomainRegistry,
@@ -198,6 +240,27 @@ pub fn spawn_origin_health(
     let probe_timeout =
         Duration::from_secs(env_u32("ORIGIN_HEALTH_TIMEOUT_SECS", 5).clamp(1, 120) as u64);
     let concurrency = env_u32("ORIGIN_HEALTH_CONCURRENCY", 16).clamp(1, 256) as usize;
+
+    // Probe results go to the reporter through a bounded queue, so a slow control
+    // plane cannot stretch a probe round. The bound is generous enough to hold a
+    // whole round of small JSON objects without dropping.
+    let (reports_tx, reports_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4096);
+    let dropped_reports = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    {
+        let control = control.clone();
+        let dropped_reports = dropped_reports.clone();
+        // `spawn_supervised` takes an `Fn` because it may rebuild the future on
+        // restart, and the receiver cannot be rebuilt. The reporter holds no shared
+        // state that a panic could corrupt — a panic there just ends reporting until
+        // the process restarts — so it is spawned once rather than supervised.
+        let mut reports_rx = reports_rx;
+        tokio::spawn(async move {
+            reporter_loop(&control, &mut reports_rx, &dropped_reports).await;
+        });
+    }
+    let reports = reports_tx;
+
     // Supervised: a panic here would silently stop health probing, so dead
     // origins would keep receiving traffic.
     crate::agent::spawn_supervised("origin-health", move || {
@@ -205,6 +268,8 @@ pub fn spawn_origin_health(
         let registry = registry.clone();
         let origin = origin.clone();
         let health_map = health_map.clone();
+        let reports = reports.clone();
+        let dropped_reports = dropped_reports.clone();
         async move {
             tracing::info!(
                 url = %control.endpoint("/api/v1/origin-health/report"),
@@ -215,6 +280,14 @@ pub fn spawn_origin_health(
                 recover_threshold = health_map.recover_threshold,
                 "origin health probe started"
             );
+
+            // Fixed-rate ticks with `Skip`: a round that overruns does not queue up
+            // the missed ones and then burst. The old `sleep(interval)` at the end of
+            // the loop measured the interval from the end of the work, so a slow round
+            // pushed the next probe even further out.
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
 
             loop {
                 let mut targets = Vec::new();
@@ -248,11 +321,13 @@ pub fn spawn_origin_health(
 
                 let origin = origin.clone();
                 let health_map = health_map.clone();
-                let control = control.clone();
+                let reports = reports.clone();
+                let dropped_reports = dropped_reports.clone();
                 run_limited(targets, concurrency, move |(domain, url, headers, sni)| {
                     let origin = origin.clone();
                     let health_map = health_map.clone();
-                    let control = control.clone();
+                    let reports = reports.clone();
+                    let dropped_reports = dropped_reports.clone();
                     async move {
                         let start = Instant::now();
                         let result = tokio::time::timeout(
@@ -285,6 +360,15 @@ pub fn spawn_origin_health(
                         let healthy = health_map
                             .record_origin(&domain, &url, ok, latency, &err)
                             .await;
+                        // Hand the report to the reporter task instead of sending it
+                        // here. Posting from the probe task meant a slow control plane
+                        // (up to the 15 s request timeout) was paid per target, inside
+                        // the round: 1000 targets at concurrency 16 came to ~63 batches
+                        // of probe+post, so a "30 second" interval could stretch past
+                        // twenty minutes and the health table would lag reality by that
+                        // long. `try_send` keeps a stalled reporter from blocking the
+                        // probe — the report is dropped and counted, which is visible,
+                        // unlike the silent `debug!` it replaced.
                         let body = json!({
                             "domain_name": domain,
                             "origin_url": url,
@@ -292,16 +376,13 @@ pub fn spawn_origin_health(
                             "latency_ms": latency,
                             "error": err,
                         });
-                        if let Err(e) = control
-                            .post_json("/api/v1/origin-health/report", &body)
-                            .await
-                        {
-                            tracing::debug!(error = %e, "origin health report failed");
+                        if reports.try_send(body).is_err() {
+                            dropped_reports.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 })
                 .await;
-                tokio::time::sleep(interval).await;
+                ticker.tick().await;
             }
         }
     });
@@ -387,5 +468,41 @@ mod tests {
 
         assert_eq!(maximum.load(Ordering::SeqCst), 3);
         assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+    /// A stalled reporter must not block probing.
+    ///
+    /// Reports used to be posted inline from the probe task, so the control
+    /// plane's 15 s request timeout was paid per target inside the round: 1000
+    /// targets at concurrency 16 is ~63 batches of probe+post, which stretched a
+    /// "30 second" interval past twenty minutes. The queue decouples them; when it
+    /// is full the report is dropped and counted rather than blocking.
+    #[tokio::test]
+    async fn a_full_report_queue_drops_instead_of_blocking() {
+        // Capacity 1, never drained: this is the worst case for the probe path.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1);
+        assert!(tx.try_send(serde_json::json!({"n": 1})).is_ok());
+
+        let started = std::time::Instant::now();
+        let second = tx.try_send(serde_json::json!({"n": 2}));
+        assert!(
+            second.is_err(),
+            "a full queue must report failure, not wait"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "try_send must return immediately"
+        );
+    }
+
+    /// A drained queue accepts reports again, so a recovered control plane catches up.
+    #[tokio::test]
+    async fn a_drained_queue_accepts_reports_again() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(2);
+        assert!(tx.try_send(serde_json::json!({"n": 1})).is_ok());
+        assert!(tx.try_send(serde_json::json!({"n": 2})).is_ok());
+        assert!(tx.try_send(serde_json::json!({"n": 3})).is_err());
+
+        assert_eq!(rx.recv().await.unwrap()["n"], 1);
+        assert!(tx.try_send(serde_json::json!({"n": 4})).is_ok());
     }
 }
