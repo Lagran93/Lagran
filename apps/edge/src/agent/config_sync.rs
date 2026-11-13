@@ -822,6 +822,7 @@ mod tests {
     #[test]
     fn a_failed_poll_clears_the_validator() {
         let mut last_etag: Option<String> = Some("\"abc\"".to_string());
+        assert!(last_etag.is_some(), "precondition: a validator was cached");
 
         // What the error arm does.
         last_etag = None;
