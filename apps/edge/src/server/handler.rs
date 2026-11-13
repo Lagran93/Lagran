@@ -52,8 +52,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Largest request body we are willing to buffer for pass-through traffic.
 const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;
 /// Largest origin object we keep in the cache.
-/// How long a follower waits for the in-flight fetch before fetching itself.
-const FETCH_WAIT: Duration = Duration::from_secs(5);
+/// Margin added to the origin timeout when deriving the follower wait.
+///
+/// The leader needs its fetch time plus the write into the cache, so the follower
+/// has to wait a little longer than the origin itself can take.
+const FETCH_WAIT_MARGIN: Duration = Duration::from_millis(500);
+
+/// Upper bound on the follower wait, matching the largest origin timeout the
+/// control plane accepts plus the margin.
+const FETCH_WAIT_MAX: Duration = Duration::from_secs(65);
+
+/// How long an in-process follower waits for the leader's fetch.
+///
+/// This was a fixed 5 s, which is shorter than the default 10 s origin timeout —
+/// so on any slow object every follower gave up at five seconds and issued its own
+/// origin request, multiplying origin load exactly where coalescing mattered most.
+/// It is now derived from the same timeout the fetch is allowed to use.
+fn fetch_wait(origin_timeout_ms: u64) -> Duration {
+    Duration::from_millis(origin_timeout_ms)
+        .saturating_add(FETCH_WAIT_MARGIN)
+        .min(FETCH_WAIT_MAX)
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1468,7 +1487,7 @@ async fn fetch_with_single_flight(
             result.map(|r| (Fetched::FromOrigin(r), true))
         }
         Slot::Follower(mut rx) => {
-            let _ = inflight::wait_for(&mut rx, FETCH_WAIT).await;
+            let _ = inflight::wait_for(&mut rx, fetch_wait(eff.timeout_ms)).await;
             match state.cache.get_result(key).await {
                 CacheGetResult::Hit(entry) | CacheGetResult::Stale(entry) => {
                     Ok((Fetched::FromCache(entry_into_origin(entry)), false))
@@ -3476,5 +3495,35 @@ mod tests {
             Some("1"),
             "a verified marker must survive the hand-off"
         );
+    }
+    /// An in-process follower must wait longer than the origin fetch it waits on.
+    ///
+    /// `FETCH_WAIT` used to be a fixed 5 s while the default origin timeout is
+    /// 10 s, so every follower gave up at five seconds and issued its own origin
+    /// request — N times the origin load on exactly the slow objects where
+    /// coalescing matters.
+    #[test]
+    fn fetch_wait_covers_the_origin_timeout() {
+        for origin_ms in [1_000u64, 5_000, 10_000, 30_000, 60_000] {
+            let wait = fetch_wait(origin_ms);
+            assert!(
+                wait.as_millis() as u64 > origin_ms,
+                "wait {wait:?} must exceed the {origin_ms}ms origin timeout"
+            );
+            assert!(
+                wait <= FETCH_WAIT_MAX,
+                "wait {wait:?} must stay within the cap"
+            );
+        }
+        // The default origin timeout now yields a wait that outlasts it.
+        assert_eq!(fetch_wait(10_000), Duration::from_millis(10_500));
+    }
+
+    /// The wait is capped so a very long origin timeout cannot make a follower
+    /// hang indefinitely.
+    #[test]
+    fn fetch_wait_is_capped() {
+        assert_eq!(fetch_wait(600_000), FETCH_WAIT_MAX);
+        assert!(fetch_wait(u64::MAX) <= FETCH_WAIT_MAX);
     }
 }
