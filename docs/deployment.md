@@ -599,11 +599,36 @@ npm run generate
 
 ### 4.7 创建管理员
 
-登录控制台后注册自己的账号，然后提权：
+**这一步不能跳过。** `SEED_DEMO` 在 `REQUIRE_SECURE_SECRETS=true` 时会被拒绝启动，
+若库中没有任何账户，控制台将无人可登录。
+
+首次部署取账户的流程：**第一个注册的账号自动成为管理员**。
 
 ```bash
-psql "$DATABASE_URL" -c \
-  "UPDATE users SET role='admin' WHERE email='you@example.com';"
+# 1. 临时打开注册开关并重启
+sudo sed -i 's/^ALLOW_REGISTER=.*/ALLOW_REGISTER=true/' /etc/lagran/control.env
+sudo systemctl restart lagran-control
+
+# 2. 打开控制台注册你的账号（此时 captcha 若开启需一并完成）
+#    日志会打印：first account registered and granted admin; disable ALLOW_REGISTER now
+
+# 3. 立刻关掉注册开关并重启
+sudo sed -i 's/^ALLOW_REGISTER=.*/ALLOW_REGISTER=false/' /etc/lagran/control.env
+sudo systemctl restart lagran-control
+```
+
+规则：
+
+- **只在 `users` 表为空时生效**。库中已有任何账号时，新注册一律是普通 `user`，
+  不会覆盖或提权。
+- 判定与插入在同一条 SQL 内完成，多请求并发注册也只有一个成为管理员。
+- 第 3 步不能省：注册接口对外开放期间，任何能访问到端口的人都能抢先注册。
+
+**验证结果**：
+
+```bash
+psql "$DATABASE_URL" -c "SELECT email, role FROM users;"
+# 你的账号应为 admin
 ```
 
 确认新管理员可登录后，删除示例域名 `cdn.example.com`，并限制/删除 demo 账号。

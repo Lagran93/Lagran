@@ -217,6 +217,37 @@ pub async fn create_user(
     .await
 }
 
+/// Create a user, granting `admin` if this is the very first account.
+///
+/// The cold-start problem this solves: `SEED_DEMO` is refused when
+/// `REQUIRE_SECURE_SECRETS=true` and nothing else creates an account, so a fresh
+/// deployment would have no one who can log in. Rather than shipping a CLI bootstrap,
+/// the existing self-registration flow promotes its first caller — the operator turns
+/// `ALLOW_REGISTER` on, registers, and is immediately able to administer the instance.
+///
+/// The emptiness test and the INSERT are one statement, so two concurrent first
+/// registrations cannot both come out as admin: the second sees the first's row.
+pub async fn create_user_first_is_admin(
+    pool: &PgPool,
+    email: &str,
+    password_hash: &str,
+    name: &str,
+) -> sqlx::Result<UserRow> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        INSERT INTO users (email, password_hash, name, role)
+        SELECT $1, $2, $3,
+               CASE WHEN EXISTS (SELECT 1 FROM users) THEN 'user' ELSE 'admin' END
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, token_version, created_at
+        "#,
+    )
+    .bind(email)
+    .bind(password_hash)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+}
+
 pub async fn create_user_with_role(
     pool: &PgPool,
     email: &str,

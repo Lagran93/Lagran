@@ -491,7 +491,10 @@ pub async fn register(
             }),
         ));
     }
-    let user = repository::create_user(&state.pool, &email, &hash, &name)
+    // The first account on a fresh deployment becomes the administrator, so an
+    // operator can bootstrap by turning ALLOW_REGISTER on, registering once, and
+    // turning it back off. Everyone after that is a plain `user`.
+    let user = repository::create_user_first_is_admin(&state.pool, &email, &hash, &name)
         .await
         .map_err(|e| {
             let unique = e
@@ -516,6 +519,17 @@ pub async fn register(
             }
         })?;
 
+    if user.role == "admin" {
+        // Worth a warning rather than debug: this account just gained full control
+        // of the instance, and it was created through an endpoint that anyone
+        // reaching the port could have used first.
+        tracing::warn!(
+            email = %user.email,
+            user_id = %user.id,
+            ip = %client_ip,
+            "first account registered and granted admin; disable ALLOW_REGISTER now"
+        );
+    }
     if let Err(e) = repository::ensure_personal_project(&state.pool, user.id).await {
         tracing::warn!(error = %e, user_id = %user.id, "create personal project failed");
     }
