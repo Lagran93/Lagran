@@ -158,6 +158,44 @@ impl EdgeMetrics {
             .collect()
     }
 
+    /// Subtract a reported batch from the counters.
+    ///
+    /// Used after a report succeeds: the values were read earlier by
+    /// `take_snapshots_peek`, and requests that arrived in between must survive.
+    /// A plain `swap(0)` would discard them, and a `merge_back` on failure would
+    /// double-count on the retry. Subtracting exactly what was reported keeps the
+    /// local counters equal to "everything not yet acknowledged by the control
+    /// plane".
+    ///
+    /// `fetch_sub` can transiently undershoot if more than 2^64 events arrive
+    /// between the peek and this call, which is not reachable.
+    pub fn subtract_reported(&self, reported: &[DomainSnapshot]) {
+        for snap in reported {
+            if let Some(counters) = self.by_domain.get(&snap.domain) {
+                counters
+                    .requests
+                    .fetch_sub(snap.requests, Ordering::Relaxed);
+                counters
+                    .cache_hits
+                    .fetch_sub(snap.cache_hits, Ordering::Relaxed);
+                counters
+                    .cache_misses
+                    .fetch_sub(snap.cache_misses, Ordering::Relaxed);
+                counters
+                    .bytes_sent
+                    .fetch_sub(snap.bytes_sent, Ordering::Relaxed);
+            }
+        }
+        // Drop buckets that are now empty, as `take_snapshots` does, so the map
+        // does not grow with every domain ever seen.
+        self.by_domain.retain(|_, counters| {
+            counters.requests.load(Ordering::Relaxed) > 0
+                || counters.cache_hits.load(Ordering::Relaxed) > 0
+                || counters.cache_misses.load(Ordering::Relaxed) > 0
+                || counters.bytes_sent.load(Ordering::Relaxed) > 0
+        });
+    }
+
     /// Snapshot and reset all domain counters for reporting.
     pub fn take_snapshots(&self) -> Vec<DomainSnapshot> {
         let mut out = Vec::new();
@@ -223,5 +261,61 @@ mod tests {
         assert_eq!(snaps.len(), 1, "both spellings must share one bucket");
         assert_eq!(snaps[0].domain, "example.com");
         assert_eq!(snaps[0].requests, 2);
+    }
+    /// A peek does not disturb the counters, so a failed report loses nothing.
+    ///
+    /// `take_snapshots` cleared them before the report was attempted, so a control
+    /// plane outage dropped whole batches: the hit-ratio charts showed gaps and the
+    /// `cache_hit_ratio` alert, which returns early when `requests <= 0`, could hide
+    /// a real problem behind "no data".
+    #[test]
+    fn peek_leaves_counters_intact() {
+        let m = EdgeMetrics::default();
+        m.record_hit("a.test", 10);
+
+        let first = m.take_snapshots_peek();
+        let second = m.take_snapshots_peek();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].requests, second[0].requests);
+        assert_eq!(first[0].requests, 1);
+        assert_eq!(first[0].cache_hits, 1);
+    }
+
+    /// Subtracting an acknowledged batch keeps requests that arrived meanwhile.
+    #[test]
+    fn subtract_reported_preserves_newer_events() {
+        let m = EdgeMetrics::default();
+        m.record_hit("a.test", 10);
+        m.record_hit("a.test", 10);
+        m.record_hit("a.test", 10);
+
+        // Snapshot the first two as "reported".
+        let peeked = m.take_snapshots_peek();
+        assert_eq!(peeked[0].requests, 3);
+
+        // A request arrives after the snapshot.
+        m.record_miss("a.test", 10);
+
+        // Subtract what was actually reported (3 requests, 3 hits).
+        m.subtract_reported(&peeked);
+
+        // The one that arrived in between survives, and its miss is not erased.
+        let after = m.take_snapshots_peek();
+        assert_eq!(after[0].requests, 1, "the newer request must survive");
+        assert_eq!(after[0].cache_hits, 0);
+        assert_eq!(after[0].cache_misses, 1);
+    }
+
+    /// Fully reported domains drop out of the map, as `take_snapshots` did.
+    #[test]
+    fn subtract_reported_drops_empty_buckets() {
+        let m = EdgeMetrics::default();
+        m.record_hit("a.test", 10);
+        let peeked = m.take_snapshots_peek();
+        m.subtract_reported(&peeked);
+        assert!(
+            m.take_snapshots_peek().is_empty(),
+            "a fully reported domain must not linger"
+        );
     }
 }
