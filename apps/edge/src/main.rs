@@ -79,13 +79,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let challenges = edge::server::acme_challenge::ChallengeStore::new();
-    let access_log = AccessLog::open(
+    let mut access_log = AccessLog::open(
         config.access_log_path.as_deref(),
         &config.node_id,
         config.access_log_buffer,
         config.access_log_json,
     )
     .await;
+    if !config.access_log_enabled {
+        tracing::warn!("ACCESS_LOG_ENABLED=0: access records will not be kept");
+        access_log.set_enabled(false);
+    }
     let rate_limiter = edge::server::rate_limit::RateLimiter::new(
         std::env::var("RATE_LIMIT_RPS")
             .ok()

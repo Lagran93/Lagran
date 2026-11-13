@@ -54,6 +54,12 @@ pub struct EdgeConfig {
     pub redis_url: String,
     pub domain: String,
     pub access_log_path: Option<String>,
+    /// When false, requests skip the access-log path entirely.
+    ///
+    /// Exists to separate "we are not writing logs" from "the log writer is
+    /// slow": both used to look identical from the outside, and only the second is
+    /// a problem worth fixing. Defaults to true.
+    pub access_log_enabled: bool,
     pub agent_token: String,
     /// HMAC secret for signed WAF rulepacks (empty = AGENT_TOKEN fallback).
     pub waf_rulepack_secret: String,
@@ -240,6 +246,14 @@ impl Default for EdgeConfig {
                 .unwrap_or(5),
             redis_url: env_nonempty("REDIS_URL").unwrap_or_default(),
             domain: std::env::var("EDGE_DOMAIN").unwrap_or_default(),
+            access_log_enabled: std::env::var("ACCESS_LOG_ENABLED")
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no" | "disabled"
+                    )
+                })
+                .unwrap_or(true),
             access_log_path: std::env::var("ACCESS_LOG_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),

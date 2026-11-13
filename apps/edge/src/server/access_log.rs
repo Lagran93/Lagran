@@ -53,6 +53,11 @@ pub struct AccessLog {
     /// had already accepted.
     enqueued: std::sync::Arc<std::sync::atomic::AtomicU64>,
     processed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// False when `ACCESS_LOG_ENABLED=0`: `write` returns immediately.
+    ///
+    /// Kept here rather than at each call site so the request path checks one
+    /// atomic instead of threading a config copy through nine handlers.
+    enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AccessLog {
@@ -184,7 +189,17 @@ impl AccessLog {
             node_id: node_id.to_string(),
             enqueued,
             processed,
+            enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
+    }
+
+    /// Disable the access log for this instance.
+    ///
+    /// Used by `ACCESS_LOG_ENABLED=0`, which exists so a benchmark (or an operator
+    /// under pressure) can tell "logging is off" apart from "logging is too slow".
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -248,6 +263,9 @@ impl AccessLog {
         // bounded channel whose only consumer writes to a file: one stalled
         // write_all() backed up all in-flight requests. Losing a log line under
         // overload is strictly better than stalling the data plane.
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         match self.tx.try_send(rec) {
             Ok(()) => {
                 self.enqueued
