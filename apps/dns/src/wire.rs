@@ -415,12 +415,30 @@ pub fn soa_record(name: &str, mname: &str, rname: &str, serial: u32, ttl: u32) -
     }
 }
 
+/// Length field for a single record's RDATA.
+///
+/// RDATA is bounded by 65535 on the wire. Nothing in the current callers can
+/// exceed that — the builders only emit A/AAAA/NS/SOA data — but the cast to
+/// `u16` was unchecked, so a future record type or a caller constructing
+/// `Record` directly would silently truncate the length and emit a malformed
+/// message that parses as a short, wrong record. Saturating keeps the wire length
+/// truthful (the reader stops early) instead of claiming a length the bytes do
+/// not have.
+fn rdata_len(rdata: &[u8]) -> u16 {
+    debug_assert!(
+        rdata.len() <= u16::MAX as usize,
+        "RDATA of {} bytes exceeds the 65535-byte wire limit",
+        rdata.len()
+    );
+    u16::try_from(rdata.len()).unwrap_or(u16::MAX)
+}
+
 fn write_record(out: &mut Vec<u8>, rec: &Record) {
     put_name(out, &rec.name);
     out.extend_from_slice(&rec.rtype.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes());
     out.extend_from_slice(&rec.ttl.to_be_bytes());
-    out.extend_from_slice(&(rec.rdata.len() as u16).to_be_bytes());
+    out.extend_from_slice(&rdata_len(&rec.rdata).to_be_bytes());
     out.extend_from_slice(&rec.rdata);
 }
 
@@ -443,7 +461,7 @@ fn write_opt(out: &mut Vec<u8>, query: &Query) {
         rdata.push(ecs.source_prefix.min(if family == 1 { 32 } else { 128 }));
         rdata.extend_from_slice(&bytes);
     }
-    out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    out.extend_from_slice(&rdata_len(&rdata).to_be_bytes());
     out.extend_from_slice(&rdata);
 }
 
@@ -698,5 +716,37 @@ mod tests {
         let mut buf = Vec::new();
         put_name(&mut buf, &many);
         assert!(matches!(read_name(&buf, 0), Err(WireError::BadName)));
+    }
+    /// An RDATA length must match the bytes emitted, even at the boundary.
+    ///
+    /// The cast to `u16` was unchecked; a value over 65535 would have truncated
+    /// the length field and produced a record whose declared size disagrees with
+    /// the payload. Current builders cannot reach that, so this pins the helper
+    /// rather than the encoder.
+    #[test]
+    fn rdata_length_is_capped_at_the_wire_limit() {
+        assert_eq!(rdata_len(&[]), 0);
+        assert_eq!(rdata_len(b"abc"), 3);
+        assert_eq!(rdata_len(&vec![0u8; u16::MAX as usize]), u16::MAX);
+        // Beyond the limit the helper saturates rather than wrapping to a small
+        // number. `debug_assert!` fires there by design, so only check the
+        // saturating behaviour in a release build.
+        if !cfg!(debug_assertions) {
+            assert_eq!(rdata_len(&vec![0u8; u16::MAX as usize + 1]), u16::MAX);
+        }
+    }
+
+    /// Every record the builders produce fits the length field.
+    #[test]
+    fn built_records_fit_the_length_field() {
+        let a = a_record("cdn.example.", "203.0.113.9".parse().unwrap(), 60);
+        let aaaa = aaaa_record("cdn.example.", "2001:db8::1".parse().unwrap(), 60);
+        let ns = ns_record("example.", "ns1.example.", 60);
+        let soa = soa_record("example.", "ns1.example.", "host.example.", 1, 60);
+        for rec in [a, aaaa, ns, soa] {
+            let len = rdata_len(&rec.rdata);
+            assert_eq!(len as usize, rec.rdata.len());
+            assert!(len > 0, "a built record must carry RDATA");
+        }
     }
 }
