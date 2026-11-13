@@ -6,7 +6,7 @@ use crate::wire::{
     a_record, aaaa_record, encode_response, ns_record, parse_query, soa_record, Query, Record,
     RCODE_NOERROR, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA, TYPE_ANY, TYPE_NS, TYPE_SOA,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,8 +23,36 @@ pub struct Service {
     cfg: DnsConfig,
     control: ControlClient,
     cache: Mutex<HashMap<String, CacheEntry>>,
+    /// Keys currently being fetched from the control plane.
+    ///
+    /// A hot name missed by every worker at once used to produce one control-plane
+    /// call per worker. The set makes the first caller the leader and the rest wait
+    /// for its result.
+    in_flight: Mutex<HashSet<String>>,
+    /// Signalled whenever an in-flight fetch finishes, so waiters re-check the
+    /// cache instead of polling.
+    flight_done: Condvar,
     hits: AtomicU64,
     misses: AtomicU64,
+}
+
+/// Mark `key` as being fetched. Returns true when this caller is the leader.
+///
+/// A poisoned mutex returns true: falling through as the leader costs a duplicate
+/// fetch, while refusing would leave the query unanswered.
+fn claim_flight(in_flight: &Mutex<HashSet<String>>, key: &str) -> bool {
+    match in_flight.lock() {
+        Ok(mut set) => set.insert(key.to_string()),
+        Err(_) => true,
+    }
+}
+
+/// Clear the in-flight marker for `key` and wake anyone waiting on it.
+fn release_flight(in_flight: &Mutex<HashSet<String>>, done: &Condvar, key: &str) {
+    if let Ok(mut set) = in_flight.lock() {
+        set.remove(key);
+    }
+    done.notify_all();
 }
 
 impl Service {
@@ -33,6 +61,8 @@ impl Service {
             cfg,
             control,
             cache: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashSet::new()),
+            flight_done: Condvar::new(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -92,6 +122,39 @@ impl Service {
             .and_then(|s| s.trim().parse::<IpAddr>().ok())
     }
 
+    /// Wait until the in-flight fetch for `key` finishes, or a short deadline.
+    ///
+    /// Bounded on purpose: if the leader is wedged (a hung read, a panic before it
+    /// cleared the marker) a waiter must still answer the query rather than hold
+    /// the worker thread. On timeout the caller fetches for itself, which is the
+    /// pre-single-flight behaviour — degraded, not stuck.
+    /// A fresh cached answer for `key`, if there is one.
+    fn cached_answer(&self, key: &str, now: Instant) -> Option<Option<(IpAddr, u32)>> {
+        let cache = self.cache.lock().ok()?;
+        let entry = cache.get(key)?;
+        if now.duration_since(entry.at).as_secs() > self.cfg.cache_secs {
+            return None;
+        }
+        Some(entry.ip.map(|ip| (ip, entry.ttl)))
+    }
+
+    fn wait_for_flight(&self, key: &str, _now: Instant) {
+        let deadline = Instant::now() + self.cfg.http_timeout().max(Duration::from_millis(100));
+        let Ok(mut set) = self.in_flight.lock() else {
+            return;
+        };
+        while set.contains(key) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match self.flight_done.wait_timeout(set, remaining) {
+                Ok((guard, _)) => set = guard,
+                Err(_) => return,
+            }
+        }
+    }
+
     fn lookup(
         &self,
         key: &str,
@@ -114,7 +177,37 @@ impl Service {
         }
 
         self.misses.fetch_add(1, Ordering::Relaxed);
-        match self.control.schedule(qname, subnet, Some(client_ip)) {
+
+        // Single-flight: the first caller for this key fetches, the rest wait for
+        // its result. Without this, eight workers missing the same hot name at the
+        // same moment produced eight control-plane calls, and when the control
+        // plane was slow all eight blocked on the read timeout together while the
+        // UDP queue drained.
+        //
+        // The lock is only held for the set bookkeeping. The fetch itself runs
+        // unlocked — holding it across `control.schedule` would serialise every
+        // query on the server, which is worse than the duplicate fetches.
+        let leader = claim_flight(&self.in_flight, key);
+        if !leader {
+            self.wait_for_flight(key, now);
+            // The leader is done. Its answer — or its failure — is already in the
+            // cache; re-reading is the whole point of waiting. Falling through to a
+            // fetch here would keep the duplicate origin calls the wait exists to
+            // avoid, so only a still-empty cache sends us to the control plane.
+            if let Some(now_cached) = self.cached_answer(key, now) {
+                return now_cached;
+            }
+        }
+
+        let fetched = self.control.schedule(qname, subnet, Some(client_ip));
+
+        if leader {
+            // Publish and wake waiters before doing anything else, so a slow
+            // write-back cannot extend their wait.
+            release_flight(&self.in_flight, &self.flight_done, key);
+        }
+
+        match fetched {
             Ok(reply) => {
                 let ip = reply.ip.or(reply.backup);
                 if let Ok(mut cache) = self.cache.lock() {
@@ -725,5 +818,80 @@ mod queue_tests {
         }
         assert_eq!(claimed, 3, "exactly `max` slots may be claimed");
         assert_eq!(active.load(std::sync::atomic::Ordering::Acquire), 3);
+    }
+    /// Only one caller may lead the fetch for a key.
+    ///
+    /// Before single-flight, eight workers missing the same hot name produced eight
+    /// control-plane calls, and a slow control plane blocked all of them at once
+    /// while the UDP queue drained.
+    #[test]
+    fn only_the_first_caller_leads() {
+        let in_flight = Mutex::new(HashSet::new());
+        assert!(claim_flight(&in_flight, "GET:a.test"), "first caller leads");
+        assert!(!claim_flight(&in_flight, "GET:a.test"), "second waits");
+        assert!(!claim_flight(&in_flight, "GET:a.test"), "third waits");
+        // A different key is independent.
+        assert!(claim_flight(&in_flight, "GET:b.test"), "other key leads");
+    }
+
+    /// Releasing the marker lets the next caller lead again.
+    #[test]
+    fn release_allows_a_new_leader() {
+        let in_flight = Mutex::new(HashSet::new());
+        let done = Condvar::new();
+        assert!(claim_flight(&in_flight, "GET:a.test"));
+        assert!(!claim_flight(&in_flight, "GET:a.test"));
+        release_flight(&in_flight, &done, "GET:a.test");
+        assert!(
+            claim_flight(&in_flight, "GET:a.test"),
+            "after release the next caller leads"
+        );
+    }
+
+    /// A waiter is woken by the release rather than sleeping out its deadline.
+    #[test]
+    fn release_wakes_a_waiter_promptly() {
+        let in_flight = Arc::new(Mutex::new(HashSet::new()));
+        let done = Arc::new(Condvar::new());
+        assert!(claim_flight(&in_flight, "GET:a.test"));
+
+        let waiter = {
+            let in_flight = in_flight.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let set = in_flight.lock().unwrap();
+                let (set, _) = done
+                    .wait_timeout(set, Duration::from_secs(5))
+                    .expect("wait");
+                !set.contains("GET:a.test")
+            })
+        };
+
+        // Let the waiter block, then release.
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        release_flight(&in_flight, &done, "GET:a.test");
+        let cleared = waiter.join().expect("waiter thread");
+        assert!(cleared, "the waiter must observe the marker cleared");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the waiter must wake on the signal, not the timeout"
+        );
+    }
+
+    /// A poisoned in-flight mutex falls back to leading rather than refusing.
+    #[test]
+    fn poisoned_flight_mutex_still_answers() {
+        let in_flight = Arc::new(Mutex::new(HashSet::new()));
+        let poisoner = in_flight.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the flight mutex");
+        })
+        .join();
+        assert!(
+            claim_flight(&in_flight, "GET:a.test"),
+            "a duplicate fetch beats no answer"
+        );
     }
 }

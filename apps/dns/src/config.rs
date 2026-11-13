@@ -93,10 +93,15 @@ impl DnsConfig {
             soa_rname,
             control_url: normalize_control_url(&std::env::var("CONTROL_URL").unwrap_or_default()),
             agent_token: std::env::var("AGENT_TOKEN").unwrap_or_default(),
+            // Five seconds meant every hot name missed every five seconds: eight
+            // workers would each call the control plane for the same qname, and if
+            // it was slow they all blocked on the read timeout while the UDP queue
+            // drained. Thirty seconds matches the scheduler's own answer TTL, so a
+            // cached answer is no older than one the scheduler would have returned.
             cache_secs: std::env::var("DNS_CACHE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
+                .unwrap_or(30),
             stale_secs: std::env::var("DNS_STALE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

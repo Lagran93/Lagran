@@ -402,10 +402,18 @@ impl ControlClient {
                     return parse_schedule(&body);
                 }
                 Err(e) => {
+                    let retryable = is_retryable(&e);
                     last_err = Some(e);
                     // A pooled connection may have been closed by the server;
                     // retry once with a fresh connection. The request is GET.
-                    if attempt == 1 {
+                    //
+                    // Only a connection-level failure is worth retrying. A read
+                    // timeout used to land here too, so a slow control plane made
+                    // every query pay twice: 800 ms, then another 800 ms with a new
+                    // socket, while the worker thread was blocked and the UDP queue
+                    // drained. Retrying a timeout cannot help — the deadline was
+                    // already exceeded once.
+                    if attempt == 1 || !retryable {
                         break;
                     }
                 }
@@ -413,6 +421,27 @@ impl ControlClient {
         }
         Err(last_err.unwrap_or_else(|| anyhow!("scheduler request failed")))
     }
+}
+
+/// Whether a failed attempt is worth retrying on a fresh connection.
+///
+/// Timeouts are not: the request already exceeded its budget, and the caller
+/// (a DNS worker holding a real query) should move on rather than double it.
+/// Anything else — a reset, a closed pooled socket — may succeed on a new
+/// connection.
+fn is_retryable(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return !matches!(
+                io.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            );
+        }
+    }
+    // Our own timeout wrapper produces a plain message otherwise; treat a timeout
+    // reported through it the same way.
+    !err.to_string().to_ascii_lowercase().contains("timed out")
+        && !err.to_string().to_ascii_lowercase().contains("timeout")
 }
 
 fn parse_schedule(body: &[u8]) -> Result<ScheduleReply> {
