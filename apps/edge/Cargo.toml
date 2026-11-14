@@ -20,6 +20,11 @@ redis = { version = "0.27", features = [
     "tokio-comp",
     "connection-manager",
     "script",
+    # Without TCP_NODELAY, Nagle + delayed ACK adds ~40 ms to a small
+    # request/response every so often. `redis-cli --latency` (which sets the flag)
+    # showed max 21 ms while the edge saw >50 ms timeouts: the extra delay was
+    # Nagle, not the network.
+    "tcp_nodelay",
 ] }
 
 pingora = { version = "0.9.0", features = ["proxy", "openssl"] }

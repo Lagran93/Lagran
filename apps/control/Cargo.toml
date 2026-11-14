@@ -53,6 +53,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 redis = { version = "0.27", features = [
     "tokio-comp",
+    "tcp_nodelay",
     "tokio-rustls-comp",
     "connection-manager",
     "script",

@@ -422,6 +422,8 @@ no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 - CC 防御
 
 > 跨节点 CC 依赖 `REDIS_URL`。单次 Redis 往返超过 `CC_REDIS_TIMEOUT_MS`（默认 50ms）时，该次检查会回退到单机预算，以避免 Redis 故障拖慢请求路径。周期报告按**增量**统计：只有回退比例 ≥5% 或出现 Redis 错误时才打 `WARN`；少量尾延迟只会在 `debug` 日志中出现。历史上单次超时会导致每分钟永久 `WARN`，该问题已修复。
+>
+> 客户端已启用 `TCP_NODELAY`：未开启时 Nagle + delayed ACK 会给小请求偶尔叠加约 40ms，`redis-cli --latency`（默认开启 nodelay）看起来正常而 Edge 却会超时。若升级后仍偶发超时，再考虑调大 `CC_REDIS_TIMEOUT_MS`。
 - 源站池/备用源站
 - 每个源站可独立配置 TLS SNI、回源 Host
 

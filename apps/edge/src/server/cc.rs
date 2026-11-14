@@ -257,7 +257,10 @@ pub fn log_shared_counters(ok: u64, timeout: u64, error: u64, budget_ms: u64) {
             "cross-node CC: a significant share of checks fell back to the per-process limit"
         );
     } else if fallback > 0 {
-        tracing::info!(
+        // Below the threshold this is a tail-latency event, not a fault. Keep it
+        // out of the default journal; the counters are still in the message when
+        // debug logging is enabled.
+        tracing::debug!(
             shared_ok = ok,
             shared_timeout = timeout,
             shared_error = error,
@@ -298,6 +301,8 @@ pub struct RedisCc {
     /// Last time a failure was logged, so a cross-ocean outage does not flood the
     /// journal with one line per request.
     last_failure_log: Arc<AtomicU64>,
+    /// Compiled once; `Script::new` used to re-hash the body on every check.
+    script: Arc<redis::Script>,
 }
 
 impl RedisCc {
@@ -322,6 +327,22 @@ impl RedisCc {
             prefix,
             seq: Arc::new(AtomicU64::new(0)),
             timeout_ms,
+            script: Arc::new(redis::Script::new(
+                r#"
+                local t = redis.call('TIME')
+                local now = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
+                local window = tonumber(ARGV[1])
+                local limit = tonumber(ARGV[2])
+                redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+                local count = redis.call('ZCARD', KEYS[1])
+                if count < limit then
+                    redis.call('ZADD', KEYS[1], now, ARGV[3])
+                    redis.call('PEXPIRE', KEYS[1], window * 2)
+                    return 0
+                end
+                return 1
+                "#,
+            )),
             shared_ok: Arc::new(AtomicU64::new(0)),
             shared_timeout: Arc::new(AtomicU64::new(0)),
             shared_error: Arc::new(AtomicU64::new(0)),
@@ -339,26 +360,10 @@ impl RedisCc {
                 .unwrap_or(0),
             self.seq.fetch_add(1, Ordering::Relaxed)
         );
-        let script = redis::Script::new(
-            r#"
-            local t = redis.call('TIME')
-            local now = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
-            local window = tonumber(ARGV[1])
-            local limit = tonumber(ARGV[2])
-            redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
-            local count = redis.call('ZCARD', KEYS[1])
-            if count < limit then
-                redis.call('ZADD', KEYS[1], now, ARGV[3])
-                redis.call('PEXPIRE', KEYS[1], window * 2)
-                return 0
-            end
-            return 1
-            "#,
-        );
         let redis_key = format!("{}:win:{}", self.prefix, key);
         let attempt = tokio::time::timeout(
             Duration::from_millis(self.timeout_ms),
-            script
+            self.script
                 .key(redis_key)
                 .arg(window_ms as i64)
                 .arg(i64::from(limit))
