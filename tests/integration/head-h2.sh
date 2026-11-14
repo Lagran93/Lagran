@@ -40,11 +40,24 @@ trap cleanup EXIT
 hdr() { tr -d '\r' <"$LOG_DIR/h" | awk -F': ' -v k="$1" 'tolower($1)==k{print $2}' | head -1; }
 
 command -v openssl >/dev/null || { echo "openssl required"; exit 1; }
+# A real chain: leaf + intermediate. The edge used to install only the leaf, so
+# clients without a cached intermediate failed the handshake; the test below
+# verifies the chain as an untrusting client would.
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$CERT_DIR/$DOMAIN.key" -out "$CERT_DIR/$DOMAIN.crt" \
-  -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN" >/dev/null 2>&1 || {
-  echo "cert generation failed"; exit 1;
+  -keyout "$CERT_DIR/ca.key" -out "$CERT_DIR/ca.crt" -subj "/CN=Test CA" >/dev/null 2>&1 || {
+  echo "CA generation failed"; exit 1;
 }
+openssl req -newkey rsa:2048 -nodes \
+  -keyout "$CERT_DIR/$DOMAIN.key" -out "$CERT_DIR/$DOMAIN.csr" \
+  -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN" >/dev/null 2>&1 || {
+  echo "leaf request failed"; exit 1;
+}
+openssl x509 -req -in "$CERT_DIR/$DOMAIN.csr" -CA "$CERT_DIR/ca.crt" \
+  -CAkey "$CERT_DIR/ca.key" -CAcreateserial -days 1 -copy_extensions copy \
+  -out "$CERT_DIR/$DOMAIN.leaf.crt" >/dev/null 2>&1 || {
+  echo "leaf signing failed"; exit 1;
+}
+cat "$CERT_DIR/$DOMAIN.leaf.crt" "$CERT_DIR/ca.crt" >"$CERT_DIR/$DOMAIN.crt"
 
 MOCK_BIN="$ROOT/target/mock-origin"
 if [[ ! -x "$MOCK_BIN" || tools/mock-origin/origin.rs -nt "$MOCK_BIN" ]]; then
@@ -94,6 +107,12 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 check "edge synced domain" "$SYNCED" "1"
+
+echo "== TLS chain =="
+VERIFY=$(echo | openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername "$DOMAIN" \
+  -CAfile "$CERT_DIR/ca.crt" 2>/dev/null | grep 'Verify return code' | tail -1 \
+  | sed 's/^[[:space:]]*//')
+check "TLS chain verifies against the issuing CA" "$VERIFY" "Verify return code: 0 (ok)"
 
 echo "== HTTP/2 HEAD =="
 CODE=$(curl -sk -I --http2 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \

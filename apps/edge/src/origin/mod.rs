@@ -140,6 +140,7 @@ fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name,
         "connection"
+            | "alt-svc"
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"

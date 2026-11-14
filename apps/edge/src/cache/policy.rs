@@ -1206,6 +1206,7 @@ pub fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "connection"
+            | "alt-svc"
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
@@ -1270,7 +1271,18 @@ pub fn duration_secs(d: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use bytes::Bytes;
+
+    #[test]
+    fn strips_alt_svc_from_origin_responses() {
+        let mut headers = HeaderMap::new();
+        headers.insert("alt-svc", HeaderValue::from_static("h3=\":443\""));
+        headers.insert("content-type", HeaderValue::from_static("text/html"));
+        strip_response_headers(&mut headers);
+        assert!(headers.get("alt-svc").is_none());
+        assert!(headers.get("content-type").is_some());
+    }
 
     fn rule(path: &str, ttl: u64, priority: i32, action: &str, swr: u64) -> CacheRule {
         CacheRule {

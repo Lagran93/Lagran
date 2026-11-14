@@ -224,6 +224,16 @@ ensure_users() {
     useradd --system --gid lagran --home-dir "$DATA_DIR" --shell /usr/sbin/nologin lagran
   chown -R root:lagran "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
   chmod -R g+rwX "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
+  # Upgrade migration: files created by the old single `lagran` account may be
+  # group-writable but owned by another user. The edge now replaces cert/key
+  # files atomically through the directory, but handing it the cert/cache tree
+  # also keeps `ls -l` and manual cleanup predictable.
+  local sub
+  for sub in certs cache large-cache; do
+    if [[ -d "$DATA_DIR/$sub" ]]; then
+      chown -R lagran-edge:lagran "$DATA_DIR/$sub" 2>/dev/null || true
+    fi
+  done
 }
 
 install_env_example() {

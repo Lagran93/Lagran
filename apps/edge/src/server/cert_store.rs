@@ -17,7 +17,13 @@ pub struct CertStore {
     dir: Option<PathBuf>,
 }
 
-type OpenSslKeyPair = (Arc<X509>, Arc<PKey<Private>>);
+/// Leaf certificate, private key and the intermediate chain (in PEM order).
+///
+/// The chain used to be discarded: only the leaf was installed on the OpenSSL
+/// connection, so clients that did not already cache the intermediate (curl,
+/// Android, many synthetic probes) failed the handshake with "unable to verify
+/// the first certificate" while browsers with a cached intermediate worked.
+type OpenSslKeyPair = (Arc<X509>, Arc<PKey<Private>>, Vec<X509>);
 
 #[derive(Default)]
 struct StoreInner {
@@ -119,7 +125,7 @@ impl CertStore {
             let stem = n.replace('*', "_star_").to_lowercase();
             let crt = dir.join(format!("{stem}.crt"));
             let key = dir.join(format!("{stem}.key"));
-            if let Err(e) = std::fs::write(&crt, cert_pem) {
+            if let Err(e) = write_public(&crt, cert_pem) {
                 tracing::warn!(error = %e, path = %crt.display(), "write cert failed");
             }
             // The private key must never be world-readable. `fs::write` creates
@@ -142,12 +148,19 @@ impl CertStore {
         let ck = Arc::new(parse_certified_key(cert_pem, key_pem)?);
         // Parse the OpenSSL representation once while the certificate is
         // installed, never on the connection handshake path.
+        let mut chain = X509::stack_from_pem(cert_pem)
+            .map_err(|e| format!("parse openssl cert: {e}"))?;
+        if chain.is_empty() {
+            return Err("certificate PEM contains no certificate".into());
+        }
+        let leaf = chain.remove(0);
         let tls_pair: OpenSslKeyPair = (
-            Arc::new(X509::from_pem(cert_pem).map_err(|e| format!("parse openssl cert: {e}"))?),
+            Arc::new(leaf),
             Arc::new(
                 PKey::private_key_from_pem(key_pem)
                     .map_err(|e| format!("parse openssl key: {e}"))?,
             ),
+            chain,
         );
         let mut w = self.inner.write().map_err(|e| e.to_string())?;
         for n in names {
@@ -349,23 +362,61 @@ fn normalize_cert_name(name: &str) -> String {
 /// writing first and chmod-ing afterwards leaves a window where the private key
 /// is world-readable.
 #[cfg(unix)]
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Write a file by staging a uniquely named sibling and renaming it into place.
+///
+/// The previous implementation opened the destination and then `fchmod`ed it.
+/// After the service-account split, cert files created by the old `lagran`
+/// account are group-writable (so the edge can open them) but owned by a
+/// different user, and `fchmod` on a file you do not own fails with EPERM even
+/// when the directory is writable. A fresh inode sidesteps ownership entirely
+/// and makes the replacement atomic.
+#[cfg(unix)]
+fn atomic_write(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    // `mode` is ignored when the file already exists, so normalise it.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!(
+        "{}.tmp{}-{}",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("key"),
+        std::process::id(),
+        seq
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write(path, bytes, 0o600)
+}
+
+#[cfg(unix)]
+fn write_public(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write(path, bytes, 0o644)
 }
 
 #[cfg(not(unix))]
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+#[cfg(not(unix))]
+fn write_public(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
@@ -414,6 +465,90 @@ mod tests {
         let second = store.certificate_for("b.example.com").unwrap();
         assert!(Arc::ptr_eq(&first.0, &second.0));
         assert!(Arc::ptr_eq(&first.1, &second.1));
+        assert!(first.2.is_empty(), "self-signed cert has no intermediates");
+    }
+
+    #[test]
+    fn private_key_rewrite_is_atomic_and_owner_safe() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-cert-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("host.key");
+        write_private(&path, b"first").unwrap();
+        write_private(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path() != path)
+            .collect();
+        assert!(leftovers.is_empty(), "staging file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PEM with leaf + intermediate must keep the intermediate for the
+    /// handshake; dropping it breaks every client without a cached chain.
+    #[test]
+    fn certificate_chain_is_kept_for_the_handshake() {
+        let ca_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut ca_name = X509NameBuilder::new().unwrap();
+        ca_name.append_entry_by_text("CN", "Test CA").unwrap();
+        let ca_name = ca_name.build();
+        let mut ca_builder = X509::builder().unwrap();
+        ca_builder.set_version(2).unwrap();
+        ca_builder.set_subject_name(&ca_name).unwrap();
+        ca_builder.set_issuer_name(&ca_name).unwrap();
+        ca_builder.set_pubkey(&ca_key).unwrap();
+        ca_builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        ca_builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        ca_builder.sign(&ca_key, MessageDigest::sha256()).unwrap();
+        let ca = ca_builder.build();
+
+        let leaf_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut leaf_name = X509NameBuilder::new().unwrap();
+        leaf_name.append_entry_by_text("CN", "example.com").unwrap();
+        let leaf_name = leaf_name.build();
+        let mut leaf_builder = X509::builder().unwrap();
+        leaf_builder.set_version(2).unwrap();
+        leaf_builder.set_subject_name(&leaf_name).unwrap();
+        leaf_builder.set_issuer_name(&ca_name).unwrap();
+        leaf_builder.set_pubkey(&leaf_key).unwrap();
+        leaf_builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        leaf_builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        leaf_builder.sign(&ca_key, MessageDigest::sha256()).unwrap();
+        let leaf = leaf_builder.build();
+
+        let mut pem = leaf.to_pem().unwrap();
+        pem.extend(ca.to_pem().unwrap());
+        let key_pem = leaf_key.private_key_to_pem_pkcs8().unwrap();
+
+        let store = CertStore::new();
+        store
+            .upsert(&["example.com".to_string()], &pem, &key_pem)
+            .unwrap();
+        let (stored_leaf, _, chain) = store.certificate_for("example.com").unwrap();
+        assert_eq!(stored_leaf.subject_name().entries().count(), 1);
+        assert_eq!(chain.len(), 1, "intermediate must be retained");
     }
     /// Removing a certificate must drop it from memory and from disk.
     ///

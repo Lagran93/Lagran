@@ -76,13 +76,22 @@ impl TlsAccept for CertCallback {
             .servername(ssl::NameType::HOST_NAME)
             .unwrap_or_default()
             .to_string();
-        let Some((cert, key)) = self.store.certificate_for(&name) else {
+        let Some((cert, key, chain)) = self.store.certificate_for(&name) else {
             tracing::warn!(sni = %name, "no certificate for TLS SNI");
             return;
         };
         if let Err(e) = ext::ssl_use_certificate(ssl, &cert) {
             tracing::error!(sni = %name, error = %e, "install certificate failed");
             return;
+        }
+        // Without the intermediate(s) in the handshake, clients that do not
+        // already have them cached reject the leaf ("unable to verify the first
+        // certificate"). The store keeps the full PEM, so install the rest of
+        // the chain alongside the leaf.
+        for intermediate in &chain {
+            if let Err(e) = ext::ssl_add_chain_cert(ssl, intermediate) {
+                tracing::error!(sni = %name, error = %e, "install chain certificate failed");
+            }
         }
         if let Err(e) = ext::ssl_use_private_key(ssl, &key) {
             tracing::error!(sni = %name, error = %e, "install private key failed");
@@ -4149,9 +4158,13 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
+    // `alt-svc` is not hop-by-hop by RFC, but this edge has no QUIC listener.
+    // Passing the origin's `h3=":443"` through sends browsers to UDP/443, which
+    // is closed here; some clients stall before falling back to h2.
     matches!(
         name,
         "connection"
+            | "alt-svc"
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
