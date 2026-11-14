@@ -4,11 +4,11 @@
 //! a fresh TCP/TLS connection for every DNS cache miss and read the response
 //! until a socket timeout; both are avoided here.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 trait ReadWrite: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWrite for T {}
@@ -28,11 +28,28 @@ struct Target {
     base_path: String,
 }
 
+/// An idle keep-alive connection and when it was returned to the pool.
+struct IdleConnection {
+    conn: Box<dyn ReadWrite>,
+    at: Instant,
+}
+
+/// How long a pooled HTTP/1.1 connection may sit idle before it is discarded.
+///
+/// The control plane (or a proxy in front of it) may close idle connections at
+/// any time; the client only learns that on the next write/read. DNS traffic is
+/// bursty and often minutes apart, so without an age check the pool mostly
+/// hands out sockets that are already gone. The value is kept above the 30 s
+/// scheduler cache so a warm DNS entry can still reuse its connection; sockets
+/// that die earlier are recovered by the clear-and-retry path below.
+const DEFAULT_POOL_IDLE: Duration = Duration::from_secs(60);
+
 pub struct ControlClient {
     target: Target,
     token: String,
     timeout: Duration,
-    idle: Mutex<Vec<Box<dyn ReadWrite>>>,
+    pool_idle: Duration,
+    idle: Mutex<Vec<IdleConnection>>,
 }
 
 fn parse_target(url: &str) -> Result<Target> {
@@ -183,16 +200,29 @@ fn host_is_loopback(host: &str) -> bool {
     }
 }
 
-fn read_more(stream: &mut dyn ReadWrite, buf: &mut Vec<u8>) -> Result<bool> {
+/// One read from a control-plane socket.
+///
+/// A read timeout is deliberately distinct from EOF: the previous code folded
+/// both into Ok(false), so a scheduler answer slower than the read timeout
+/// was reported as a closed connection and then retried as if a fresh socket
+/// could help. It could not, and the second attempt doubled the time a DNS
+/// worker was blocked.
+enum ReadEvent {
+    Data,
+    Eof,
+    Timeout,
+}
+
+fn read_event(stream: &mut dyn ReadWrite, buf: &mut Vec<u8>) -> Result<ReadEvent> {
     let mut chunk = [0u8; 4096];
     match stream.read(&mut chunk) {
-        Ok(0) => Ok(false),
+        Ok(0) => Ok(ReadEvent::Eof),
         Ok(n) => {
             buf.extend_from_slice(&chunk[..n]);
-            Ok(true)
+            Ok(ReadEvent::Data)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(ReadEvent::Timeout),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(ReadEvent::Timeout),
         Err(e) => Err(e.into()),
     }
 }
@@ -208,8 +238,10 @@ fn read_response(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<u8>, bool)> {
         if raw.len() > 64 * 1024 {
             return Err(anyhow!("response header too large"));
         }
-        if !read_more(stream, &mut raw)? {
-            return Err(anyhow!("connection closed before response header"));
+        match read_event(stream, &mut raw)? {
+            ReadEvent::Data => {}
+            ReadEvent::Eof => return Err(anyhow!("connection closed before response header")),
+            ReadEvent::Timeout => return Err(anyhow!("control response timed out before header")),
         }
     };
 
@@ -247,8 +279,12 @@ fn read_response(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<u8>, bool)> {
             ));
         }
         while body.len() < len {
-            if !read_more(stream, &mut body)? {
-                return Err(anyhow!("short HTTP body"));
+            match read_event(stream, &mut body)? {
+                ReadEvent::Data => {}
+                ReadEvent::Eof => return Err(anyhow!("short HTTP body")),
+                ReadEvent::Timeout => {
+                    return Err(anyhow!("control response timed out before body"));
+                }
             }
             if body.len() > MAX_BODY_BYTES {
                 return Err(anyhow!("HTTP body exceeded {MAX_BODY_BYTES} bytes"));
@@ -264,7 +300,13 @@ fn read_response(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<u8>, bool)> {
 
     // No framing: read until close/timeout. Never reuse this connection. Bounded,
     // because an origin that never closes would otherwise stream forever.
-    while read_more(stream, &mut body)? {
+    loop {
+        match read_event(stream, &mut body)? {
+            ReadEvent::Data => {}
+            // Without Content-Length or chunked framing, close (or the read
+            // deadline) is the only end-of-body signal.
+            ReadEvent::Eof | ReadEvent::Timeout => break,
+        }
         if body.len() > MAX_BODY_BYTES {
             return Err(anyhow!("HTTP body exceeded {MAX_BODY_BYTES} bytes"));
         }
@@ -279,8 +321,12 @@ fn decode_chunked(stream: &mut dyn ReadWrite, mut raw: Vec<u8>) -> Result<Vec<u8
             if let Some(pos) = find(&raw, b"\r\n") {
                 break pos;
             }
-            if !read_more(stream, &mut raw)? {
-                return Err(anyhow!("malformed chunk"));
+            match read_event(stream, &mut raw)? {
+                ReadEvent::Data => {}
+                ReadEvent::Eof => return Err(anyhow!("malformed chunk")),
+                ReadEvent::Timeout => {
+                    return Err(anyhow!("control response timed out before chunk"));
+                }
             }
         };
         let line = String::from_utf8_lossy(&raw[..line_end]);
@@ -302,8 +348,12 @@ fn decode_chunked(stream: &mut dyn ReadWrite, mut raw: Vec<u8>) -> Result<Vec<u8
                     if let Some(pos) = find(&raw, b"\r\n") {
                         break pos;
                     }
-                    if !read_more(stream, &mut raw)? {
-                        return Ok(out);
+                    match read_event(stream, &mut raw)? {
+                        ReadEvent::Data => {}
+                        ReadEvent::Eof => return Ok(out),
+                        ReadEvent::Timeout => {
+                            return Err(anyhow!("control response timed out before trailer"));
+                        }
                     }
                 };
                 if end == 0 {
@@ -314,8 +364,12 @@ fn decode_chunked(stream: &mut dyn ReadWrite, mut raw: Vec<u8>) -> Result<Vec<u8
             }
         }
         while raw.len() < size + 2 {
-            if !read_more(stream, &mut raw)? {
-                return Err(anyhow!("short chunk"));
+            match read_event(stream, &mut raw)? {
+                ReadEvent::Data => {}
+                ReadEvent::Eof => return Err(anyhow!("short chunk")),
+                ReadEvent::Timeout => {
+                    return Err(anyhow!("control response timed out before chunk body"));
+                }
             }
         }
         out.extend_from_slice(&raw[..size]);
@@ -325,22 +379,55 @@ fn decode_chunked(stream: &mut dyn ReadWrite, mut raw: Vec<u8>) -> Result<Vec<u8
 
 impl ControlClient {
     pub fn new(url: &str, token: &str, timeout: Duration) -> Result<Self> {
+        Self::with_pool_idle(url, token, timeout, DEFAULT_POOL_IDLE)
+    }
+
+    fn with_pool_idle(
+        url: &str,
+        token: &str,
+        timeout: Duration,
+        pool_idle: Duration,
+    ) -> Result<Self> {
         Ok(Self {
             target: parse_target(url)?,
             token: token.to_string(),
             timeout,
+            pool_idle,
             idle: Mutex::new(Vec::new()),
         })
     }
 
     fn take_connection(&self) -> Option<Box<dyn ReadWrite>> {
-        self.idle.lock().ok().and_then(|mut pool| pool.pop())
+        let mut pool = self.idle.lock().ok()?;
+        let now = Instant::now();
+        while let Some(item) = pool.pop() {
+            // `pool_idle` of zero means never reuse, which the tests use to
+            // exercise the age check deterministically.
+            if now.duration_since(item.at) < self.pool_idle {
+                return Some(item.conn);
+            }
+        }
+        None
+    }
+
+    /// Drop every pooled socket after a connection-level failure.
+    ///
+    /// The control plane (or a proxy) usually closes idle connections in a
+    /// batch. Draining them one per attempt means the retry can pick another
+    /// dead socket and fail too; clearing the pool makes the retry start clean.
+    fn clear_connections(&self) {
+        if let Ok(mut pool) = self.idle.lock() {
+            pool.clear();
+        }
     }
 
     fn put_connection(&self, conn: Box<dyn ReadWrite>) {
         if let Ok(mut pool) = self.idle.lock() {
             if pool.len() < 8 {
-                pool.push(conn);
+                pool.push(IdleConnection {
+                    conn,
+                    at: Instant::now(),
+                });
             }
         }
     }
@@ -376,16 +463,29 @@ impl ControlClient {
         );
 
         let mut last_err = None;
+        // A pooled socket that failed may be one of several closed together.
+        // Never hand the retry another pooled socket: dial fresh instead.
+        let mut force_fresh = false;
         for attempt in 0..2 {
-            let mut conn = match self.take_connection() {
-                Some(c) => c,
-                None => match connect(&self.target, self.timeout) {
+            let mut conn = if force_fresh {
+                match connect(&self.target, self.timeout) {
                     Ok(c) => c,
                     Err(e) => {
                         last_err = Some(e);
-                        continue;
+                        break;
                     }
-                },
+                }
+            } else {
+                match self.take_connection() {
+                    Some(c) => c,
+                    None => match connect(&self.target, self.timeout) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            last_err = Some(e);
+                            continue;
+                        }
+                    },
+                }
             };
             let result = (|| -> Result<(u16, Vec<u8>, bool)> {
                 conn.write_all(request.as_bytes())?;
@@ -402,20 +502,16 @@ impl ControlClient {
                     return parse_schedule(&body);
                 }
                 Err(e) => {
+                    // Every pooled socket is suspect after one connection-level
+                    // failure: they were likely closed together by the control
+                    // plane. Clear the pool before deciding whether to retry.
+                    self.clear_connections();
                     let retryable = is_retryable(&e);
                     last_err = Some(e);
-                    // A pooled connection may have been closed by the server;
-                    // retry once with a fresh connection. The request is GET.
-                    //
-                    // Only a connection-level failure is worth retrying. A read
-                    // timeout used to land here too, so a slow control plane made
-                    // every query pay twice: 800 ms, then another 800 ms with a new
-                    // socket, while the worker thread was blocked and the UDP queue
-                    // drained. Retrying a timeout cannot help — the deadline was
-                    // already exceeded once.
                     if attempt == 1 || !retryable {
                         break;
                     }
+                    force_fresh = true;
                 }
             }
         }
@@ -618,6 +714,142 @@ mod tests {
         let (status, body, _) = read_response(&mut dyn_read(&mut stream)).expect("parse");
         assert_eq!(status, 200);
         assert_eq!(body, b"hello".to_vec());
+    }
+
+    /// A pooled socket closed by the control plane must not consume both
+    /// attempts. One failure clears the pool and the retry dials fresh.
+    #[test]
+    fn dead_pooled_connections_are_replaced_with_a_fresh_socket() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_srv = accepted.clone();
+        let body = r#"{"primary":{"public_ip":"203.0.113.10"},"ttl":30}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        thread::spawn(move || {
+            // The first two connections stand in for stale pool entries: the
+            // server closes them without reading a request.
+            for _ in 0..2 {
+                if let Ok((stream, _)) = listener.accept() {
+                    accepted_srv.fetch_add(1, Ordering::Relaxed);
+                    drop(stream);
+                }
+            }
+            for stream in listener.incoming().flatten() {
+                accepted_srv.fetch_add(1, Ordering::Relaxed);
+                let response = response.clone();
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}");
+        let client = ControlClient::new(&url, "token", Duration::from_secs(2)).unwrap();
+        let target = parse_target(&url).unwrap();
+        for _ in 0..2 {
+            let conn = connect(&target, Duration::from_secs(1)).unwrap();
+            client.idle.lock().unwrap().push(IdleConnection {
+                conn,
+                at: Instant::now(),
+            });
+        }
+        while accepted.load(Ordering::Relaxed) < 2 {
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(20));
+
+        let reply = client.schedule("c.test", None, None).expect("fresh retry");
+        assert_eq!(reply.ip, Some(Ipv4Addr::new(203, 0, 113, 10).into()));
+        assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    }
+
+    /// A slow scheduler response must time out once, not twice.
+    #[test]
+    fn header_timeout_is_not_retried() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_srv = accepted.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                accepted_srv.fetch_add(1, Ordering::Relaxed);
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    // Never answer; the client's read timeout must fire.
+                    thread::sleep(Duration::from_millis(300));
+                });
+            }
+        });
+
+        let client = ControlClient::new(
+            &format!("http://127.0.0.1:{port}"),
+            "token",
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let err = client.schedule("slow.test", None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    }
+
+    /// An idle socket is discarded once its age reaches the pool TTL.
+    #[test]
+    fn pooled_connection_is_not_reused_after_idle_ttl() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_srv = accepted.clone();
+        let body = r#"{"primary":{"public_ip":"203.0.113.10"},"ttl":30}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                accepted_srv.fetch_add(1, Ordering::Relaxed);
+                let response = response.clone();
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    loop {
+                        let mut buf = [0u8; 4096];
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                if stream.write_all(response.as_bytes()).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // Zero TTL disables reuse deterministically.
+        let client = ControlClient::with_pool_idle(
+            &format!("http://127.0.0.1:{port}"),
+            "token",
+            Duration::from_secs(2),
+            Duration::ZERO,
+        )
+        .unwrap();
+        client.schedule("a.test", None, None).unwrap();
+        client.schedule("b.test", None, None).unwrap();
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
     }
 
     fn dyn_read(r: &mut std::io::Cursor<Vec<u8>>) -> TestStream<'_> {
