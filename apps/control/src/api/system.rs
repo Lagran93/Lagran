@@ -4,6 +4,7 @@ use crate::middleware::authz::Actor;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -328,11 +329,31 @@ pub async fn apply_update(
         }
         // Recreate the file so the systemd .path unit always observes a change.
         let _ = std::fs::remove_file(&request);
-        let tmp = request.with_extension("request.tmp");
-        std::fs::write(&tmp, format!("{tag}\n"))
-            .map_err(|e| internal(format!("cannot write update request: {e}")))?;
-        std::fs::rename(&tmp, &request)
-            .map_err(|e| internal(format!("cannot queue update request: {e}")))?;
+        // The old single `lagran` account may have left `update.request.tmp`
+        // owned by a uid the new `lagran-control` account cannot write. A
+        // per-process name plus `create_new` makes a stale file or symlink
+        // impossible to trip over, and the error names the directory to check.
+        let tmp = request.with_extension(format!("request.tmp.{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&tmp);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| {
+                internal(format!(
+                    "cannot write update request {}: {e} (the control service user must be able to write this directory)",
+                    tmp.display()
+                ))
+            })?;
+        if let Err(e) = file.write_all(format!("{tag}\n").as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(internal(format!("cannot write update request: {e}")));
+        }
+        drop(file);
+        if let Err(e) = std::fs::rename(&tmp, &request) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(internal(format!("cannot queue update request: {e}")));
+        }
     }
     let _ = crate::repository::insert_audit(
         &state.pool,

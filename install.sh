@@ -224,6 +224,9 @@ ensure_users() {
     useradd --system --gid lagran --home-dir "$DATA_DIR" --shell /usr/sbin/nologin lagran
   chown -R root:lagran "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
   chmod -R g+rwX "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
+  # A previous control run as the legacy `lagran` user may have left the
+  # update temp file owned by a uid the new service account cannot write.
+  rm -f "$DATA_DIR"/update.request.tmp "$DATA_DIR"/update.request.tmp.* 2>/dev/null || true
   # Upgrade migration: files created by the old single `lagran` account may be
   # group-writable but owned by another user. The edge now replaces cert/key
   # files atomically through the directory, but handing it the cert/cache tree
