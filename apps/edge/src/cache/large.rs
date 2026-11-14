@@ -10,8 +10,8 @@ use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -49,6 +49,27 @@ pub struct LargeMeta {
     /// complete objects (where `complete` means 0..content_length-1).
     #[serde(default)]
     pub segments: Vec<(u64, u64)>,
+    /// Chunk grid used when this entry was written. Zero for legacy/complete
+    /// byte-stream objects. Diagnosing `cat *.meta.json` shows this directly.
+    #[serde(default)]
+    pub chunk_bytes: u64,
+}
+
+/// One contiguous run of fixed-size chunks with the same cache state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkRun {
+    pub start: u64,
+    pub end: u64,
+    pub cached: bool,
+}
+
+/// Chunk-aligned response plan. Every byte range is aligned to the fixed
+/// `chunk_bytes` grid except for the final short chunk of the object. Cached
+/// runs are served from disk; origin runs are fetched in one Range request and
+/// filled back as whole chunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkPlan {
+    pub runs: Vec<ChunkRun>,
 }
 
 impl LargeMeta {
@@ -57,7 +78,7 @@ impl LargeMeta {
     }
 
     /// Bytes resident in the sparse data file, not the sparse file's logical
-    /// length. This keeps eviction fair when a 700 MB video only has a 32 MiB
+    /// length. This keeps eviction fair when a large video only has a partial
     /// prefix cached.
     pub fn stored_bytes(&self) -> u64 {
         if self.complete {
@@ -69,16 +90,85 @@ impl LargeMeta {
             .sum()
     }
 
-    /// End of the cached contiguous run that contains start, if any.
-    /// Used to splice a cached prefix with an origin remainder.
-    pub fn contiguous_end(&self, start: u64) -> Option<u64> {
-        if self.complete {
-            return self.content_length.checked_sub(1);
+    /// Build a fixed-chunk plan for `[start, end]`.
+    ///
+    /// A chunk counts as cached only when the complete chunk is covered. A
+    /// request that starts or ends inside a chunk still fetches that whole
+    /// chunk from origin, so the next request can use it without another
+    /// partial fetch.
+    pub fn chunk_plan(&self, start: u64, end: u64, chunk_bytes: u64) -> Option<ChunkPlan> {
+        let chunk_bytes = if self.chunk_bytes > 0 {
+            self.chunk_bytes
+        } else {
+            chunk_bytes
+        };
+        if chunk_bytes == 0 || start > end || end >= self.content_length {
+            return None;
         }
-        self.segments
-            .iter()
-            .find(|(s, e)| *s <= start && *e >= start)
-            .map(|(_, e)| *e)
+        let first = start / chunk_bytes;
+        let last = end / chunk_bytes;
+        let mut runs: Vec<ChunkRun> = Vec::new();
+        for index in first..=last {
+            let chunk_start = index.saturating_mul(chunk_bytes);
+            if chunk_start >= self.content_length {
+                break;
+            }
+            let chunk_end = chunk_start
+                .saturating_add(chunk_bytes)
+                .saturating_sub(1)
+                .min(self.content_length.saturating_sub(1));
+            let cached = self.covers(chunk_start, chunk_end);
+            if let Some(last_run) = runs.last_mut() {
+                if last_run.cached == cached {
+                    last_run.end = chunk_end;
+                    continue;
+                }
+            }
+            runs.push(ChunkRun {
+                start: chunk_start,
+                end: chunk_end,
+                cached,
+            });
+        }
+        if runs.is_empty() {
+            return None;
+        }
+        Some(ChunkPlan { runs })
+    }
+
+    /// Number of bytes missing from `[start, end]`.
+    ///
+    /// Fill admission counts genuinely absent bytes, not the full chunk span;
+    /// otherwise a fragmented object could stop filling before the cap.
+    pub fn missing_bytes(&self, start: u64, end: u64) -> u64 {
+        if start > end || end >= self.content_length || self.complete {
+            return 0;
+        }
+        let mut missing = 0u64;
+        let mut cursor = start;
+        for (seg_start, seg_end) in &self.segments {
+            if *seg_end < cursor {
+                continue;
+            }
+            if *seg_start > end {
+                break;
+            }
+            if *seg_start > cursor {
+                missing = missing.saturating_add(
+                    (*seg_start)
+                        .min(end.saturating_add(1))
+                        .saturating_sub(cursor),
+                );
+            }
+            cursor = (*seg_end).saturating_add(1).min(end.saturating_add(1));
+            if cursor > end {
+                break;
+            }
+        }
+        if cursor <= end {
+            missing = missing.saturating_add(end.saturating_sub(cursor).saturating_add(1));
+        }
+        missing
     }
 }
 
@@ -241,6 +331,9 @@ pub struct RangeWriter {
     start_stored: u64,
     fresh_secs: u64,
     swr_secs: u64,
+    /// Zero for byte-precise legacy fills; non-zero commits only whole chunks
+    /// after a disconnect.
+    chunk_bytes: u64,
     _range_guard: OwnedMutexGuard<()>,
 }
 
@@ -288,7 +381,17 @@ impl RangeWriter {
             self.abort().await;
             return false;
         }
-        let segment_end = self.start.saturating_add(written).saturating_sub(1);
+        let expected = self.end.saturating_sub(self.start).saturating_add(1);
+        let committed = if self.chunk_bytes > 0 && written < expected {
+            (written / self.chunk_bytes) * self.chunk_bytes
+        } else {
+            written
+        };
+        if committed == 0 {
+            self.abort().await;
+            return false;
+        }
+        let segment_end = self.start.saturating_add(committed).saturating_sub(1);
         self.meta.segments.push((self.start, segment_end));
         self.meta.segments.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.meta.segments.len());
@@ -424,6 +527,29 @@ impl LargeCache {
 
     pub fn max_object_bytes(&self) -> u64 {
         self.max_object_bytes
+    }
+
+    pub fn min_object_bytes(&self) -> u64 {
+        self.min_object_bytes
+    }
+
+    /// Maximum bytes one object may fill, including holes rewritten inside a
+    /// span. `configured == 0` means "use the object/complete-cache limit".
+    pub fn fill_cap(&self, content_length: u64, configured: u64) -> u64 {
+        let object_cap = content_length.min(self.max_object_bytes);
+        if configured == 0 {
+            object_cap
+        } else {
+            object_cap.min(configured)
+        }
+    }
+
+    /// Bytes still available before the global large-cache budget is reached.
+    /// This is an admission hint, not a reservation; eviction remains the
+    /// final authority after commit.
+    pub fn available_bytes(&self) -> u64 {
+        self.max_bytes
+            .saturating_sub(self.used_bytes.load(Ordering::Relaxed))
     }
 
     fn release_bytes(&self, bytes: u64) {
@@ -643,6 +769,7 @@ impl LargeCache {
             stored_at: 0,
             complete: false,
             segments: Vec::new(),
+            chunk_bytes: 0,
         };
         Some(LargeWriter {
             cache: self.clone(),
@@ -672,6 +799,63 @@ impl LargeCache {
         end: u64,
         fresh_secs: u64,
         swr_secs: u64,
+    ) -> Option<RangeWriter> {
+        self.begin_range_inner(
+            key,
+            status,
+            headers,
+            content_length,
+            start,
+            end,
+            fresh_secs,
+            swr_secs,
+            0,
+        )
+        .await
+    }
+
+    /// Chunk-aligned fill: a disconnect commits only completely written
+    /// chunks, never a partial chunk that the chunk planner would have to
+    /// request again anyway.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn begin_chunk_range(
+        self: &Arc<Self>,
+        key: &str,
+        status: u16,
+        headers: Vec<(String, String)>,
+        content_length: u64,
+        start: u64,
+        end: u64,
+        fresh_secs: u64,
+        swr_secs: u64,
+        chunk_bytes: u64,
+    ) -> Option<RangeWriter> {
+        self.begin_range_inner(
+            key,
+            status,
+            headers,
+            content_length,
+            start,
+            end,
+            fresh_secs,
+            swr_secs,
+            chunk_bytes,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_range_inner(
+        self: &Arc<Self>,
+        key: &str,
+        status: u16,
+        headers: Vec<(String, String)>,
+        content_length: u64,
+        start: u64,
+        end: u64,
+        fresh_secs: u64,
+        swr_secs: u64,
+        chunk_bytes: u64,
     ) -> Option<RangeWriter> {
         if content_length == 0
             || content_length < self.min_object_bytes
@@ -744,7 +928,7 @@ impl LargeCache {
         file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
         let now = now_unix();
         let fresh = fresh_secs.max(1);
-        let meta = existing.unwrap_or_else(|| LargeMeta {
+        let mut meta = existing.unwrap_or_else(|| LargeMeta {
             key: key.to_string(),
             status,
             headers,
@@ -754,7 +938,11 @@ impl LargeCache {
             stored_at: 0,
             complete: false,
             segments: Vec::new(),
+            chunk_bytes: 0,
         });
+        if chunk_bytes > 0 {
+            meta.chunk_bytes = chunk_bytes;
+        }
         Some(RangeWriter {
             cache: self.clone(),
             meta,
@@ -769,6 +957,7 @@ impl LargeCache {
             start_stored,
             fresh_secs: fresh,
             swr_secs,
+            chunk_bytes,
             _range_guard: range_guard,
         })
     }
@@ -802,9 +991,9 @@ impl LargeCache {
                         continue;
                     };
                     if meta.key.is_empty()
-                        || !targets.iter().any(|target| {
-                            lagran_cache::cache_key_matches(&meta.key, target)
-                        })
+                        || !targets
+                            .iter()
+                            .any(|target| lagran_cache::cache_key_matches(&meta.key, target))
                     {
                         continue;
                     }
@@ -1112,24 +1301,167 @@ mod tests {
         }
     }
 
-    #[test]
-    fn contiguous_segments_expose_splice_boundary() {
-        let meta = LargeMeta {
+    fn meta_with_segments(segments: Vec<(u64, u64)>, content_length: u64) -> LargeMeta {
+        LargeMeta {
             key: "GET:video.test:/movie.mp4".into(),
             status: 206,
             headers: Vec::new(),
-            content_length: 1024,
+            content_length,
             fresh_until: u64::MAX,
             stale_until: u64::MAX,
             stored_at: 0,
             complete: false,
-            segments: vec![(0, 255), (512, 767)],
-        };
-        assert_eq!(meta.contiguous_end(0), Some(255));
-        assert_eq!(meta.contiguous_end(128), Some(255));
-        assert_eq!(meta.contiguous_end(256), None);
-        assert_eq!(meta.contiguous_end(600), Some(767));
-        assert_eq!(meta.stored_bytes(), 512);
+            segments,
+            chunk_bytes: 0,
+        }
+    }
+
+    fn chunk_plan_for(
+        segments: Vec<(u64, u64)>,
+        content_length: u64,
+        start: u64,
+        end: u64,
+    ) -> ChunkPlan {
+        let meta = meta_with_segments(segments, content_length);
+        meta.chunk_plan(start, end, 4).expect("chunk plan")
+    }
+
+    #[test]
+    fn chunk_plan_marks_only_whole_chunks_cached() {
+        let plan = chunk_plan_for(vec![(0, 3)], 16, 0, 15);
+        assert_eq!(
+            plan.runs,
+            vec![
+                ChunkRun {
+                    start: 0,
+                    end: 3,
+                    cached: true
+                },
+                ChunkRun {
+                    start: 4,
+                    end: 15,
+                    cached: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn chunk_plan_requests_only_missing_chunks() {
+        let plan = chunk_plan_for(vec![(4, 7)], 16, 0, 15);
+        assert_eq!(
+            plan.runs,
+            vec![
+                ChunkRun {
+                    start: 0,
+                    end: 3,
+                    cached: false
+                },
+                ChunkRun {
+                    start: 4,
+                    end: 7,
+                    cached: true
+                },
+                ChunkRun {
+                    start: 8,
+                    end: 15,
+                    cached: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn chunk_plan_partial_chunk_is_not_cached() {
+        let plan = chunk_plan_for(vec![(1, 2)], 16, 0, 3);
+        assert_eq!(
+            plan.runs,
+            vec![ChunkRun {
+                start: 0,
+                end: 3,
+                cached: false
+            }]
+        );
+    }
+
+    #[test]
+    fn chunk_plan_clamps_last_short_chunk() {
+        let plan = chunk_plan_for(Vec::new(), 10, 8, 9);
+        assert_eq!(
+            plan.runs,
+            vec![ChunkRun {
+                start: 8,
+                end: 9,
+                cached: false
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_bytes_counts_only_gaps() {
+        let meta = meta_with_segments(vec![(0, 9), (20, 29), (40, 49)], 100);
+        assert_eq!(meta.missing_bytes(0, 49), 20);
+        assert_eq!(meta.missing_bytes(5, 25), 10);
+        assert_eq!(meta.missing_bytes(10, 19), 10);
+        assert_eq!(meta.missing_bytes(0, 9), 0);
+    }
+
+    #[test]
+    fn fill_cap_defaults_to_object_size_and_honours_configured_limit() {
+        let dir = std::env::temp_dir();
+        let root = dir.join(format!(
+            "lagran-fill-cap-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cache = rt
+            .block_on(LargeCache::open(
+                &root,
+                1024 * 1024,
+                64 * 1024 * 1024,
+                1024 * 1024 * 1024,
+            ))
+            .unwrap();
+        assert_eq!(cache.fill_cap(10 * 1024 * 1024, 0), 10 * 1024 * 1024);
+        assert_eq!(cache.fill_cap(100 * 1024 * 1024, 0), 64 * 1024 * 1024);
+        assert_eq!(
+            cache.fill_cap(100 * 1024 * 1024, 8 * 1024 * 1024),
+            8 * 1024 * 1024
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn chunk_writer_commits_only_whole_chunks_on_disconnect() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-chunk-writer-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = LargeCache::open(&dir, 1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024)
+            .await
+            .unwrap();
+        let key = "GET:video.test:/chunked.mp4";
+        let total = 4_u64 * 1024 * 1024;
+        let chunk = 1024_u64 * 1024;
+
+        let mut writer = cache
+            .begin_chunk_range(key, 206, Vec::new(), total, 0, 3 * chunk - 1, 60, 0, chunk)
+            .await
+            .expect("chunk writer");
+        // 1.5 chunks received, then disconnect. Only chunk 0 is complete.
+        writer
+            .write_all(&vec![1_u8; (chunk + chunk / 2) as usize])
+            .await;
+        assert!(writer.commit_partial().await);
+
+        let entry = cache.get_any(key).await.expect("partial entry");
+        assert_eq!(entry.meta.segments, vec![(0, chunk - 1)]);
+        assert!(!entry.meta.complete);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1215,10 +1547,12 @@ mod tests {
             .unwrap();
         let key = "GET:video.test:/huge.mp4";
         let total = 8_u64 * 1024 * 1024;
-        assert!(cache
-            .begin(key, 200, Vec::new(), total, 60, 0)
-            .await
-            .is_none());
+        assert!(
+            cache
+                .begin(key, 200, Vec::new(), total, 60, 0)
+                .await
+                .is_none()
+        );
         let mut writer = cache
             .begin_range(key, 206, Vec::new(), total, 0, 1024 * 1024 - 1, 60, 0)
             .await

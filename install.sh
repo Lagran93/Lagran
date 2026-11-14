@@ -78,6 +78,8 @@ Environment:
   LARGE_CACHE_ENABLED=true|false edge: large-object disk cache (default false)
   LARGE_CACHE_DIR=...            edge: default /var/lib/lagran/large-cache
   LARGE_CACHE_MAX_OBJECT_BYTES=  edge: default 1 GiB
+  LARGE_CACHE_FILL_MAX_BYTES=    edge: default 0 (object max); per-object fill cap
+  LARGE_CACHE_CHUNK_BYTES=       edge: fixed Range chunk size (default 1 MiB)
   PUBLIC_IP=...                  edge: public IP for GeoDNS
   NODE_REGION=...                edge: region label
   DNS_ZONE=...                   dns: default edge.lagran.net
@@ -525,6 +527,8 @@ LARGE_CACHE_ENABLED=${LARGE_CACHE_ENABLED:-false}
 LARGE_CACHE_DIR=${LARGE_CACHE_DIR:-${DATA_DIR}/large-cache}
 LARGE_CACHE_MIN_OBJECT_BYTES=${LARGE_CACHE_MIN_OBJECT_BYTES:-8388608}
 LARGE_CACHE_MAX_OBJECT_BYTES=${LARGE_CACHE_MAX_OBJECT_BYTES:-1073741824}
+LARGE_CACHE_FILL_MAX_BYTES=${LARGE_CACHE_FILL_MAX_BYTES:-0}
+LARGE_CACHE_CHUNK_BYTES=${LARGE_CACHE_CHUNK_BYTES:-1048576}
 LARGE_CACHE_MAX_BYTES=${LARGE_CACHE_MAX_BYTES:-21474836480}
 CHALLENGE_SECRET=${challenge_secret}
 EDGE_UPDATE_HELPER=${BIN_DIR}/lagran-edge-update

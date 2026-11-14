@@ -116,6 +116,10 @@ curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
 LARGE_CACHE_ENABLED=true
 LARGE_CACHE_DIR=/var/lib/lagran/large-cache
 LARGE_CACHE_MAX_OBJECT_BYTES=1073741824
+# 0 = 使用 LARGE_CACHE_MAX_OBJECT_BYTES；可设 268435456 限制单对象
+LARGE_CACHE_FILL_MAX_BYTES=0
+# Range 固定分片；缺失分片才回源
+LARGE_CACHE_CHUNK_BYTES=1048576
 ```
 
 修改后重启：

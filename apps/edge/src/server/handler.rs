@@ -128,6 +128,8 @@ pub struct AppState {
     pub origin_read_timeout_ms: u64,
     pub origin_stream_read_timeout_ms: u64,
     pub range_fill_max_bytes: u64,
+    pub large_cache_fill_max_bytes: u64,
+    pub large_cache_chunk_bytes: u64,
     pub downstream_keepalive_secs: u64,
     pub downstream_h2_idle_secs: u64,
     pub downstream_keepalive_requests: u32,

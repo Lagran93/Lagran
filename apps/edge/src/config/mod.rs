@@ -143,11 +143,19 @@ pub struct EdgeConfig {
     /// Idle read timeout for Range/media streaming. Longer than the normal
     /// origin read timeout so slow video origins do not become 504s.
     pub origin_stream_read_timeout_ms: u64,
-    /// Maximum bytes written into the large cache from one Range response.
-    /// Bounded ranges larger than this are proxied without filling; an
-    /// open-ended video range fills a bounded prefix, and a suffix range fills
-    /// the tail, both up to this limit.
+    /// Prefetch-only cap for the synchronous Range prefix. Client Range
+    /// requests use `large_cache_fill_max_bytes` instead, so this no longer
+    /// truncates a fully consumed object at 32 MiB.
     pub range_fill_max_bytes: u64,
+    /// Maximum bytes one object may write into the large cache from Range
+    /// fills. `0` means "use `large_cache_max_object_bytes` as the object
+    /// limit". Prefetch keeps using `range_fill_max_bytes` for its small
+    /// synchronous prefix.
+    pub large_cache_fill_max_bytes: u64,
+    /// Fixed cache/origin granularity for large-object Range requests.
+    /// Missing bytes are requested in whole chunks; chunks are the unit of
+    /// cache coverage.
+    pub large_cache_chunk_bytes: u64,
     /// Downstream HTTP/1.1 keepalive idle timeout.
     pub downstream_keepalive_secs: u64,
     /// Downstream HTTP/2 idle timeout after the last active stream.
@@ -162,7 +170,8 @@ pub struct EdgeConfig {
     pub large_cache_min_object_bytes: u64,
     /// Maximum complete object admitted to the large cache. Partial Range
     /// windows are still admitted for larger objects, limited by
-    /// `range_fill_max_bytes`, because only the written segments occupy disk.
+    /// `large_cache_fill_max_bytes`, because only the written segments occupy
+    /// disk.
     pub large_cache_max_object_bytes: u64,
     pub large_cache_max_bytes: u64,
     /// How often the edge pulls domain config from control (seconds).
@@ -380,6 +389,16 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32 * 1024 * 1024)
                 .clamp(0, 1024 * 1024 * 1024),
+            large_cache_fill_max_bytes: std::env::var("LARGE_CACHE_FILL_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+                .clamp(0, 4 * 1024 * 1024 * 1024),
+            large_cache_chunk_bytes: std::env::var("LARGE_CACHE_CHUNK_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024 * 1024)
+                .clamp(64 * 1024, 64 * 1024 * 1024),
             downstream_keepalive_secs: std::env::var("DOWNSTREAM_KEEPALIVE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -513,5 +532,4 @@ mod tests {
 
         std::env::remove_var("CACHE_FLIGHT_TIMEOUT_MS");
     }
-
 }

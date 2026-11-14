@@ -1,7 +1,7 @@
 use edge::agent::{self, access_report, cert_sync, config_sync, metrics_report, origin_health};
 use edge::cache::{self, policy::RuleSet};
-use edge::config::registry::DomainRegistry;
 use edge::config::EdgeConfig;
+use edge::config::registry::DomainRegistry;
 use edge::metrics::EdgeMetrics;
 use edge::origin::OriginClient;
 use edge::server::access_log::AccessLog;
@@ -302,6 +302,8 @@ async fn main() -> anyhow::Result<()> {
         origin_read_timeout_ms: config.origin_read_timeout_ms,
         origin_stream_read_timeout_ms: config.origin_stream_read_timeout_ms,
         range_fill_max_bytes: config.range_fill_max_bytes,
+        large_cache_fill_max_bytes: config.large_cache_fill_max_bytes,
+        large_cache_chunk_bytes: config.large_cache_chunk_bytes,
         downstream_keepalive_secs: config.downstream_keepalive_secs,
         downstream_h2_idle_secs: config.downstream_h2_idle_secs,
         downstream_keepalive_requests: config.downstream_keepalive_requests,
@@ -485,6 +487,14 @@ fn check_config(config: &EdgeConfig) -> anyhow::Result<()> {
         config.origin_stream_read_timeout_ms
     );
     println!("range_fill_max_bytes: {}", config.range_fill_max_bytes);
+    println!(
+        "large_cache_fill_max_bytes: {}",
+        config.large_cache_fill_max_bytes
+    );
+    println!(
+        "large_cache_chunk_bytes: {}",
+        config.large_cache_chunk_bytes
+    );
     println!(
         "access_log: {}",
         config.access_log_path.as_deref().unwrap_or("disabled")
