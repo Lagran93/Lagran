@@ -77,6 +77,9 @@ async fn send_webhook(
     if cfg.url.trim().is_empty() {
         return Err("webhook url is required".into());
     }
+    crate::service::net_guard::validate_http_url(cfg.url.trim())
+        .await
+        .map_err(|e| format!("webhook url rejected: {e}"))?;
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -97,19 +100,16 @@ async fn send_webhook(
         signature = format!("sha256={}", hex(tag.as_ref()));
         headers.push(("x-lagran-signature-256", signature.as_str()));
     }
-    let (status, body) = agent_http::post_json_with_headers(&cfg.url, &body, &headers)
+    let (status, _body) = agent_http::post_json_with_headers(&cfg.url, &body, &headers)
         .await
         .map_err(|_| "webhook request failed".to_string())?;
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        Err(format!(
-            "webhook HTTP {status}: {}",
-            String::from_utf8_lossy(&body)
-                .chars()
-                .take(200)
-                .collect::<String>()
-        ))
+        // Never echo the upstream body: `POST /alert-channels/:id/test`
+        // returns this string to the tenant and it used to leak up to 200 bytes
+        // of whatever an internal service answered.
+        Err(format!("webhook HTTP {status}"))
     }
 }
 
@@ -131,6 +131,9 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
     if !base.starts_with("http://") && !base.starts_with("https://") {
         return Err("telegram api_base must start with http:// or https://".into());
     }
+    crate::service::net_guard::validate_http_url(&base)
+        .await
+        .map_err(|e| format!("telegram api_base rejected: {e}"))?;
     let url = format!("{base}/bot{}/sendMessage", cfg.bot_token.trim());
     let text = format!("<b>{}</b>\n{}", html_escape(subject), html_escape(message));
     let body = json!({
@@ -153,6 +156,9 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
         Some(cfg.proxy.trim().to_string())
     };
     if let Some(proxy) = proxy {
+        crate::service::net_guard::validate_proxy_url(&proxy)
+            .await
+            .map_err(|e| format!("telegram proxy rejected: {e}"))?;
         let proxy = reqwest::Proxy::all(&proxy)
             .map_err(|e| format!("invalid telegram proxy: {e}"))?;
         builder = builder.proxy(proxy);
@@ -171,15 +177,11 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
             )
         })?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let _body = response.text().await.unwrap_or_default();
     if status.is_success() {
         Ok(())
     } else {
-        Err(format!(
-            "telegram HTTP {}: {}",
-            status.as_u16(),
-            body.chars().take(300).collect::<String>()
-        ))
+        Err(format!("telegram HTTP {}", status.as_u16()))
     }
 }
 
@@ -189,6 +191,9 @@ async fn send_email(config: &Value, subject: &str, message: &str) -> Result<(), 
     if cfg.smtp_host.trim().is_empty() || cfg.from.trim().is_empty() || cfg.to.is_empty() {
         return Err("email smtp_host, from and to are required".into());
     }
+    crate::service::net_guard::validate_smtp_host(cfg.smtp_host.trim(), cfg.smtp_port)
+        .await
+        .map_err(|e| format!("smtp host rejected: {e}"))?;
     let from: Mailbox = cfg
         .from
         .parse()

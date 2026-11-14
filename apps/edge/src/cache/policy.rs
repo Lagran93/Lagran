@@ -718,10 +718,29 @@ fn decide_storage_with<'a>(
     }
 
     // Explicit rule TTL wins over the origin; otherwise honour the origin.
-    let ttl = match policy.ttl_override {
+    let mut ttl = match policy.ttl_override {
         Some(t) => t,
         None => origin_ttl.unwrap_or(default_ttl_secs),
     };
+    if ttl == 0 {
+        return Err("ttl-zero");
+    }
+    // RFC 9111 §4.2.3: a response's age reduces its remaining freshness. This
+    // used to be ignored, so `max-age=60, Age:59` from an upstream cache was
+    // stored as fresh for another full minute. A skewed `Date` is capped at one
+    // day so a broken origin clock cannot zero every TTL.
+    let origin_age = {
+        let header_age = get("age")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let date_age = get("date")
+            .and_then(|value| httpdate::parse_http_date(value).ok())
+            .and_then(|date| SystemTime::now().duration_since(date).ok())
+            .map(|age| age.as_secs().min(86_400))
+            .unwrap_or(0);
+        header_age.max(date_age)
+    };
+    ttl = ttl.saturating_sub(origin_age);
     if ttl == 0 {
         return Err("ttl-zero");
     }
@@ -1150,7 +1169,15 @@ pub fn compute_etag(entry: &CacheEntry) -> String {
     }
     h ^= entry.status as u64;
     h ^= (body.len() as u64).rotate_left(17);
-    format!("\"{h:016x}\"")
+    // Above the full-hash limit only the head and tail are hashed, which is not
+    // a representation hash. Emit a weak validator so `If-None-Match` can still
+    // match, but `If-Range` (which requires a strong validator) cannot silently
+    // resume a changed object.
+    if body.len() > ETAG_FULL_LIMIT {
+        format!("W/\"{h:016x}\"")
+    } else {
+        format!("\"{h:016x}\"")
+    }
 }
 
 pub fn etag_matches(if_none_match: &str, etag: &str) -> bool {
@@ -1464,6 +1491,33 @@ mod tests {
         let d = decide_storage(200, &hdrs(&[("cache-control", "max-age=60")]), policy, 60).unwrap();
         assert_eq!(d.ttl_secs, lagran_cache::MAX_TTL_SECS);
         assert_eq!(d.swr_secs, lagran_cache::MAX_TTL_SECS);
+    }
+
+    #[test]
+    fn origin_age_reduces_ttl() {
+        let d = decide_storage(
+            200,
+            &hdrs(&[("cache-control", "max-age=60"), ("age", "45")]),
+            ResolvedPolicy::default(),
+            60,
+        )
+        .unwrap();
+        assert_eq!(d.ttl_secs, 15);
+
+        assert!(decide_storage(
+            200,
+            &hdrs(&[("cache-control", "max-age=60"), ("age", "60")]),
+            ResolvedPolicy::default(),
+            60,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn large_computed_etag_is_weak() {
+        let entry = CacheEntry::new(200, vec![], bytes::Bytes::from(vec![7u8; 128 * 1024]));
+        let etag = compute_etag(&entry);
+        assert!(etag.starts_with("W/"), "got {etag}");
     }
 
     #[test]

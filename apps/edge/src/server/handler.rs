@@ -706,6 +706,24 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
         let lookup = state.cache.get_result(&key).await;
         match lookup {
             CacheGetResult::Hit(entry) if !entry_response_bypass(&eff, &entry) => {
+                if !range_preconditions_met(&entry, &headers, if_none_match.as_deref()) {
+                    return serve_cached(
+                        &state,
+                        entry,
+                        CacheStatus::Hit,
+                        &method,
+                        &host,
+                        &path_only,
+                        &client_ip,
+                        &user_agent,
+                        &referer,
+                        &request_id,
+                        if_none_match.as_deref(),
+                        &eff,
+                        start,
+                    )
+                    .await;
+                }
                 return serve_range_entry(
                     &state,
                     entry,
@@ -724,6 +742,24 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                 .await;
             }
             CacheGetResult::Stale(entry) if !entry_response_bypass(&eff, &entry) => {
+                if !range_preconditions_met(&entry, &headers, if_none_match.as_deref()) {
+                    return serve_cached(
+                        &state,
+                        entry,
+                        CacheStatus::Stale,
+                        &method,
+                        &host,
+                        &path_only,
+                        &client_ip,
+                        &user_agent,
+                        &referer,
+                        &request_id,
+                        if_none_match.as_deref(),
+                        &eff,
+                        start,
+                    )
+                    .await;
+                }
                 return serve_range_entry(
                     &state,
                     entry,
@@ -2097,6 +2133,54 @@ enum RangeSpec {
     Suffix(u64),
 }
 
+/// Whether a Range request may be answered from `entry` (RFC 9110 §13.1.5).
+///
+/// `If-None-Match` takes precedence over `Range` (a match means 304) and
+/// `If-Range` requires the cached validator to still match; otherwise the Range
+/// must be ignored and the full representation returned. Without this a
+/// resumed download could splice bytes from a changed object.
+fn range_preconditions_met(
+    entry: &CacheEntry,
+    headers: &HeaderMap,
+    if_none_match: Option<&str>,
+) -> bool {
+    let etag = entry
+        .header("etag")
+        .map(str::to_string)
+        .unwrap_or_else(|| compute_etag(entry));
+    if let Some(inm) = if_none_match {
+        if etag_matches(inm, &etag) {
+            return false;
+        }
+    }
+    let Some(if_range) = headers
+        .get(header::IF_RANGE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    if_range_matches(if_range.trim(), entry, &etag)
+}
+
+fn if_range_matches(value: &str, entry: &CacheEntry, etag: &str) -> bool {
+    if value.starts_with('"') || value.starts_with("W/") {
+        // If-Range requires a strong validator; a weak ETag never matches.
+        if value.starts_with("W/") || etag.starts_with("W/") {
+            return false;
+        }
+        return value == etag;
+    }
+    let (Ok(date), Some(last_modified)) =
+        (httpdate::parse_http_date(value), entry.header("last-modified"))
+    else {
+        return false;
+    };
+    let Ok(last_modified) = httpdate::parse_http_date(last_modified) else {
+        return false;
+    };
+    last_modified <= date
+}
+
 fn parse_range_spec(raw: &str) -> Option<RangeSpec> {
     let value = raw.trim().strip_prefix("bytes=")?;
     if value.contains(',') {
@@ -3341,6 +3425,69 @@ pub(crate) fn https_redirect_response(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    fn range_entry() -> CacheEntry {
+        CacheEntry::new(
+            200,
+            vec![
+                ("etag".into(), "\"abc\"".into()),
+                ("last-modified".into(), "Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            ],
+            Bytes::from_static(b"0123456789"),
+        )
+    }
+
+    fn if_range(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_RANGE, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn range_requires_matching_if_range() {
+        let entry = range_entry();
+        assert!(range_preconditions_met(&entry, &HeaderMap::new(), None));
+        assert!(range_preconditions_met(&entry, &if_range("\"abc\""), None));
+        assert!(!range_preconditions_met(
+            &entry,
+            &if_range("\"different\""),
+            None
+        ));
+        assert!(!range_preconditions_met(&entry, &if_range("W/\"abc\""), None));
+        assert!(range_preconditions_met(
+            &entry,
+            &if_range("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        ));
+        assert!(!range_preconditions_met(
+            &entry,
+            &if_range("Tue, 20 Oct 2015 07:28:00 GMT"),
+            None
+        ));
+    }
+
+    #[test]
+    fn range_yields_to_if_none_match() {
+        let entry = range_entry();
+        assert!(!range_preconditions_met(
+            &entry,
+            &HeaderMap::new(),
+            Some("\"abc\"")
+        ));
+        assert!(range_preconditions_met(
+            &entry,
+            &HeaderMap::new(),
+            Some("\"other\"")
+        ));
+    }
+
+    #[test]
+    fn weak_computed_etag_never_satisfies_if_range() {
+        let entry = CacheEntry::new(200, vec![], Bytes::from(vec![1u8; 100 * 1024]));
+        let etag = compute_etag(&entry);
+        assert!(etag.starts_with("W/"));
+        assert!(!range_preconditions_met(&entry, &if_range(&etag), None));
+    }
 
     #[test]
     fn challenge_only_for_html_document_navigation() {

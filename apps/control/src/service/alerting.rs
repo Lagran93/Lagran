@@ -19,7 +19,7 @@ struct Finding {
     message: String,
 }
 
-pub fn spawn(pool: PgPool, interval_secs: u64, redis: Option<Arc<RedisService>>) {
+pub fn spawn(pool: PgPool, interval_secs: u64, redis: Option<Arc<RedisService>>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_secs.clamp(5, 3600));
         tracing::info!(?interval, "alert evaluator started");
@@ -62,7 +62,7 @@ pub fn spawn(pool: PgPool, interval_secs: u64, redis: Option<Arc<RedisService>>)
                 redis.unlock(lock).await;
             }
         }
-    });
+    })
 }
 
 async fn run_once(pool: &PgPool) -> Result<(), sqlx::Error> {
@@ -128,6 +128,11 @@ async fn evaluate_rule(
                 let _ = repository::mark_alert_notified(pool, event.id).await;
             }
             let _ = repository::touch_alert_rule(pool, rule.id).await;
+        } else {
+            // Suppressed by the cooldown. Mark it as handled, otherwise the
+            // active-event branch notifies it one evaluation later and the
+            // cooldown applies to alternate events only.
+            let _ = repository::mark_alert_notified(pool, event.id).await;
         }
     }
 

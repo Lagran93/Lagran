@@ -561,6 +561,12 @@ pub async fn publish_release(
     }
     let targets: Vec<String> =
         serde_json::from_value(current.target_nodes.clone()).unwrap_or_default();
+    // Both branches claim the release the same way, so a zero-target publish
+    // cannot race another publish or bypass the previous_versions snapshot.
+    let claimed = repository::start_publishing(&state.pool, uid)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| bad_request("release cannot be published"))?;
     let release = if targets.is_empty() {
         repository::set_published_versions(&state.pool, &current.versions)
             .await
@@ -573,10 +579,7 @@ pub async fn publish_release(
             .map_err(|_| db_error())?
             .ok_or_else(|| not_found("release not found"))?
     } else {
-        repository::start_publishing(&state.pool, uid)
-            .await
-            .map_err(|_| db_error())?
-            .ok_or_else(|| bad_request("release cannot be published"))?
+        claimed
     };
     let _ = repository::insert_audit(
         &state.pool,
@@ -602,6 +605,19 @@ pub async fn rollback_release(
         return Err(forbidden());
     }
     let uid = parse_uuid(&id, "release id")?;
+    let current = repository::get_release(&state.pool, uid)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| not_found("release not found"))?;
+    if current.status == "published"
+        && !repository::is_latest_published(&state.pool, uid)
+            .await
+            .map_err(|_| db_error())?
+    {
+        return Err(bad_request(
+            "only the latest published release can be rolled back",
+        ));
+    }
     release_service::rollback(&state, uid, "manual rollback")
         .await
         .map_err(|_| db_error())?;

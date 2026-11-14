@@ -493,7 +493,11 @@ impl CacheBackend for RedisL2Cache {
             status: entry.status,
             headers: entry.headers,
             body: entry.body,
-            stored_at: now,
+            stored_at: if entry.stored_at_epoch_secs == 0 {
+                now
+            } else {
+                entry.stored_at_epoch_secs
+            },
             fresh_until: now.saturating_add(fresh_secs.max(1)),
             stale_until: now
                 .saturating_add(fresh_secs.max(1))

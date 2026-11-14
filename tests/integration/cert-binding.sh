@@ -39,13 +39,16 @@ trap cleanup EXIT
 
 command -v openssl >/dev/null || { echo "openssl required"; exit 1; }
 gen_pair() {
-  local name=$1
-  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$name" \
-    -addext "subjectAltName=DNS:$name" \
-    -keyout "$LOG_DIR/$name.key" -out "$LOG_DIR/$name.crt" >/dev/null 2>&1
+  local label=$1 san=$2
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$san" \
+    -addext "subjectAltName=DNS:$san" \
+    -keyout "$LOG_DIR/$label.key" -out "$LOG_DIR/$label.crt" >/dev/null 2>&1
 }
-gen_pair p1
-gen_pair p2
+# The binding cases upload one certificate under several domains; a wildcard
+# keeps them covered by its SAN while still exercising the authorisation rules.
+gen_pair p1 "*.test"
+gen_pair p2 "*.test"
+gen_pair p3 "other.test"
 
 CONTROL_BIND="127.0.0.1:$CONTROL_PORT" CAPTCHA_ENABLED=false ./target/debug/lagran-control \
   >"$LOG_DIR/control.log" 2>&1 &
@@ -107,6 +110,9 @@ CODE=$(upload "$TOKEN" "$A" "$DOMAIN_B" "$LOG_DIR/p1.crt" "$LOG_DIR/p1.key")
 check "upload returns 201" "$CODE" "201"
 STORED=$(jq -r '.domain_name // empty' "$LOG_DIR/upload.json")
 check "certificate stored under A, not B" "$STORED" "$DOMAIN_A"
+
+CODE=$(upload "$TOKEN" "$A" "$DOMAIN_A" "$LOG_DIR/p3.crt" "$LOG_DIR/p3.key")
+check "certificate for another domain is rejected" "$CODE" "400"
 
 echo "== malformed or mismatched PEM is rejected =="
 CODE=$(upload "$TOKEN" "$A" "$DOMAIN_A" "$LOG_DIR/p1.crt" "$LOG_DIR/p2.key")

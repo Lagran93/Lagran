@@ -592,7 +592,14 @@ impl CacheBackend for MemoryCache {
         entry.stale_until_epoch_secs = now_epoch
             .saturating_add(fresh_secs)
             .saturating_add(swr_secs);
-        entry.stored_at_epoch_secs = now_epoch;
+        // Preserve the age of a promoted entry (disk/L2 → L1). Resetting it to
+        // `now` made a 50-second-old object look brand new, so downstream caches
+        // could keep it for another full max-age.
+        entry.stored_at_epoch_secs = if entry.stored_at_epoch_secs == 0 {
+            now_epoch
+        } else {
+            entry.stored_at_epoch_secs.min(now_epoch)
+        };
         // Account for the replacement atomically per key.
         //
         // The previous code added the new size and subtracted the old one as two
@@ -718,6 +725,22 @@ mod tests {
             other => panic!("expected hit, got {other:?}"),
         }
         assert!(matches!(c.get_result("nope").await, CacheGetResult::Miss));
+    }
+
+    #[tokio::test]
+    async fn promotion_preserves_entry_age() {
+        let c = MemoryCache::new(10);
+        let mut e = entry("a");
+        e.stored_at_epoch_secs = now_epoch_secs().saturating_sub(30);
+        c.set_with_swr("k", e, 60, 0).await;
+        let CacheGetResult::Hit(e) = c.get_result("k").await else {
+            panic!("expected hit");
+        };
+        assert!(
+            e.age_secs() >= 29,
+            "age was reset on store: {}",
+            e.age_secs()
+        );
     }
 
     #[tokio::test]

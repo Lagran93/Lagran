@@ -1777,18 +1777,19 @@ pub async fn list_events(
     }
 
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
-    let rows = repository::list_waf_events(&state.pool, q.domain.as_deref(), limit)
-        .await
-        .map_err(|_| db_error())?;
+    let visible_names = visible.map(|names| names.into_iter().collect::<Vec<_>>());
+    let rows = repository::list_waf_events(
+        &state.pool,
+        q.domain.as_deref(),
+        visible_names,
+        Some(q.action.as_deref().unwrap_or("")),
+        limit,
+    )
+    .await
+    .map_err(|_| db_error())?;
 
-    let action_filter = q.action.as_deref().unwrap_or("").to_ascii_lowercase();
     Ok(Json(
         rows.into_iter()
-            .filter(|r| match &visible {
-                None => true,
-                Some(names) => names.contains(&r.domain),
-            })
-            .filter(|r| action_filter.is_empty() || r.action == action_filter)
             .map(|r| WafEventDto {
                 id: r.id,
                 ts: r.ts.to_rfc3339(),

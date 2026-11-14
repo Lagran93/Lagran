@@ -1,7 +1,7 @@
 //! Auth helpers: password hash + JWT
 
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use uuid::Uuid;
@@ -27,6 +27,12 @@ pub fn normalize_node_ip(raw: &str) -> Option<String> {
     Some(ip.to_string())
 }
 
+/// Issuer/audience bound into every control-plane token. Two deployments that
+/// share a JWT secret (copied env, restored staging dump) must not accept each
+/// other's tokens.
+pub const TOKEN_ISSUER: &str = "lagran-control";
+pub const TOKEN_AUDIENCE: &str = "lagran-console";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub sub: String, // user id
@@ -38,6 +44,10 @@ pub struct Claims {
     /// password change/reset.
     #[serde(default)]
     pub ver: i64,
+    #[serde(default)]
+    pub iss: String,
+    #[serde(default)]
+    pub aud: String,
 }
 
 pub fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
@@ -64,6 +74,8 @@ pub fn issue_token(
         iat: now.timestamp(),
         exp: (now + Duration::hours(expire_hours)).timestamp(),
         ver: token_version,
+        iss: TOKEN_ISSUER.to_string(),
+        aud: TOKEN_AUDIENCE.to_string(),
     };
     encode(
         &Header::default(),
@@ -73,10 +85,14 @@ pub fn issue_token(
 }
 
 pub fn decode_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_issuer(&[TOKEN_ISSUER]);
+    validation.set_audience(&[TOKEN_AUDIENCE]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     let data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
-        &Validation::default(),
+        &validation,
     )?;
     Ok(data.claims)
 }
@@ -92,6 +108,33 @@ mod tests {
         let token = issue_token(id, "u@example.test", "U", "test-secret", 1, 7).unwrap();
         let claims = decode_token(&token, "test-secret").unwrap();
         assert_eq!(claims.ver, 7);
+    }
+
+    #[test]
+    fn token_without_audience_is_rejected() {
+        #[derive(serde::Serialize)]
+        struct LegacyClaims {
+            sub: String,
+            email: String,
+            name: String,
+            exp: i64,
+            iat: i64,
+        }
+        let now = Utc::now().timestamp();
+        let legacy = LegacyClaims {
+            sub: Uuid::nil().to_string(),
+            email: "u@example.test".into(),
+            name: "U".into(),
+            exp: now + 3600,
+            iat: now,
+        };
+        let token = encode(
+            &Header::default(),
+            &legacy,
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap();
+        assert!(decode_token(&token, "test-secret").is_err());
     }
 
     #[test]

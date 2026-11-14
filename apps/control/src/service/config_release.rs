@@ -6,7 +6,7 @@ use crate::state::AppState;
 use std::time::Duration;
 use uuid::Uuid;
 
-pub fn spawn(state: AppState, interval_secs: u64) {
+pub fn spawn(state: AppState, interval_secs: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_secs.clamp(5, 300));
         loop {
@@ -40,7 +40,7 @@ pub fn spawn(state: AppState, interval_secs: u64) {
                 tracing::warn!(error = %e, "config release sweep failed");
             }
         }
-    });
+    })
 }
 
 async fn invalidate_config_cache(state: &AppState, release_id: Uuid) {

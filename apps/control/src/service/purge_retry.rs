@@ -9,7 +9,7 @@ use crate::service::agent_http;
 use sqlx::PgPool;
 use std::time::Duration;
 
-pub fn spawn(pool: PgPool, fallback_token: String) {
+pub fn spawn(pool: PgPool, fallback_token: String) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             if let Err(e) = run_once(&pool, &fallback_token).await {
@@ -17,7 +17,7 @@ pub fn spawn(pool: PgPool, fallback_token: String) {
             }
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
-    });
+    })
 }
 
 async fn run_once(pool: &PgPool, fallback_token: &str) -> Result<(), sqlx::Error> {

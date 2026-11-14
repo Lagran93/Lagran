@@ -413,10 +413,20 @@ async fn check_origin(host: &str, port: u16) -> (bool, String) {
     if host.trim().is_empty() || port == 0 {
         return (false, "源站地址或端口为空".into());
     }
+    // A tenant controls this host/port. Refuse loopback/link-local targets so
+    // diagnosis cannot be used to probe the control host or the cloud metadata
+    // service, and never return the raw OS error (that was a port-scan oracle).
+    if let Err(reason) = crate::service::net_guard::validate_origin_probe(host, port).await {
+        tracing::debug!(%reason, "origin probe rejected");
+        return (false, "源站地址不可探测".into());
+    }
     match tokio::time::timeout(Duration::from_secs(6), TcpStream::connect((host, port))).await {
         Ok(Ok(_)) => (true, format!("TCP 连接 {host}:{port} 成功")),
-        Ok(Err(e)) => (false, format!("TCP 连接 {host}:{port} 失败：{e}")),
-        Err(_) => (false, format!("TCP 连接 {host}:{port} 超时")),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, %host, port, "origin probe failed");
+            (false, "TCP 连接失败".into())
+        }
+        Err(_) => (false, "TCP 连接超时".into()),
     }
 }
 

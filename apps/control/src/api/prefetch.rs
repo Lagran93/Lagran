@@ -67,9 +67,22 @@ pub async fn create(
     if !actor.can_write_domain_name(&state, &req.domain).await {
         return Err(forbidden());
     }
+    // Each path used to become its own INSERT in a serial loop; an unbounded
+    // list could hold a pooled connection for minutes.
+    const MAX_PREFETCH_PATHS: usize = 500;
+    if req.paths.len() > MAX_PREFETCH_PATHS {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorBody {
+                error: format!("at most {MAX_PREFETCH_PATHS} paths per request"),
+            }),
+        ));
+    }
     let headers = normalize_key_headers(req.headers);
+    let mut seen = std::collections::HashSet::new();
+    let paths: Vec<&String> = req.paths.iter().filter(|p| seen.insert((*p).clone())).collect();
     let mut ids = Vec::new();
-    for path in &req.paths {
+    for path in paths {
         let p = if path.starts_with('/') {
             path.clone()
         } else {

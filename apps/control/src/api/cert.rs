@@ -91,7 +91,7 @@ fn bad_request(message: &str) -> (StatusCode, Json<ErrorBody>) {
 /// Parse the uploaded PEM pair and verify the private key belongs to the
 /// certificate. Without this, any `BEGIN ...` blob was accepted as an "active"
 /// certificate and pushed to every edge.
-fn validate_cert_pair(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+fn validate_cert_pair(cert_pem: &str, key_pem: &str) -> Result<Vec<String>, String> {
     use rustls::pki_types::CertificateDer;
 
     let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
@@ -108,9 +108,43 @@ fn validate_cert_pair(cert_pem: &str, key_pem: &str) -> Result<(), String> {
         .key_provider
         .load_private_key(key)
         .map_err(|e| format!("unsupported private key: {e}"))?;
-    rustls::sign::CertifiedKey::new(certs, signing_key)
+    rustls::sign::CertifiedKey::new(certs.clone(), signing_key)
         .keys_match()
-        .map_err(|e| format!("certificate and private key do not match: {e}"))
+        .map_err(|e| format!("certificate and private key do not match: {e}"))?;
+
+    let (_, parsed) = x509_parser::parse_x509_certificate(certs[0].as_ref())
+        .map_err(|e| format!("invalid X.509 certificate: {e}"))?;
+    let mut sans = Vec::new();
+    match parsed.subject_alternative_name() {
+        Ok(Some(extension)) => {
+            for name in &extension.value.general_names {
+                if let x509_parser::prelude::GeneralName::DNSName(dns) = name {
+                    sans.push((*dns).to_string());
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => return Err(format!("invalid subjectAltName: {e}")),
+    }
+    Ok(sans)
+}
+
+/// Whether a certificate's DNS SANs cover `domain` (single-label wildcards).
+fn san_covers_domain(sans: &[String], domain: &str) -> bool {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    sans.iter().any(|san| {
+        let san = san.trim().trim_end_matches('.').to_ascii_lowercase();
+        match san.strip_prefix("*.") {
+            Some(suffix) => {
+                let Some(prefix) = domain.strip_suffix(suffix) else {
+                    return false;
+                };
+                let label = prefix.strip_suffix('.').unwrap_or("");
+                !label.is_empty() && !label.contains('.')
+            }
+            None => san == domain,
+        }
+    })
 }
 
 /// Read access to a certificate follows its domain.
@@ -195,7 +229,12 @@ pub async fn create(
     if cert_pem.is_empty() || key_pem.is_empty() {
         return Err(bad_request("cert_pem and key_pem are required"));
     }
-    validate_cert_pair(cert_pem, key_pem).map_err(|e| bad_request(&e))?;
+    let sans = validate_cert_pair(cert_pem, key_pem).map_err(|e| bad_request(&e))?;
+    if !san_covers_domain(&sans, &domain.name) {
+        return Err(bad_request(
+            "certificate subjectAltName does not cover this domain",
+        ));
+    }
 
     let row = repository::create_cert(
         &state.pool,
@@ -425,7 +464,18 @@ mod tests {
     #[test]
     fn valid_certificate_key_pair_is_accepted() {
         let (cert, key) = self_signed();
-        validate_cert_pair(&cert, &key).expect("generated pair must validate");
+        let sans = validate_cert_pair(&cert, &key).expect("generated pair must validate");
+        assert!(sans.iter().any(|name| name == "example.test"));
+    }
+
+    #[test]
+    fn subject_alt_name_matching_handles_wildcards() {
+        let wildcard = vec!["*.example.test".to_string()];
+        assert!(super::san_covers_domain(&wildcard, "a.example.test"));
+        assert!(!super::san_covers_domain(&wildcard, "example.test"));
+        assert!(!super::san_covers_domain(&wildcard, "a.b.example.test"));
+        let exact = vec!["Example.Test".to_string()];
+        assert!(super::san_covers_domain(&exact, "example.test"));
     }
 
     #[test]

@@ -5,8 +5,7 @@ use crate::middleware::authz::Actor;
 use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize)]
@@ -179,14 +178,12 @@ pub async fn test(
     let subnet = req.ip.as_deref().and_then(parse_subnet);
     let query = build_query(name, subnet);
     let started = Instant::now();
-    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| {
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
     })?;
-    sock.set_read_timeout(Some(Duration::from_millis(1500)))
-        .ok();
     let addr: SocketAddr = match server.parse() {
         Ok(a) => a,
         Err(_) => {
@@ -210,25 +207,30 @@ pub async fn test(
             }
         }
     };
-    sock.send_to(&query, addr).map_err(|e| {
+    sock.send_to(&query, addr).await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
     })?;
     let mut buf = [0u8; 4096];
-    let (rcode, truncated, answers) = match sock.recv_from(&mut buf) {
-        Ok((n, _)) => parse_response(&buf[..n]),
-        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-            return Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({ "error": "DNS query timeout" })),
-            ))
-        }
-        Err(e) => {
+    let (rcode, truncated, answers) = match tokio::time::timeout(
+        Duration::from_millis(1500),
+        sock.recv_from(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok((n, _))) => parse_response(&buf[..n]),
+        Ok(Err(e)) => {
             return Err((
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": e.to_string() })),
+            ))
+        }
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({ "error": "DNS query timeout" })),
             ))
         }
     };

@@ -27,6 +27,7 @@ pub struct RedisService {
     conn: ConnectionManager,
 }
 
+#[derive(Clone)]
 pub struct LockToken {
     pub key: String,
     pub token: String,
@@ -168,6 +169,33 @@ impl RedisService {
             Ok(None) => Ok(None),
             Err(_) => Err(()),
         }
+    }
+
+    /// Extend a held lock when it still belongs to us. A long prefetch round
+    /// used to outlive the 120 s lock, letting a second replica start a parallel
+    /// round against the same tasks.
+    pub async fn renew_lock(&self, lock: &LockToken, ttl: Duration) -> bool {
+        let script = Script::new(
+            r#"
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+            end
+            return 0
+            "#,
+        );
+        let mut conn = self.conn().await;
+        matches!(
+            tokio::time::timeout(
+                OP_TIMEOUT,
+                script
+                    .key(&lock.key)
+                    .arg(&lock.token)
+                    .arg(ttl.as_millis() as u64)
+                    .invoke_async::<i64>(&mut conn),
+            )
+            .await,
+            Ok(Ok(1))
+        )
     }
 
     pub async fn unlock(&self, lock: &LockToken) {

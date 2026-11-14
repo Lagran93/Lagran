@@ -1482,6 +1482,19 @@ pub async fn get_cert_by_domain(pool: &PgPool, domain_name: &str) -> sqlx::Resul
     .await
 }
 
+/// Parse the certificate's real validity window (first certificate in the PEM).
+fn parse_cert_validity(cert_pem: &str) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let der = certs.first()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(der.as_ref()).ok()?;
+    let validity = parsed.validity();
+    let start = chrono::DateTime::<Utc>::from_timestamp(validity.not_before.timestamp(), 0)?;
+    let end = chrono::DateTime::<Utc>::from_timestamp(validity.not_after.timestamp(), 0)?;
+    Some((start, end))
+}
+
 pub async fn create_cert(
     pool: &PgPool,
     domain_id: Option<Uuid>,
@@ -1492,22 +1505,24 @@ pub async fn create_cert(
     auto_renew: bool,
 ) -> sqlx::Result<CertRow> {
     // Simple expiry parse: if PEM looks present mark active for 90 days
-    let status = if cert_pem.contains("BEGIN CERTIFICATE") && key_pem.contains("BEGIN") {
+    // Real validity comes from the certificate itself. A fabricated now+90d
+    // made the console and expiry alerts report a date that had nothing to do
+    // with the certificate.
+    let validity = if cert_pem.contains("BEGIN CERTIFICATE") && key_pem.contains("BEGIN") {
+        parse_cert_validity(cert_pem)
+    } else {
+        None
+    };
+    let status = if validity.is_some() {
         "active"
     } else if cert_pem.is_empty() {
         "pending"
     } else {
         "error"
     };
-    let not_after = if status == "active" {
-        Some(Utc::now() + chrono::Duration::days(90))
-    } else {
-        None
-    };
-    let not_before = if status == "active" {
-        Some(Utc::now())
-    } else {
-        None
+    let (not_before, not_after) = match validity {
+        Some((start, end)) => (Some(start), Some(end)),
+        None => (None, None),
     };
 
     // Serialise "replace the active certificate" per domain. Two concurrent
@@ -3455,32 +3470,51 @@ pub async fn insert_waf_events_batch(pool: &PgPool, events: &[WafEventInput]) ->
 pub async fn list_waf_events(
     pool: &PgPool,
     domain: Option<&str>,
+    visible_domains: Option<Vec<String>>,
+    action: Option<&str>,
     limit: i64,
 ) -> sqlx::Result<Vec<WafEventRow>> {
-    if let Some(domain) = domain.filter(|d| !d.is_empty()) {
-        sqlx::query_as::<_, WafEventRow>(
-            r#"
-            SELECT id, ts, domain, node_id, client_ip, method, path, action, category, rule_name, mode
-            FROM waf_events WHERE domain = $1
-            ORDER BY ts DESC LIMIT $2
-            "#,
+    // Visibility filtering must happen before LIMIT. Filtering the newest 500
+    // rows in Rust let one noisy tenant fill the page and hid a smaller
+    // tenant's own events entirely.
+    sqlx::query_as::<_, WafEventRow>(
+        r#"
+        SELECT id, ts, domain, node_id, client_ip, method, path, action, category, rule_name, mode
+        FROM waf_events
+        WHERE ($1::text IS NULL OR domain = $1)
+          AND ($2::text[] IS NULL OR domain = ANY($2))
+          AND ($3::text IS NULL OR action = $3)
+        ORDER BY ts DESC LIMIT $4
+        "#,
+    )
+    .bind(domain.filter(|d| !d.is_empty()))
+    .bind(visible_domains)
+    .bind(action.filter(|a| !a.is_empty()))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Whether this published release is still the newest one.
+///
+/// Rolling back an older release would restore a `previous_versions` snapshot
+/// that predates everything published since, silently undoing newer changes.
+pub async fn is_latest_published(pool: &PgPool, id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT NOT EXISTS (
+            SELECT 1
+            FROM config_releases newer
+            JOIN config_releases current ON current.id = $1
+            WHERE newer.status = 'published'
+              AND newer.id <> $1
+              AND newer.published_at > current.published_at
         )
-        .bind(domain)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-    } else {
-        sqlx::query_as::<_, WafEventRow>(
-            r#"
-            SELECT id, ts, domain, node_id, client_ip, method, path, action, category, rule_name, mode
-            FROM waf_events
-            ORDER BY ts DESC LIMIT $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-    }
+        "#,
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
 }
 
 /// Aggregated WAF events for the dashboard.

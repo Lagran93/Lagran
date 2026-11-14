@@ -23,7 +23,7 @@ struct EdgePrefetchReply {
     message: String,
 }
 
-pub fn spawn(state: AppState, interval_secs: u64) {
+pub fn spawn(state: AppState, interval_secs: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_secs.clamp(5, 3600));
         tracing::info!(?interval, "prefetch worker started");
@@ -48,8 +48,28 @@ pub fn spawn(state: AppState, interval_secs: u64) {
                         continue;
                     }
                 };
+                // Keep the lock alive for the whole round; a queue of slow
+                // origins easily exceeds the initial 120 s.
+                let renewer = lock.as_ref().map(|lock| {
+                    let redis = redis.clone();
+                    let lock = lock.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(45)).await;
+                            if !redis
+                                .renew_lock(&lock, Duration::from_secs(120))
+                                .await
+                            {
+                                break;
+                            }
+                        }
+                    })
+                });
                 if let Err(e) = run_once(&state).await {
                     tracing::warn!(error = %e, "prefetch worker failed");
+                }
+                if let Some(renewer) = renewer {
+                    renewer.abort();
                 }
                 if let Some(lock) = lock.as_ref() {
                     redis.unlock(lock).await;
@@ -58,7 +78,7 @@ pub fn spawn(state: AppState, interval_secs: u64) {
                 tracing::warn!(error = %e, "prefetch worker failed");
             }
         }
-    });
+    })
 }
 
 async fn run_once(state: &AppState) -> Result<(), sqlx::Error> {
@@ -99,8 +119,28 @@ async fn run_once(state: &AppState) -> Result<(), sqlx::Error> {
         }
         return Ok(());
     }
+    // Dispatch a few tasks at a time instead of strictly serially. One slow
+    // origin used to delay every other tenant's warm-up by up to its 300 s
+    // timeout; four in flight keeps the round bounded without hammering edges.
+    const CONCURRENCY: usize = 4;
+    let nodes = std::sync::Arc::new(nodes);
+    let mut set = tokio::task::JoinSet::new();
     for task in tasks {
-        process_task(state, &task, &nodes).await;
+        while set.len() >= CONCURRENCY {
+            if let Some(Err(e)) = set.join_next().await {
+                tracing::warn!(error = %e, "prefetch task panicked");
+            }
+        }
+        let state = state.clone();
+        let nodes = nodes.clone();
+        set.spawn(async move {
+            process_task(&state, &task, nodes.as_slice()).await;
+        });
+    }
+    while let Some(result) = set.join_next().await {
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "prefetch task panicked");
+        }
     }
     Ok(())
 }

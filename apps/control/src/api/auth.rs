@@ -253,12 +253,26 @@ pub async fn login(
         return Err(err);
     }
 
+    // Two buckets: the account (20 failures/min) and the client IP
+    // (60/min). Per-email locking alone let anyone lock a victim out of their
+    // own account from anywhere; per-IP alone let a sprayer try unlimited
+    // accounts. Only *failed* credentials are counted, so a successful login
+    // never consumes budget and clears the account bucket.
     let limit_key = format!("login:{email}");
-    if !state
+    let ip_limit_key = format!("login-ip:{client_ip}");
+    let allowed = state
         .login_limiter
-        .check_shared(state.redis.as_deref(), &limit_key)
+        .peek_shared(state.redis.as_deref(), &limit_key, 20)
         .await
-    {
+        && state
+            .login_limiter
+            .peek_shared(
+                state.redis.as_deref(),
+                &ip_limit_key,
+                crate::middleware::login_limit::LOGIN_IP_LIMIT,
+            )
+            .await;
+    if !allowed {
         record_login(
             &state,
             &email,
@@ -290,6 +304,14 @@ pub async fn login(
                 "invalid_credentials",
             )
             .await;
+            state
+                .login_limiter
+                .record_failure_shared(state.redis.as_deref(), &limit_key)
+                .await;
+            state
+                .login_limiter
+                .record_failure_shared(state.redis.as_deref(), &ip_limit_key)
+                .await;
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorBody {
@@ -330,6 +352,14 @@ pub async fn login(
             "invalid_password",
         )
         .await;
+        state
+            .login_limiter
+            .record_failure_shared(state.redis.as_deref(), &limit_key)
+            .await;
+        state
+            .login_limiter
+            .record_failure_shared(state.redis.as_deref(), &ip_limit_key)
+            .await;
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorBody {
@@ -386,6 +416,13 @@ pub async fn login(
         }
     };
 
+    // A correct password clears the account's failure window. The IP bucket is
+    // intentionally left alone: one successful login must not wipe the evidence
+    // of a sprayer sharing the same address.
+    state
+        .login_limiter
+        .clear_shared(state.redis.as_deref(), &limit_key)
+        .await;
     record_login(
         &state,
         &email,

@@ -367,7 +367,11 @@ impl CacheBackend for DiskCache {
             headers: entry.headers.clone(),
             fresh_until: now.saturating_add(fresh),
             stale_until: now.saturating_add(fresh).saturating_add(swr_secs),
-            stored_at: entry.stored_at_epoch_secs.max(now),
+            stored_at: if entry.stored_at_epoch_secs == 0 {
+                now
+            } else {
+                entry.stored_at_epoch_secs
+            },
         };
         let meta_bytes = match serde_json::to_vec(&meta) {
             Ok(b) => b,

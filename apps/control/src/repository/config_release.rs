@@ -261,11 +261,27 @@ pub async fn approve_release(
 }
 
 pub async fn start_publishing(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<ConfigReleaseRow>> {
+    // Two things happen in this one statement, on purpose:
+    //  * the `NOT EXISTS` claim closes the check-then-act race in the API, so
+    //    two concurrent publishes cannot both start;
+    //  * `previous_versions` is captured here rather than at creation time, so a
+    //    later rollback restores what was actually live when this release went
+    //    out instead of a stale snapshot from days earlier.
     sqlx::query_as::<_, ConfigReleaseRow>(
         r#"
         UPDATE config_releases SET
-            status = 'publishing', published_at = NOW()
+            status = 'publishing',
+            published_at = NOW(),
+            previous_versions = COALESCE((
+                SELECT jsonb_object_agg(d.name, to_jsonb(d.published_version_id))
+                FROM domains d
+                WHERE d.name IN (
+                    SELECT jsonb_object_keys(v.versions)
+                    FROM config_releases v WHERE v.id = $1
+                )
+            ), '{}'::jsonb)
         WHERE id = $1 AND status = 'approved'
+          AND NOT EXISTS (SELECT 1 FROM config_releases WHERE status = 'publishing')
         RETURNING id, status, versions, previous_versions, target_nodes, target_domains,
                   note, created_by, approved_by, error, created_at,
                   approved_at, published_at, finished_at
@@ -287,6 +303,10 @@ pub async fn finish_release(
         UPDATE config_releases SET
             status = $2, error = $3, finished_at = NOW()
         WHERE id = $1
+          -- Terminal state must not be overwritten by a late sweep or a second
+          -- report. A manual rollback of an already-published release is the
+          -- only published -> rolled_back transition allowed.
+          AND (status = 'publishing' OR (status = 'published' AND $2 = 'rolled_back'))
         "#,
     )
     .bind(id)

@@ -107,8 +107,10 @@ async fn main() -> anyhow::Result<()> {
 
     {
         let pool = pool.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        control::service::supervisor::supervise_handle("stale-nodes", move || {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 // `Delay`, not the default `Burst`: a tick that overran (a slow
                 // query, a stalled connection) must not be followed by an immediate
                 // catch-up run. `purge_old_telemetry` below would otherwise run
@@ -122,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
                     _ => {}
                 }
             }
+            })
         });
     }
 
@@ -129,8 +132,10 @@ async fn main() -> anyhow::Result<()> {
     if config.log_retention_days > 0 {
         let pool = pool.clone();
         let days = config.log_retention_days;
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        control::service::supervisor::supervise_handle("telemetry-retention", move || {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
@@ -154,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
                     _ => {}
                 }
             }
+            })
         });
     }
 
@@ -176,17 +182,32 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let state = AppState::new(pool, config, redis);
-    control::service::alerting::spawn(
-        state.pool.clone(),
-        alert_eval_secs,
-        state.redis.clone(),
-    );
-    control::service::prefetch::spawn(state.clone(), 15);
-    control::service::config_release::spawn(state.clone(), 10);
-    control::service::purge_retry::spawn(
-        state.pool.clone(),
-        state.config.agent_token.clone(),
-    );
+    {
+        let pool = state.pool.clone();
+        let redis = state.redis.clone();
+        control::service::supervisor::supervise_handle("alerting", move || {
+            control::service::alerting::spawn(pool.clone(), alert_eval_secs, redis.clone())
+        });
+    }
+    {
+        let state = state.clone();
+        control::service::supervisor::supervise_handle("prefetch", move || {
+            control::service::prefetch::spawn(state.clone(), 15)
+        });
+    }
+    {
+        let state = state.clone();
+        control::service::supervisor::supervise_handle("config-release", move || {
+            control::service::config_release::spawn(state.clone(), 10)
+        });
+    }
+    {
+        let pool = state.pool.clone();
+        let token = state.config.agent_token.clone();
+        control::service::supervisor::supervise_handle("purge-retry", move || {
+            control::service::purge_retry::spawn(pool.clone(), token.clone())
+        });
+    }
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -196,8 +217,10 @@ async fn main() -> anyhow::Result<()> {
 
     {
         let state = state.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        control::service::supervisor::supervise_handle("acme-renewal", move || {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
                 // ACME renewal: a burst here could fire two orders for the same
                 // certificate.
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -208,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!(renewed, "Let's Encrypt auto-renewal completed");
                 }
             }
+            })
         });
     }
 

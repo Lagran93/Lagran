@@ -84,18 +84,29 @@ pub struct AccessLogDto {
 /// Keeping this pure lets the ingest boundary have a regression test without a
 /// database: hostless rows are exactly what produced unattributed `—` entries
 /// in the console.
-fn partition_domain_rows(entries: Vec<AccessEntryIn>) -> (Vec<AccessLogInsertRow>, usize) {
+fn partition_domain_rows(
+    entries: Vec<AccessEntryIn>,
+    node_name: &str,
+) -> (Vec<AccessLogInsertRow>, usize, usize) {
     let mut rows = Vec::new();
     let mut rejected = 0usize;
+    let mut bad_ts = 0usize;
+    let now = chrono::Utc::now();
     for e in entries {
         let host = e.host.unwrap_or_default();
         if host.trim().is_empty() {
             rejected += 1;
             continue;
         }
+        let Some(ts) = normalize_ts(e.ts.as_deref(), now) else {
+            bad_ts += 1;
+            continue;
+        };
         rows.push((
-            e.ts.unwrap_or_default(),
-            e.node_id.unwrap_or_default(),
+            ts,
+            // Attribution comes from the authenticated token, not the payload:
+            // one agent must not be able to write entries for another node.
+            node_name.to_string(),
             e.client_ip.unwrap_or_default(),
             e.method.unwrap_or_default(),
             host,
@@ -109,21 +120,42 @@ fn partition_domain_rows(entries: Vec<AccessEntryIn>) -> (Vec<AccessLogInsertRow
             e.referer.unwrap_or_default(),
         ));
     }
-    (rows, rejected)
+    (rows, rejected, bad_ts)
+}
+
+/// Validate and clamp an agent-supplied timestamp. Bad values are dropped
+/// instead of failing the whole batch inside Postgres (one bad row used to
+/// reject every log from that node, forever, because the agent requeued it).
+fn normalize_ts(raw: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    let raw = raw.unwrap_or("").trim();
+    let parsed = if raw.is_empty() {
+        now
+    } else if let Ok(value) = chrono::DateTime::parse_from_rfc3339(raw) {
+        value.with_timezone(&chrono::Utc)
+    } else if let Ok(secs) = raw.parse::<i64>() {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)?
+    } else {
+        return None;
+    };
+    let max_ahead = now + chrono::Duration::minutes(5);
+    let min_behind = now - chrono::Duration::days(1);
+    let clamped = parsed.clamp(min_behind, max_ahead);
+    Some(clamped.to_rfc3339())
 }
 
 pub async fn report(
     State(state): State<AppState>,
-    _agent: AgentAuth,
+    agent: AgentAuth,
     Json(body): Json<ReportBody>,
 ) -> Json<ReportAck> {
-    let (rows, rejected) = partition_domain_rows(body.entries);
+    let (rows, rejected, bad_ts) = partition_domain_rows(body.entries, &agent.node_name);
     let n = rows.len();
-    if rejected > 0 {
+    if rejected > 0 || bad_ts > 0 {
         tracing::warn!(
             rejected,
+            bad_ts,
             accepted = n,
-            "access-log report contained hostless entries; dropped"
+            "access-log report contained invalid entries; dropped"
         );
     }
     if let Err(e) = repository::insert_access_logs_batch(&state.pool, &rows).await {
@@ -229,9 +261,11 @@ mod tests {
             entry(Some("  "), "/mailjet.env"),
             entry(Some("cdn.example.com"), "/asset.js"),
         ];
-        let (rows, rejected) = partition_domain_rows(entries);
+        let (rows, rejected, bad_ts) = partition_domain_rows(entries, "edge-1");
         assert_eq!(rejected, 2);
+        assert_eq!(bad_ts, 0);
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "edge-1");
         assert_eq!(rows[0].4, "cdn.example.com");
         assert_eq!(rows[0].5, "/asset.js");
     }
