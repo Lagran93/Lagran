@@ -1,8 +1,8 @@
 //! Per-domain edge request counters
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
 struct Counters {
@@ -29,6 +29,11 @@ pub struct EdgeMetrics {
     downstream_cancels: AtomicU64,
     datapath_pingora: AtomicU64,
     datapath_legacy: AtomicU64,
+    chunk_requests: AtomicU64,
+    chunk_origin_runs: AtomicU64,
+    chunk_fallbacks: AtomicU64,
+    chunk_fill_drops: AtomicU64,
+    chunk_fill_dropped_bytes: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,6 +46,11 @@ pub struct GlobalSnapshot {
     pub downstream_cancels: u64,
     pub datapath_pingora: u64,
     pub datapath_legacy: u64,
+    pub chunk_requests: u64,
+    pub chunk_origin_runs: u64,
+    pub chunk_fallbacks: u64,
+    pub chunk_fill_drops: u64,
+    pub chunk_fill_dropped_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +151,29 @@ impl EdgeMetrics {
         self.datapath_legacy.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_chunk_request(&self) {
+        self.chunk_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_chunk_origin_runs(&self, runs: u64) {
+        self.chunk_origin_runs.fetch_add(runs, Ordering::Relaxed);
+    }
+
+    /// A fragmented cache exceeded the per-request origin-run budget and fell
+    /// back to the initial range path.
+    pub fn record_chunk_fallback(&self) {
+        self.chunk_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bytes discarded because the per-fill queue or process-wide fill budget
+    /// was full. The client response is unaffected; the cache simply keeps the
+    /// already committed prefix/chunks.
+    pub fn record_chunk_fill_drop(&self, bytes: u64) {
+        self.chunk_fill_drops.fetch_add(1, Ordering::Relaxed);
+        self.chunk_fill_dropped_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub fn global_snapshot(&self) -> GlobalSnapshot {
         GlobalSnapshot {
             origin_timeouts: self.origin_timeouts.load(Ordering::Relaxed),
@@ -151,6 +184,11 @@ impl EdgeMetrics {
             downstream_cancels: self.downstream_cancels.load(Ordering::Relaxed),
             datapath_pingora: self.datapath_pingora.load(Ordering::Relaxed),
             datapath_legacy: self.datapath_legacy.load(Ordering::Relaxed),
+            chunk_requests: self.chunk_requests.load(Ordering::Relaxed),
+            chunk_origin_runs: self.chunk_origin_runs.load(Ordering::Relaxed),
+            chunk_fallbacks: self.chunk_fallbacks.load(Ordering::Relaxed),
+            chunk_fill_drops: self.chunk_fill_drops.load(Ordering::Relaxed),
+            chunk_fill_dropped_bytes: self.chunk_fill_dropped_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -320,6 +358,16 @@ mod tests {
     }
 
     /// Fully reported domains drop out of the map, as `take_snapshots` did.
+    #[test]
+    fn chunk_fill_drop_counters_accumulate() {
+        let metrics = EdgeMetrics::default();
+        metrics.record_chunk_fill_drop(1024);
+        metrics.record_chunk_fill_drop(2048);
+        let snapshot = metrics.global_snapshot();
+        assert_eq!(snapshot.chunk_fill_drops, 2);
+        assert_eq!(snapshot.chunk_fill_dropped_bytes, 3072);
+    }
+
     #[test]
     fn subtract_reported_drops_empty_buckets() {
         let m = EdgeMetrics::default();

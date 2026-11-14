@@ -1839,6 +1839,17 @@ LARGE_CACHE_CHUNK_BYTES=1048576
 
 同一对象同一时间只允许一个填充 writer；其他请求读取已提交分片，缺失分片回源但不重复写盘。
 
+生产加固：
+
+- 每个 fill 队列上限 128 MiB，进程全局 chunk fill 队列上限 256 MiB；超过时丢弃后续写盘，客户端响应不受影响。
+- 分片 writer 在开始前先做磁盘字节预留：used_bytes（已提交 + 活跃预留）<= LARGE_CACHE_MAX_BYTES 是硬上限；空间不足时先驱逐，仍不足则放弃填充而不是超限写入。
+- 一个请求最多处理 16 个不连续的缺失分片区间；超过时回退首次 Range 填充路径，避免请求变成几十/上百个源站连接。
+- 正在写入或读取的对象会被 pin 住，LRU 驱逐会跳过它，避免 data/meta 被删后 writer 又提交半个对象。
+- 手动分片回源按 origin 健康度/优先级/权重依次 failover；网络错误、超时、非 206 会尝试下一个源站，ETag/Content-Range/编码不匹配也不会盲目拼接。
+- 首次后缀 Range（`bytes=-N`）先用 HEAD 探测对象总长度，再把后缀起点换算成普通 Range 进入分片路径；源站不支持 HEAD 时用 `bytes=0-0` 探测。
+- 分片写入只提交完整分片；客户端中断时正在写的半个分片丢弃。
+- 监控项：lagran_edge_chunk_requests_total、lagran_edge_chunk_origin_runs_total、lagran_edge_chunk_fallbacks_total、lagran_edge_chunk_fill_drops_total、lagran_edge_chunk_fill_dropped_bytes_total。
+
 ### 5.9 视频 Range 与 504 优化
 
 播放器常见的：
@@ -1949,7 +1960,7 @@ X-Lagran-Cache-Reason: range-large-cache
 - 源站返回 200、ETag/Content-Range 不匹配时删除旧段并回退普通回源；
 - 源站非 identity `Content-Encoding` 时不拼接；
 - 多段 Range（`bytes=0-1,4-5`）仍不拼接，按普通请求处理；
-- 首次后缀 Range 需要先知道对象总长度，会先走普通 Range 路径，后续请求再按分片补齐。
+- 首次后缀 Range 会先做一次 HEAD（或 `bytes=0-0`）探测总长度，然后按分片填充。
 
 ### 5.9.1 回源超时体系
 

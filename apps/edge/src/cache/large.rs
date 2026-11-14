@@ -8,7 +8,7 @@
 
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -208,6 +208,63 @@ impl LargeEntry {
     }
 }
 
+/// Process-wide cap on bytes buffered between the client/origin path and the
+/// background disk writers. Each fill has its own 128 MiB queue; this stops
+/// many concurrent ranges from multiplying that queue into an OOM.
+pub struct FillBudget {
+    used: AtomicU64,
+    max: u64,
+}
+
+/// Headroom for the sidecar JSON when a writer reserves its body range.
+/// Pruned origin headers are normally far smaller, but this keeps the hard cap
+/// from being exceeded by metadata on the common paths.
+const RESERVATION_SLACK: u64 = 64 * 1024;
+
+impl FillBudget {
+    const DEFAULT_MAX: u64 = 256 * 1024 * 1024;
+
+    fn new() -> Self {
+        Self {
+            used: AtomicU64::new(0),
+            max: Self::DEFAULT_MAX,
+        }
+    }
+
+    pub(crate) fn reserve(&self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(bytes);
+            if next > self.max {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn release(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+}
+
 pub struct LargeWriter {
     cache: Arc<LargeCache>,
     meta: LargeMeta,
@@ -219,10 +276,18 @@ pub struct LargeWriter {
     failed: bool,
     fresh_secs: u64,
     swr_secs: u64,
+    reserved: u64,
     _range_guard: OwnedMutexGuard<()>,
 }
 
 impl LargeWriter {
+    fn release_reservation(&mut self) {
+        if self.reserved > 0 {
+            self.cache.release_reserved(self.reserved);
+            self.reserved = 0;
+        }
+    }
+
     pub fn content_length(&self) -> u64 {
         self.meta.content_length
     }
@@ -297,12 +362,16 @@ impl LargeWriter {
         } else {
             self.cache.entries.fetch_add(1, Ordering::Relaxed);
         }
+        // See RangeWriter::finish: count the real bytes first, then release the
+        // reservation, so a concurrent admission cannot overbook the gap.
+        self.release_reservation();
         self.cache.evict_overflow().await;
         true
     }
 
     async fn abort(&mut self) {
         let _ = fs::remove_file(&self.temp_path).await;
+        self.release_reservation();
     }
 }
 
@@ -311,6 +380,8 @@ impl Drop for LargeWriter {
         // Remove an uncommitted temp file if the cache write is cancelled by a
         // client disconnect or an upstream error.
         let _ = std::fs::remove_file(&self.temp_path);
+        self.release_reservation();
+        self.cache.unpin(&self.meta.key);
     }
 }
 
@@ -329,15 +400,28 @@ pub struct RangeWriter {
     new_entry: bool,
     committed: bool,
     start_stored: u64,
+    start_meta_len: u64,
     fresh_secs: u64,
     swr_secs: u64,
     /// Zero for byte-precise legacy fills; non-zero commits only whole chunks
     /// after a disconnect.
     chunk_bytes: u64,
+    reserved: u64,
     _range_guard: OwnedMutexGuard<()>,
 }
 
 impl RangeWriter {
+    fn release_reservation(&mut self) {
+        if self.reserved > 0 {
+            self.cache.release_reserved(self.reserved);
+            self.reserved = 0;
+        }
+    }
+
+    pub(crate) fn fill_budget(&self) -> Arc<FillBudget> {
+        self.cache.fill_budget()
+    }
+
     pub async fn write_all(&mut self, data: &[u8]) {
         if self.written + data.len() as u64 > self.end - self.start + 1 {
             return;
@@ -409,8 +493,12 @@ impl RangeWriter {
             .meta
             .covers(0, self.meta.content_length.saturating_sub(1));
         let committed_at = now_unix();
-        self.meta.fresh_until = committed_at + self.fresh_secs.max(1);
-        self.meta.stale_until = self.meta.fresh_until + self.swr_secs;
+        // A partial fill must not keep extending the whole object's freshness.
+        // Keep the earliest freshness deadline; a revalidation (304) updates it
+        // explicitly through refresh_meta.
+        let proposed = committed_at.saturating_add(self.fresh_secs.max(1));
+        self.meta.fresh_until = self.meta.fresh_until.min(proposed);
+        self.meta.stale_until = self.meta.fresh_until.saturating_add(self.swr_secs);
         self.meta.stored_at = committed_at;
         let Ok(meta_bytes) = serde_json::to_vec(&self.meta) else {
             self.abort().await;
@@ -421,22 +509,29 @@ impl RangeWriter {
             return false;
         }
         let stored = self.meta.stored_bytes();
-        if self.new_entry {
+        let old_total = self.start_stored.saturating_add(self.start_meta_len);
+        let new_total = stored.saturating_add(meta_bytes.len() as u64);
+        if new_total > old_total {
             self.cache
                 .used_bytes
-                .fetch_add(stored + meta_bytes.len() as u64, Ordering::Relaxed);
-            self.cache.entries.fetch_add(1, Ordering::Relaxed);
-        } else if stored > self.start_stored {
-            self.cache
-                .used_bytes
-                .fetch_add(stored - self.start_stored, Ordering::Relaxed);
+                .fetch_add(new_total - old_total, Ordering::Relaxed);
+        } else if old_total > new_total {
+            self.cache.release_bytes(old_total - new_total);
         }
+        if self.new_entry {
+            self.cache.entries.fetch_add(1, Ordering::Relaxed);
+        }
+        // Add the committed bytes before releasing the reservation. The other
+        // order leaves a window where another fill can claim the freed space
+        // before this writer's bytes are counted.
+        self.release_reservation();
         self.committed = true;
         self.cache.evict_overflow().await;
         true
     }
 
     async fn abort(&mut self) {
+        self.release_reservation();
         if self.new_entry {
             let _ = fs::remove_file(&self.data_path).await;
             let _ = fs::remove_file(&self.meta_path).await;
@@ -446,10 +541,12 @@ impl RangeWriter {
 
 impl Drop for RangeWriter {
     fn drop(&mut self) {
+        self.release_reservation();
         if self.new_entry && !self.committed {
             let _ = std::fs::remove_file(&self.data_path);
             let _ = std::fs::remove_file(&self.meta_path);
         }
+        self.cache.unpin(&self.meta.key);
     }
 }
 
@@ -458,6 +555,8 @@ pub struct LargeCache {
     min_object_bytes: u64,
     max_object_bytes: u64,
     max_bytes: u64,
+    /// Committed bytes plus bytes reserved by active writers. Reservations are
+    /// added here atomically, so concurrent fills cannot overshoot `max_bytes`.
     used_bytes: AtomicU64,
     entries: AtomicUsize,
     evict_lock: Mutex<()>,
@@ -466,6 +565,11 @@ pub struct LargeCache {
     /// One active range writer per object. A second request on the same key
     /// streams from origin normally instead of racing the sparse file/meta.
     range_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Objects with an active writer are pinned from eviction. Deleting the
+    /// data/meta pair while a writer still owns the file would let the writer
+    /// recreate a sidecar without its body (or vice versa).
+    active: std::sync::Mutex<HashSet<String>>,
+    fill_budget: Arc<FillBudget>,
 }
 
 impl LargeCache {
@@ -504,6 +608,8 @@ impl LargeCache {
             evict_lock: Mutex::new(()),
             evict_cursor: AtomicUsize::new(0),
             range_locks: Mutex::new(HashMap::new()),
+            active: std::sync::Mutex::new(HashSet::new()),
+            fill_budget: Arc::new(FillBudget::new()),
         }))
     }
 
@@ -529,6 +635,29 @@ impl LargeCache {
         self.max_object_bytes
     }
 
+    pub(crate) fn fill_budget(&self) -> Arc<FillBudget> {
+        self.fill_budget.clone()
+    }
+
+    fn pin(&self, key: &str) {
+        if let Ok(mut active) = self.active.lock() {
+            active.insert(key.to_string());
+        }
+    }
+
+    fn unpin(&self, key: &str) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(key);
+        }
+    }
+
+    fn is_active(&self, key: &str) -> bool {
+        self.active
+            .lock()
+            .map(|active| active.contains(key))
+            .unwrap_or(false)
+    }
+
     pub fn min_object_bytes(&self) -> u64 {
         self.min_object_bytes
     }
@@ -550,6 +679,46 @@ impl LargeCache {
     pub fn available_bytes(&self) -> u64 {
         self.max_bytes
             .saturating_sub(self.used_bytes.load(Ordering::Relaxed))
+    }
+
+    fn reserve_bytes(&self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        if bytes > self.max_bytes {
+            return false;
+        }
+        let mut used = self.used_bytes.load(Ordering::Relaxed);
+        loop {
+            if used.saturating_add(bytes) > self.max_bytes {
+                return false;
+            }
+            match self.used_bytes.compare_exchange_weak(
+                used,
+                used.saturating_add(bytes),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => used = observed,
+            }
+        }
+    }
+
+    fn release_reserved(&self, bytes: u64) {
+        self.release_bytes(bytes);
+    }
+
+    async fn reserve_or_evict(&self, bytes: u64) -> bool {
+        if bytes > self.max_bytes {
+            return false;
+        }
+        if self.reserve_bytes(bytes) {
+            return true;
+        }
+        let target = self.max_bytes.saturating_sub(bytes);
+        self.evict_to(target).await;
+        self.reserve_bytes(bytes)
     }
 
     fn release_bytes(&self, bytes: u64) {
@@ -771,6 +940,12 @@ impl LargeCache {
             segments: Vec::new(),
             chunk_bytes: 0,
         };
+        let reserved = content_length.saturating_add(RESERVATION_SLACK);
+        if !self.reserve_or_evict(reserved).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return None;
+        }
+        self.pin(key);
         Some(LargeWriter {
             cache: self.clone(),
             meta,
@@ -782,6 +957,7 @@ impl LargeCache {
             failed: false,
             fresh_secs: fresh,
             swr_secs,
+            reserved,
             _range_guard: range_guard,
         })
     }
@@ -870,6 +1046,13 @@ impl LargeCache {
         if fs::create_dir_all(parent).await.is_err() {
             return None;
         }
+        let reserved = end
+            .saturating_sub(start)
+            .saturating_add(1)
+            .saturating_add(RESERVATION_SLACK);
+        if !self.reserve_or_evict(reserved).await {
+            return None;
+        }
         let key_lock = {
             let mut locks = self.range_locks.lock().await;
             locks.retain(|_, lock| Arc::strong_count(lock) > 1);
@@ -878,7 +1061,13 @@ impl LargeCache {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let range_guard = key_lock.try_lock_owned().ok()?;
+        let range_guard = match key_lock.try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.release_reserved(reserved);
+                return None;
+            }
+        };
         let data_ok = fs::metadata(&data_path)
             .await
             .map(|m| m.len() >= content_length)
@@ -891,6 +1080,7 @@ impl LargeCache {
         };
         if let Some(meta) = &existing {
             if meta.covers(start, end) {
+                self.release_reserved(reserved);
                 return None;
             }
         }
@@ -914,18 +1104,37 @@ impl LargeCache {
             let _ = fs::remove_file(&meta_path).await;
         }
         let start_stored = existing.as_ref().map(LargeMeta::stored_bytes).unwrap_or(0);
-        let mut file = OpenOptions::new()
+        let start_meta_len = if new_entry {
+            0
+        } else {
+            fs::metadata(&meta_path).await.map(|m| m.len()).unwrap_or(0)
+        };
+        let mut file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&data_path)
             .await
-            .ok()?;
+        {
+            Ok(file) => file,
+            Err(_) => {
+                self.release_reserved(reserved);
+                return None;
+            }
+        };
         if new_entry && file.set_len(content_length).await.is_err() {
+            self.release_reserved(reserved);
+            let _ = fs::remove_file(&data_path).await;
             return None;
         }
-        file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
+        if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+            self.release_reserved(reserved);
+            if new_entry {
+                let _ = fs::remove_file(&data_path).await;
+            }
+            return None;
+        }
         let now = now_unix();
         let fresh = fresh_secs.max(1);
         let mut meta = existing.unwrap_or_else(|| LargeMeta {
@@ -943,6 +1152,7 @@ impl LargeCache {
         if chunk_bytes > 0 {
             meta.chunk_bytes = chunk_bytes;
         }
+        self.pin(key);
         Some(RangeWriter {
             cache: self.clone(),
             meta,
@@ -955,9 +1165,11 @@ impl LargeCache {
             new_entry,
             committed: false,
             start_stored,
+            start_meta_len,
             fresh_secs: fresh,
             swr_secs,
             chunk_bytes,
+            reserved,
             _range_guard: range_guard,
         })
     }
@@ -1002,12 +1214,23 @@ impl LargeCache {
                         .trim_end_matches(".meta.json")
                         .to_string();
                     let data = PathBuf::from(format!("{base}.data"));
-                    victims.push((path, data, meta.stored_bytes(), bytes.len() as u64));
+                    victims.push((
+                        path,
+                        data,
+                        meta.stored_bytes(),
+                        bytes.len() as u64,
+                        meta.key,
+                    ));
                 }
             }
         }
         let mut n = 0;
-        for (meta, data, stored, meta_len) in victims {
+        for (meta, data, stored, meta_len, key) in victims {
+            if self.is_active(&key) {
+                // A fill/read still owns this object; let the next purge retry
+                // instead of unlinking the data under the writer.
+                continue;
+            }
             if fs::remove_file(&data).await.is_ok() || fs::remove_file(&meta).await.is_ok() {
                 n += 1;
                 self.release_bytes(stored + meta_len);
@@ -1048,15 +1271,23 @@ impl LargeCache {
     /// directories from a rotating cursor and finishes any remaining overflow
     /// on the next commit.
     pub async fn evict_overflow(&self) {
-        if self.max_bytes == 0 || self.used_bytes.load(Ordering::Relaxed) <= self.max_bytes {
+        self.evict_to(self.max_bytes / 10 * 9).await;
+    }
+
+    /// Evict until committed usage is at or below `target`.
+    ///
+    /// Admission uses this with `max_bytes - reserved - requested` instead of
+    /// the 90% background target: a cache sitting just under 90% must still
+    /// make room for one more object instead of rejecting every new fill.
+    async fn evict_to(&self, target: u64) {
+        if self.max_bytes == 0 || self.used_bytes.load(Ordering::Relaxed) <= target {
             return;
         }
         let _guard = self.evict_lock.lock().await;
         let used = self.used_bytes.load(Ordering::Relaxed);
-        if used <= self.max_bytes {
+        if used <= target {
             return;
         }
-        let target = self.max_bytes / 10 * 9;
 
         let shards = 256usize;
         let start = self.evict_cursor.load(Ordering::Relaxed) % shards;
@@ -1065,8 +1296,8 @@ impl LargeCache {
         // single pass cost ~100 ms of sequential syscalls.
         let root = self.root.clone();
         let sample = tokio::task::spawn_blocking(move || {
-            // (mtime, accounted bytes, data path, meta path)
-            let mut candidates: Vec<(u64, u64, PathBuf, PathBuf)> = Vec::new();
+            // (mtime, accounted bytes, data path, meta path, key)
+            let mut candidates: Vec<(u64, u64, PathBuf, PathBuf, String)> = Vec::new();
             let mut examined = 0usize;
             let mut cursor = start;
             'scan: for offset in 0..shards {
@@ -1102,12 +1333,17 @@ impl LargeCache {
                     // `stored_bytes()` is the resident size of a sparse file,
                     // which can be far smaller than the logical length. Reading
                     // the sidecar keeps accounting honest.
-                    let stored = std::fs::read(&path)
+                    let parsed = std::fs::read(&path)
                         .ok()
-                        .and_then(|bytes| serde_json::from_slice::<LargeMeta>(&bytes).ok())
+                        .and_then(|bytes| serde_json::from_slice::<LargeMeta>(&bytes).ok());
+                    let key = parsed
+                        .as_ref()
+                        .map(|row| row.key.clone())
+                        .unwrap_or_default();
+                    let stored = parsed
                         .map(|row| row.stored_bytes())
                         .unwrap_or_else(|| std::fs::metadata(&data).map(|m| m.len()).unwrap_or(0));
-                    candidates.push((mtime, stored + meta_stat.len(), data, path));
+                    candidates.push((mtime, stored + meta_stat.len(), data, path, key));
                 }
             }
             (candidates, examined, cursor)
@@ -1117,13 +1353,16 @@ impl LargeCache {
         let (mut candidates, examined, cursor) = sample;
         self.evict_cursor
             .store((cursor + 1) % shards, Ordering::Relaxed);
-        candidates.sort_unstable_by_key(|(mtime, _, _, _)| *mtime);
+        candidates.sort_unstable_by_key(|(mtime, _, _, _, _)| *mtime);
 
         let mut freed = 0u64;
         let mut victims = 0usize;
-        for (_, size, data, meta) in candidates {
+        for (_, size, data, meta, key) in candidates {
             if used.saturating_sub(freed) <= target || victims >= EVICT_VICTIM_BUDGET {
                 break;
+            }
+            if !key.is_empty() && self.is_active(&key) {
+                continue;
             }
             let data_removed = fs::remove_file(&data).await.is_ok();
             let meta_removed = fs::remove_file(&meta).await.is_ok();
@@ -1316,6 +1555,61 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reservations_are_hard_cap_and_released() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-large-reserve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let min = 1024 * 1024;
+        let cache = LargeCache::open(&dir, min, 2 * min, 3 * min).await.unwrap();
+        let w1 = cache
+            .begin("GET:reserve.test:/a.bin", 200, Vec::new(), min, 60, 0)
+            .await
+            .expect("first writer");
+        let w2 = cache
+            .begin("GET:reserve.test:/b.bin", 200, Vec::new(), min, 60, 0)
+            .await
+            .expect("second writer");
+        assert!(
+            cache
+                .begin("GET:reserve.test:/c.bin", 200, Vec::new(), min, 60, 0)
+                .await
+                .is_none(),
+            "a third reservation must not overshoot max_bytes"
+        );
+        drop(w1);
+        drop(w2);
+        assert_eq!(
+            cache.used_bytes.load(Ordering::Relaxed),
+            0,
+            "uncommitted reservations must be released"
+        );
+        assert!(
+            cache
+                .begin("GET:reserve.test:/d.bin", 200, Vec::new(), min, 60, 0)
+                .await
+                .is_some(),
+            "space must be reusable after the reservations are dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fill_budget_caps_and_releases() {
+        let budget = FillBudget::new();
+        assert!(budget.reserve(FillBudget::DEFAULT_MAX));
+        assert!(!budget.reserve(1));
+        budget.release(FillBudget::DEFAULT_MAX);
+        assert!(budget.reserve(1));
+        budget.release(1);
+    }
+
     fn chunk_plan_for(
         segments: Vec<(u64, u64)>,
         content_length: u64,
@@ -1382,6 +1676,15 @@ mod tests {
                 cached: false
             }]
         );
+    }
+
+    #[test]
+    fn chunk_plan_aligns_suffix_start() {
+        let plan = chunk_plan_for(Vec::new(), 16, 15, 15);
+        assert_eq!(plan.runs.len(), 1);
+        assert_eq!(plan.runs[0].start, 12);
+        assert_eq!(plan.runs[0].end, 15);
+        assert!(!plan.runs[0].cached);
     }
 
     #[test]

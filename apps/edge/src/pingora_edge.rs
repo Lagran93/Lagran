@@ -7,7 +7,7 @@
 //! bypass/dynamic traffic, disk/hybrid cache, control endpoints and
 //! WebSocket) are handed to the in-process handler.
 
-use crate::cache::large::{ChunkPlan, LargeEntry, RangeWriter};
+use crate::cache::large::{ChunkPlan, FillBudget, LargeEntry, RangeWriter};
 use crate::cache::policy::{
     ResolvedPolicy, RuleAction, VALIDATOR_SOURCE_HEADER, apply_key_ignore_default, compute_etag,
     decide_storage_reason, decide_storage_reason_map, request_bypass_reason_headers,
@@ -63,6 +63,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;
 const RANGE_FILL_QUEUE_BYTES: u64 = 128 * 1024 * 1024;
+/// Bound the number of sequential origin requests for one client request.
+/// A pathologically fragmented cache would otherwise produce one connection
+/// per chunk; above this the initial range path is used instead.
+const MAX_CHUNK_ORIGIN_RUNS: usize = 16;
 
 #[derive(Debug)]
 struct Sni(String);
@@ -160,6 +164,8 @@ struct RangeSink {
 struct RangeFillSink {
     tx: Option<tokio::sync::mpsc::UnboundedSender<RangeMsg>>,
     queued: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    budget: std::sync::Arc<FillBudget>,
+    metrics: std::sync::Arc<crate::metrics::EdgeMetrics>,
     offset: u64,
     end: u64,
     /// Kept so a request with several missing chunk runs can wait for the
@@ -185,14 +191,31 @@ impl RangeFillSink {
         if queued > RANGE_FILL_QUEUE_BYTES {
             // Disk is slower than the origin/client path. Drop the fill and
             // let the worker commit whatever it already drained.
+            self.queued
+                .fetch_sub(take as u64, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.record_chunk_fill_drop(take as u64);
+            self.tx = None;
+            return;
+        }
+        if !self.budget.reserve(take as u64) {
+            self.queued
+                .fetch_sub(take as u64, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.record_chunk_fill_drop(take as u64);
             self.tx = None;
             return;
         }
         let Some(tx) = self.tx.as_ref() else {
+            self.budget.release(take as u64);
+            self.queued
+                .fetch_sub(take as u64, std::sync::atomic::Ordering::Relaxed);
             return;
         };
         let chunk = Bytes::copy_from_slice(&data[..take]);
         if tx.send(RangeMsg::Chunk(chunk)).is_err() {
+            self.budget.release(take as u64);
+            self.queued
+                .fetch_sub(take as u64, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.record_chunk_fill_drop(take as u64);
             self.tx = None;
             return;
         }
@@ -214,6 +237,7 @@ impl RangeFillSink {
 /// prefix the worker received, which is what a client disconnect should keep.
 fn spawn_range_writer(
     writer: RangeWriter,
+    budget: Option<std::sync::Arc<FillBudget>>,
 ) -> (
     tokio::sync::mpsc::UnboundedSender<RangeMsg>,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -230,6 +254,9 @@ fn spawn_range_writer(
                 RangeMsg::Chunk(data) => {
                     writer_queued
                         .fetch_sub(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(budget) = budget.as_ref() {
+                        budget.release(data.len() as u64);
+                    }
                     if let Some(w) = writer.as_mut() {
                         w.write_all(&data).await;
                     }
@@ -880,9 +907,16 @@ impl ProxyHttp for DataPlaneProxy {
                                         end,
                                         self.state.large_cache_chunk_bytes,
                                     ) {
-                                        let has_missing =
-                                            chunk_plan.runs.iter().any(|run| !run.cached);
-                                        if has_missing
+                                        let missing_runs = chunk_plan
+                                            .runs
+                                            .iter()
+                                            .filter(|run| !run.cached)
+                                            .count();
+                                        if missing_runs > MAX_CHUNK_ORIGIN_RUNS {
+                                            self.state.metrics.record_chunk_fallback();
+                                        }
+                                        if missing_runs > 0
+                                            && missing_runs <= MAX_CHUNK_ORIGIN_RUNS
                                             && self
                                                 .serve_large_range_chunks(
                                                     session,
@@ -982,6 +1016,33 @@ impl ProxyHttp for DataPlaneProxy {
         _is_fresh: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedFreshness>> {
+        // A complete normal-cache copy must not mask a partial large-cache
+        // object. Otherwise a Range can be answered from an old full entry and
+        // the missing chunk is never filled. Force an origin fetch and let the
+        // Range fill path repair the chunk grid.
+        if session.req_header().headers.contains_key("range") {
+            if let (Some(plan), Some(large)) = (ctx.plan.as_ref(), self.state.large_cache.as_ref())
+            {
+                if let Some(entry) = large.get_any(&plan.key).await {
+                    if !entry.meta.complete {
+                        if ctx.range_fill.is_none() {
+                            if let Some(raw) = session
+                                .req_header()
+                                .headers
+                                .get("range")
+                                .and_then(|value| value.to_str().ok())
+                            {
+                                ctx.range_fill = Some(RangeFill {
+                                    key: plan.key.clone(),
+                                    raw_range: raw.to_string(),
+                                });
+                            }
+                        }
+                        return Ok(Some(ForcedFreshness::ForceMiss));
+                    }
+                }
+            }
+        }
         ctx.cache_age_secs = Some(meta.age().as_secs());
         ctx.cache_ttl_secs = Some(meta.fresh_sec().saturating_sub(meta.age().as_secs()));
         let Some(plan) = ctx.plan.as_ref() else {
@@ -1549,7 +1610,7 @@ impl ProxyHttp for DataPlaneProxy {
                                     )
                                     .await
                                 {
-                                    let (tx, queued, _task) = spawn_range_writer(writer);
+                                    let (tx, queued, _task) = spawn_range_writer(writer, None);
                                     ctx.range_sink = Some(RangeSink {
                                         tx,
                                         offset: fill_start,
@@ -2746,10 +2807,16 @@ impl DataPlaneProxy {
             || response
                 .insert_header("x-lagran-cache-source", "l3")
                 .is_err()
-            || (!fresh
-                && response
-                    .insert_header("x-lagran-cache-reason", "stale-range")
-                    .is_err())
+            || response
+                .insert_header(
+                    "x-lagran-cache-reason",
+                    if fresh {
+                        "range-large-cache"
+                    } else {
+                        "stale-range"
+                    },
+                )
+                .is_err()
         {
             return false;
         }
@@ -2832,6 +2899,55 @@ impl DataPlaneProxy {
     /// Content-Range mismatch); the caller should drop the entry. `Err(false)`
     /// is a transient/unsupported response and leaves the cache alone.
     #[allow(clippy::too_many_arguments)]
+    /// Origin targets in failover order for manual Range requests.
+    ///
+    /// `origin_order` applies health, priority and weighted ordering. It returns
+    /// URLs only, so re-attach the full OriginTarget (Host/SNI) where possible.
+    async fn chunk_origin_targets(&self, domain: &DomainEntry) -> Vec<OriginTarget> {
+        let order = self.origin_order(&domain.domain, domain).await;
+        let mut targets = Vec::with_capacity(order.len().max(1));
+        for url in order {
+            if let Some(target) = domain
+                .origins
+                .iter()
+                .find(|target| target.enabled && target.url == url)
+            {
+                targets.push(target.clone());
+            } else {
+                targets.push(OriginTarget {
+                    url,
+                    weight: 100,
+                    priority: 0,
+                    enabled: true,
+                    host_header: None,
+                    sni: None,
+                });
+            }
+        }
+        if targets.is_empty() {
+            if let Some(target) = domain.origins.iter().find(|target| target.enabled) {
+                targets.push(target.clone());
+            } else if !domain.origin_url.is_empty() {
+                targets.push(OriginTarget {
+                    url: domain.origin_url.clone(),
+                    weight: 100,
+                    priority: 0,
+                    enabled: true,
+                    host_header: None,
+                    sni: None,
+                });
+            }
+        }
+        targets
+    }
+
+    /// Open one chunk-aligned origin range, failing over across origins.
+    ///
+    /// `Err(false)` means every origin failed transiently and the caller should
+    /// fall back to the normal range path. `Err(true)` means an origin returned
+    /// a response that cannot be represented as the cached object (wrong ETag,
+    /// encoding, or Content-Range); trying another origin would risk mixing
+    /// representations, so the caller must abandon the chunk fill.
     async fn open_chunk_origin(
         &self,
         session: &Session,
@@ -2841,28 +2957,17 @@ impl DataPlaneProxy {
         run_end: u64,
         total: u64,
     ) -> Result<crate::origin::OriginStreamResponse, bool> {
+        let targets = self.chunk_origin_targets(&native_plan.domain).await;
+        if targets.is_empty() {
+            return Err(false);
+        }
         let path_and_query = session
             .req_header()
             .uri
             .path_and_query()
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
-        let target = native_plan
-            .domain
-            .origins
-            .iter()
-            .find(|origin| origin.enabled)
-            .cloned()
-            .unwrap_or_else(|| OriginTarget {
-                url: native_plan.domain.origin_url.clone(),
-                weight: 100,
-                priority: 0,
-                enabled: true,
-                host_header: None,
-                sni: None,
-            });
-
-        let mut headers = session.req_header().headers.clone();
+        let mut base_headers = session.req_header().headers.clone();
         for name in [
             "if-range",
             "if-none-match",
@@ -2870,106 +2975,340 @@ impl DataPlaneProxy {
             "if-match",
             "if-unmodified-since",
         ] {
-            headers.remove(name);
+            base_headers.remove(name);
         }
         let Ok(range) = HeaderValue::from_str(&format!("bytes={run_start}-{run_end}")) else {
             return Err(false);
         };
-        headers.insert("range", range);
-        headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+        base_headers.insert("range", range);
+        base_headers.insert("accept-encoding", HeaderValue::from_static("identity"));
         for (name, value) in &entry.meta.headers {
             if (name.eq_ignore_ascii_case("etag") || name.eq_ignore_ascii_case("last-modified"))
                 && !value.is_empty()
             {
                 if let Ok(value) = HeaderValue::from_str(value) {
-                    headers.insert("if-range", value);
+                    base_headers.insert("if-range", value);
                 }
                 break;
             }
         }
-        if let Some(host) = target
-            .host_header
-            .clone()
-            .or_else(|| target.sni.clone())
-            .or_else(|| parse_origin(&target.url).map(|(host, _, _)| host))
-        {
-            if let Ok(value) = HeaderValue::from_str(&host) {
-                headers.insert(axum::http::header::HOST, value);
-            }
-        }
         origin_auth::apply(
-            &mut headers,
+            &mut base_headers,
             &native_plan.domain.origin_auth_header,
             &native_plan.domain.origin_auth_value,
         );
-
         let idle_timeout =
             Duration::from_millis(self.state.origin_stream_read_timeout_ms.max(1_000));
-        let response = match tokio::time::timeout(
-            idle_timeout,
-            self.state.origin.request_stream_with_sni(
-                &target.url,
-                &Method::GET,
-                &path_and_query,
-                &headers,
-                None,
-                true,
-                target.sni.as_deref(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            _ => return Err(false),
-        };
-        if response.status == StatusCode::OK {
-            return Err(true);
-        }
-        if response.status != StatusCode::PARTIAL_CONTENT {
-            return Err(false);
-        }
-        if response
-            .headers
-            .get("content-encoding")
-            .is_some_and(|value| {
-                value
-                    .to_str()
-                    .map(|v| !v.eq_ignore_ascii_case("identity") && !v.is_empty())
-                    .unwrap_or(true)
-            })
-        {
-            return Err(true);
-        }
-        let Some((origin_start, origin_end, origin_total)) = response
-            .headers
-            .get("content-range")
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_content_range)
-        else {
-            return Err(true);
-        };
-        // The chunk executor forwards from the requested run start. A wider
-        // origin range would shift every byte; require the exact start.
-        if origin_total != total || origin_start != run_start || origin_end < run_end {
-            return Err(true);
-        }
-        if let Some((_, cached_etag)) = entry
-            .meta
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
-        {
-            if let Some(origin_etag) = response
-                .headers
-                .get("etag")
-                .and_then(|value| value.to_str().ok())
+        let mut invalid = false;
+        for target in targets {
+            let mut headers = base_headers.clone();
+            if let Some(host) = target
+                .host_header
+                .clone()
+                .or_else(|| target.sni.clone())
+                .or_else(|| parse_origin(&target.url).map(|(host, _, _)| host))
             {
-                if origin_etag != cached_etag {
-                    return Err(true);
+                if let Ok(value) = HeaderValue::from_str(&host) {
+                    headers.insert(axum::http::header::HOST, value);
                 }
             }
+            let response = match tokio::time::timeout(
+                idle_timeout,
+                self.state.origin.request_stream_with_sni(
+                    &target.url,
+                    &Method::GET,
+                    &path_and_query,
+                    &headers,
+                    None,
+                    true,
+                    target.sni.as_deref(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                _ => {
+                    tracing::debug!(origin = %target.url, "chunk origin attempt failed");
+                    continue;
+                }
+            };
+            if response.status != StatusCode::PARTIAL_CONTENT {
+                tracing::debug!(
+                    origin = %target.url,
+                    status = response.status.as_u16(),
+                    "chunk origin did not return 206"
+                );
+                // A 200 means the origin ignored Range; another pool member may
+                // still support it. Try the next origin before giving up.
+                continue;
+            }
+            if response
+                .headers
+                .get("content-encoding")
+                .is_some_and(|value| {
+                    value
+                        .to_str()
+                        .map(|v| !v.eq_ignore_ascii_case("identity") && !v.is_empty())
+                        .unwrap_or(true)
+                })
+            {
+                invalid = true;
+                continue;
+            }
+            let Some((origin_start, origin_end, origin_total)) = response
+                .headers
+                .get("content-range")
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_content_range)
+            else {
+                invalid = true;
+                continue;
+            };
+            // The chunk executor forwards from the requested run start. A wider
+            // origin range would shift every byte; require the exact start.
+            if origin_total != total || origin_start != run_start || origin_end < run_end {
+                invalid = true;
+                continue;
+            }
+            if let Some((_, cached_etag)) = entry
+                .meta
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+            {
+                if let Some(origin_etag) = response
+                    .headers
+                    .get("etag")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    if origin_etag != cached_etag {
+                        invalid = true;
+                        continue;
+                    }
+                }
+            }
+            return Ok(response);
         }
-        Ok(response)
+        Err(invalid)
+    }
+
+    /// Open a cache-independent chunk range (no cached ETag yet), failing over
+    /// across origin targets. Returns the origin response, total object length
+    /// and the origin's last byte.
+    async fn open_miss_origin(
+        &self,
+        session: &Session,
+        native_plan: &NativePlan,
+        run_start: u64,
+        run_end: Option<u64>,
+    ) -> Result<(crate::origin::OriginStreamResponse, u64, u64), bool> {
+        let targets = self.chunk_origin_targets(&native_plan.domain).await;
+        if targets.is_empty() {
+            return Err(false);
+        }
+        let path_and_query = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let mut base_headers = session.req_header().headers.clone();
+        for name in [
+            "if-range",
+            "if-none-match",
+            "if-modified-since",
+            "if-match",
+            "if-unmodified-since",
+        ] {
+            base_headers.remove(name);
+        }
+        let range = match run_end {
+            Some(end) => format!("bytes={run_start}-{end}"),
+            None => format!("bytes={run_start}-"),
+        };
+        let Ok(value) = HeaderValue::from_str(&range) else {
+            return Err(false);
+        };
+        base_headers.insert("range", value);
+        base_headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+        origin_auth::apply(
+            &mut base_headers,
+            &native_plan.domain.origin_auth_header,
+            &native_plan.domain.origin_auth_value,
+        );
+        let idle_timeout =
+            Duration::from_millis(self.state.origin_stream_read_timeout_ms.max(1_000));
+        let mut invalid = false;
+        for target in targets {
+            let mut headers = base_headers.clone();
+            if let Some(host) = target
+                .host_header
+                .clone()
+                .or_else(|| target.sni.clone())
+                .or_else(|| parse_origin(&target.url).map(|(host, _, _)| host))
+            {
+                if let Ok(value) = HeaderValue::from_str(&host) {
+                    headers.insert(axum::http::header::HOST, value);
+                }
+            }
+            let response = match tokio::time::timeout(
+                idle_timeout,
+                self.state.origin.request_stream_with_sni(
+                    &target.url,
+                    &Method::GET,
+                    &path_and_query,
+                    &headers,
+                    None,
+                    true,
+                    target.sni.as_deref(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                _ => continue,
+            };
+            if response.status != StatusCode::PARTIAL_CONTENT {
+                continue;
+            }
+            if response
+                .headers
+                .get("content-encoding")
+                .is_some_and(|value| {
+                    value
+                        .to_str()
+                        .map(|v| !v.eq_ignore_ascii_case("identity") && !v.is_empty())
+                        .unwrap_or(true)
+                })
+            {
+                invalid = true;
+                continue;
+            }
+            let Some((origin_start, origin_end, total)) = response
+                .headers
+                .get("content-range")
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_content_range)
+            else {
+                invalid = true;
+                continue;
+            };
+            if origin_start != run_start || origin_end < run_start {
+                invalid = true;
+                continue;
+            }
+            if run_end.is_some_and(|end| origin_end < end) {
+                invalid = true;
+                continue;
+            }
+            return Ok((response, total, origin_end));
+        }
+        Err(invalid)
+    }
+
+    /// Resolve the total object length for a suffix Range (`bytes=-N`).
+    ///
+    /// HEAD is cheapest and does not pull a body. Some origins reject HEAD, so
+    /// fall back to a one-byte `bytes=0-0` GET and read Content-Range.
+    async fn probe_origin_total(&self, session: &Session, native_plan: &NativePlan) -> Option<u64> {
+        let targets = self.chunk_origin_targets(&native_plan.domain).await;
+        if targets.is_empty() {
+            return None;
+        }
+        let path_and_query = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let mut base_headers = session.req_header().headers.clone();
+        for name in [
+            "range",
+            "if-range",
+            "if-none-match",
+            "if-modified-since",
+            "if-match",
+            "if-unmodified-since",
+        ] {
+            base_headers.remove(name);
+        }
+        base_headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+        origin_auth::apply(
+            &mut base_headers,
+            &native_plan.domain.origin_auth_header,
+            &native_plan.domain.origin_auth_value,
+        );
+        let idle_timeout =
+            Duration::from_millis(self.state.origin_stream_read_timeout_ms.max(1_000));
+        for target in &targets {
+            let mut headers = base_headers.clone();
+            if let Some(host) = target
+                .host_header
+                .clone()
+                .or_else(|| target.sni.clone())
+                .or_else(|| parse_origin(&target.url).map(|(host, _, _)| host))
+            {
+                if let Ok(value) = HeaderValue::from_str(&host) {
+                    headers.insert(axum::http::header::HOST, value);
+                }
+            }
+            let response = match tokio::time::timeout(
+                idle_timeout,
+                self.state.origin.request_stream_with_sni(
+                    &target.url,
+                    &Method::HEAD,
+                    &path_and_query,
+                    &headers,
+                    None,
+                    true,
+                    target.sni.as_deref(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                _ => continue,
+            };
+            if response
+                .headers
+                .get("content-encoding")
+                .is_some_and(|value| {
+                    value
+                        .to_str()
+                        .map(|v| !v.eq_ignore_ascii_case("identity") && !v.is_empty())
+                        .unwrap_or(true)
+                })
+            {
+                continue;
+            }
+            let total = if response.status == StatusCode::OK {
+                response
+                    .headers
+                    .get("content-length")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+            } else if response.status == StatusCode::PARTIAL_CONTENT {
+                response
+                    .headers
+                    .get("content-range")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_content_range)
+                    .map(|(_, _, total)| total)
+            } else {
+                None
+            };
+            if let Some(total) = total.filter(|total| *total > 0) {
+                return Some(total);
+            }
+        }
+        // HEAD unsupported or unusable: a one-byte range still gives the total.
+        self.open_miss_origin(session, native_plan, 0, Some(0))
+            .await
+            .ok()
+            .map(|(response, total, _)| {
+                drop(response);
+                total
+            })
     }
 
     /// First request for a large Range: fetch whole chunks starting at the
@@ -3001,10 +3340,26 @@ impl DataPlaneProxy {
         };
         let start_text = start_text.trim();
         if start_text.is_empty() {
-            // A suffix request needs the object length before it can be
-            // chunk-aligned; leave the first one to the legacy range path.
-            return false;
+            let Ok(suffix) = end_text.trim().parse::<u64>() else {
+                return false;
+            };
+            if suffix == 0 {
+                return false;
+            }
+            self.state.metrics.record_chunk_origin_runs(1);
+            let Some(total) = self.probe_origin_total(session, native_plan).await else {
+                return false;
+            };
+            let client_start = total.saturating_sub(suffix);
+            let synthesized = format!("bytes={client_start}-");
+            return Box::pin(self.serve_large_range_miss_chunks(
+                session,
+                native_plan,
+                &synthesized,
+            ))
+            .await;
         }
+        self.state.metrics.record_chunk_request();
         let Ok(client_start) = start_text.parse::<u64>() else {
             return false;
         };
@@ -3025,99 +3380,13 @@ impl DataPlaneProxy {
                 .saturating_sub(1)
         });
 
-        let path_and_query = session
-            .req_header()
-            .uri
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_else(|| "/".to_string());
-        let target = native_plan
-            .domain
-            .origins
-            .iter()
-            .find(|origin| origin.enabled)
-            .cloned()
-            .unwrap_or_else(|| OriginTarget {
-                url: native_plan.domain.origin_url.clone(),
-                weight: 100,
-                priority: 0,
-                enabled: true,
-                host_header: None,
-                sni: None,
-            });
-
-        let mut headers = session.req_header().headers.clone();
-        for name in [
-            "if-range",
-            "if-none-match",
-            "if-modified-since",
-            "if-match",
-            "if-unmodified-since",
-        ] {
-            headers.remove(name);
-        }
-        let range = match chunk_end_hint {
-            Some(end) => format!("bytes={chunk_start}-{end}"),
-            None => format!("bytes={chunk_start}-"),
-        };
-        let Ok(value) = HeaderValue::from_str(&range) else {
-            return false;
-        };
-        headers.insert("range", value);
-        headers.insert("accept-encoding", HeaderValue::from_static("identity"));
-        if let Some(host) = target
-            .host_header
-            .clone()
-            .or_else(|| target.sni.clone())
-            .or_else(|| parse_origin(&target.url).map(|(host, _, _)| host))
+        self.state.metrics.record_chunk_origin_runs(1);
+        let (origin, total, origin_end) = match self
+            .open_miss_origin(session, native_plan, chunk_start, chunk_end_hint)
+            .await
         {
-            if let Ok(value) = HeaderValue::from_str(&host) {
-                headers.insert(axum::http::header::HOST, value);
-            }
-        }
-        origin_auth::apply(
-            &mut headers,
-            &native_plan.domain.origin_auth_header,
-            &native_plan.domain.origin_auth_value,
-        );
-
-        let idle_timeout =
-            Duration::from_millis(self.state.origin_stream_read_timeout_ms.max(1_000));
-        let origin = match tokio::time::timeout(
-            idle_timeout,
-            self.state.origin.request_stream_with_sni(
-                &target.url,
-                &Method::GET,
-                &path_and_query,
-                &headers,
-                None,
-                true,
-                target.sni.as_deref(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            _ => return false,
-        };
-        if origin.status != StatusCode::PARTIAL_CONTENT {
-            return false;
-        }
-        if origin.headers.get("content-encoding").is_some_and(|value| {
-            value
-                .to_str()
-                .map(|v| !v.eq_ignore_ascii_case("identity") && !v.is_empty())
-                .unwrap_or(true)
-        }) {
-            return false;
-        }
-        let Some((origin_start, origin_end, total)) = origin
-            .headers
-            .get("content-range")
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_content_range)
-        else {
-            return false;
+            Ok(value) => value,
+            Err(_) => return false,
         };
         if total < large.min_object_bytes() {
             // Below the large-cache threshold: let the normal cache/range path
@@ -3125,9 +3394,6 @@ impl DataPlaneProxy {
             return false;
         }
         if client_start >= total || bounded_end.is_some_and(|end| end >= total) {
-            return false;
-        }
-        if origin_start != chunk_start {
             return false;
         }
         let cache_end = chunk_end_hint
@@ -3205,15 +3471,21 @@ impl DataPlaneProxy {
                     )
                     .await
                 {
-                    let (tx, queued, task) = spawn_range_writer(writer);
+                    let budget = writer.fill_budget();
+                    let (tx, queued, task) = spawn_range_writer(writer, Some(budget.clone()));
                     Some(RangeFillSink {
                         tx: Some(tx),
                         queued,
+                        budget,
+                        metrics: self.state.metrics.clone(),
                         offset: chunk_start,
                         end: fill_end,
                         task: Some(task),
                     })
                 } else {
+                    if fill_len > 0 {
+                        self.state.metrics.record_chunk_fill_drop(fill_len);
+                    }
                     None
                 }
             } else {
@@ -3280,6 +3552,8 @@ impl DataPlaneProxy {
             return false;
         }
 
+        let idle_timeout =
+            Duration::from_millis(self.state.origin_stream_read_timeout_ms.max(1_000));
         let mut body = origin.body;
         let mut pos = chunk_start;
         while pos <= cache_end {
@@ -3362,6 +3636,11 @@ impl DataPlaneProxy {
         let Some(large) = self.state.large_cache.as_ref() else {
             return false;
         };
+        self.state.metrics.record_chunk_request();
+        let origin_run_count = chunk_plan.runs.iter().filter(|run| !run.cached).count() as u64;
+        self.state
+            .metrics
+            .record_chunk_origin_runs(origin_run_count);
         if entry.meta.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("content-encoding")
                 && !value.eq_ignore_ascii_case("identity")
@@ -3550,15 +3829,21 @@ impl DataPlaneProxy {
                     )
                     .await
                 {
-                    let (tx, queued, task) = spawn_range_writer(writer);
+                    let budget = writer.fill_budget();
+                    let (tx, queued, task) = spawn_range_writer(writer, Some(budget.clone()));
                     Some(RangeFillSink {
                         tx: Some(tx),
                         queued,
+                        budget,
+                        metrics: self.state.metrics.clone(),
                         offset: run.start,
                         end: fill_end,
                         task: Some(task),
                     })
                 } else {
+                    if fill_len > 0 {
+                        self.state.metrics.record_chunk_fill_drop(fill_len);
+                    }
                     None
                 }
             } else {

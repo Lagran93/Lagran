@@ -4,11 +4,11 @@ use crate::server::agent_auth::RequireAgentToken;
 use crate::server::handler::AppState;
 use crate::server::purge::{self, EdgePurgeRequest};
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post, put},
-    Json, Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -234,7 +234,22 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
          lagran_edge_datapath_legacy_total {}\n\
          # HELP lagran_edge_downstream_cancels_total Client stopped reading the response\n\
          # TYPE lagran_edge_downstream_cancels_total counter\n\
-         lagran_edge_downstream_cancels_total {}\n",
+         lagran_edge_downstream_cancels_total {}\n\
+         # HELP lagran_edge_chunk_requests_total Requests served by the chunked large-cache path\n\
+         # TYPE lagran_edge_chunk_requests_total counter\n\
+         lagran_edge_chunk_requests_total {}\n\
+         # HELP lagran_edge_chunk_origin_runs_total Missing chunk runs fetched from origin\n\
+         # TYPE lagran_edge_chunk_origin_runs_total counter\n\
+         lagran_edge_chunk_origin_runs_total {}\n\
+         # HELP lagran_edge_chunk_fallbacks_total Fragmented ranges that exceeded the run budget\n\
+         # TYPE lagran_edge_chunk_fallbacks_total counter\n\
+         lagran_edge_chunk_fallbacks_total {}\n\
+         # HELP lagran_edge_chunk_fill_drops_total Chunk fills dropped by queue/budget limits\n\
+         # TYPE lagran_edge_chunk_fill_drops_total counter\n\
+         lagran_edge_chunk_fill_drops_total {}\n\
+         # HELP lagran_edge_chunk_fill_dropped_bytes_total Bytes dropped by queue/budget limits\n\
+         # TYPE lagran_edge_chunk_fill_dropped_bytes_total counter\n\
+         lagran_edge_chunk_fill_dropped_bytes_total {}\n",
         global.origin_timeouts,
         global.origin_errors,
         global.stream_requests,
@@ -242,7 +257,12 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         global.stream_errors,
         global.datapath_pingora,
         global.datapath_legacy,
-        global.downstream_cancels
+        global.downstream_cancels,
+        global.chunk_requests,
+        global.chunk_origin_runs,
+        global.chunk_fallbacks,
+        global.chunk_fill_drops,
+        global.chunk_fill_dropped_bytes
     ));
     out.push_str(&format!("lagran_edge_domains {}\n", snaps.len()));
     (
