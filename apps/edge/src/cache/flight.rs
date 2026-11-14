@@ -46,10 +46,19 @@ pub(crate) fn lock_wait(ttl_ms: u64) -> Duration {
         .max(Duration::from_millis(100))
 }
 
+/// Per-process random-ish nonce, stable for the process lifetime.
+fn process_nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.finish()
+}
+
 pub struct RedisFlight {
     conn: redis::aio::ConnectionManager,
     prefix: String,
     seq: AtomicU64,
+    token_nonce: u64,
     /// Timeout for one lock round trip (`SET NX`, `EXISTS`, release `EVAL`).
     ///
     /// 250 ms was hardcoded and is tight for a Redis that is not on the same host:
@@ -127,6 +136,7 @@ impl RedisFlight {
             conn,
             prefix,
             seq: AtomicU64::new(0),
+            token_nonce: process_nonce(),
             timeout,
         }))
     }
@@ -140,8 +150,13 @@ impl RedisFlight {
         key: &str,
         ttl_ms: u64,
     ) -> Result<Option<FlightGuard>, FlightError> {
+        // `pid:seq` alone collides across containers (both often run pid 1 and
+        // start their sequence at 0), so one replica could delete another's lock
+        // and both would fetch the same object. The per-process nonce is seeded
+        // from the OS randomness in `RandomState`.
         let token = format!(
-            "{}:{}",
+            "{:016x}:{}:{}",
+            self.token_nonce,
             std::process::id(),
             self.seq.fetch_add(1, Ordering::Relaxed)
         );

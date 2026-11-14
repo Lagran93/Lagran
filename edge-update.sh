@@ -94,7 +94,7 @@ trap 'on_error $LINENO' ERR
 VERSION="${TAG#v}"
 ASSET="lagran-cdn-${VERSION}-linux-amd64.tar.gz"
 BASE="${LAGRAN_UPDATE_BASE:-https://github.com/${REPO}/releases/download/${TAG}}"
-WORK="$(mktemp -d "${DATA_DIR}/edge-update.XXXXXX")"
+WORK="$(mktemp -d "/var/tmp/lagran-edge-update.XXXXXX")"
 status "running" "downloading ${ASSET}"
 
 curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 "${BASE}/${ASSET}" \

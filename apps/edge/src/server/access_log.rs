@@ -97,12 +97,14 @@ impl AccessLog {
         // `processed` by the writer, so `flush` can wait for them to meet.
         let enqueued = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let processed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let (tx, mut rx) = mpsc::channel::<AccessRecord>(buffer_cap.clamp(1_000, 20_000));
 
         {
             let buffer = buffer.clone();
             let processed = processed.clone();
+            let dropped = dropped.clone();
             // Not `spawn_supervised`: the writer owns the file handle and the
             // channel receiver, neither of which can be rebuilt, so restarting it
             // would silently lose the log file. Watch it instead — a panic would
@@ -151,6 +153,11 @@ impl AccessLog {
                             let mut buf = buffer.lock().await;
                             if buf.len() >= buffer_cap {
                                 buf.pop_front();
+                                // The ring buffer is a second, independent loss
+                                // point. It used to evict silently while only the
+                                // channel counted drops, so the reported loss was
+                                // wrong exactly when it mattered.
+                                dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             buf.push_back(rec);
                             drop(buf);
@@ -183,7 +190,7 @@ impl AccessLog {
 
         Self {
             tx,
-            dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped,
             buffer,
             buffer_cap,
             node_id: node_id.to_string(),
@@ -256,6 +263,11 @@ impl AccessLog {
     /// All formatting (and the `tracing` event) happens in the writer task. The
     /// request path used to format the line here and the writer formatted it
     /// again, doubling the cost on the hottest path in the process.
+    /// Total records dropped by either the channel or the ring buffer.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn write(&self, rec: AccessRecord) {
         // Never block the request path on the log writer.
         //

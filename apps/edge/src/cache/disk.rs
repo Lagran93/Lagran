@@ -312,10 +312,17 @@ async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {
 }
 
 async fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    // `tmp<pid>` collided for every concurrent writer in this process: two
+    // requests storing the same key (or a purge racing a write) shared one temp
+    // file and could rename a half-written body into place. A per-write sequence
+    // makes each staging file unique.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!(
-        "{}.tmp{}",
+        "{}.tmp{}-{}",
         path.extension().and_then(|e| e.to_str()).unwrap_or("bin"),
-        std::process::id()
+        std::process::id(),
+        seq
     ));
     fs::write(&tmp, data).await?;
     match fs::rename(&tmp, path).await {
@@ -628,6 +635,30 @@ impl CacheBackend for HybridCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_writes_use_distinct_staging_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-disk-race-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.bin");
+        let (a, b) = tokio::join!(
+            write_atomic(&path, b"aaaa"),
+            write_atomic(&path, b"bbbb")
+        );
+        a.unwrap();
+        b.unwrap();
+        let body = tokio::fs::read(&path).await.unwrap();
+        assert!(body == b"aaaa" || body == b"bbbb", "torn body: {body:?}");
+        let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert_eq!(entry.path(), path, "staging file left behind");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn overwrite_keeps_used_bytes_exact() {

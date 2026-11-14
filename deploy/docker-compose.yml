@@ -4,10 +4,13 @@ services:
     container_name: lagran-postgres
     environment:
       POSTGRES_USER: lagran
-      POSTGRES_PASSWORD: lagran
+      # Required: a well-known default password on a database port was the
+      # easiest way to lose a deployment. Set it in deploy/.env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
       POSTGRES_DB: lagran
     ports:
-      - "5432:5432"
+      # Loopback only; the control plane runs on the same host by default.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

@@ -297,6 +297,16 @@ pub fn parse_query(buf: &[u8]) -> Result<Query, WireError> {
     }
     let id = be16(buf, 0)?;
     let flags = be16(buf, 2)?;
+    // QR must be 0: a response echoed into the listener is not a query, and
+    // answering it lets two resolvers ping-pong packets forever. Only the
+    // standard QUERY opcode is implemented; anything else is refused instead of
+    // being silently treated as QUERY.
+    if flags & 0x8000 != 0 {
+        return Err(WireError::BadMessage);
+    }
+    if (flags >> 11) & 0x000F != 0 {
+        return Err(WireError::BadMessage);
+    }
     let qd = be16(buf, 4)?;
     let an = be16(buf, 6)?;
     let ns = be16(buf, 8)?;
@@ -521,6 +531,17 @@ pub fn encode_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_responses_and_non_query_opcodes() {
+        let mut response = build_query("example.com", TYPE_A, None);
+        response[2] |= 0x80; // QR = 1
+        assert!(matches!(parse_query(&response), Err(WireError::BadMessage)));
+
+        let mut iquery = build_query("example.com", TYPE_A, None);
+        iquery[2] |= 0x08; // opcode = 1 (IQUERY) in the high byte
+        assert!(matches!(parse_query(&iquery), Err(WireError::BadMessage)));
+    }
 
     fn build_query(name: &str, qtype: u16, ecs: Option<(IpAddr, u8)>) -> Vec<u8> {
         let mut out = Vec::new();

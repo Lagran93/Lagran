@@ -203,11 +203,26 @@ ensure_dirs() {
   install -d -m 0755 "$PREFIX" "$BIN_DIR" "$CONF_DIR" "$DATA_DIR" "$LOG_DIR"
 }
 
-ensure_user() {
+ensure_users() {
   getent group lagran >/dev/null 2>&1 || groupadd --system lagran
+  # One account per service. A single `lagran` uid meant a DNS compromise could
+  # read control.env (JWT secret, agent token, database password). The shared
+  # `lagran` group still allows all services to use the same data dir, while each
+  # env file is owned by its own group and is therefore unreadable by the other
+  # service accounts. No process is a member of those groups: systemd reads
+  # EnvironmentFile as root before dropping privileges.
+  local user
+  for user in lagran-control lagran-edge lagran-dns; do
+    getent group "$user" >/dev/null 2>&1 || groupadd --system "$user"
+    if ! id -u "$user" >/dev/null 2>&1; then
+      useradd --system --gid lagran --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$user"
+    fi
+  done
+  # Keep the legacy account for existing installs; it no longer runs a service.
   id -u lagran >/dev/null 2>&1 || \
     useradd --system --gid lagran --home-dir "$DATA_DIR" --shell /usr/sbin/nologin lagran
-  chown -R lagran:lagran "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
+  chown -R root:lagran "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
+  chmod -R g+rwX "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
 }
 
 install_env_example() {
@@ -274,13 +289,19 @@ write_control_env() {
   local env_file="$CONF_DIR/control.env"
   if [[ -f "$env_file" ]]; then
     log "Keeping existing $env_file"
+    chown root:lagran-control "$env_file" 2>/dev/null || true
+    chmod 0640 "$env_file"
     return
   fi
   local database_url
   database_url="$(setup_database)"
   local jwt_secret="${LAGRAN_JWT_SECRET:-$(rand_hex 32)}"
   local agent_token="${LAGRAN_AGENT_TOKEN:-$(rand_hex 24)}"
-  local bind="${LAGRAN_CONTROL_BIND:-0.0.0.0:8080}"
+  # With Caddy the console is proxied over loopback, so the control API does
+  # not need to listen on every interface.
+  local default_bind="0.0.0.0:8080"
+  if [[ "$WITH_CADDY" == "1" ]]; then default_bind="127.0.0.1:8080"; fi
+  local bind="${LAGRAN_CONTROL_BIND:-$default_bind}"
   # Never create the well-known demo account by default: it is incompatible
   # with REQUIRE_SECURE_SECRETS=true below, so the service would refuse to boot.
   local seed_demo="${LAGRAN_SEED_DEMO:-false}"
@@ -314,7 +335,7 @@ LAGRAN_UPDATE_HELPER=${BIN_DIR}/lagran-update
 LAGRAN_UPDATE_REQUEST_PATH=${DATA_DIR}/update.request
 LAGRAN_UPDATE_STATUS_PATH=${DATA_DIR}/update.status
 EOF
-  chown root:lagran "$env_file"
+  chown root:lagran-control "$env_file"
   chmod 0640 "$env_file"
   if [[ "$seed_demo" == "true" ]]; then
     warn "SEED_DEMO=true creates demo@lagran.dev / demo123; change it immediately"
@@ -330,7 +351,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=lagran
+User=lagran-control
 Group=lagran
 EnvironmentFile=${CONF_DIR}/control.env
 ExecStart=${BIN_DIR}/lagran-control
@@ -443,6 +464,8 @@ write_edge_env() {
   local env_file="$CONF_DIR/edge.env"
   if [[ -f "$env_file" ]]; then
     log "Keeping existing $env_file"
+    chown root:lagran-edge "$env_file" 2>/dev/null || true
+    chmod 0640 "$env_file"
     return
   fi
   [[ -n "${AGENT_TOKEN:-}" ]] || die "edge install requires AGENT_TOKEN (create a node in the console first)"
@@ -492,7 +515,7 @@ CHALLENGE_SECRET=${challenge_secret}
 EDGE_UPDATE_HELPER=${BIN_DIR}/lagran-edge-update
 EDGE_UPDATE_REQUEST_PATH=${DATA_DIR}/edge-update.request
 EOF
-  chown root:lagran "$env_file"
+  chown root:lagran-edge "$env_file"
   chmod 0640 "$env_file"
 }
 
@@ -505,7 +528,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=lagran
+User=lagran-edge
 Group=lagran
 EnvironmentFile=${CONF_DIR}/edge.env
 ExecStart=${BIN_DIR}/lagran-edge
@@ -533,6 +556,8 @@ write_dns_env() {
   local env_file="$CONF_DIR/dns.env"
   if [[ -f "$env_file" ]]; then
     log "Keeping existing $env_file"
+    chown root:lagran-dns "$env_file" 2>/dev/null || true
+    chmod 0640 "$env_file"
     return
   fi
   local agent_token="${AGENT_TOKEN:-}"
@@ -551,12 +576,12 @@ DNS_TCP=${DNS_TCP:-true}
 DNS_WORKERS=${DNS_WORKERS:-8}
 CONTROL_URL=${CONTROL_URL:-http://127.0.0.1:8080}
 AGENT_TOKEN=${agent_token}
-DNS_CACHE_SECS=${DNS_CACHE_SECS:-5}
+DNS_CACHE_SECS=${DNS_CACHE_SECS:-30}
 DNS_STALE_SECS=${DNS_STALE_SECS:-300}
 DNS_CONTROL_TIMEOUT_MS=${DNS_CONTROL_TIMEOUT_MS:-800}
 DNS_FALLBACK_IP=${DNS_FALLBACK_IP:-}
 EOF
-  chown root:lagran "$env_file"
+  chown root:lagran-dns "$env_file"
   chmod 0640 "$env_file"
 }
 
@@ -569,7 +594,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=lagran
+User=lagran-dns
 Group=lagran
 EnvironmentFile=${CONF_DIR}/dns.env
 ExecStart=${BIN_DIR}/lagran-dns
@@ -630,8 +655,12 @@ install_frontend() {
   check_web_readable "$WEB_DIR"
   install_env_example frontend.env.example
   if [[ "$WITH_CADDY" == "1" ]]; then
+    local caddy_site="${LAGRAN_CADDY_SITE:-:80}"
+    if [[ "$caddy_site" == ":80" ]]; then
+      warn "Caddy site defaults to plaintext :80; set LAGRAN_CADDY_SITE=console.example.com for automatic HTTPS"
+    fi
     cat > "$CONF_DIR/Caddyfile.lagran" <<EOF
-:80 {
+${caddy_site} {
     root * ${WEB_DIR}
     encode gzip
     @api path /api/* /health /ready
@@ -664,7 +693,7 @@ enable_service() {
 
 main_control() {
   install_binary lagran-control
-  ensure_user
+  ensure_users
   install_env_example control.env.example
   write_control_env
   write_control_unit
@@ -694,7 +723,7 @@ EOF
 
 main_edge() {
   install_binary lagran-edge
-  ensure_user
+  ensure_users
   install_env_example edge.env.example
   write_edge_env
   write_edge_unit
@@ -711,7 +740,7 @@ EOF
 
 main_dns() {
   install_binary lagran-dns
-  ensure_user
+  ensure_users
   install_env_example dns.env.example
   write_dns_env
   write_dns_unit

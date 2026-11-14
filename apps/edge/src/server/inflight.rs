@@ -70,7 +70,24 @@ impl Leader {
     pub async fn finish(mut self) {
         self.finished = true;
         self.tx.send_replace(true);
-        self.inner.lock().map(|mut m| m.remove(&self.key)).ok();
+        self.remove_if_owner();
+    }
+
+    /// Remove the entry only while it is still ours.
+    ///
+    /// Signalling `true` before removing leaves a window in which a new leader
+    /// can claim the key; an unconditional `remove` then evicted *that* leader,
+    /// so a follower subscribed to it never got a wake-up and the key stayed
+    /// unowned.
+    fn remove_if_owner(&self) {
+        if let Ok(mut map) = self.inner.lock() {
+            if map
+                .get(&self.key)
+                .is_some_and(|tx| tx.same_channel(&self.tx))
+            {
+                map.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -84,9 +101,7 @@ impl Drop for Leader {
         // what keeps the map bounded; signalling alone leaked one entry per
         // cancelled request on a key that is never requested again.
         self.tx.send_replace(true);
-        if let Ok(mut map) = self.inner.lock() {
-            map.remove(&self.key);
-        }
+        self.remove_if_owner();
     }
 }
 
@@ -151,6 +166,25 @@ mod tests {
     /// This is the normal path when a client disconnects mid-fetch. The entry used
     /// to be removed only by a later request for the same key, so a unique URL
     /// (a signed download) leaked one map entry per cancellation, forever.
+    #[tokio::test]
+    async fn stale_leader_does_not_remove_the_new_owner() {
+        let inflight = Inflight::default();
+        let Slot::Leader(leader) = inflight.begin("k").await else {
+            panic!("expected leader");
+        };
+        // Simulate a new leader claiming the key after the old sender was
+        // signalled but before the old leader's cleanup ran.
+        {
+            let mut map = inflight.lock();
+            map.insert("k".to_string(), watch::channel(false).0);
+        }
+        drop(leader);
+        assert!(
+            inflight.lock().contains_key("k"),
+            "stale leader removed the new leader's entry"
+        );
+    }
+
     #[tokio::test]
     async fn dropped_leader_releases_its_key() {
         let inflight = Inflight::new_for_test();

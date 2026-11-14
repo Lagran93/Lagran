@@ -181,23 +181,26 @@ impl Service {
         }
     }
 
+    /// `None` means "no usable answer" (SERVFAIL); `Some(None)` means the name
+    /// has a fresh negative cache entry (NODATA).
     fn lookup(
         &self,
         key: &str,
         qname: &str,
         subnet: Option<&str>,
         client_ip: IpAddr,
-    ) -> Option<(IpAddr, u32)> {
+    ) -> Option<Option<(IpAddr, u32)>> {
         let now = Instant::now();
         {
             let cache = self.cache.lock().ok()?;
             if let Some(entry) = cache.get(key) {
                 let age = now.duration_since(entry.at).as_secs();
                 if age <= self.cfg.cache_secs {
-                    if let Some(ip) = entry.ip {
-                        self.hits.fetch_add(1, Ordering::Relaxed);
-                        return Some((ip, entry.ttl));
-                    }
+                    // Cache negative answers too. Requiring `Some(ip)` here meant
+                    // an empty answer was fetched again on every query, so the
+                    // negative cache existed but never took effect.
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(entry.ip.map(|ip| (ip, entry.ttl)));
                 }
             }
         }
@@ -221,7 +224,7 @@ impl Service {
             // fetch here would keep the duplicate origin calls the wait exists to
             // avoid, so only a still-empty cache sends us to the control plane.
             if let Some(now_cached) = self.cached_answer(key, now) {
-                return now_cached;
+                return Some(now_cached);
             }
         }
 
@@ -256,7 +259,7 @@ impl Service {
                         Self::evict_expired(&mut cache, now, self.cfg.stale_secs, 256);
                     }
                 }
-                ip.map(|ip| (ip, reply.ttl))
+                Some(ip.map(|ip| (ip, reply.ttl)))
             }
             Err(e) => {
                 tracing::warn!(error = %e, qname, "scheduler lookup failed");
@@ -266,12 +269,13 @@ impl Service {
                         if age <= self.cfg.stale_secs {
                             if let Some(ip) = entry.ip {
                                 tracing::warn!(qname, age, "serving stale scheduling result");
-                                return Some((ip, entry.ttl.max(5)));
+                                return Some(Some((ip, entry.ttl.max(5))));
                             }
                         }
                     }
                 }
-                self.fallback_ip().map(|ip| (ip, self.cfg.ttl))
+                self.fallback_ip()
+                    .map(|ip| Some((ip, self.cfg.ttl)))
             }
         }
     }
@@ -322,8 +326,13 @@ impl Service {
             .map(|e| format!("{}/{}", e.addr, e.source_prefix));
         let subnet_key = subnet.clone().unwrap_or_else(|| client_ip.to_string());
         let key = format!("{}|{}|{}", qname, q.qtype, subnet_key);
-        let Some((ip, ttl)) = self.lookup(&key, qname, subnet.as_deref(), client_ip) else {
+        let Some(answer) = self.lookup(&key, qname, subnet.as_deref(), client_ip) else {
             return (RCODE_SERVFAIL, vec![], vec![], vec![]);
+        };
+        let Some((ip, ttl)) = answer else {
+            // A fresh negative cache entry: answer NODATA with our SOA rather
+            // than hitting the control plane again.
+            return (RCODE_NOERROR, vec![], vec![self.soa()], vec![]);
         };
         let ttl = ttl.min(self.cfg.ttl).max(5);
         let answers = match (q.qtype, ip) {
@@ -706,7 +715,11 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
     // Loopback is exempt and a zero `per_source` disables the limiter.
     let mut limiter = crate::ratelimit::RateLimiter::new(cfg.rate_limit);
     let mut last_report = Instant::now();
-    let mut buf = [0u8; 4096];
+    // EDNS0 lets a client advertise up to 65535 bytes, and a 4096-byte stack
+    // buffer truncated larger UDP datagrams; the truncated tail then parsed as a
+    // malformed query and the client got FORMERR. One datagram is never larger
+    // than 64 KiB, so size the buffer for the protocol maximum.
+    let mut buf = [0u8; 65_535];
     loop {
         if stop.load(std::sync::atomic::Ordering::SeqCst) {
             break;

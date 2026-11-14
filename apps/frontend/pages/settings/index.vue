@@ -193,9 +193,9 @@
             {{ updateBusy ? '更新中…' : '立即更新' }}
           </button>
           <a
-            v-if="updateInfo?.release_url"
+            v-if="releaseLink"
             class="btn btn-default btn-sm"
-            :href="updateInfo.release_url"
+            :href="releaseLink"
             target="_blank"
             rel="noopener"
           >
@@ -325,6 +325,18 @@ interface UpdateInfo {
   error: string | null
 }
 const updateInfo = ref<UpdateInfo | null>(null)
+// The release URL comes from the update API; only follow http(s) links so a
+// compromised/misconfigured response cannot inject `javascript:` into href.
+const releaseLink = computed(() => {
+  const raw = updateInfo.value?.release_url
+  if (!raw) return null
+  try {
+    const url = new URL(raw)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null
+  } catch {
+    return null
+  }
+})
 const updateChecking = ref(false)
 const updateApplying = ref(false)
 const UPDATE_PENDING_KEY = 'lagran-update-pending'

@@ -969,10 +969,17 @@ fn now_unix() -> u64 {
 }
 
 async fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    // `tmp<pid>` collided for every concurrent writer in this process: two
+    // requests storing the same key (or a purge racing a write) shared one temp
+    // file and could rename a half-written body into place. A per-write sequence
+    // makes each staging file unique.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!(
-        "{}.tmp{}",
+        "{}.tmp{}-{}",
         path.extension().and_then(|e| e.to_str()).unwrap_or("meta"),
-        std::process::id()
+        std::process::id(),
+        seq
     ));
     fs::write(&tmp, data).await?;
     match fs::rename(&tmp, path).await {
