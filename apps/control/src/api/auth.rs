@@ -609,6 +609,67 @@ pub async fn register(
     ))
 }
 
+/// Revoke the caller's sessions.
+///
+/// JWTs are stateless, so clearing browser storage on logout left a copied or
+/// stale token valid until its `exp`. Bumping `token_version` makes every token
+/// issued before this call fail the version check. This revokes all of the
+/// user's sessions (every device), which is the safe default for a console that
+/// may have left an administrator tab open elsewhere.
+pub async fn logout(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    let id = Uuid::parse_str(&claims.sub).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "invalid token".into(),
+            }),
+        )
+    })?;
+    let session = repository::get_user_session(&state.pool, id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, user_id = %id, "load session for logout");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "database error".into(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: "user not found".into(),
+                }),
+            )
+        })?;
+    if session.2 != claims.ver {
+        // An already-revoked token must not be able to bump the version again:
+        // otherwise a copied admin token could keep logging the real admin out.
+        return Ok(Json(serde_json::json!({ "success": true })));
+    }
+    repository::bump_token_version(&state.pool, id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, user_id = %id, "revoke sessions on logout");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "database error".into(),
+                }),
+            )
+        })?;
+    if let Some(redis) = state.redis.as_deref() {
+        redis.invalidate_session(id).await;
+    }
+    tracing::info!(user_id = %id, "sessions revoked on logout");
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
 pub async fn me(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,

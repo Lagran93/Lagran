@@ -55,6 +55,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1",
             Router::new()
                 .route("/auth/login", post(auth::login))
+                .route("/auth/logout", post(auth::logout))
                 .route("/auth/register", post(auth::register))
                 .route("/auth/config", get(auth::public_config))
                 .route("/auth/captcha", get(auth::captcha))
@@ -263,6 +264,7 @@ pub fn create_router(state: AppState) -> Router {
             state.clone(),
             crate::middleware::permission::require_permission,
         ))
+        .layer(axum::middleware::from_fn(no_store_auth))
         .layer(axum::middleware::from_fn(trace_http_request))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
@@ -303,6 +305,28 @@ fn build_cors(allowed: &[String]) -> CorsLayer {
         return base.allow_origin(Vec::<axum::http::HeaderValue>::new());
     }
     base.allow_origin(origins)
+}
+
+/// Auth responses are per-user and must never be stored by a shared cache.
+///
+/// The browser (or a reverse proxy in front of the control plane) keys a cached
+/// response by URL, not by the `Authorization` header. Without `no-store` and
+/// `Vary: Authorization`, a cached `/api/v1/auth/me` for an administrator could
+/// be replayed to a different account on the same origin.
+async fn no_store_auth(request: Request<Body>, next: Next) -> Response {
+    let is_auth = request.uri().path().starts_with("/api/v1/auth/");
+    let mut response = next.run(request).await;
+    if is_auth {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::VARY,
+            axum::http::HeaderValue::from_static("Authorization"),
+        );
+    }
+    response
 }
 
 async fn trace_http_request(request: Request<Body>, next: Next) -> Response {

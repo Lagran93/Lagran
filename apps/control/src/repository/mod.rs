@@ -346,6 +346,22 @@ pub async fn update_user_password(
     Ok(row.map(|r| r.0))
 }
 
+/// Revoke every JWT issued for this user before now.
+///
+/// `token_version` is checked by `Actor` and `/auth/me`, so bumping it makes all
+/// previously issued tokens fail immediately. Logout uses this because the JWT
+/// itself is stateless: clearing localStorage does not revoke anything.
+pub async fn bump_token_version(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "UPDATE users SET token_version = token_version + 1, updated_at = NOW() \
+         WHERE id = $1 RETURNING token_version",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
 /// Session fields needed to validate a JWT: current role, active flag and the
 /// token version/epoch. Incrementing `token_version` revokes old tokens.
 pub async fn get_user_session(
