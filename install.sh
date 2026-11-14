@@ -73,6 +73,7 @@ Environment:
   EDGE_ADMIN_LISTEN=...          edge: default 127.0.0.1:8082
   REDIS_URL=...                  edge: optional shared CC sliding-window Redis
   CC_REDIS_PREFIX=...            edge: default lagran:cc
+  CC_REDIS_TIMEOUT_MS=...        edge: cross-node CC Redis budget (default 50)
   RATE_LIMIT_REDIS_PREFIX=...    edge: default lagran:rate
   LARGE_CACHE_ENABLED=true|false edge: large-object disk cache (default false)
   LARGE_CACHE_DIR=...            edge: default /var/lib/lagran/large-cache
@@ -500,6 +501,7 @@ CACHE_BACKEND=memory
 CACHE_TTL=60
 REDIS_URL=${REDIS_URL:-}
 CC_REDIS_PREFIX=${CC_REDIS_PREFIX:-lagran:cc}
+CC_REDIS_TIMEOUT_MS=${CC_REDIS_TIMEOUT_MS:-50}
 RATE_LIMIT_REDIS_PREFIX=${RATE_LIMIT_REDIS_PREFIX:-lagran:rate}
 CC_STATIC_MULTIPLIER=${CC_STATIC_MULTIPLIER:-8}
 CC_AUTH_DIVISOR=${CC_AUTH_DIVISOR:-2}

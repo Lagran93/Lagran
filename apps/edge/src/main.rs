@@ -158,10 +158,15 @@ async fn main() -> anyhow::Result<()> {
         });
         edge::server::cc::CcProtector::new()
     } else {
-        match edge::server::cc::RedisCc::connect(&config.redis_url).await {
+        match edge::server::cc::RedisCc::connect_with_timeout(
+            &config.redis_url,
+            config.cc_redis_timeout_ms,
+        )
+        .await
+        {
             Ok(redis) => {
                 edge::server::cc::log_shared_wiring(&edge::server::cc::SharedWiring::Redis {
-                    budget_ms: edge::server::cc::REDIS_TIMEOUT_MS,
+                    budget_ms: config.cc_redis_timeout_ms,
                 });
                 edge::server::cc::CcProtector::with_redis(Some(redis))
             }
@@ -178,33 +183,32 @@ async fn main() -> anyhow::Result<()> {
 
     // Periodic report on whether the cross-node CC budget is actually reaching Redis.
     //
-    // Reported rather than logged per request: the counters answer "did any shared
-    // round trip ever complete", which is the question a cross-region deployment
-    // cannot answer from request logs alone. A rising `ok` means the shared limiter
-    // works; a rising `timeout` with a flat `ok` means the link is too slow for
-    // REDIS_TIMEOUT and every request is silently using the per-process budget.
+    // Reported rather than logged per request: the counters answer "is the shared
+    // budget actually reaching Redis", which a cross-region deployment cannot answer
+    // from request logs alone. The report consumes **deltas**: passing cumulative
+    // counters made one early timeout warn forever.
     if cc.shared_counters().is_some() {
         let cc = cc.clone();
+        let budget_ms = config.cc_redis_timeout_ms;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await;
+            let mut last = (0u64, 0u64, 0u64);
             loop {
                 tick.tick().await;
                 let Some((ok, timeout, error)) = cc.shared_counters() else {
                     return;
                 };
-                if ok == 0 && timeout == 0 && error == 0 {
-                    continue;
-                }
+                let delta = (
+                    ok.saturating_sub(last.0),
+                    timeout.saturating_sub(last.1),
+                    error.saturating_sub(last.2),
+                );
+                last = (ok, timeout, error);
                 // Also emitted from the cc module so the periodic answer survives a
                 // `RUST_LOG=edge=...` filter; a report nobody can see defeats the point.
-                edge::server::cc::log_shared_counters(
-                    ok,
-                    timeout,
-                    error,
-                    edge::server::cc::REDIS_TIMEOUT_MS,
-                );
+                edge::server::cc::log_shared_counters(delta.0, delta.1, delta.2, budget_ms);
             }
         });
     }

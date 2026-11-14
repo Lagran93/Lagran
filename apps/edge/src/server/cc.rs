@@ -18,14 +18,14 @@ const WINDOW: Duration = Duration::from_secs(1);
 const STATE_TTL: Duration = Duration::from_secs(600);
 /// Budget for one shared-budget Redis round trip.
 ///
-/// Small on purpose: this sits on the request path. It is also why a cross-region
-/// Redis never works here — a 137 ms link cannot answer within 15 ms, so every check
-/// falls back to the per-process counter and the fleet-wide limit silently becomes a
-/// per-node limit. `shared_counters()` and the periodic report exist to make that
-/// visible instead of leaving it as a silent degradation.
-pub const REDIS_TIMEOUT_MS: u64 = 15;
-
-const REDIS_TIMEOUT: Duration = Duration::from_millis(REDIS_TIMEOUT_MS);
+/// Default budget for one Redis round trip, overridable with
+/// `CC_REDIS_TIMEOUT_MS`.
+///
+/// This sits on the request path, so it must stay bounded. 15 ms was too tight
+/// even on a LAN: a multiplexed connection under load occasionally queued past
+/// it and silently downgraded the fleet-wide limit to per-process. 50 ms leaves
+/// headroom for a same-rack Redis while still bounding the worst case.
+pub const DEFAULT_REDIS_TIMEOUT_MS: u64 = 50;
 const IPV4_PREFIX: u8 = 24;
 const IPV6_PREFIX: u8 = 64;
 
@@ -235,18 +235,38 @@ pub fn log_shared_wiring(wiring: &SharedWiring) {
     }
 }
 
-/// Report the shared/fallback tallies gathered since startup.
+/// Report the tallies gathered **since the previous report** (deltas).
+///
+/// The callers used to pass cumulative counters, so a single timeout in the
+/// first minute made every later report warn forever even when 97% of checks
+/// were succeeding. Deltas plus a significance threshold keep the signal honest.
 pub fn log_shared_counters(ok: u64, timeout: u64, error: u64, budget_ms: u64) {
-    if timeout > 0 || error > 0 {
+    let total = ok.saturating_add(timeout).saturating_add(error);
+    if total == 0 {
+        return;
+    }
+    let fallback = timeout.saturating_add(error);
+    let fallback_pct = fallback.saturating_mul(100) / total;
+    if error > 0 || (total >= 20 && fallback_pct >= 5) {
         tracing::warn!(
             shared_ok = ok,
             shared_timeout = timeout,
             shared_error = error,
             budget_ms,
-            "cross-node CC: some checks fell back to the per-process limit"
+            fallback_pct,
+            "cross-node CC: a significant share of checks fell back to the per-process limit"
+        );
+    } else if fallback > 0 {
+        tracing::info!(
+            shared_ok = ok,
+            shared_timeout = timeout,
+            shared_error = error,
+            budget_ms,
+            fallback_pct,
+            "cross-node CC: minor fallback to the per-process limit"
         );
     } else {
-        tracing::info!(shared_ok = ok, "cross-node CC: all checks used Redis");
+        tracing::debug!(shared_ok = ok, "cross-node CC: all checks used Redis");
     }
 }
 
@@ -261,6 +281,8 @@ pub struct RedisCc {
     conn: redis::aio::ConnectionManager,
     prefix: String,
     seq: Arc<AtomicU64>,
+    /// Per-call budget for one Redis round trip (configurable).
+    timeout_ms: u64,
     /// Times a shared-budget check actually completed against Redis.
     ///
     /// Counted separately from the failures because "is cross-node CC working at all"
@@ -280,6 +302,11 @@ pub struct RedisCc {
 
 impl RedisCc {
     pub async fn connect(url: &str) -> Result<Self, String> {
+        Self::connect_with_timeout(url, DEFAULT_REDIS_TIMEOUT_MS).await
+    }
+
+    pub async fn connect_with_timeout(url: &str, timeout_ms: u64) -> Result<Self, String> {
+        let timeout_ms = timeout_ms.clamp(5, 2_000);
         let client = redis::Client::open(url).map_err(|e| format!("invalid REDIS_URL: {e}"))?;
         let conn = tokio::time::timeout(Duration::from_secs(2), client.get_connection_manager())
             .await
@@ -294,6 +321,7 @@ impl RedisCc {
             conn,
             prefix,
             seq: Arc::new(AtomicU64::new(0)),
+            timeout_ms,
             shared_ok: Arc::new(AtomicU64::new(0)),
             shared_timeout: Arc::new(AtomicU64::new(0)),
             shared_error: Arc::new(AtomicU64::new(0)),
@@ -329,7 +357,7 @@ impl RedisCc {
         );
         let redis_key = format!("{}:win:{}", self.prefix, key);
         let attempt = tokio::time::timeout(
-            REDIS_TIMEOUT,
+            Duration::from_millis(self.timeout_ms),
             script
                 .key(redis_key)
                 .arg(window_ms as i64)
@@ -358,7 +386,7 @@ impl RedisCc {
                     "timeout",
                     &format!(
                         "no reply within {}ms; per-process budget only",
-                        REDIS_TIMEOUT.as_millis()
+                        self.timeout_ms
                     ),
                 );
                 None
@@ -388,14 +416,29 @@ impl RedisCc {
         {
             return;
         }
-        tracing::warn!(
-            kind,
-            detail,
-            shared_ok = self.shared_ok.load(Ordering::Relaxed),
-            shared_timeout = self.shared_timeout.load(Ordering::Relaxed),
-            shared_error = self.shared_error.load(Ordering::Relaxed),
-            "cross-node CC budget unavailable; falling back to the per-process limit"
-        );
+        // A timeout is a tail-latency event, not necessarily a fault: the
+        // periodic report decides when the rate is worth a warning. Log it at
+        // debug so a healthy LAN with 1% tail misses does not warn every 30 s.
+        // An actual Redis error still warns, because that is a real fault.
+        if kind == "timeout" {
+            tracing::debug!(
+                kind,
+                detail,
+                shared_ok = self.shared_ok.load(Ordering::Relaxed),
+                shared_timeout = self.shared_timeout.load(Ordering::Relaxed),
+                shared_error = self.shared_error.load(Ordering::Relaxed),
+                "cross-node CC budget timed out; using the per-process limit"
+            );
+        } else {
+            tracing::warn!(
+                kind,
+                detail,
+                shared_ok = self.shared_ok.load(Ordering::Relaxed),
+                shared_timeout = self.shared_timeout.load(Ordering::Relaxed),
+                shared_error = self.shared_error.load(Ordering::Relaxed),
+                "cross-node CC budget unavailable; falling back to the per-process limit"
+            );
+        }
     }
 
     /// Shared-versus-local tallies, for a startup or periodic report.

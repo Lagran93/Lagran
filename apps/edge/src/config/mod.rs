@@ -59,6 +59,13 @@ pub struct EdgeConfig {
     /// Optional Redis URL for distributed CC sliding-window counters.
     /// Empty keeps CC fully in-process.
     pub redis_url: String,
+    /// Budget for one cross-node CC Redis round trip, in milliseconds.
+    ///
+    /// The old value was hardcoded to 15 ms. A same-rack Redis under load can
+    /// miss that on a small percentage of requests, and every miss silently
+    /// downgrades the domain budget to per-process. Configurable so a LAN can
+    /// raise the budget without giving a cross-region link an unbounded stall.
+    pub cc_redis_timeout_ms: u64,
     pub domain: String,
     pub access_log_path: Option<String>,
     /// When false, requests skip the access-log path entirely.
@@ -257,6 +264,11 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5),
             redis_url: env_nonempty("REDIS_URL").unwrap_or_default(),
+            cc_redis_timeout_ms: std::env::var("CC_REDIS_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(50)
+                .clamp(5, 2_000),
             domain: std::env::var("EDGE_DOMAIN").unwrap_or_default(),
             access_log_enabled: std::env::var("ACCESS_LOG_ENABLED")
                 .map(|v| {
