@@ -66,6 +66,9 @@ const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;
 /// A pathologically fragmented cache would otherwise produce one connection
 /// per chunk; above this the initial range path is used instead.
 const MAX_CHUNK_ORIGIN_RUNS: usize = 16;
+/// Bound multipart Range parts so one request cannot create unbounded origin
+/// work or response overhead.
+const MAX_MULTI_RANGES: usize = 16;
 
 #[derive(Debug)]
 struct Sni(String);
@@ -878,6 +881,29 @@ impl ProxyHttp for DataPlaneProxy {
                     .map(str::to_string);
                 if let Some(raw_range) = raw_range {
                     if let Some(large) = self.state.large_cache.as_ref() {
+                        if raw_range.contains(',') {
+                            let total = if let Some(entry) = large.get_any(&plan.key).await {
+                                entry.content_length()
+                            } else {
+                                self.probe_origin_total(session, &plan)
+                                    .await
+                                    .unwrap_or_default()
+                            };
+                            if total > 0 {
+                                if let Some(ranges) = parse_multi_ranges(&raw_range, total) {
+                                    if self
+                                        .serve_large_multipart(session, &plan, &ranges, total)
+                                        .await
+                                    {
+                                        ctx.cache_label = "HIT";
+                                        ctx.cache_reason = Some("range-multipart");
+                                        ctx.status = StatusCode::PARTIAL_CONTENT.as_u16();
+                                        ctx.plan = Some(plan);
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                        }
                         let mut had_entry = false;
                         if let Some(mut entry) = large.get_any(&plan.key).await {
                             had_entry = true;
@@ -2863,6 +2889,366 @@ impl DataPlaneProxy {
 
         let _ = self
             .write_large_body(session, entry, start, end, true)
+            .await;
+        true
+    }
+
+    /// Fill the chunk-aligned span covering a multipart request without
+    /// writing a client response. Returns false when the cache cannot be made
+    /// complete for the span (no entry, stale entry, cap/disk limits, origin
+    /// mismatch); the caller then falls back to the origin's multipart response.
+    async fn fill_large_span(
+        &self,
+        session: &Session,
+        native_plan: &NativePlan,
+        start: u64,
+        end: u64,
+        total: u64,
+    ) -> bool {
+        if start > end || end >= total {
+            return false;
+        }
+        let chunk_bytes = self.state.large_cache_chunk_bytes;
+        if chunk_bytes == 0 {
+            return false;
+        }
+        let Some(large) = self.state.large_cache.as_ref() else {
+            return false;
+        };
+        if let Some(entry) = large.get_any(&native_plan.key).await {
+            let fill_chunk_bytes = if entry.meta.chunk_bytes > 0 {
+                entry.meta.chunk_bytes
+            } else {
+                chunk_bytes
+            };
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now > entry.meta.fresh_until {
+                return false;
+            }
+            if entry.covers(start, end) {
+                return true;
+            }
+            let Some(plan) = entry.meta.chunk_plan(start, end, chunk_bytes) else {
+                return false;
+            };
+            let missing_runs = plan.runs.iter().filter(|run| !run.cached).count();
+            if missing_runs == 0 || missing_runs > MAX_CHUNK_ORIGIN_RUNS {
+                return false;
+            }
+            let cap = large.fill_cap(total, self.state.large_cache_fill_max_bytes);
+            let missing_bytes = entry.meta.missing_bytes(start, end);
+            if entry.meta.stored_bytes().saturating_add(missing_bytes) > cap {
+                return false;
+            }
+            let fresh_secs = entry.meta.fresh_until.saturating_sub(now).max(1);
+            let swr_secs = entry
+                .meta
+                .stale_until
+                .saturating_sub(entry.meta.fresh_until);
+            for run in plan.runs.iter().filter(|run| !run.cached) {
+                let origin = match self
+                    .open_chunk_origin(session, native_plan, &entry, run.start, run.end, total)
+                    .await
+                {
+                    Ok(origin) => origin,
+                    Err(_) => return false,
+                };
+                let hdrs = entry.meta.headers.clone();
+                let Some(writer) = large
+                    .begin_chunk_range(
+                        &native_plan.key,
+                        200,
+                        hdrs,
+                        total,
+                        run.start,
+                        run.end,
+                        fresh_secs,
+                        swr_secs,
+                        fill_chunk_bytes,
+                    )
+                    .await
+                else {
+                    return false;
+                };
+                if !self
+                    .fill_origin_body(writer, origin.body, run.start, run.end)
+                    .await
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // No cache entry yet: fetch one chunk-aligned bounding span, create
+        // the sidecar from the origin response and fill it before serving the
+        // multipart response from disk.
+        let chunk_start = (start / chunk_bytes) * chunk_bytes;
+        let chunk_end = ((end / chunk_bytes) + 1)
+            .saturating_mul(chunk_bytes)
+            .saturating_sub(1)
+            .min(total.saturating_sub(1));
+        let full_len = chunk_end.saturating_sub(chunk_start).saturating_add(1);
+        let cap = large.fill_cap(total, self.state.large_cache_fill_max_bytes);
+        if full_len > cap || full_len > large.max_object_bytes() {
+            return false;
+        }
+        let (origin, origin_total, origin_end) = match self
+            .open_miss_origin(session, native_plan, chunk_start, Some(chunk_end))
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        if origin_total != total || origin_end < chunk_end {
+            return false;
+        }
+        let mut cache_headers = header_vec(&origin.headers);
+        cache_headers.retain(|(name, _)| {
+            !name.eq_ignore_ascii_case("content-range")
+                && !name.eq_ignore_ascii_case("content-length")
+                && !name.eq_ignore_ascii_case("transfer-encoding")
+                && !name.eq_ignore_ascii_case("connection")
+                && !name.eq_ignore_ascii_case("age")
+                && !name.eq_ignore_ascii_case("x-cache")
+                && !name.eq_ignore_ascii_case("x-cache-status")
+                && !name.eq_ignore_ascii_case("x-lagran-cache-reason")
+                && !name.eq_ignore_ascii_case("x-powered-by")
+        });
+        let cache_headers = crate::cache::large::LargeCache::prune_uncacheable(&cache_headers);
+        let Some(decision) = decide_storage_reason(
+            200,
+            &cache_headers,
+            native_plan.policy,
+            self.state.default_ttl_secs,
+        )
+        .ok() else {
+            return false;
+        };
+        let Some(writer) = large
+            .begin_chunk_range(
+                &native_plan.key,
+                200,
+                cache_headers,
+                total,
+                chunk_start,
+                chunk_end,
+                decision.ttl_secs,
+                decision.swr_secs,
+                chunk_bytes,
+            )
+            .await
+        else {
+            return false;
+        };
+        self.fill_origin_body(writer, origin.body, chunk_start, chunk_end)
+            .await
+    }
+
+    /// Read an origin body into a range writer. The caller already validated
+    /// the Content-Range; this only fails when the body ends before the range.
+    async fn fill_origin_body(
+        &self,
+        mut writer: RangeWriter,
+        mut body: hyper::body::Incoming,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        let idle_timeout =
+            Duration::from_millis(self.state.origin_stream_read_timeout_ms.max(1_000));
+        let mut pos = start;
+        let mut complete = true;
+        while pos <= end {
+            let frame = match tokio::time::timeout(idle_timeout, body.frame()).await {
+                Ok(Some(Ok(frame))) => frame,
+                _ => {
+                    complete = false;
+                    break;
+                }
+            };
+            let Some(data) = frame.into_data().ok() else {
+                continue;
+            };
+            if data.is_empty() {
+                continue;
+            }
+            writer.write_all(&data).await;
+            pos = pos.saturating_add(data.len() as u64);
+        }
+        let committed = writer.commit_partial().await;
+        complete && committed
+    }
+
+    async fn serve_large_multipart(
+        &self,
+        session: &mut Session,
+        native_plan: &NativePlan,
+        ranges: &[(u64, u64)],
+        total: u64,
+    ) -> bool {
+        if ranges.is_empty() {
+            return false;
+        }
+        let start = ranges.iter().map(|(start, _)| *start).min().unwrap_or(0);
+        let end = ranges.iter().map(|(_, end)| *end).max().unwrap_or(0);
+        if !self
+            .fill_large_span(session, native_plan, start, end, total)
+            .await
+        {
+            return false;
+        }
+        let Some(large) = self.state.large_cache.as_ref() else {
+            return false;
+        };
+        let Some(mut entry) = large.get_any(&native_plan.key).await else {
+            return false;
+        };
+        if entry.content_length() != total
+            || !ranges.iter().all(|(start, end)| entry.covers(*start, *end))
+        {
+            return false;
+        }
+        let fresh = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() <= entry.meta.fresh_until)
+            .unwrap_or(false);
+        if !fresh {
+            return false;
+        }
+
+        let boundary = format!(
+            "lagran-{:x}-{:x}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            self.origin_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let part_content_type = entry
+            .meta
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let mut part_headers = Vec::with_capacity(ranges.len());
+        let mut content_length = 0u64;
+        for (start, end) in ranges {
+            let header = format!(
+                "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {start}-{end}/{total}\r\n\r\n"
+            )
+            .into_bytes();
+            content_length = content_length
+                .saturating_add(header.len() as u64)
+                .saturating_add(end.saturating_sub(*start).saturating_add(1))
+                .saturating_add(2);
+            part_headers.push((header, *start, *end));
+        }
+        let final_boundary = format!("--{boundary}--\r\n");
+        content_length = content_length.saturating_add(final_boundary.len() as u64);
+        if content_length > usize::MAX as u64 {
+            return false;
+        }
+        let Ok(mut response) = ResponseHeader::build(
+            StatusCode::PARTIAL_CONTENT.as_u16(),
+            Some(content_length as usize),
+        ) else {
+            return false;
+        };
+        for (name, value) in &entry.meta.headers {
+            if name.eq_ignore_ascii_case(META_HEADER)
+                || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                || name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("content-range")
+                || name.eq_ignore_ascii_case("content-type")
+                || name.eq_ignore_ascii_case("accept-ranges")
+                || name.eq_ignore_ascii_case("age")
+                || name.eq_ignore_ascii_case("cache-status")
+                || is_hop_by_hop(name)
+                || !crate::cache::large::LargeCache::replayable_header(name)
+            {
+                continue;
+            }
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                if response.append_header(name, value).is_err() {
+                    return false;
+                }
+            }
+        }
+        if response
+            .insert_header(
+                "content-type",
+                format!("multipart/byteranges; boundary={boundary}"),
+            )
+            .is_err()
+            || response
+                .insert_header("content-length", content_length.to_string())
+                .is_err()
+            || response.insert_header("accept-ranges", "bytes").is_err()
+            || response.insert_header("x-cache", "HIT").is_err()
+            || response.insert_header("x-cache-status", "HIT").is_err()
+            || response
+                .insert_header("x-lagran-cache-source", "l3")
+                .is_err()
+            || response
+                .insert_header("x-lagran-cache-reason", "range-multipart")
+                .is_err()
+        {
+            return false;
+        }
+        Self::apply_security_headers(&mut response);
+        Self::apply_cors_and_custom(&mut response, &native_plan.domain.response_headers);
+        let _ = response.insert_header("x-powered-by", "lagran-edge");
+        if entry.meta.stored_at > 0 {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ =
+                response.insert_header("age", now.saturating_sub(entry.meta.stored_at).to_string());
+            let _ = response.insert_header(
+                "x-lagran-cache-ttl",
+                entry.meta.fresh_until.saturating_sub(now).to_string(),
+            );
+        }
+        if session
+            .write_response_header(Box::new(response), false)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        for (header, start, end) in part_headers {
+            if session
+                .write_response_body(Some(Bytes::from(header)), false)
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            if !self
+                .write_large_body(session, &mut entry, start, end, false)
+                .await
+            {
+                return true;
+            }
+            if session
+                .write_response_body(Some(Bytes::from_static(b"\r\n")), false)
+                .await
+                .is_err()
+            {
+                return true;
+            }
+        }
+        let _ = session
+            .write_response_body(Some(Bytes::from(final_boundary)), true)
             .await;
         true
     }
@@ -4985,6 +5371,36 @@ fn parse_single_range(raw: &str, total: u64) -> Option<(u64, u64)> {
     (start <= end && start < total).then_some((start, end))
 }
 
+/// Parse a comma-separated Range request into satisfiable byte ranges.
+///
+/// Unsatifiable/invalid parts are ignored when at least one part is valid,
+/// which matches RFC 9110's handling of a mixed Range set. Returns `None` when
+/// no part is usable or the set is too large for the bounded multipart path.
+fn parse_multi_ranges(raw: &str, total: u64) -> Option<Vec<(u64, u64)>> {
+    if total == 0 {
+        return None;
+    }
+    let value = raw.trim().strip_prefix("bytes=")?;
+    if !value.contains(',') {
+        return None;
+    }
+    let mut ranges = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let single = format!("bytes={part}");
+        if let Some(range) = parse_single_range(&single, total) {
+            ranges.push(range);
+        }
+    }
+    if ranges.is_empty() || ranges.len() > MAX_MULTI_RANGES {
+        return None;
+    }
+    Some(ranges)
+}
+
 fn range_is_small_bounded(headers: &HeaderMap) -> bool {
     const MAX_SLICE: u64 = 1024 * 1024;
     let Some(raw) = headers.get("range").and_then(|v| v.to_str().ok()) else {
@@ -5361,8 +5777,8 @@ mod tests {
     use super::{
         DataPlaneProxy, ResponsePolicySlot, cached_response_policy, compressed_variant_key,
         effective_connect_timeout_ms, fill_window, gzip_engine_body,
-        head_content_length_for_protocol, parse_single_range, range_fill_is_candidate,
-        valid_release_tag, vary_on_accept_encoding, weaken_etag,
+        head_content_length_for_protocol, parse_multi_ranges, parse_single_range,
+        range_fill_is_candidate, valid_release_tag, vary_on_accept_encoding, weaken_etag,
     };
     use crate::cache::policy::ResolvedPolicy;
     use crate::server::response_headers::ResponseHeaderOverrides;
@@ -5551,6 +5967,20 @@ mod tests {
         assert_eq!(parse_single_range("bytes=5000-", 4096), None);
         assert_eq!(parse_single_range("bytes=-0", 4096), None);
         assert_eq!(parse_single_range("items=0-1", 4096), None);
+        assert_eq!(
+            parse_multi_ranges("bytes=0-1,4-5", 4096),
+            Some(vec![(0, 1), (4, 5)])
+        );
+        assert_eq!(
+            parse_multi_ranges("bytes=-2,0-0", 4096),
+            Some(vec![(4094, 4095), (0, 0)])
+        );
+        assert_eq!(
+            parse_multi_ranges("bytes=0-1,5000-", 4096),
+            Some(vec![(0, 1)])
+        );
+        assert_eq!(parse_multi_ranges("bytes=5000-,6000-", 4096), None);
+        assert_eq!(parse_multi_ranges("bytes=0-1", 4096), None);
     }
 
     #[test]

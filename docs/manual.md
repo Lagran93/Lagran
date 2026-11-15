@@ -2166,6 +2166,69 @@ LARGE_CACHE_MAX_BYTES
 
 分片大小影响回源粒度和缓存覆盖；队列参数只影响填充过程中的内存缓冲和丢弃行为。
 
+#### 5.8.2 多段 Range
+
+支持标准多段请求：
+
+```http
+Range: bytes=0-1,4-5
+```
+
+解析规则：
+
+- 最多 16 段；
+- 每段独立解析，支持 `bytes=start-end`、`bytes=start-`、`bytes=-N`；
+- 不可满足的段在还有其他可用段时跳过；
+- 全部不可满足时回退源站，由源站返回 416 或自己的 multipart 响应；
+- 超过 16 段时回退源站。
+
+缓存命中时：
+
+1. 计算所有段的最小 start 和最大 end，得到首尾包络；
+2. 对包络内的分片执行 `ChunkPlan`；
+3. 已缓存分片读磁盘，缺失分片按分片回源并写入；
+4. 从磁盘读取各段，构造 `multipart/byteranges` 响应。
+
+冷缓存时：
+
+- 先通过 HEAD（不支持时用 `bytes=0-0`）获取对象总长度；
+- 在首尾包络内做 chunk-aligned fill；
+- 填充完成后再从磁盘构造 multipart 响应。
+
+响应格式：
+
+```http
+HTTP/1.1 206 Partial Content
+Content-Type: multipart/byteranges; boundary=lagran-...
+Content-Length: ...
+X-Cache: HIT
+X-Lagran-Cache-Source: l3
+X-Lagran-Cache-Reason: range-multipart
+```
+
+每个 part 包含：
+
+```http
+--lagran-...
+Content-Type: <cached content-type>
+Content-Range: bytes 0-1/<total>
+
+<bytes 0-1>
+```
+
+特点：
+
+- 不把整个对象读入内存，part 直接流式读取稀疏文件；
+- `Content-Length` 按 part header、part body、CRLF 和最终 boundary 精确计算；
+- 重叠段按客户端顺序分别输出，不去重；
+- 段跨度过大、超过单对象填充上限、磁盘/文件系统空间不足、源站 ETag/Content-Range 不匹配时，回退源站 multipart 响应，客户端仍得到正确结果。
+
+限制：
+
+- 冷请求的多段 Range 会填充首尾包络之间的所有缺失分片；如果两段相隔很远，可能触发填充上限并回退源站；
+- `If-Range` 请求仍交给源站处理，不参与 large cache 多段拼接；
+- 普通小对象/未启用 large cache 时仍由源站处理多段请求。
+
 ### 5.9 视频 Range 与 504 优化
 
 播放器常见的：
@@ -2275,7 +2338,7 @@ X-Lagran-Cache-Reason: range-large-cache
 - 多个不连续缺失区间分别回源；
 - 源站返回 200、ETag/Content-Range 不匹配时删除旧段并回退普通回源；
 - 源站非 identity `Content-Encoding` 时不拼接；
-- 多段 Range（`bytes=0-1,4-5`）仍不拼接，按普通请求处理；
+- 多段 Range（`bytes=0-1,4-5`）在 large cache 上返回 `multipart/byteranges`；缺失区间按分片填充，无法覆盖时回退源站透传；
 - 首次后缀 Range 会先做一次 HEAD（或 `bytes=0-0`）探测总长度，然后按分片填充。
 
 ### 5.9.1 回源超时体系
@@ -3142,7 +3205,7 @@ Accept-Ranges: bytes
 检查是否：
 
 - 请求带 `If-Range`
-- 多段 Range
+- 多段 Range 的首尾包络超过填充上限（会透传）
 - 对象低于大缓存阈值
 - 规则 bypass
 - 带 Cookie/Authorization/no-store
@@ -3467,7 +3530,7 @@ cd apps/frontend && npm run generate
 
 - 普通缓存以完整对象为单位；大对象支持 partial Range segment，但仅覆盖已请求区间。
 - 大对象完整 GET 需要 `complete=true`；partial 不能拼接为完整响应。
-- 单段 Range 才支持 partial 填充；多段 Range 透传。
+- 大对象多段 Range 已在 large cache 支持 multipart 缓存响应；冷请求的填充范围是首尾包络，跨度过大或超过填充上限时回退源站透传。
 - `no-cache` 响应不进入共享缓存；请求 no-cache、`max-age=0` 有 validator 时走条件请求 304 复用，无 validator 时回源。
 - `only-if-cached`、`min-fresh`、`max-stale`、`stale-if-error` 尚未完整实现；请求 no-cache 选择直接回源。
 - 修改缓存规则/配置不会自动删除旧缓存。
