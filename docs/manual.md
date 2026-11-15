@@ -1856,6 +1856,209 @@ LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=268435456
 - 分片写入只提交完整分片；客户端中断时正在写的半个分片丢弃。
 - 监控项：lagran_edge_chunk_requests_total、lagran_edge_chunk_origin_runs_total、lagran_edge_chunk_fallbacks_total、lagran_edge_chunk_fill_drops_total、lagran_edge_chunk_fill_dropped_bytes_total、lagran_edge_chunk_origin_attempts_total、lagran_edge_chunk_origin_failures_total；容量水位：lagran_large_cache_used_bytes、lagran_large_cache_available_bytes、lagran_large_cache_capacity_bytes。
 
+#### 5.8.1 Fill 队列预算
+
+`LARGE_CACHE_FILL_QUEUE_BYTES` 和 `LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES` 控制的是 edge 在“源站/客户端 → 磁盘 writer”之间允许缓冲多少在途数据。它们不是磁盘缓存容量，也不是单对象填充上限。
+
+```text
+origin/client
+     │
+     ▼
+ RangeSink / RangeFillSink
+     │  每个 fill 一个内存队列
+     │  ← LARGE_CACHE_FILL_QUEUE_BYTES 限制单个队列
+     ▼
+ RangeWriter（后台 writer）
+     │
+     ▼
+稀疏 .data + .meta.json
+```
+
+所有 fill 队列的已预留字节合计受 `LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES` 限制。
+
+| 参数 | 作用域 | 限制对象 | 默认值 |
+|---|---|---|---|
+| `LARGE_CACHE_FILL_QUEUE_BYTES` | 单个 fill worker | 一个 `RangeSink` / `RangeFillSink` 队列中等待写盘的字节 | 128 MiB |
+| `LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES` | 整个 edge 进程 | 所有活跃 fill 队列的预留字节总和 | 256 MiB |
+
+单个 fill 的处理流程：
+
+- 源站数据先进入 fill 队列；
+- 后台 `RangeWriter` 从队列取 chunk 写入稀疏文件；
+- 磁盘速度低于数据到达速度时，队列增长；
+- 超过单 fill 上限后，停止该 fill 的后续写盘；
+- 队列中已经写入的部分仍然提交。
+
+全局预算防止多个并发 fill 同时增长：
+
+```text
+请求 A：40 MiB 队列
+请求 B：90 MiB 队列
+请求 C：80 MiB 队列
+...
+所有预留合计 <= LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES
+```
+
+默认的 128 MiB / 256 MiB 最坏情况下大约只能容纳两个接近满队列的大 fill；第三个 fill 会提前丢弃后续字节。
+
+##### 不是单对象缓存上限
+
+`LARGE_CACHE_FILL_QUEUE_BYTES` 是**在途缓冲上限**，不是单个对象最多缓存多少。
+
+只要磁盘跟得上：
+
+```text
+1 GiB 对象
+→ 队列可能长期只有几 MiB
+→ writer 持续消费
+→ 最终可以缓存完整 1 GiB
+```
+
+单对象最多写多少由 `LARGE_CACHE_FILL_MAX_BYTES` 控制。
+
+##### 不是磁盘硬上限
+
+两个上限属于不同的资源维度：
+
+```text
+FILL_QUEUE_*          → 内存中的在途字节
+LARGE_CACHE_MAX_BYTES → 磁盘上已提交 + 预留的逻辑字节
+```
+
+即使队列很小，磁盘缓存仍可能写满；即使磁盘还有空间，队列也可能因为内存预算先丢弃。
+
+磁盘水位看：
+
+```text
+lagran_large_cache_used_bytes
+lagran_large_cache_available_bytes
+lagran_large_cache_capacity_bytes
+```
+
+队列丢弃看：
+
+```text
+lagran_edge_chunk_fill_drops_total
+lagran_edge_chunk_fill_dropped_bytes_total
+```
+
+不要用 `large_cache_available_bytes` 判断 fill 队列是否满。
+
+##### 队列满时的行为
+
+1. 停止把这个 fill 的后续字节送入 writer；
+2. 客户端响应不受影响，继续接收源站/现有流；
+3. writer 提交已经完整写入的前缀；
+4. 分片模式只提交完整分片；
+5. 对象保持 `complete=false`；
+6. 下一次请求只补缺失分片；
+7. 丢弃字节计入 fill drop 指标。
+
+因此这是**缓存降级**，不是请求失败。代价是：
+
+- 已读取的源站数据被丢弃；
+- 缓存不完整；
+- 后续请求可能再次回源缺失部分；
+- 源站带宽被浪费。
+
+##### 运行时关系
+
+配置加载时做钳制：
+
+```text
+LARGE_CACHE_FILL_QUEUE_BYTES：      1 MiB – 1 GiB
+LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES：1 MiB – 4 GiB
+```
+
+实际全局预算：
+
+```text
+max(LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES,
+    LARGE_CACHE_FILL_QUEUE_BYTES)
+```
+
+例如：
+
+```env
+LARGE_CACHE_FILL_QUEUE_BYTES=134217728
+LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=67108864
+```
+
+实际总预算仍是 128 MiB，否则单 fill 本身就无法容纳。
+
+修改后需要重启 edge 生效。两个值不预分配内存：配置 256 MiB 不会在启动时直接占用 256 MiB，只是运行时预留上限。
+
+##### 调优
+
+当前默认值偏保守，适合“内存优先、允许缓存不完整”的 edge。
+
+队列经常丢弃，但磁盘水位不高：
+
+- 适当增大 `LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES`；
+- 或降低并发大 Range 数量；
+- 或提高磁盘写入能力。
+
+队列经常丢弃，且磁盘水位接近上限：
+
+- 增大 `LARGE_CACHE_MAX_BYTES`；
+- 清理缓存；
+- 或降低单对象填充上限。
+
+内存紧张：
+
+```env
+# 单 fill 仍应能容纳几个分片，避免轻微抖动就丢弃
+LARGE_CACHE_FILL_QUEUE_BYTES=33554432
+LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=134217728
+```
+
+高并发大文件、内存充足：
+
+```env
+LARGE_CACHE_FILL_QUEUE_BYTES=67108864
+LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=536870912
+```
+
+可按下面的关系估算：
+
+```text
+全局预算 ≈ 预期同时活跃的 fill 数 × 单 fill 上限
+```
+
+但不要只靠调大队列解决慢磁盘问题：队列越大，只是把更多数据暂存在内存里，最终仍受磁盘吞吐限制。
+
+##### 内存估算的边界
+
+预算统计的是**队列中等待 writer 接收的字节**：
+
+- 数据 reserve 后进入队列；
+- writer 收到 chunk 后释放预算；
+- writer 正在写盘的那一个 chunk 不再计入队列预算；
+- 源站响应体、客户端响应缓冲、`Bytes` 复制和 Tokio 任务也有额外开销。
+
+所以实际 RSS 会略高于这两个预算值。它们是保护线，不是精确内存配额。
+
+##### 和分片参数的区别
+
+```text
+LARGE_CACHE_CHUNK_BYTES
+→ 缓存/回源的逻辑网格，默认 1 MiB
+
+LARGE_CACHE_FILL_QUEUE_BYTES
+→ 单个 fill 的内存队列
+
+LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES
+→ 所有 fill 队列的内存总预算
+
+LARGE_CACHE_FILL_MAX_BYTES
+→ 单对象最多填充多少逻辑字节
+
+LARGE_CACHE_MAX_BYTES
+→ 磁盘缓存硬上限
+```
+
+分片大小影响回源粒度和缓存覆盖；队列参数只影响填充过程中的内存缓冲和丢弃行为。
+
 ### 5.9 视频 Range 与 504 优化
 
 播放器常见的：
