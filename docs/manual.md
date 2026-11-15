@@ -1857,7 +1857,7 @@ LARGE_CACHE_MIN_FREE_BYTES=1073741824
 - 手动分片回源按 origin 健康度/优先级/权重依次 failover；网络错误、超时、非 206 会尝试下一个源站，ETag/Content-Range/编码不匹配也不会盲目拼接。
 - 首次后缀 Range（`bytes=-N`）先用 HEAD 探测对象总长度，再把后缀起点换算成普通 Range 进入分片路径；源站不支持 HEAD 时用 `bytes=0-0` 探测。
 - 分片写入只提交完整分片；客户端中断时正在写的半个分片丢弃。
-- 监控项：lagran_edge_chunk_requests_total、lagran_edge_chunk_origin_runs_total、lagran_edge_chunk_fallbacks_total、lagran_edge_chunk_fill_drops_total、lagran_edge_chunk_fill_dropped_bytes_total、lagran_edge_chunk_origin_attempts_total、lagran_edge_chunk_origin_failures_total；容量水位：lagran_large_cache_used_bytes、lagran_large_cache_available_bytes、lagran_large_cache_capacity_bytes、lagran_large_cache_fs_available_bytes、lagran_large_cache_fs_reserved_bytes、lagran_large_cache_min_free_bytes。
+- 监控项：lagran_edge_chunk_requests_total、lagran_edge_chunk_origin_runs_total、lagran_edge_chunk_fallbacks_total、lagran_edge_chunk_fill_drops_total、lagran_edge_chunk_fill_dropped_bytes_total、lagran_edge_chunk_fill_drop_queue_total、lagran_edge_chunk_fill_drop_budget_total、lagran_edge_chunk_fill_drop_send_total、lagran_edge_chunk_fill_rejects_total、lagran_edge_chunk_fill_rejected_bytes_total、lagran_edge_chunk_origin_attempts_total、lagran_edge_chunk_origin_failures_total；容量水位：lagran_large_cache_used_bytes、lagran_large_cache_available_bytes、lagran_large_cache_capacity_bytes、lagran_large_cache_fs_available_bytes、lagran_large_cache_fs_reserved_bytes、lagran_large_cache_fs_admission_headroom_bytes、lagran_large_cache_min_free_bytes。
 
 #### 5.8.1 Fill 队列预算
 
@@ -2000,6 +2000,20 @@ writer 提交/中止：fs_reserved -= reservation
 
 因为 writer 实际写盘会消耗空闲空间，而预留仍然存在，所以并发期间的空闲空间判断是偏保守的：可能出现磁盘实际上还能再写一点，但新 fill 已经被拒绝。这是有意的安全取舍。
 
+`fs_reserved_bytes` 只统计**当前活跃 writer** 的预留。没有 fill 进行时它为 0 是正常的，不代表 `LARGE_CACHE_MIN_FREE_BYTES` 没生效。`MIN_FREE` 是每个新 fill 准入时扣减的下限，不是常驻预留。
+
+实际可准入余量：
+
+```text
+fs_available_bytes - fs_reserved_bytes - min_free_bytes
+```
+
+对应指标：
+
+```text
+lagran_large_cache_fs_admission_headroom_bytes
+```
+
 ##### 和逻辑硬上限的区别
 
 ```text
@@ -2046,6 +2060,7 @@ writer 的磁盘预留不再对 sidecar 使用固定 64 KiB：
 ```text
 lagran_large_cache_fs_available_bytes
 lagran_large_cache_fs_reserved_bytes
+lagran_large_cache_fs_admission_headroom_bytes
 lagran_large_cache_min_free_bytes
 ```
 

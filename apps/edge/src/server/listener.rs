@@ -173,9 +173,10 @@ async fn update_authed(
 
 async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snaps = state.metrics.take_snapshots_peek();
+    let global = state.metrics.global_snapshot();
     let mut out = String::from(
         "# HELP lagran_edge_up Edge process up\n# TYPE lagran_edge_up gauge\nlagran_edge_up 1\n\
-         # HELP lagran_edge_domains Domains with traffic counters\n# TYPE lagran_edge_domains gauge\n\
+         # HELP lagran_edge_domains Domains with unreported traffic counters\n# TYPE lagran_edge_domains gauge\n\
          # HELP lagran_edge_requests_total Requests handled\n# TYPE lagran_edge_requests_total counter\n",
     );
     let mut hits = String::from(
@@ -206,10 +207,22 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
             s.bytes_sent
         ));
     }
+    out.push_str(&format!("lagran_edge_requests_total {}\n", global.requests));
+    hits.push_str(&format!(
+        "lagran_edge_cache_hits_total {}\n",
+        global.cache_hits
+    ));
+    misses.push_str(&format!(
+        "lagran_edge_cache_misses_total {}\n",
+        global.cache_misses
+    ));
+    bytes.push_str(&format!(
+        "lagran_edge_bytes_sent_total {}\n",
+        global.bytes_sent
+    ));
     out.push_str(&hits);
     out.push_str(&misses);
     out.push_str(&bytes);
-    let global = state.metrics.global_snapshot();
     out.push_str(&format!(
         "# HELP lagran_edge_origin_timeouts_total Origin connect/header timeouts\n\
          # TYPE lagran_edge_origin_timeouts_total counter\n\
@@ -247,9 +260,24 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
          # HELP lagran_edge_chunk_fill_drops_total Chunk fills dropped by queue/budget limits\n\
          # TYPE lagran_edge_chunk_fill_drops_total counter\n\
          lagran_edge_chunk_fill_drops_total {}\n\
-         # HELP lagran_edge_chunk_fill_dropped_bytes_total Bytes dropped by queue/budget limits\n\
+         # HELP lagran_edge_chunk_fill_dropped_bytes_total Bytes actually discarded by queue/budget limits\n\
          # TYPE lagran_edge_chunk_fill_dropped_bytes_total counter\n\
          lagran_edge_chunk_fill_dropped_bytes_total {}\n\
+         # HELP lagran_edge_chunk_fill_drop_queue_total Fill drops caused by the per-fill queue limit\n\
+         # TYPE lagran_edge_chunk_fill_drop_queue_total counter\n\
+         lagran_edge_chunk_fill_drop_queue_total {}\n\
+         # HELP lagran_edge_chunk_fill_drop_budget_total Fill drops caused by the process fill budget\n\
+         # TYPE lagran_edge_chunk_fill_drop_budget_total counter\n\
+         lagran_edge_chunk_fill_drop_budget_total {}\n\
+         # HELP lagran_edge_chunk_fill_drop_send_total Fill drops caused by a closed writer channel\n\
+         # TYPE lagran_edge_chunk_fill_drop_send_total counter\n\
+         lagran_edge_chunk_fill_drop_send_total {}\n\
+         # HELP lagran_edge_chunk_fill_rejects_total Fills rejected before any byte was queued\n\
+         # TYPE lagran_edge_chunk_fill_rejects_total counter\n\
+         lagran_edge_chunk_fill_rejects_total {}\n\
+         # HELP lagran_edge_chunk_fill_rejected_bytes_total Planned bytes for rejected fills\n\
+         # TYPE lagran_edge_chunk_fill_rejected_bytes_total counter\n\
+         lagran_edge_chunk_fill_rejected_bytes_total {}\n\
          # HELP lagran_edge_chunk_origin_attempts_total Origin attempts by manual chunk paths\n\
          # TYPE lagran_edge_chunk_origin_attempts_total counter\n\
          lagran_edge_chunk_origin_attempts_total {}\n\
@@ -269,6 +297,11 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         global.chunk_fallbacks,
         global.chunk_fill_drops,
         global.chunk_fill_dropped_bytes,
+        global.chunk_fill_drop_queue,
+        global.chunk_fill_drop_budget,
+        global.chunk_fill_drop_send,
+        global.chunk_fill_rejects,
+        global.chunk_fill_rejected_bytes,
         global.chunk_origin_attempts,
         global.chunk_origin_failures
     ));
@@ -298,21 +331,27 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     ));
     if let Some(cache) = state.large_cache.as_ref() {
         out.push_str(&format!(
-            "# HELP lagran_large_cache_fs_reserved_bytes In-flight filesystem reservations\n\
+            "# HELP lagran_large_cache_fs_reserved_bytes In-flight writer reservations; 0 when idle\n\
              # TYPE lagran_large_cache_fs_reserved_bytes gauge\n\
              lagran_large_cache_fs_reserved_bytes {}\n\
-             # HELP lagran_large_cache_min_free_bytes Filesystem free-space floor\n\
+             # HELP lagran_large_cache_min_free_bytes Filesystem free-space floor (not a reservation)\n\
              # TYPE lagran_large_cache_min_free_bytes gauge\n\
              lagran_large_cache_min_free_bytes {}\n",
             cache.fs_reserved_bytes(),
             cache.min_free_bytes()
         ));
         if let Some(free) = cache.fs_available_bytes() {
+            let headroom = free
+                .saturating_sub(cache.fs_reserved_bytes())
+                .saturating_sub(cache.min_free_bytes());
             out.push_str(&format!(
-                "# HELP lagran_large_cache_fs_available_bytes Filesystem bytes available to the edge user\n\
+                "# HELP lagran_large_cache_fs_available_bytes Raw filesystem bytes available to the edge user\n\
                  # TYPE lagran_large_cache_fs_available_bytes gauge\n\
-                 lagran_large_cache_fs_available_bytes {}\n",
-                free
+                 lagran_large_cache_fs_available_bytes {}\n\
+                 # HELP lagran_large_cache_fs_admission_headroom_bytes Free space above in-flight reservations and MIN_FREE\n\
+                 # TYPE lagran_large_cache_fs_admission_headroom_bytes gauge\n\
+                 lagran_large_cache_fs_admission_headroom_bytes {}\n",
+                free, headroom
             ));
         }
     }

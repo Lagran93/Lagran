@@ -199,14 +199,14 @@ impl RangeFillSink {
             // let the worker commit whatever it already drained.
             self.queued
                 .fetch_sub(take as u64, std::sync::atomic::Ordering::Relaxed);
-            self.metrics.record_chunk_fill_drop(take as u64);
+            self.metrics.record_chunk_fill_drop_queue(take as u64);
             self.tx = None;
             return;
         }
         if !self.budget.reserve(take as u64) {
             self.queued
                 .fetch_sub(take as u64, std::sync::atomic::Ordering::Relaxed);
-            self.metrics.record_chunk_fill_drop(take as u64);
+            self.metrics.record_chunk_fill_drop_budget(take as u64);
             self.tx = None;
             return;
         }
@@ -221,7 +221,7 @@ impl RangeFillSink {
             self.budget.release(take as u64);
             self.queued
                 .fetch_sub(take as u64, std::sync::atomic::Ordering::Relaxed);
-            self.metrics.record_chunk_fill_drop(take as u64);
+            self.metrics.record_chunk_fill_drop_send(take as u64);
             self.tx = None;
             return;
         }
@@ -1760,7 +1760,7 @@ impl ProxyHttp for DataPlaneProxy {
                     };
                     let bytes = data.len() as u64;
                     if !sink.budget.reserve(bytes) {
-                        sink.metrics.record_chunk_fill_drop(bytes);
+                        sink.metrics.record_chunk_fill_drop_budget(bytes);
                         ctx.range_sink = None;
                         return Ok(None);
                     }
@@ -1768,14 +1768,22 @@ impl ProxyHttp for DataPlaneProxy {
                         .queued
                         .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
                         + bytes;
-                    if queued > sink.queue_limit || sink.tx.send(RangeMsg::Chunk(data)).is_err() {
+                    if queued > sink.queue_limit {
                         // Disk writer is slower than the origin. Drop the fill
                         // rather than growing an unbounded queue; the client
                         // body is still forwarded unchanged.
                         sink.queued
                             .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
                         sink.budget.release(bytes);
-                        sink.metrics.record_chunk_fill_drop(bytes);
+                        sink.metrics.record_chunk_fill_drop_queue(bytes);
+                        ctx.range_sink = None;
+                        return Ok(None);
+                    }
+                    if sink.tx.send(RangeMsg::Chunk(data)).is_err() {
+                        sink.queued
+                            .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                        sink.budget.release(bytes);
+                        sink.metrics.record_chunk_fill_drop_send(bytes);
                         ctx.range_sink = None;
                         return Ok(None);
                     }
@@ -3909,7 +3917,7 @@ impl DataPlaneProxy {
                     })
                 } else {
                     if fill_len > 0 {
-                        self.state.metrics.record_chunk_fill_drop(fill_len);
+                        self.state.metrics.record_chunk_fill_reject(fill_len);
                     }
                     None
                 }
@@ -4268,7 +4276,7 @@ impl DataPlaneProxy {
                     })
                 } else {
                     if fill_len > 0 {
-                        self.state.metrics.record_chunk_fill_drop(fill_len);
+                        self.state.metrics.record_chunk_fill_reject(fill_len);
                     }
                     None
                 }

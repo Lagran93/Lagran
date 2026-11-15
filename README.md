@@ -315,17 +315,29 @@ curl -fsS http://127.0.0.1:8082/__lagran/metrics
 重点指标：
 
 ```text
+lagran_edge_requests_total
+lagran_edge_cache_hits_total
+lagran_edge_cache_misses_total
+lagran_edge_bytes_sent_total
 lagran_edge_chunk_requests_total
 lagran_edge_chunk_origin_attempts_total
 lagran_edge_chunk_origin_failures_total
 lagran_edge_chunk_fill_drops_total
 lagran_edge_chunk_fill_dropped_bytes_total
+lagran_edge_chunk_fill_drop_queue_total
+lagran_edge_chunk_fill_drop_budget_total
+lagran_edge_chunk_fill_drop_send_total
+lagran_edge_chunk_fill_rejects_total
+lagran_edge_chunk_fill_rejected_bytes_total
 lagran_large_cache_used_bytes
 lagran_large_cache_available_bytes
 lagran_large_cache_fs_available_bytes
 lagran_large_cache_fs_reserved_bytes
+lagran_large_cache_fs_admission_headroom_bytes
 lagran_large_cache_min_free_bytes
 ```
+
+`fill_dropped_bytes` 是实际进入队列后又被丢弃的字节；`fill_rejected_bytes` 是 writer 创建前就被拒绝的**计划填充量**，不代表已经读取/浪费了这些源站字节。
 
 ### 升级
 

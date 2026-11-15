@@ -34,8 +34,17 @@ pub struct EdgeMetrics {
     chunk_fallbacks: AtomicU64,
     chunk_fill_drops: AtomicU64,
     chunk_fill_dropped_bytes: AtomicU64,
+    chunk_fill_drop_queue: AtomicU64,
+    chunk_fill_drop_budget: AtomicU64,
+    chunk_fill_drop_send: AtomicU64,
+    chunk_fill_rejects: AtomicU64,
+    chunk_fill_rejected_bytes: AtomicU64,
     chunk_origin_attempts: AtomicU64,
     chunk_origin_failures: AtomicU64,
+    requests: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    bytes_sent: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -53,8 +62,17 @@ pub struct GlobalSnapshot {
     pub chunk_fallbacks: u64,
     pub chunk_fill_drops: u64,
     pub chunk_fill_dropped_bytes: u64,
+    pub chunk_fill_drop_queue: u64,
+    pub chunk_fill_drop_budget: u64,
+    pub chunk_fill_drop_send: u64,
+    pub chunk_fill_rejects: u64,
+    pub chunk_fill_rejected_bytes: u64,
     pub chunk_origin_attempts: u64,
     pub chunk_origin_failures: u64,
+    pub requests: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub bytes_sent: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +110,9 @@ impl EdgeMetrics {
     }
 
     pub fn record_hit(&self, domain: &str, bytes: u64) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         let c = self.bucket(domain);
         c.requests.fetch_add(1, Ordering::Relaxed);
         c.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -99,6 +120,9 @@ impl EdgeMetrics {
     }
 
     pub fn record_miss(&self, domain: &str, bytes: u64) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         let c = self.bucket(domain);
         c.requests.fetch_add(1, Ordering::Relaxed);
         c.cache_misses.fetch_add(1, Ordering::Relaxed);
@@ -106,6 +130,8 @@ impl EdgeMetrics {
     }
 
     pub fn record_bypass(&self, domain: &str, bytes: u64) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         let c = self.bucket(domain);
         c.requests.fetch_add(1, Ordering::Relaxed);
         c.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
@@ -178,6 +204,29 @@ impl EdgeMetrics {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn record_chunk_fill_drop_queue(&self, bytes: u64) {
+        self.chunk_fill_drop_queue.fetch_add(1, Ordering::Relaxed);
+        self.record_chunk_fill_drop(bytes);
+    }
+
+    pub fn record_chunk_fill_drop_budget(&self, bytes: u64) {
+        self.chunk_fill_drop_budget.fetch_add(1, Ordering::Relaxed);
+        self.record_chunk_fill_drop(bytes);
+    }
+
+    pub fn record_chunk_fill_drop_send(&self, bytes: u64) {
+        self.chunk_fill_drop_send.fetch_add(1, Ordering::Relaxed);
+        self.record_chunk_fill_drop(bytes);
+    }
+
+    /// A fill was rejected before any byte was queued (admission/disk/lock).
+    /// These bytes were planned, not actually discarded.
+    pub fn record_chunk_fill_reject(&self, bytes: u64) {
+        self.chunk_fill_rejects.fetch_add(1, Ordering::Relaxed);
+        self.chunk_fill_rejected_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub fn record_chunk_origin_attempt(&self) {
         self.chunk_origin_attempts.fetch_add(1, Ordering::Relaxed);
     }
@@ -201,8 +250,17 @@ impl EdgeMetrics {
             chunk_fallbacks: self.chunk_fallbacks.load(Ordering::Relaxed),
             chunk_fill_drops: self.chunk_fill_drops.load(Ordering::Relaxed),
             chunk_fill_dropped_bytes: self.chunk_fill_dropped_bytes.load(Ordering::Relaxed),
+            chunk_fill_drop_queue: self.chunk_fill_drop_queue.load(Ordering::Relaxed),
+            chunk_fill_drop_budget: self.chunk_fill_drop_budget.load(Ordering::Relaxed),
+            chunk_fill_drop_send: self.chunk_fill_drop_send.load(Ordering::Relaxed),
+            chunk_fill_rejects: self.chunk_fill_rejects.load(Ordering::Relaxed),
+            chunk_fill_rejected_bytes: self.chunk_fill_rejected_bytes.load(Ordering::Relaxed),
             chunk_origin_attempts: self.chunk_origin_attempts.load(Ordering::Relaxed),
             chunk_origin_failures: self.chunk_origin_failures.load(Ordering::Relaxed),
+            requests: self.requests.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
         }
     }
 
@@ -385,6 +443,37 @@ mod tests {
         assert_eq!(snapshot.chunk_fill_dropped_bytes, 3072);
         assert_eq!(snapshot.chunk_origin_attempts, 2);
         assert_eq!(snapshot.chunk_origin_failures, 1);
+    }
+
+    #[test]
+    fn global_counters_survive_domain_reporting() {
+        let metrics = EdgeMetrics::default();
+        metrics.record_hit("a.test", 10);
+        metrics.record_miss("b.test", 20);
+        let reported = metrics.take_snapshots_peek();
+        metrics.subtract_reported(&reported);
+        let snapshot = metrics.global_snapshot();
+        assert_eq!(snapshot.requests, 2);
+        assert_eq!(snapshot.cache_hits, 1);
+        assert_eq!(snapshot.cache_misses, 1);
+        assert_eq!(snapshot.bytes_sent, 30);
+    }
+
+    #[test]
+    fn fill_drop_reasons_and_rejects_are_separate() {
+        let metrics = EdgeMetrics::default();
+        metrics.record_chunk_fill_drop_queue(100);
+        metrics.record_chunk_fill_drop_budget(200);
+        metrics.record_chunk_fill_drop_send(300);
+        metrics.record_chunk_fill_reject(400);
+        let snapshot = metrics.global_snapshot();
+        assert_eq!(snapshot.chunk_fill_drops, 3);
+        assert_eq!(snapshot.chunk_fill_dropped_bytes, 600);
+        assert_eq!(snapshot.chunk_fill_drop_queue, 1);
+        assert_eq!(snapshot.chunk_fill_drop_budget, 1);
+        assert_eq!(snapshot.chunk_fill_drop_send, 1);
+        assert_eq!(snapshot.chunk_fill_rejects, 1);
+        assert_eq!(snapshot.chunk_fill_rejected_bytes, 400);
     }
 
     #[test]
