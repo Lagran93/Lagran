@@ -216,10 +216,30 @@ pub struct FillBudget {
     max: u64,
 }
 
-/// Headroom for the sidecar JSON when a writer reserves its body range.
-/// Pruned origin headers are normally far smaller, but this keeps the hard cap
-/// from being exceeded by metadata on the common paths.
+/// Last-resort sidecar headroom if serialization/estimation fails.
 const RESERVATION_SLACK: u64 = 64 * 1024;
+/// Safety margin for timestamp digit changes and JSON encoder details.
+const META_RESERVE_HEADROOM: u64 = 1024;
+
+fn meta_reservation_for_meta(meta: &LargeMeta) -> u64 {
+    serde_json::to_vec(meta)
+        .map(|bytes| (bytes.len() as u64).saturating_add(META_RESERVE_HEADROOM))
+        .unwrap_or(RESERVATION_SLACK)
+}
+
+/// Upper bound for a new sidecar. JSON string escaping can expand each byte
+/// up to six bytes, so this deliberately over-reserves rather than risking a
+/// metadata overrun after commit.
+fn meta_reservation_for_headers(key: &str, headers: &[(String, String)]) -> u64 {
+    let mut bytes = key.len().saturating_mul(6).saturating_add(512);
+    for (name, value) in headers {
+        bytes = bytes
+            .saturating_add(name.len().saturating_mul(6))
+            .saturating_add(value.len().saturating_mul(6))
+            .saturating_add(16);
+    }
+    bytes as u64
+}
 /// Bytes available to the edge user on the filesystem containing `path`.
 ///
 /// `None` means the platform or syscall does not expose it; callers then fall
@@ -1108,7 +1128,7 @@ impl LargeCache {
             segments: Vec::new(),
             chunk_bytes: 0,
         };
-        let reserved = content_length.saturating_add(RESERVATION_SLACK);
+        let reserved = content_length.saturating_add(meta_reservation_for_meta(&meta));
         if !self.reserve_or_evict(reserved).await {
             let _ = fs::remove_file(&temp_path).await;
             return None;
@@ -1214,10 +1234,18 @@ impl LargeCache {
         if fs::create_dir_all(parent).await.is_err() {
             return None;
         }
+        let old_meta_len = fs::metadata(&meta_path).await.map(|m| m.len()).unwrap_or(0);
+        // A stale sidecar may be replaced by a new entry whose headers are much
+        // larger, so reserve the max of:
+        //   * replacing/updating this sidecar (old length + one segment)
+        //   * a brand-new sidecar built from the supplied headers
+        let meta_reserve = old_meta_len
+            .saturating_add(META_RESERVE_HEADROOM)
+            .max(meta_reservation_for_headers(key, &headers));
         let reserved = end
             .saturating_sub(start)
             .saturating_add(1)
-            .saturating_add(RESERVATION_SLACK);
+            .saturating_add(meta_reserve);
         if !self.reserve_or_evict(reserved).await {
             return None;
         }
@@ -1746,6 +1774,36 @@ mod tests {
             segments,
             chunk_bytes: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn large_headers_cannot_overrun_logical_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-large-metacap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let min = 1024 * 1024;
+        let cap = min + 80 * 1024;
+        let cache = LargeCache::open(&dir, min, min, cap).await.unwrap();
+        let huge = vec![("x-big".to_string(), "a".repeat(100_000))];
+        assert!(
+            cache
+                .begin("GET:bigheaders.test:/a.bin", 200, huge, min, 60, 0)
+                .await
+                .is_none(),
+            "metadata reservation must include large sidecar headers"
+        );
+        assert_eq!(
+            cache.used_bytes.load(Ordering::Relaxed),
+            0,
+            "a rejected metadata reservation must be released"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

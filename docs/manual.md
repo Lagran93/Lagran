@@ -2015,6 +2015,15 @@ LARGE_CACHE_MIN_FREE_BYTES
 - 逻辑上限没到，但文件系统快满 → 先按 LRU 驱逐缓存对象，仍不足才拒绝新 fill；
 - 文件系统还有空间，但逻辑缓存已到上限 → 仍按逻辑驱逐/拒绝。
 
+writer 的磁盘预留不再对 sidecar 使用固定 64 KiB：
+
+- 新对象按实际序列化后的 `LargeMeta` 大小预留；
+- 更新已有对象按旧 sidecar 大小加一个 segment 的余量预留；
+- 新 entry 的请求头使用保守上界（JSON 转义最多放大 6 倍）；
+- 额外保留 1 KiB 给时间戳位数和 JSON 编码细节。
+
+因此即使源站返回很大的响应头，元数据也会被计入 `used_bytes` 预留，不会在提交后把逻辑硬上限顶超。
+
 ##### 平台差异
 
 - Linux/Unix：通过 `statvfs` 读取；
