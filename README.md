@@ -180,17 +180,29 @@ EDGE_SHIELD_DISABLED=true
 EDGE_SHIELD_DISABLED=false
 ```
 
-控制台配置：
+管理员配置：
+
+```text
+系统 → Shield 节点 → 新增 Shield
+```
+
+填写平台信任的 Shield 内部地址，例如：
+
+```text
+https://shield-s1.internal.example.com
+```
+
+域名配置：
 
 ```text
 域名列表 → 目标域名 → 高级设置 → Origin Shield 地址
 ```
 
-填写 Shield 的内部地址，例如：
+这里现在是从管理员配置的 Shield 节点中**下拉选择**，普通用户不能直接输入任意 URL。后端也会再次校验：
 
-```text
-https://shield-s1.internal.example.com
-```
+- 只能选择启用中的 Shield 节点；
+- 已停用/未登记的地址不能保存；
+- 仍被域名使用的节点不能停用或删除。
 
 注意：
 

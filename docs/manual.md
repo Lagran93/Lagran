@@ -418,7 +418,7 @@ no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 - CORS 允许来源
 - 防盗链 Referer
 - 自定义响应头
-- Origin Shield 地址
+- Origin Shield 地址（管理员配置白名单，域名下拉选择）
 - CC 防御
 
 > 跨节点 CC 依赖 `REDIS_URL`。单次 Redis 往返超过 `CC_REDIS_TIMEOUT_MS`（默认 50ms）时，该次检查会回退到单机预算，以避免 Redis 故障拖慢请求路径。周期报告按**增量**统计：只有回退比例 ≥5% 或出现 Redis 错误时才打 `WARN`；少量尾延迟只会在 `debug` 日志中出现。历史上单次超时会导致每分钟永久 `WARN`，该问题已修复。
@@ -428,6 +428,14 @@ no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 - 每个源站可独立配置 TLS SNI、回源 Host
 
 #### Origin Shield 配置
+
+管理员先在「系统 → Shield 节点」维护平台允许的 Shield 地址；域名高级设置只能从该列表中选择，不能直接输入任意 URL。
+
+后端会校验：
+
+- 只能选择启用中的 Shield 节点；
+- 未登记/已停用的地址不能保存；
+- 被域名引用的节点不能停用或删除。
 
 完整的部署步骤、TLS/Host 要求、部署顺序、验证、高可用和故障排查见
 [Origin Shield 配置](<Origin Shield配置.md>)。

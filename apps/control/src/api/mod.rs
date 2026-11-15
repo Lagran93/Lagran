@@ -24,6 +24,7 @@ pub mod prefetch;
 pub mod project;
 pub mod purge;
 pub mod rule;
+pub mod shield_node;
 pub mod stats;
 pub mod system;
 pub mod user;
@@ -96,6 +97,14 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/domains", get(domain::list).post(domain::create))
                 .route("/origin-health", get(health_origin::list))
                 .route("/origin-health/report", post(health_origin::report))
+                .route(
+                    "/shield-nodes",
+                    get(shield_node::list).post(shield_node::create),
+                )
+                .route(
+                    "/shield-nodes/:id",
+                    put(shield_node::update).delete(shield_node::delete),
+                )
                 .route(
                     "/domains/:id",
                     get(domain::get).put(domain::update).delete(domain::delete),

@@ -51,6 +51,24 @@ const EXACT: Record<string, string> = {
   'cc_mode must be block or monitor': 'CC 模式必须为 block 或 monitor',
   'shield_url must start with http:// or https://':
     'Origin Shield 地址必须以 http:// 或 https:// 开头',
+  'shield_url must be selected from the administrator-configured shield nodes':
+    '请从管理员配置的 Shield 节点中选择',
+  'shield url already exists': '该 Shield 地址已经存在',
+  'shield node not found': 'Shield 节点不存在或已被删除',
+  'shield url is required': '请填写 Shield 地址',
+  'shield url is too long': 'Shield 地址过长',
+  'invalid shield url': 'Shield 地址格式不正确',
+  'shield url must include http:// or https://':
+    'Shield 地址必须包含 http:// 或 https://',
+  'shield url must use http:// or https://':
+    'Shield 地址必须使用 http:// 或 https://',
+  'shield url must include a host': 'Shield 地址缺少主机名',
+  'shield url must not contain credentials': 'Shield 地址不能包含账号密码',
+  'shield url must not contain query or fragment':
+    'Shield 地址不能包含查询串或 fragment',
+  'shield url must be an origin without a path': 'Shield 地址不能包含路径',
+  'name is required': '请填写名称',
+  'name must be at most 64 characters': '名称不能超过 64 个字符',
   'schedule not found': '调度记录不存在',
   'user is the project owner': '不能移除项目所有者',
   'cannot remove the project owner': '不能移除项目所有者',
@@ -67,6 +85,8 @@ const PATTERNS: Array<[RegExp, (match: RegExpMatchArray) => string]> = [
   [/^invalid release version$/i, () => '版本号格式不正确'],
   [/^invalid latest release tag$/i, () => '最新 Release 的版本号格式不正确'],
   [/^HTTP\s+(\d+)$/i, (m) => `服务返回异常状态（HTTP ${m[1]}），请稍后重试`],
+  [/^shield node is used by (\d+) domain\(s\); update those domains first$/i,
+    (m) => `该 Shield 节点仍被 ${m[1]} 个域名使用，请先修改这些域名`],
 ]
 
 export function friendlyErrorMessage(input: unknown, fallback = '操作失败，请稍后重试'): string {

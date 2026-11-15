@@ -25,6 +25,7 @@ const DICT: Record<string, { zh: string; en: string }> = {
   'nav.projects': { zh: '项目管理', en: 'Projects' },
   'nav.users': { zh: '用户管理', en: 'Users' },
   'nav.groups': { zh: '用户组', en: 'Groups' },
+  'nav.shieldNodes': { zh: 'Shield 节点', en: 'Shield Nodes' },
   'nav.settings': { zh: '系统设置', en: 'Settings' },
   'nav.config': { zh: '配置发布', en: 'Config Releases' },
   'common.refresh': { zh: '刷新', en: 'Refresh' },

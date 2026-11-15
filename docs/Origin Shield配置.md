@@ -161,14 +161,22 @@ origin_shield_disabled: true
 进入控制台：
 
 ```text
-域名列表 → 目标域名 → 高级设置 → Origin Shield 地址
+系统 → Shield 节点 → 新增 Shield
 ```
 
-填写 Shield 的内部地址：
+管理员填写平台信任的 Shield 内部地址：
 
 ```text
 https://shield-s1.internal.example.com
 ```
+
+然后业务域名在：
+
+```text
+域名列表 → 目标域名 → 高级设置 → Origin Shield 地址
+```
+
+从管理员配置的 Shield 节点中下拉选择；普通用户不能直接输入任意 URL。
 
 保存后，普通 Edge 约 15 秒内同步。
 
@@ -771,8 +779,7 @@ cdn-b.example.com 的证书装到 Shield
 10.0.0.10  shield-s1.example.com
 ```
 
-4. 在所有业务域名的「高级设置 → Origin Shield 地址」填同一个值：
-
+4. 在所有业务域名的「高级设置 → Origin Shield 地址」下拉选择同一个 Shield 节点：
 ```text
 https://shield-s1.example.com
 ```
@@ -1047,48 +1054,45 @@ Shield：
 
 两台业务域名共用同一个 Shield、同一张 Shield 证书、同一组 Edge 内部 DNS，但缓存和源站按 Host 隔离。
 
-### 5.9 Shield URL 的权限和 SSRF 风险
+### 5.9 Shield URL 的权限和 SSRF 防护
 
-当前 `shield_url` 是域名级设置：
-
-```text
-PUT /api/v1/domains/{id}/settings
-```
-
-控制面只校验它以 `http://` 或 `https://` 开头，并检查调用者是否有该域名的写权限。
-
-这意味着，如果普通项目成员/域名所有者可以编辑高级设置，他们可以填写任意地址，例如：
+Shield URL 现在由管理员维护白名单：
 
 ```text
-http://127.0.0.1:...
-http://169.254.169.254/...
-http://internal-service...
-https://attacker.example.com
+系统 → Shield 节点
 ```
 
-Edge 会按 Shield 回源流程向该地址发起请求，并携带业务 Host。这会形成 SSRF/内网探测风险，也可能绕过平台缓存/WAF 策略。
+只有管理员可以：
 
-对于多租户环境，**不要直接让普通用户填写任意 `shield_url`**。
+- 新增 Shield 节点；
+- 修改名称/URL/启用状态；
+- 删除 Shield 节点。
 
-建议至少采用以下之一：
+普通域名用户只能从启用中的 Shield 节点下拉选择，不能提交任意 URL。
 
-1. `shield_url` 仅管理员可修改；
-2. 只允许平台预先定义的 Shield 主机名/端口（allowlist）；
-3. 前端不暴露原始 URL，只提供“Shield 组”选择，后端映射到固定 URL；
-4. 对修改 `shield_url` 写审计日志；
-5. 禁止私网 IP、link-local、metadata 地址，除非是平台自己的 Shield 网段。
+后端校验：
 
-同时：
+- `shield_url` 必须对应 `shield_nodes` 表中的已启用记录；
+- 未登记/已停用的 URL 不能保存；
+- 被域名引用的 Shield 节点不能停用或删除；
+- 被引用的 URL 不能直接改掉，必须先迁移域名；
+- URL 只接受 http(s) origin，不能带路径、查询串、fragment 或账号密码。
 
-- `shield-s1.example.com` 域名应归平台所有；
-- 证书应由平台管理员上传；
-- 普通用户不能修改/删除 Shield 域名；
-- 不要让普通用户把 Shield 指向自己创建的源站；
-- 共享 Shield 还需要 per-domain 容量配额，当前版本没有实现。
+限制的目的：
 
-如果普通用户只是选择“使用平台 Shield / 不使用”，应由后端根据域名/项目策略映射到固定 Shield，而不是把 URL 交给用户。
+- 防止普通用户把 Edge 回源指向 `127.0.0.1`、metadata、内网服务或任意外部地址；
+- 防止 SSRF/内网探测；
+- 让 Shield 地址变更可审计、可统一治理。
 
-在当前代码中，上面的 URL 校验还不够，生产多租户环境需要先加权限或 allowlist 再开放给普通用户。
+仍需要注意：
+
+- 管理员添加的 URL 本身必须是可信的；
+- 私有/内网 Shield 地址由管理员负责审核；
+- 旧版本遗留的 `shield_url` 如果不在白名单，保存其他设置时仍可保留原值，但不能改成新的任意地址；
+- 共享 Shield 还需要 per-domain 容量配额，当前版本没有实现；
+- 普通用户仍可选择一个已启用的共享 Shield，因此管理员需要控制共享 Shield 的容量和租户范围。
+
+如果未来要完全隐藏 URL，可以进一步改为“Shield 组”模型；当前实现已经是 URL allowlist。
 
 ---
 
@@ -1102,10 +1106,11 @@ Edge 会按 Shield 回源流程向该地址发起请求，并携带业务 Host�
 4. 用 `--check-config` 确认 `origin_shield_disabled: true`；
 5. 确认 Shield 的 `LARGE_CACHE_ENABLED=true`；
 6. 确认 Shield 可以按业务 Host 正常响应；
-7. 在控制台为域名填写 `shield_url`；
-8. 等待普通 Edge 同步；
-9. 做冷 Range 验证；
-10. 观察 Shield 和源站流量。
+7. 管理员在「Shield 节点」中登记 Shield URL；
+8. 在业务域名高级设置中下拉选择该 Shield；
+9. 等待普通 Edge 同步；
+10. 做冷 Range 验证；
+11. 观察 Shield 和源站流量。
 
 不要在 Shield 还没启用保护开关时先配置 `shield_url`。
 

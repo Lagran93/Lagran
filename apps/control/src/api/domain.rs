@@ -4,9 +4,9 @@ use crate::middleware::authz::Actor;
 use crate::repository;
 use crate::state::AppState;
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -213,11 +213,7 @@ fn normalize_backup(host: &str, port: u16, proto: &str) -> Result<(String, i32, 
         return Err("backup origin protocol must be http or https".into());
     }
     let port = if port == 0 {
-        if proto == "https" {
-            443
-        } else {
-            80
-        }
+        if proto == "https" { 443 } else { 80 }
     } else {
         port
     };
@@ -1498,25 +1494,55 @@ pub async fn put_settings(
                 Json(ErrorBody {
                     error: "cc_mode must be block or monitor".into(),
                 }),
-            ))
+            ));
         }
         None => None,
     };
-    let shield_url = req
-        .shield_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    if let Some(url) = shield_url {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorBody {
-                    error: "shield_url must start with http:// or https://".into(),
-                }),
-            ));
+    // Shield URLs are an administrator-managed allowlist. Compare against the
+    // stored value so an unchanged legacy value can still be saved, but a new
+    // value must reference an enabled shield_nodes row. This blocks arbitrary
+    // SSRF targets from ordinary domain owners.
+    let shield_url = match req.shield_url.as_deref() {
+        None => None,
+        Some(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                // Some("") clears the column; None would leave it unchanged.
+                Some(String::new())
+            } else {
+                let url = crate::api::shield_node::normalize_shield_url(raw)
+                    .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorBody { error })))?;
+                let current = stored_settings
+                    .as_ref()
+                    .map(|settings| settings.shield_url.trim_end_matches('/'))
+                    .unwrap_or("");
+                if url != current {
+                    let enabled = crate::api::shield_node::enabled_url(&state.pool, &url)
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(error = %e, "check shield node");
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorBody {
+                                    error: "database error".into(),
+                                }),
+                            )
+                        })?;
+                    if !enabled {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorBody {
+                                error:
+                                    "shield_url must be selected from the administrator-configured Shield nodes"
+                                        .into(),
+                            }),
+                        ));
+                    }
+                }
+                Some(url)
+            }
         }
-    }
+    };
     let cache_key_ignore_headers = match req.cache_key_ignore_headers.as_deref() {
         Some(value) => match normalize_cache_key_ignore_headers(value) {
             Ok(value) => Some(value),
@@ -1552,7 +1578,7 @@ pub async fn put_settings(
         req.cc_ban_seconds.map(|v| v.clamp(1, 86_400) as i32),
         cc_mode.as_deref(),
         req.cc_allow_ips.as_deref(),
-        shield_url,
+        shield_url.as_deref(),
         cache_key_ignore_headers.as_deref(),
     )
     .await
@@ -1578,7 +1604,7 @@ pub async fn put_settings(
                 Json(ErrorBody {
                     error: "signed_url_mode must be off, all or paths".into(),
                 }),
-            ))
+            ));
         }
         None => req
             .signed_url_enabled
@@ -1796,9 +1822,11 @@ mod tests {
         );
 
         changes.signed_url_secret_generated = true;
-        assert!(changes
-            .audit_detail()
-            .contains("signed_url_secret(generated)"));
+        assert!(
+            changes
+                .audit_detail()
+                .contains("signed_url_secret(generated)")
+        );
     }
 
     /// The audit log is retained and broadly readable, so it must never contain

@@ -410,9 +410,24 @@
             </div>
             <div class="field">
               <label class="field-label">Origin Shield 地址</label>
-              <input v-model="settings.shield_url" class="input" placeholder="留空关闭" />
+              <select v-model="settings.shield_url" class="select">
+                <option value="">关闭</option>
+                <option
+                  v-for="node in enabledShieldNodes"
+                  :key="node.id"
+                  :value="node.url"
+                >
+                  {{ node.name }} · {{ node.url }}
+                </option>
+                <option
+                  v-if="currentShieldUnregistered"
+                  :value="settings.shield_url"
+                >
+                  当前值（未登记或已停用）· {{ settings.shield_url }}
+                </option>
+              </select>
               <span class="field-hint">
-                配置 Shield 后边缘优先向它回源并保留当前域名 Host；Shield 不可用时自动回退到普通源站。
+                只能从管理员配置的 Shield 节点中选择；不选择时直接回源普通源站。
               </span>
             </div>
           </div>
@@ -671,6 +686,28 @@ const showOriginAuthInput = ref(false)
 const rotatedSecret = ref('')
 const rotatedSecretOpen = ref(false)
 const settingsDomain = ref<any>(null)
+
+interface ShieldNode {
+  id: string
+  name: string
+  url: string
+  enabled: boolean
+}
+const shieldNodes = ref<ShieldNode[]>([])
+const enabledShieldNodes = computed(() => shieldNodes.value.filter((node) => node.enabled))
+
+function sameShieldUrl(a: string, b: string) {
+  return a.replace(/\/+$/, '') === b.replace(/\/+$/, '')
+}
+
+async function loadShieldNodes() {
+  try {
+    shieldNodes.value = await api.get<ShieldNode[]>('/api/v1/shield-nodes')
+  } catch {
+    shieldNodes.value = []
+  }
+}
+
 const settings = ref({
   ignore_query_string: false,
   ignore_origin: false,
@@ -699,6 +736,12 @@ const settings = ref({
   origin_auth_value: '',
   hotlink_signature_enabled: false,
 })
+
+const currentShieldUnregistered = computed(
+  () =>
+    Boolean(settings.value.shield_url) &&
+    !enabledShieldNodes.value.some((node) => sameShieldUrl(node.url, settings.value.shield_url)),
+)
 
 const filtered = computed(() => {
   const q = keyword.value.trim().toLowerCase()
@@ -951,6 +994,7 @@ async function saveOrigin() {
 
 async function openSettings(d: any) {
   settingsDomain.value = d
+  await loadShieldNodes()
   try {
     const s = await api.get<any>(`/api/v1/domains/${d.id}/settings`)
     const cachedHeaders = String(s.cache_key_ignore_headers || '')
@@ -966,7 +1010,7 @@ async function openSettings(d: any) {
       // not fall back to a truthy default here.
       origin_timeout_ms: s.origin_timeout_ms ?? 0,
       custom_headers: s.custom_headers || '',
-      shield_url: s.shield_url || '',
+      shield_url: (s.shield_url || '').replace(/\/+$/, ''),
       rate_limit_rps: s.rate_limit_rps || 0,
       rate_limit_burst: s.rate_limit_burst || 0,
       cc_enabled: !!s.cc_enabled,
@@ -1141,7 +1185,10 @@ async function remove(d: any) {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadShieldNodes()
+})
 </script>
 
 <style scoped>

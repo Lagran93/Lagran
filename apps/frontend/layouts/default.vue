@@ -48,6 +48,7 @@ const MENU: MenuGroup[] = [
       { label: '项目管理', to: '/projects', icon: 'project' },
       { label: '用户管理', to: '/users', icon: 'users', admin: true },
       { label: '用户组', to: '/groups', icon: 'users', admin: true },
+      { label: 'Shield 节点', to: '/shield-nodes', icon: 'shield', admin: true },
       { label: '系统设置', to: '/settings', icon: 'settings' },
     ],
   },
@@ -79,6 +80,7 @@ const NAV_KEYS: Record<string, string> = {
   '/projects': 'nav.projects',
   '/users': 'nav.users',
   '/groups': 'nav.groups',
+  '/shield-nodes': 'nav.shieldNodes',
   '/settings': 'nav.settings',
 }
 const GROUP_KEYS: Record<string, string> = {
