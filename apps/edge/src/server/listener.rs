@@ -249,7 +249,13 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
          lagran_edge_chunk_fill_drops_total {}\n\
          # HELP lagran_edge_chunk_fill_dropped_bytes_total Bytes dropped by queue/budget limits\n\
          # TYPE lagran_edge_chunk_fill_dropped_bytes_total counter\n\
-         lagran_edge_chunk_fill_dropped_bytes_total {}\n",
+         lagran_edge_chunk_fill_dropped_bytes_total {}\n\
+         # HELP lagran_edge_chunk_origin_attempts_total Origin attempts by manual chunk paths\n\
+         # TYPE lagran_edge_chunk_origin_attempts_total counter\n\
+         lagran_edge_chunk_origin_attempts_total {}\n\
+         # HELP lagran_edge_chunk_origin_failures_total Failed manual chunk origin attempts\n\
+         # TYPE lagran_edge_chunk_origin_failures_total counter\n\
+         lagran_edge_chunk_origin_failures_total {}\n",
         global.origin_timeouts,
         global.origin_errors,
         global.stream_requests,
@@ -262,9 +268,34 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         global.chunk_origin_runs,
         global.chunk_fallbacks,
         global.chunk_fill_drops,
-        global.chunk_fill_dropped_bytes
+        global.chunk_fill_dropped_bytes,
+        global.chunk_origin_attempts,
+        global.chunk_origin_failures
     ));
     out.push_str(&format!("lagran_edge_domains {}\n", snaps.len()));
+    let (large_used, large_available, large_capacity) = state
+        .large_cache
+        .as_ref()
+        .map(|cache| {
+            (
+                cache.usage_bytes(),
+                cache.available_bytes(),
+                cache.capacity_bytes(),
+            )
+        })
+        .unwrap_or((0, 0, 0));
+    out.push_str(&format!(
+        "# HELP lagran_large_cache_used_bytes Large-cache committed plus reserved bytes\n\
+         # TYPE lagran_large_cache_used_bytes gauge\n\
+         lagran_large_cache_used_bytes {}\n\
+         # HELP lagran_large_cache_available_bytes Large-cache admission headroom\n\
+         # TYPE lagran_large_cache_available_bytes gauge\n\
+         lagran_large_cache_available_bytes {}\n\
+         # HELP lagran_large_cache_capacity_bytes Configured large-cache capacity\n\
+         # TYPE lagran_large_cache_capacity_bytes gauge\n\
+         lagran_large_cache_capacity_bytes {}\n",
+        large_used, large_available, large_capacity
+    ));
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],

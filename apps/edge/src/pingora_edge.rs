@@ -62,7 +62,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;
-const RANGE_FILL_QUEUE_BYTES: u64 = 128 * 1024 * 1024;
 /// Bound the number of sequential origin requests for one client request.
 /// A pathologically fragmented cache would otherwise produce one connection
 /// per chunk; above this the initial range path is used instead.
@@ -154,6 +153,9 @@ struct RangeSink {
     /// non-zero for a large suffix request where only the tail is cached.
     skip: u64,
     queued: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    budget: std::sync::Arc<FillBudget>,
+    metrics: std::sync::Arc<crate::metrics::EdgeMetrics>,
+    queue_limit: u64,
 }
 
 /// Fill sink for a manual cache+origin chunk response.
@@ -166,6 +168,7 @@ struct RangeFillSink {
     queued: std::sync::Arc<std::sync::atomic::AtomicU64>,
     budget: std::sync::Arc<FillBudget>,
     metrics: std::sync::Arc<crate::metrics::EdgeMetrics>,
+    queue_limit: u64,
     offset: u64,
     end: u64,
     /// Kept so a request with several missing chunk runs can wait for the
@@ -188,7 +191,7 @@ impl RangeFillSink {
             .queued
             .fetch_add(take as u64, std::sync::atomic::Ordering::Relaxed)
             + take as u64;
-        if queued > RANGE_FILL_QUEUE_BYTES {
+        if queued > self.queue_limit {
             // Disk is slower than the origin/client path. Drop the fill and
             // let the worker commit whatever it already drained.
             self.queued
@@ -1610,13 +1613,18 @@ impl ProxyHttp for DataPlaneProxy {
                                     )
                                     .await
                                 {
-                                    let (tx, queued, _task) = spawn_range_writer(writer, None);
+                                    let budget = large.fill_budget();
+                                    let (tx, queued, _task) =
+                                        spawn_range_writer(writer, Some(budget.clone()));
                                     ctx.range_sink = Some(RangeSink {
                                         tx,
                                         offset: fill_start,
                                         end: fill_end,
                                         skip: fill_start.saturating_sub(start),
                                         queued,
+                                        budget,
+                                        metrics: self.state.metrics.clone(),
+                                        queue_limit: self.state.large_cache_fill_queue_bytes,
                                     });
                                 } else {
                                     ctx.cache_reason = Some(
@@ -1724,16 +1732,24 @@ impl ProxyHttp for DataPlaneProxy {
                     } else {
                         Bytes::copy_from_slice(&chunk_ref[..take])
                     };
+                    let bytes = data.len() as u64;
+                    if !sink.budget.reserve(bytes) {
+                        sink.metrics.record_chunk_fill_drop(bytes);
+                        ctx.range_sink = None;
+                        return Ok(None);
+                    }
                     let queued = sink
                         .queued
-                        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed)
-                        + data.len() as u64;
-                    if queued > RANGE_FILL_QUEUE_BYTES
-                        || sink.tx.send(RangeMsg::Chunk(data)).is_err()
-                    {
+                        .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+                        + bytes;
+                    if queued > sink.queue_limit || sink.tx.send(RangeMsg::Chunk(data)).is_err() {
                         // Disk writer is slower than the origin. Drop the fill
                         // rather than growing an unbounded queue; the client
                         // body is still forwarded unchanged.
+                        sink.queued
+                            .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                        sink.budget.release(bytes);
+                        sink.metrics.record_chunk_fill_drop(bytes);
                         ctx.range_sink = None;
                         return Ok(None);
                     }
@@ -3012,6 +3028,7 @@ impl DataPlaneProxy {
                     headers.insert(axum::http::header::HOST, value);
                 }
             }
+            self.state.metrics.record_chunk_origin_attempt();
             let response = match tokio::time::timeout(
                 idle_timeout,
                 self.state.origin.request_stream_with_sni(
@@ -3028,6 +3045,7 @@ impl DataPlaneProxy {
             {
                 Ok(Ok(response)) => response,
                 _ => {
+                    self.state.metrics.record_chunk_origin_failure();
                     tracing::debug!(origin = %target.url, "chunk origin attempt failed");
                     continue;
                 }
@@ -3040,6 +3058,7 @@ impl DataPlaneProxy {
                 );
                 // A 200 means the origin ignored Range; another pool member may
                 // still support it. Try the next origin before giving up.
+                self.state.metrics.record_chunk_origin_failure();
                 continue;
             }
             if response
@@ -3052,6 +3071,7 @@ impl DataPlaneProxy {
                         .unwrap_or(true)
                 })
             {
+                self.state.metrics.record_chunk_origin_failure();
                 invalid = true;
                 continue;
             }
@@ -3061,12 +3081,14 @@ impl DataPlaneProxy {
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_content_range)
             else {
+                self.state.metrics.record_chunk_origin_failure();
                 invalid = true;
                 continue;
             };
             // The chunk executor forwards from the requested run start. A wider
             // origin range would shift every byte; require the exact start.
             if origin_total != total || origin_start != run_start || origin_end < run_end {
+                self.state.metrics.record_chunk_origin_failure();
                 invalid = true;
                 continue;
             }
@@ -3082,6 +3104,7 @@ impl DataPlaneProxy {
                     .and_then(|value| value.to_str().ok())
                 {
                     if origin_etag != cached_etag {
+                        self.state.metrics.record_chunk_origin_failure();
                         invalid = true;
                         continue;
                     }
@@ -3151,6 +3174,7 @@ impl DataPlaneProxy {
                     headers.insert(axum::http::header::HOST, value);
                 }
             }
+            self.state.metrics.record_chunk_origin_attempt();
             let response = match tokio::time::timeout(
                 idle_timeout,
                 self.state.origin.request_stream_with_sni(
@@ -3166,9 +3190,13 @@ impl DataPlaneProxy {
             .await
             {
                 Ok(Ok(response)) => response,
-                _ => continue,
+                _ => {
+                    self.state.metrics.record_chunk_origin_failure();
+                    continue;
+                }
             };
             if response.status != StatusCode::PARTIAL_CONTENT {
+                self.state.metrics.record_chunk_origin_failure();
                 continue;
             }
             if response
@@ -3181,6 +3209,7 @@ impl DataPlaneProxy {
                         .unwrap_or(true)
                 })
             {
+                self.state.metrics.record_chunk_origin_failure();
                 invalid = true;
                 continue;
             }
@@ -3190,14 +3219,17 @@ impl DataPlaneProxy {
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_content_range)
             else {
+                self.state.metrics.record_chunk_origin_failure();
                 invalid = true;
                 continue;
             };
             if origin_start != run_start || origin_end < run_start {
+                self.state.metrics.record_chunk_origin_failure();
                 invalid = true;
                 continue;
             }
             if run_end.is_some_and(|end| origin_end < end) {
+                self.state.metrics.record_chunk_origin_failure();
                 invalid = true;
                 continue;
             }
@@ -3252,6 +3284,7 @@ impl DataPlaneProxy {
                     headers.insert(axum::http::header::HOST, value);
                 }
             }
+            self.state.metrics.record_chunk_origin_attempt();
             let response = match tokio::time::timeout(
                 idle_timeout,
                 self.state.origin.request_stream_with_sni(
@@ -3267,7 +3300,10 @@ impl DataPlaneProxy {
             .await
             {
                 Ok(Ok(response)) => response,
-                _ => continue,
+                _ => {
+                    self.state.metrics.record_chunk_origin_failure();
+                    continue;
+                }
             };
             if response
                 .headers
@@ -3279,6 +3315,7 @@ impl DataPlaneProxy {
                         .unwrap_or(true)
                 })
             {
+                self.state.metrics.record_chunk_origin_failure();
                 continue;
             }
             let total = if response.status == StatusCode::OK {
@@ -3300,6 +3337,7 @@ impl DataPlaneProxy {
             if let Some(total) = total.filter(|total| *total > 0) {
                 return Some(total);
             }
+            self.state.metrics.record_chunk_origin_failure();
         }
         // HEAD unsupported or unusable: a one-byte range still gives the total.
         self.open_miss_origin(session, native_plan, 0, Some(0))
@@ -3478,6 +3516,7 @@ impl DataPlaneProxy {
                         queued,
                         budget,
                         metrics: self.state.metrics.clone(),
+                        queue_limit: self.state.large_cache_fill_queue_bytes,
                         offset: chunk_start,
                         end: fill_end,
                         task: Some(task),
@@ -3836,6 +3875,7 @@ impl DataPlaneProxy {
                         queued,
                         budget,
                         metrics: self.state.metrics.clone(),
+                        queue_limit: self.state.large_cache_fill_queue_bytes,
                         offset: run.start,
                         end: fill_end,
                         task: Some(task),

@@ -156,6 +156,11 @@ pub struct EdgeConfig {
     /// Missing bytes are requested in whole chunks; chunks are the unit of
     /// cache coverage.
     pub large_cache_chunk_bytes: u64,
+    /// Maximum bytes buffered by one chunk/fill worker before dropping the
+    /// remainder of that fill.
+    pub large_cache_fill_queue_bytes: u64,
+    /// Process-wide cap across all active chunk/fill workers.
+    pub large_cache_fill_queue_total_bytes: u64,
     /// Downstream HTTP/1.1 keepalive idle timeout.
     pub downstream_keepalive_secs: u64,
     /// Downstream HTTP/2 idle timeout after the last active stream.
@@ -399,6 +404,16 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1024 * 1024)
                 .clamp(64 * 1024, 64 * 1024 * 1024),
+            large_cache_fill_queue_bytes: std::env::var("LARGE_CACHE_FILL_QUEUE_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(128 * 1024 * 1024)
+                .clamp(1024 * 1024, 1024 * 1024 * 1024),
+            large_cache_fill_queue_total_bytes: std::env::var("LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256 * 1024 * 1024)
+                .clamp(1024 * 1024, 4096 * 1024 * 1024),
             downstream_keepalive_secs: std::env::var("DOWNSTREAM_KEEPALIVE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

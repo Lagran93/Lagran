@@ -34,6 +34,8 @@ pub struct EdgeMetrics {
     chunk_fallbacks: AtomicU64,
     chunk_fill_drops: AtomicU64,
     chunk_fill_dropped_bytes: AtomicU64,
+    chunk_origin_attempts: AtomicU64,
+    chunk_origin_failures: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -51,6 +53,8 @@ pub struct GlobalSnapshot {
     pub chunk_fallbacks: u64,
     pub chunk_fill_drops: u64,
     pub chunk_fill_dropped_bytes: u64,
+    pub chunk_origin_attempts: u64,
+    pub chunk_origin_failures: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +178,14 @@ impl EdgeMetrics {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn record_chunk_origin_attempt(&self) {
+        self.chunk_origin_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_chunk_origin_failure(&self) {
+        self.chunk_origin_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn global_snapshot(&self) -> GlobalSnapshot {
         GlobalSnapshot {
             origin_timeouts: self.origin_timeouts.load(Ordering::Relaxed),
@@ -189,6 +201,8 @@ impl EdgeMetrics {
             chunk_fallbacks: self.chunk_fallbacks.load(Ordering::Relaxed),
             chunk_fill_drops: self.chunk_fill_drops.load(Ordering::Relaxed),
             chunk_fill_dropped_bytes: self.chunk_fill_dropped_bytes.load(Ordering::Relaxed),
+            chunk_origin_attempts: self.chunk_origin_attempts.load(Ordering::Relaxed),
+            chunk_origin_failures: self.chunk_origin_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -363,9 +377,14 @@ mod tests {
         let metrics = EdgeMetrics::default();
         metrics.record_chunk_fill_drop(1024);
         metrics.record_chunk_fill_drop(2048);
+        metrics.record_chunk_origin_attempt();
+        metrics.record_chunk_origin_attempt();
+        metrics.record_chunk_origin_failure();
         let snapshot = metrics.global_snapshot();
         assert_eq!(snapshot.chunk_fill_drops, 2);
         assert_eq!(snapshot.chunk_fill_dropped_bytes, 3072);
+        assert_eq!(snapshot.chunk_origin_attempts, 2);
+        assert_eq!(snapshot.chunk_origin_failures, 1);
     }
 
     #[test]

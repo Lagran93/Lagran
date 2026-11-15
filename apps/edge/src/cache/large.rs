@@ -222,12 +222,12 @@ pub struct FillBudget {
 const RESERVATION_SLACK: u64 = 64 * 1024;
 
 impl FillBudget {
-    const DEFAULT_MAX: u64 = 256 * 1024 * 1024;
+    pub(crate) const DEFAULT_MAX: u64 = 256 * 1024 * 1024;
 
-    fn new() -> Self {
+    pub(crate) fn new(max: u64) -> Self {
         Self {
             used: AtomicU64::new(0),
-            max: Self::DEFAULT_MAX,
+            max,
         }
     }
 
@@ -579,6 +579,23 @@ impl LargeCache {
         max_object_bytes: u64,
         max_bytes: u64,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::open_with_fill_budget(
+            dir,
+            min_object_bytes,
+            max_object_bytes,
+            max_bytes,
+            FillBudget::DEFAULT_MAX,
+        )
+        .await
+    }
+
+    pub async fn open_with_fill_budget(
+        dir: impl AsRef<Path>,
+        min_object_bytes: u64,
+        max_object_bytes: u64,
+        max_bytes: u64,
+        fill_budget_bytes: u64,
+    ) -> anyhow::Result<Arc<Self>> {
         let root = dir.as_ref().to_path_buf();
         fs::create_dir_all(&root).await?;
         let min_object_bytes = min_object_bytes.max(1024 * 1024);
@@ -609,7 +626,7 @@ impl LargeCache {
             evict_cursor: AtomicUsize::new(0),
             range_locks: Mutex::new(HashMap::new()),
             active: std::sync::Mutex::new(HashSet::new()),
-            fill_budget: Arc::new(FillBudget::new()),
+            fill_budget: Arc::new(FillBudget::new(fill_budget_bytes.max(1))),
         }))
     }
 
@@ -633,6 +650,15 @@ impl LargeCache {
 
     pub fn max_object_bytes(&self) -> u64 {
         self.max_object_bytes
+    }
+
+    /// Committed bytes plus active writer reservations.
+    pub fn usage_bytes(&self) -> u64 {
+        self.used_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn capacity_bytes(&self) -> u64 {
+        self.max_bytes
     }
 
     pub(crate) fn fill_budget(&self) -> Arc<FillBudget> {
@@ -1602,7 +1628,7 @@ mod tests {
 
     #[test]
     fn fill_budget_caps_and_releases() {
-        let budget = FillBudget::new();
+        let budget = FillBudget::new(FillBudget::DEFAULT_MAX);
         assert!(budget.reserve(FillBudget::DEFAULT_MAX));
         assert!(!budget.reserve(1));
         budget.release(FillBudget::DEFAULT_MAX);

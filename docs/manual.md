@@ -1092,6 +1092,8 @@ Control 的 CONTROL_PUBLIC_URL
 | `RANGE_FILL_MAX_BYTES` | 预热任务单次 Range 前缀上限，默认 32 MiB；不再限制客户端 Range 的完整对象填充 |
 | `LARGE_CACHE_FILL_MAX_BYTES` | 单对象填充上限，0 表示使用 `LARGE_CACHE_MAX_OBJECT_BYTES` |
 | `LARGE_CACHE_CHUNK_BYTES` | Range 固定分片大小，默认 1 MiB；缺失分片才回源 |
+| `LARGE_CACHE_FILL_QUEUE_BYTES` | 单个 fill 写盘队列上限，默认 128 MiB |
+| `LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES` | 所有 fill 队列总预算，默认 256 MiB |
 | `DOWNSTREAM_KEEPALIVE_SECS` | 下游 HTTP/1.1 keepalive 空闲超时，默认 60 |
 | `DOWNSTREAM_H2_IDLE_SECS` | 下游 HTTP/2 空闲超时，默认 120 |
 | `DOWNSTREAM_KEEPALIVE_REQUESTS` | 单连接最大请求数，默认 1000 |
@@ -1777,6 +1779,8 @@ LARGE_CACHE_MAX_BYTES=21474836480
 # 0 = 使用 LARGE_CACHE_MAX_OBJECT_BYTES
 LARGE_CACHE_FILL_MAX_BYTES=0
 LARGE_CACHE_CHUNK_BYTES=1048576
+LARGE_CACHE_FILL_QUEUE_BYTES=134217728
+LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=268435456
 ```
 
 大缓存写入要求：
@@ -1793,6 +1797,8 @@ LARGE_CACHE_CHUNK_BYTES=1048576
 
 ```env
 LARGE_CACHE_CHUNK_BYTES=1048576
+LARGE_CACHE_FILL_QUEUE_BYTES=134217728
+LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=268435456
 ```
 
 对象被切成等长分片（最后一片可以更短）。只有**完整覆盖一个分片**时，该分片才算已缓存：
@@ -1841,14 +1847,14 @@ LARGE_CACHE_CHUNK_BYTES=1048576
 
 生产加固：
 
-- 每个 fill 队列上限 128 MiB，进程全局 chunk fill 队列上限 256 MiB；超过时丢弃后续写盘，客户端响应不受影响。
+- 每个 fill 队列默认上限 128 MiB，进程全局 fill 队列默认 256 MiB；可通过 `LARGE_CACHE_FILL_QUEUE_BYTES` / `LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES` 调整，运行时总预算取 max(总预算, 单 fill 上限)。超过时丢弃后续写盘，客户端响应不受影响。
 - 分片 writer 在开始前先做磁盘字节预留：used_bytes（已提交 + 活跃预留）<= LARGE_CACHE_MAX_BYTES 是硬上限；空间不足时先驱逐，仍不足则放弃填充而不是超限写入。
 - 一个请求最多处理 16 个不连续的缺失分片区间；超过时回退首次 Range 填充路径，避免请求变成几十/上百个源站连接。
 - 正在写入或读取的对象会被 pin 住，LRU 驱逐会跳过它，避免 data/meta 被删后 writer 又提交半个对象。
 - 手动分片回源按 origin 健康度/优先级/权重依次 failover；网络错误、超时、非 206 会尝试下一个源站，ETag/Content-Range/编码不匹配也不会盲目拼接。
 - 首次后缀 Range（`bytes=-N`）先用 HEAD 探测对象总长度，再把后缀起点换算成普通 Range 进入分片路径；源站不支持 HEAD 时用 `bytes=0-0` 探测。
 - 分片写入只提交完整分片；客户端中断时正在写的半个分片丢弃。
-- 监控项：lagran_edge_chunk_requests_total、lagran_edge_chunk_origin_runs_total、lagran_edge_chunk_fallbacks_total、lagran_edge_chunk_fill_drops_total、lagran_edge_chunk_fill_dropped_bytes_total。
+- 监控项：lagran_edge_chunk_requests_total、lagran_edge_chunk_origin_runs_total、lagran_edge_chunk_fallbacks_total、lagran_edge_chunk_fill_drops_total、lagran_edge_chunk_fill_dropped_bytes_total、lagran_edge_chunk_origin_attempts_total、lagran_edge_chunk_origin_failures_total；容量水位：lagran_large_cache_used_bytes、lagran_large_cache_available_bytes、lagran_large_cache_capacity_bytes。
 
 ### 5.9 视频 Range 与 504 优化
 

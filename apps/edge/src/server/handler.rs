@@ -130,6 +130,7 @@ pub struct AppState {
     pub range_fill_max_bytes: u64,
     pub large_cache_fill_max_bytes: u64,
     pub large_cache_chunk_bytes: u64,
+    pub large_cache_fill_queue_bytes: u64,
     pub downstream_keepalive_secs: u64,
     pub downstream_h2_idle_secs: u64,
     pub downstream_keepalive_requests: u32,
