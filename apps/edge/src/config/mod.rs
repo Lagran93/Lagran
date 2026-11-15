@@ -48,6 +48,9 @@ pub struct EdgeConfig {
     pub disk_cache_dir: String,
     pub disk_cache_max_bytes: u64,
     pub node_id: String,
+    /// On a dedicated Origin Shield node, ignore domain-level `shield_url`.
+    /// Otherwise the shield would send its own cache misses back to itself.
+    pub origin_shield_disabled: bool,
     pub region: String,
     /// Public IP reported to the control plane for GeoDNS scheduling.
     pub public_ip: String,
@@ -268,6 +271,9 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1_073_741_824), // 1 GiB
             node_id: std::env::var("NODE_ID").unwrap_or_else(|_| "edge-001".into()),
+            origin_shield_disabled: std::env::var("EDGE_SHIELD_DISABLED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             region: std::env::var("NODE_REGION").unwrap_or_else(|_| "local".into()),
             public_ip: std::env::var("PUBLIC_IP").unwrap_or_default(),
             control_url: normalize_control_url(&std::env::var("CONTROL_URL").unwrap_or_default()),

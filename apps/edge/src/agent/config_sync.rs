@@ -17,11 +17,11 @@ pub fn request_config_reload() {
 // aggregate version so unchanged config is not re-applied.
 
 use crate::agent::ControlClient;
+use crate::cache::SharedCache;
 use crate::cache::large::LargeCache;
 use crate::cache::policy::{CacheRule, RuleSet};
-use crate::cache::SharedCache;
-use crate::config::registry::{DomainEntry, DomainRegistry};
 use crate::config::EdgeConfig;
+use crate::config::registry::{DomainEntry, DomainRegistry};
 use crate::origin::OriginClient;
 use crate::waf::{
     IpNet, ManagedRules, SecurityLevel, WafAction, WafConfig, WafField, WafMode, WafOp, WafRule,
@@ -226,7 +226,7 @@ impl DomainCfg {
             self.origins.iter().map(origin_target).collect()
         };
         let shield = self.shield_url.trim();
-        if !shield.is_empty() {
+        if !shield.is_empty() && !config.origin_shield_disabled {
             origins.insert(
                 0,
                 crate::config::registry::OriginTarget {

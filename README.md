@@ -23,6 +23,7 @@
 | 本地开发与测试 | [docs/development.md](docs/development.md) |
 | 架构与数据流 | [docs/architecture.md](docs/architecture.md) |
 | GeoDNS 调度 | [docs/geodns.md](docs/geodns.md) |
+| Origin Shield 配置 | [docs/Origin Shield配置.md](<docs/Origin Shield配置.md>) |
 
 ---
 
@@ -148,6 +149,63 @@ Range 行为：
 - 空间不足时先 LRU 驱逐；仍不足则放弃 fill，客户端响应不受影响。
 
 大缓存是**节点本地**缓存；不同 Edge 节点各自维护分片状态，不做跨节点合并。
+
+### Origin Shield
+
+推荐把区域内的一个大缓存 Edge 作为 Origin Shield：
+
+```text
+普通 Edge
+  → 本地 L3 命中则直接返回
+  → 本地没有则向 Origin Shield 请求
+  → Shield 命中则返回
+  → Shield 没有才回源
+```
+
+Shield 节点配置：
+
+```env
+LARGE_CACHE_ENABLED=true
+LARGE_CACHE_DIR=/var/lib/lagran/large-cache
+LARGE_CACHE_MAX_BYTES=21474836480
+LARGE_CACHE_MIN_FREE_BYTES=1073741824
+
+# 仅专用 Shield 节点开启，避免 Shield 自己回源到自己
+EDGE_SHIELD_DISABLED=true
+```
+
+普通 Edge 保持：
+
+```env
+EDGE_SHIELD_DISABLED=false
+```
+
+控制台配置：
+
+```text
+域名列表 → 目标域名 → 高级设置 → Origin Shield 地址
+```
+
+填写 Shield 的内部地址，例如：
+
+```text
+https://shield-s1.internal.example.com
+```
+
+注意：
+
+- Shield 地址必须能被普通 Edge 访问，但不要暴露公网；
+- Shield 节点的 `EDGE_SHIELD_DISABLED=true` 只对自身生效，其他 Edge 仍会使用 Shield；
+- Shield 仍接收公开业务域名 Host，因此必须能按该域名路由；
+- Shield 的证书/SNI 要匹配内部地址；
+- Shield 自身不要再把 `shield_url` 指回自己；
+- Shield 故障后，普通 Edge 会按既有源站池回退；
+- Shield 是区域汇聚点，建议按区域部署并监控磁盘、带宽和 fill drop。
+
+> 如果 `shield_url` 指向的是同一个 Lagran Edge 集群，而 Shield 节点没有设置 `EDGE_SHIELD_DISABLED=true`，Shield 的 cache miss 可能再次请求自己，形成回源环。这是必须避免的配置。
+
+完整步骤、TLS/Host 要求、部署顺序、验证、高可用和故障排查见
+[docs/Origin Shield配置.md](<docs/Origin Shield配置.md>)。
 
 ---
 

@@ -427,6 +427,86 @@ no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 - 源站池/备用源站
 - 每个源站可独立配置 TLS SNI、回源 Host
 
+#### Origin Shield 配置
+
+完整的部署步骤、TLS/Host 要求、部署顺序、验证、高可用和故障排查见
+[Origin Shield 配置](<Origin Shield配置.md>)。
+
+推荐架构：
+
+```text
+普通 Edge
+  → 本地大缓存命中则直接返回
+  → 未命中则向 Origin Shield 请求
+  → Shield 命中则返回
+  → Shield 未命中才回源
+```
+
+**Shield 节点配置**
+
+在专用 Shield Edge 的 `/etc/lagran/edge.env`：
+
+```env
+LARGE_CACHE_ENABLED=true
+LARGE_CACHE_DIR=/var/lib/lagran/large-cache
+LARGE_CACHE_MAX_BYTES=21474836480
+LARGE_CACHE_MIN_FREE_BYTES=1073741824
+LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=268435456
+
+# 仅 Shield 节点开启
+EDGE_SHIELD_DISABLED=true
+```
+
+普通 Edge 保持：
+
+```env
+EDGE_SHIELD_DISABLED=false
+```
+
+**控制台配置**
+
+```text
+域名列表 → 目标域名 → 高级设置 → Origin Shield 地址
+```
+
+填写 Shield 的内部地址：
+
+```text
+https://shield-s1.internal.example.com
+```
+
+要求：
+
+- 普通 Edge 能访问该地址，但公网不能访问；
+- Shield 仍收到公开业务域名 Host，必须能按该域名路由；
+- Shield 的证书/SNI 匹配内部地址；
+- Shield 自身不要把 `shield_url` 指回自己；
+- `EDGE_SHIELD_DISABLED=true` 只让 Shield 节点忽略域名上的 Shield 地址，避免 miss 自环；普通 Edge 仍会使用它；
+- Shield 故障时，普通 Edge 按既有源站池顺序回退；
+- 建议按区域部署多个 Shield，并在前面放内部负载均衡。
+
+> 如果 `shield_url` 指向 Lagran Edge 集群，但 Shield 节点没有设置 `EDGE_SHIELD_DISABLED=true`，Shield 的缓存 miss 可能再次请求自己，形成回源环。
+
+验证：
+
+```bash
+# 普通 Edge 冷请求，应由 Shield 提供，不应直接命中源站
+curl -I -H 'Range: bytes=0-1023' https://cdn.example.com/file.bin
+
+# Shield 节点访问日志中应出现对应请求
+journalctl -u lagran-edge -f
+```
+
+监控 Shield：
+
+```text
+lagran_large_cache_fs_available_bytes
+lagran_large_cache_fs_reserved_bytes
+lagran_large_cache_fs_admission_headroom_bytes
+lagran_edge_chunk_fill_drops_total
+lagran_edge_chunk_fill_drop_budget_total
+```
+
 开启 CC 后：
 
 - 域名全局限流 RPS/突发同时作为 CC 全局攻击阈值。

@@ -512,6 +512,7 @@ fn check_config(config: &EdgeConfig) -> anyhow::Result<()> {
         "large_cache_min_free_bytes: {}",
         config.large_cache_min_free_bytes
     );
+    println!("origin_shield_disabled: {}", config.origin_shield_disabled);
     println!(
         "access_log: {}",
         config.access_log_path.as_deref().unwrap_or("disabled")

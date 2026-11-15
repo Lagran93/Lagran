@@ -115,7 +115,8 @@ Internet
 - BYPASS、POST/PUT 等动态请求和 WebSocket 直接走 `upstream_peer`，请求/响应 body
   流式转发；开放/大范围 Range GET 由 Pingora 直接流式回源，小段命中完整对象时由旧引擎切片返回 206。
 - 配置 `shield_url` 时，边缘把 Shield 作为优先级 -1 的回源目标，仍发送公开域名 Host；
-  Shield 失败后按普通源站池顺序回退。
+  Shield 失败后按普通源站池顺序回退。Shield 节点自身设置
+  `EDGE_SHIELD_DISABLED=true`，忽略域名上的 `shield_url`，避免 miss 自环。
 - HEAD 由同进程引擎回源 GET 并复用 GET cache key，GET/HEAD 共享同一个缓存对象；
   这样 HEAD 不会把空 body 写入 GET 缓存。HTTP/2 HEAD 返回真实 `Content-Length`；
   HTTP/1.1 因 Pingora H1 编码器限制继续返回 `0`，避免客户端等待不存在的 body。
