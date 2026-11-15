@@ -10,8 +10,8 @@
 ## Demo
 
 - 在线演示：https://console.lagrancdn.com
-- 管理员用户名/密码：`暂不提供`
-- 普通用户名/密码：`demo@lagrancdn.com` / `demo123456`
+- 演示账号：`demo@lagrancdn.com` / `demo123456`
+- 管理员账号：由部署初始化或首个账号创建，项目不提供公开管理员密码
 
 
 ## 快速导航
@@ -33,10 +33,12 @@
 - Pingora HTTP/HTTPS/HTTP2、SNI 动态证书、Host 路由
 - 多源站池：优先级、权重、健康检查、故障切换、Origin Shield
 - 内存 / 磁盘 / 混合缓存；ETag、304、SWR、single-flight
-- 大对象流式缓存与 Partial Range：
-  - 完整对象按块读回
-  - Range 只缓存实际请求区间
-  - 已覆盖区间后续直接 HIT
+- 大对象流式缓存与固定分片 Range：
+  - 默认 1 MiB 分片，只有完整覆盖的分片才算已缓存
+  - 首次 Range 对齐到分片边界，后续只回源缺失分片
+  - 单段、后缀和 16 段以内的多段 `multipart/byteranges`
+  - 逻辑容量硬上限、文件系统空闲下限、LRU 驱逐和 active writer pin
+  - 填充队列预算、多源站 failover、容量/丢弃/回源指标
 - WAF：托管规则、自定义规则、IP/CIDR 黑白名单、Geo/ASN 黑白名单（MaxMind GeoLite2）、观察/拦截/质询
 - CC：IPv4 `/24`、IPv6 `/64` 聚合，路径预算，全局阈值 + 自动攻击模式，PoW 挑战
 - 共享封禁、CIDR 封禁、跨 Edge 同步、可选行为评分
@@ -110,18 +112,23 @@ curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
 
 ### 大文件缓存
 
-需要缓存 100MB～1GB 对象时，在 `/etc/lagran/edge.env` 启用：
+需要缓存大对象（默认 8 MiB～1 GiB）时，在 `/etc/lagran/edge.env` 启用：
 
 ```env
 LARGE_CACHE_ENABLED=true
 LARGE_CACHE_DIR=/var/lib/lagran/large-cache
+LARGE_CACHE_MIN_OBJECT_BYTES=8388608
 LARGE_CACHE_MAX_OBJECT_BYTES=1073741824
+# 逻辑容量硬上限；writer 还会检查 LARGE_CACHE_MIN_FREE_BYTES
+LARGE_CACHE_MAX_BYTES=21474836480
 # 0 = 使用 LARGE_CACHE_MAX_OBJECT_BYTES；可设 268435456 限制单对象
 LARGE_CACHE_FILL_MAX_BYTES=0
-# Range 固定分片；缺失分片才回源
+# Range 固定分片；只有缺失分片才回源
 LARGE_CACHE_CHUNK_BYTES=1048576
+# 单 fill 队列 / 进程总预算
 LARGE_CACHE_FILL_QUEUE_BYTES=134217728
 LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=268435456
+# 缓存盘必须保留的空闲空间
 LARGE_CACHE_MIN_FREE_BYTES=1073741824
 ```
 
@@ -130,6 +137,17 @@ LARGE_CACHE_MIN_FREE_BYTES=1073741824
 ```bash
 systemctl restart lagran-edge
 ```
+
+Range 行为：
+
+- 只有完整覆盖分片才进入缓存；
+- 首次请求从分片边界开始填充，客户端只收到自己请求的字节；
+- 后续请求按 `ChunkPlan` 只回源缺失分片；
+- 多段 `bytes=0-1,4-5` 会返回 `multipart/byteranges`，冷请求按首尾包络填充；
+- writer 开始前同时检查逻辑上限和 `LARGE_CACHE_MIN_FREE_BYTES`；
+- 空间不足时先 LRU 驱逐；仍不足则放弃 fill，客户端响应不受影响。
+
+大缓存是**节点本地**缓存；不同 Edge 节点各自维护分片状态，不做跨节点合并。
 
 ---
 
@@ -142,6 +160,9 @@ docker compose -f deploy/docker-compose.yml up -d
 # 控制面：自动迁移，默认 0.0.0.0:8080
 cargo run -p control
 
+# 需要本地演示账号时（默认不创建）
+SEED_DEMO=true cargo run -p control
+
 # 边缘节点：默认 0.0.0.0:8081
 ORIGIN_URL=http://example.com cargo run -p edge
 
@@ -151,11 +172,13 @@ npm install
 NUXT_PUBLIC_API_BASE=http://localhost:8080 npm run dev
 ```
 
-演示账号：
+演示账号（仅 `SEED_DEMO=true`）：
 
 ```text
 demo@lagran.dev / demo123
 ```
+
+该账号是普通用户，不自动获得管理员权限。
 
 > 生产环境必须设置 `SEED_DEMO=false`，并更换 `JWT_SECRET`、数据库密码和节点令牌。
 
@@ -167,7 +190,7 @@ demo@lagran.dev / demo123
 # 控制面健康检查
 curl -fsS http://127.0.0.1:8080/health
 
-# 登录
+# 登录（需要 SEED_DEMO=true 创建 demo 账号）
 TOKEN=$(curl -sS -X POST http://127.0.0.1:8080/api/v1/auth/login \
   -H 'content-type: application/json' \
   -d '{"email":"demo@lagran.dev","password":"demo123"}' | jq -r .token)
@@ -187,8 +210,25 @@ curl -i http://127.0.0.1:8081/
 ```text
 X-Powered-By: lagran-edge
 X-Cache: HIT | MISS | BYPASS | STALE
+X-Lagran-Cache-Source: l1 | l2 | l3 | l3+origin | origin
 X-Lagran-Cache-Reason: <缓存原因>
 X-Lagran-Cache-TTL: <剩余新鲜秒数>
+Age: <缓存年龄>
+```
+
+大对象 Range 常见 reason：
+
+```text
+range-large-cache   完整大缓存命中
+range-chunk-fill   首次缺失分片填充
+range-chunks       部分缓存 + 缺失分片回源
+range-multipart    多段 Range multipart 命中
+```
+
+多段 Range 示例：
+
+```bash
+curl -i -H 'Range: bytes=0-1,4-5' http://127.0.0.1:8081/
 ```
 
 ---
@@ -224,8 +264,11 @@ cargo clippy --workspace --all-targets
 # 端到端（需要 PostgreSQL 和本地模拟源站）
 bash tests/integration/smoke.sh
 bash tests/integration/cache-diagnostics.sh
+bash tests/integration/multi-origin.sh
+bash tests/integration/p2-hardening.sh
 bash tests/integration/waf.sh
 bash tests/integration/ttl.sh
+bash tests/integration/dns.sh
 ```
 
 全部集成脚本位于：
@@ -263,6 +306,27 @@ curl -fsS http://127.0.0.1:8080/ready
 curl -fsS http://127.0.0.1:8082/__lagran/health
 ```
 
+### 指标
+
+```bash
+curl -fsS http://127.0.0.1:8082/__lagran/metrics
+```
+
+重点指标：
+
+```text
+lagran_edge_chunk_requests_total
+lagran_edge_chunk_origin_attempts_total
+lagran_edge_chunk_origin_failures_total
+lagran_edge_chunk_fill_drops_total
+lagran_edge_chunk_fill_dropped_bytes_total
+lagran_large_cache_used_bytes
+lagran_large_cache_available_bytes
+lagran_large_cache_fs_available_bytes
+lagran_large_cache_fs_reserved_bytes
+lagran_large_cache_min_free_bytes
+```
+
 ### 升级
 
 优先使用控制台：
@@ -273,7 +337,13 @@ curl -fsS http://127.0.0.1:8082/__lagran/health
 
 更新助手会下载 Release、校验 `SHA256SUMS`、备份旧二进制、替换文件并重启服务。
 
-旧部署需要先重新执行一次：
+旧版 Edge 缺少 `/__lagran/update` 或 update helper 时，在每个边缘节点重新执行：
+
+```bash
+./install.sh edge
+```
+
+旧版控制面缺少更新助手时，重新执行：
 
 ```bash
 ./install.sh control
@@ -291,8 +361,12 @@ sudo tar czf /backup/lagran-config-$(date +%F).tgz /etc/lagran
 ## 已知限制
 
 - 带普通 Cookie 的请求默认绕过缓存；缓存响应不保存 `Set-Cookie`
-- Partial Range 只支持单段；多段 Range 直接透传源站
 - 大对象完整 GET 需要对象 `complete=true`；partial 对象只响应已覆盖的 Range
+- 大对象多段 Range 支持 multipart 缓存响应；冷请求按首尾包络填充，跨度超过单对象填充上限、逻辑上限或文件系统空闲下限时回退源站透传
+- `If-Range` 请求不参与大对象多段缓存拼接，交给源站处理
+- 大对象 fill 可能因单 fill 队列、全局 fill 预算、逻辑容量或 `LARGE_CACHE_MIN_FREE_BYTES` 被丢弃；客户端响应不受影响，缓存保持 partial
+- 大缓存是节点本地状态；同一 partial 对象在不同 Edge 节点上的补全进度独立
+- 元数据预留按 sidecar 实际大小/保守上界计算；极端大响应头在缓存接近上限时可能让 fill 被拒绝而不是超限写入
 - 浏览器 `no-cache`/`max-age=0`/`Pragma: no-cache` 请求走条件回源：有 ETag/Last-Modified 时源站 304 复用缓存；响应 `no-cache` 不写入共享缓存
 - CC 是 L7 防护；SYN/UDP/连接耗尽等 L4 攻击仍需云清洗或上游联动
 - 普通域名限流配置 `REDIS_URL` 后跨 Edge 共享；Redis 故障时回退单进程 bucket
