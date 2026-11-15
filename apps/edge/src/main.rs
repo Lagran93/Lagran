@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     let cache = cache::build_cache(&config).await?;
     let large_cache = if config.large_cache_enabled {
         Some(
-            edge::cache::LargeCache::open_with_fill_budget(
+            edge::cache::LargeCache::open_with_limits(
                 &config.large_cache_dir,
                 config.large_cache_min_object_bytes,
                 config.large_cache_max_object_bytes,
@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
                 config
                     .large_cache_fill_queue_total_bytes
                     .max(config.large_cache_fill_queue_bytes),
+                config.large_cache_min_free_bytes,
             )
             .await?,
         )
@@ -506,6 +507,10 @@ fn check_config(config: &EdgeConfig) -> anyhow::Result<()> {
     println!(
         "large_cache_fill_queue_total_bytes: {}",
         config.large_cache_fill_queue_total_bytes
+    );
+    println!(
+        "large_cache_min_free_bytes: {}",
+        config.large_cache_min_free_bytes
     );
     println!(
         "access_log: {}",

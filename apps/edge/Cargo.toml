@@ -53,6 +53,7 @@ dashmap = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
+libc = "0.2"
 http = { workspace = true }
 async-trait = { workspace = true }
 async-stream = "0.3"

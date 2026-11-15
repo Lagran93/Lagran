@@ -1094,6 +1094,7 @@ Control 的 CONTROL_PUBLIC_URL
 | `LARGE_CACHE_CHUNK_BYTES` | Range 固定分片大小，默认 1 MiB；缺失分片才回源 |
 | `LARGE_CACHE_FILL_QUEUE_BYTES` | 单个 fill 写盘队列上限，默认 128 MiB |
 | `LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES` | 所有 fill 队列总预算，默认 256 MiB |
+| `LARGE_CACHE_MIN_FREE_BYTES` | 大缓存文件系统保留空闲空间，默认 1 GiB |
 | `DOWNSTREAM_KEEPALIVE_SECS` | 下游 HTTP/1.1 keepalive 空闲超时，默认 60 |
 | `DOWNSTREAM_H2_IDLE_SECS` | 下游 HTTP/2 空闲超时，默认 120 |
 | `DOWNSTREAM_KEEPALIVE_REQUESTS` | 单连接最大请求数，默认 1000 |
@@ -1781,6 +1782,7 @@ LARGE_CACHE_FILL_MAX_BYTES=0
 LARGE_CACHE_CHUNK_BYTES=1048576
 LARGE_CACHE_FILL_QUEUE_BYTES=134217728
 LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=268435456
+LARGE_CACHE_MIN_FREE_BYTES=1073741824
 ```
 
 大缓存写入要求：
@@ -1799,6 +1801,7 @@ LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=268435456
 LARGE_CACHE_CHUNK_BYTES=1048576
 LARGE_CACHE_FILL_QUEUE_BYTES=134217728
 LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=268435456
+LARGE_CACHE_MIN_FREE_BYTES=1073741824
 ```
 
 对象被切成等长分片（最后一片可以更短）。只有**完整覆盖一个分片**时，该分片才算已缓存：
@@ -1848,13 +1851,13 @@ LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=268435456
 生产加固：
 
 - 每个 fill 队列默认上限 128 MiB，进程全局 fill 队列默认 256 MiB；可通过 `LARGE_CACHE_FILL_QUEUE_BYTES` / `LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES` 调整，运行时总预算取 max(总预算, 单 fill 上限)。超过时丢弃后续写盘，客户端响应不受影响。
-- 分片 writer 在开始前先做磁盘字节预留：used_bytes（已提交 + 活跃预留）<= LARGE_CACHE_MAX_BYTES 是硬上限；空间不足时先驱逐，仍不足则放弃填充而不是超限写入。
+- 分片 writer 在开始前先做磁盘字节预留：used_bytes（已提交 + 活跃预留）<= LARGE_CACHE_MAX_BYTES 是硬上限；同时检查文件系统可用空间，必须保留 `LARGE_CACHE_MIN_FREE_BYTES`。文件系统空间不足时先按 LRU 驱逐缓存对象，仍不足则放弃填充而不是超限写入。
 - 一个请求最多处理 16 个不连续的缺失分片区间；超过时回退首次 Range 填充路径，避免请求变成几十/上百个源站连接。
 - 正在写入或读取的对象会被 pin 住，LRU 驱逐会跳过它，避免 data/meta 被删后 writer 又提交半个对象。
 - 手动分片回源按 origin 健康度/优先级/权重依次 failover；网络错误、超时、非 206 会尝试下一个源站，ETag/Content-Range/编码不匹配也不会盲目拼接。
 - 首次后缀 Range（`bytes=-N`）先用 HEAD 探测对象总长度，再把后缀起点换算成普通 Range 进入分片路径；源站不支持 HEAD 时用 `bytes=0-0` 探测。
 - 分片写入只提交完整分片；客户端中断时正在写的半个分片丢弃。
-- 监控项：lagran_edge_chunk_requests_total、lagran_edge_chunk_origin_runs_total、lagran_edge_chunk_fallbacks_total、lagran_edge_chunk_fill_drops_total、lagran_edge_chunk_fill_dropped_bytes_total、lagran_edge_chunk_origin_attempts_total、lagran_edge_chunk_origin_failures_total；容量水位：lagran_large_cache_used_bytes、lagran_large_cache_available_bytes、lagran_large_cache_capacity_bytes。
+- 监控项：lagran_edge_chunk_requests_total、lagran_edge_chunk_origin_runs_total、lagran_edge_chunk_fallbacks_total、lagran_edge_chunk_fill_drops_total、lagran_edge_chunk_fill_dropped_bytes_total、lagran_edge_chunk_origin_attempts_total、lagran_edge_chunk_origin_failures_total；容量水位：lagran_large_cache_used_bytes、lagran_large_cache_available_bytes、lagran_large_cache_capacity_bytes、lagran_large_cache_fs_available_bytes、lagran_large_cache_fs_reserved_bytes、lagran_large_cache_min_free_bytes。
 
 #### 5.8.1 Fill 队列预算
 
@@ -1943,6 +1946,110 @@ lagran_edge_chunk_fill_dropped_bytes_total
 ```
 
 不要用 `large_cache_available_bytes` 判断 fill 队列是否满。
+
+##### 文件系统剩余空间
+
+`LARGE_CACHE_MAX_BYTES` 只限制逻辑字节，不能保证缓存目录所在文件系统还有空间。Edge 在 writer 开始前额外做一次文件系统准入检查。
+
+新增配置：
+
+```env
+# 大缓存文件系统必须保留的空闲空间，默认 1 GiB
+LARGE_CACHE_MIN_FREE_BYTES=1073741824
+```
+
+检查方式：
+
+```text
+statvfs(LARGE_CACHE_DIR)
+available = f_bavail * f_frsize
+```
+
+一次 fill 需要同时满足：
+
+```text
+1. used_bytes + reservation <= LARGE_CACHE_MAX_BYTES
+2. fs_available - fs_reserved >= LARGE_CACHE_MIN_FREE_BYTES + reservation
+```
+
+其中：
+
+- `used_bytes`：已提交 + 活跃 writer 的逻辑预留；
+- `fs_reserved_bytes`：活跃 writer 针对文件系统空闲空间做的预留；
+- `available`：当前对 edge 运行用户可用的文件系统空闲字节。
+
+最终准入时任一条件仍不满足：
+
+- 不创建 writer；
+- 不写入缓存；
+- 客户端响应不受影响；
+- 丢弃量计入 `lagran_edge_chunk_fill_drops_total` / `lagran_edge_chunk_fill_dropped_bytes_total`。
+
+文件系统准入检查先于本次写入。空间不足时，先按 LRU 驱逐一批已缓存对象释放实际空间；驱逐后仍低于 `LARGE_CACHE_MIN_FREE_BYTES` 才拒绝本次 fill。驱逐受 victim budget 限制，不会因为一次写入把整个缓存清空。
+
+##### 预留而不是预分配
+
+文件系统预留是计数器：
+
+```text
+writer 开始前：fs_reserved += reservation
+writer 提交/中止：fs_reserved -= reservation
+```
+
+它不会提前分配磁盘块，也不会创建占位文件；只是避免多个并发 fill 同时看到同一份空闲空间并一起超写。
+
+因为 writer 实际写盘会消耗空闲空间，而预留仍然存在，所以并发期间的空闲空间判断是偏保守的：可能出现磁盘实际上还能再写一点，但新 fill 已经被拒绝。这是有意的安全取舍。
+
+##### 和逻辑硬上限的区别
+
+```text
+LARGE_CACHE_MAX_BYTES
+→ 不能让缓存逻辑总量无限增长
+
+LARGE_CACHE_MIN_FREE_BYTES
+→ 不能把缓存所在文件系统写到只剩很少空间
+```
+
+两个条件同时生效：
+
+- 逻辑上限没到，但文件系统快满 → 先按 LRU 驱逐缓存对象，仍不足才拒绝新 fill；
+- 文件系统还有空间，但逻辑缓存已到上限 → 仍按逻辑驱逐/拒绝。
+
+##### 平台差异
+
+- Linux/Unix：通过 `statvfs` 读取；
+- 不支持 `statvfs` 的平台：跳过文件系统检查，只保留逻辑上限；
+- 运行用户不是 root 时，`f_bavail` 不包含 root 保留块，判断更保守。
+
+##### 这不是文件系统配额
+
+准入检查只能反映“开始写入那一刻”的空闲空间。以下情况仍可能发生：
+
+- 其他进程在 fill 期间大量写盘；
+- 日志、临时文件、数据库占用空间；
+- 磁盘本身故障或只读；
+- 文件系统预留块被 root 使用。
+
+这时 writer 仍可能遇到 `ENOSPC` / I/O 错误，表现为该 fill 丢弃或只提交前缀。准入检查不能替代文件系统配额或磁盘容量告警。
+
+##### 监控
+
+```text
+lagran_large_cache_fs_available_bytes
+lagran_large_cache_fs_reserved_bytes
+lagran_large_cache_min_free_bytes
+```
+
+- `fs_available_bytes` 接近 `min_free_bytes`：新 fill 会开始被拒绝；
+- `fs_reserved_bytes` 很高：大量 fill 正在并发写入；
+- 磁盘实际剩余不足但 fill drop 不增长：检查是否命中逻辑上限或队列上限。
+
+##### 调优
+
+- 默认 1 GiB 适用于缓存盘还承载日志/临时文件的节点；
+- 缓存盘是独立数据盘且空间充足，可以降低到 256–512 MiB；
+- 缓存盘与系统盘共用，建议保持 1–5 GiB；
+- 设置过大会导致明明有空间却长期无法填充，需要结合磁盘容量和业务写入量评估。
 
 ##### 队列满时的行为
 

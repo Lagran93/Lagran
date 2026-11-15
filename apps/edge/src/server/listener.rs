@@ -296,6 +296,26 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
          lagran_large_cache_capacity_bytes {}\n",
         large_used, large_available, large_capacity
     ));
+    if let Some(cache) = state.large_cache.as_ref() {
+        out.push_str(&format!(
+            "# HELP lagran_large_cache_fs_reserved_bytes In-flight filesystem reservations\n\
+             # TYPE lagran_large_cache_fs_reserved_bytes gauge\n\
+             lagran_large_cache_fs_reserved_bytes {}\n\
+             # HELP lagran_large_cache_min_free_bytes Filesystem free-space floor\n\
+             # TYPE lagran_large_cache_min_free_bytes gauge\n\
+             lagran_large_cache_min_free_bytes {}\n",
+            cache.fs_reserved_bytes(),
+            cache.min_free_bytes()
+        ));
+        if let Some(free) = cache.fs_available_bytes() {
+            out.push_str(&format!(
+                "# HELP lagran_large_cache_fs_available_bytes Filesystem bytes available to the edge user\n\
+                 # TYPE lagran_large_cache_fs_available_bytes gauge\n\
+                 lagran_large_cache_fs_available_bytes {}\n",
+                free
+            ));
+        }
+    }
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],

@@ -82,6 +82,7 @@ Environment:
   LARGE_CACHE_CHUNK_BYTES=       edge: fixed Range chunk size (default 1 MiB)
   LARGE_CACHE_FILL_QUEUE_BYTES=  edge: per-fill write queue bytes (default 128 MiB)
   LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES= edge: process fill queue budget (default 256 MiB)
+  LARGE_CACHE_MIN_FREE_BYTES=   edge: filesystem free-space floor (default 1 GiB)
   PUBLIC_IP=...                  edge: public IP for GeoDNS
   NODE_REGION=...                edge: region label
   DNS_ZONE=...                   dns: default edge.lagran.net
@@ -533,6 +534,7 @@ LARGE_CACHE_FILL_MAX_BYTES=${LARGE_CACHE_FILL_MAX_BYTES:-0}
 LARGE_CACHE_CHUNK_BYTES=${LARGE_CACHE_CHUNK_BYTES:-1048576}
 LARGE_CACHE_FILL_QUEUE_BYTES=${LARGE_CACHE_FILL_QUEUE_BYTES:-134217728}
 LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES=${LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES:-268435456}
+LARGE_CACHE_MIN_FREE_BYTES=${LARGE_CACHE_MIN_FREE_BYTES:-1073741824}
 LARGE_CACHE_MAX_BYTES=${LARGE_CACHE_MAX_BYTES:-21474836480}
 CHALLENGE_SECRET=${challenge_secret}
 EDGE_UPDATE_HELPER=${BIN_DIR}/lagran-edge-update

@@ -161,6 +161,9 @@ pub struct EdgeConfig {
     pub large_cache_fill_queue_bytes: u64,
     /// Process-wide cap across all active chunk/fill workers.
     pub large_cache_fill_queue_total_bytes: u64,
+    /// Keep at least this many bytes free on the large-cache filesystem.
+    /// New fills are rejected when the filesystem cannot preserve it.
+    pub large_cache_min_free_bytes: u64,
     /// Downstream HTTP/1.1 keepalive idle timeout.
     pub downstream_keepalive_secs: u64,
     /// Downstream HTTP/2 idle timeout after the last active stream.
@@ -414,6 +417,11 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256 * 1024 * 1024)
                 .clamp(1024 * 1024, 4096 * 1024 * 1024),
+            large_cache_min_free_bytes: std::env::var("LARGE_CACHE_MIN_FREE_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024 * 1024 * 1024)
+                .clamp(0, 1024 * 1024 * 1024 * 1024),
             downstream_keepalive_secs: std::env::var("DOWNSTREAM_KEEPALIVE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

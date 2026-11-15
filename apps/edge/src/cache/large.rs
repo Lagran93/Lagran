@@ -220,6 +220,31 @@ pub struct FillBudget {
 /// Pruned origin headers are normally far smaller, but this keeps the hard cap
 /// from being exceeded by metadata on the common paths.
 const RESERVATION_SLACK: u64 = 64 * 1024;
+/// Bytes available to the edge user on the filesystem containing `path`.
+///
+/// `None` means the platform or syscall does not expose it; callers then fall
+/// back to logical-cap accounting only.
+#[cfg(unix)]
+fn filesystem_available_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let block = if stat.f_frsize != 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    Some((stat.f_bavail as u64).saturating_mul(block as u64))
+}
+
+#[cfg(not(unix))]
+fn filesystem_available_bytes(_path: &Path) -> Option<u64> {
+    None
+}
 
 impl FillBudget {
     pub(crate) const DEFAULT_MAX: u64 = 256 * 1024 * 1024;
@@ -283,7 +308,7 @@ pub struct LargeWriter {
 impl LargeWriter {
     fn release_reservation(&mut self) {
         if self.reserved > 0 {
-            self.cache.release_reserved(self.reserved);
+            self.cache.release_reservation(self.reserved);
             self.reserved = 0;
         }
     }
@@ -413,7 +438,7 @@ pub struct RangeWriter {
 impl RangeWriter {
     fn release_reservation(&mut self) {
         if self.reserved > 0 {
-            self.cache.release_reserved(self.reserved);
+            self.cache.release_reservation(self.reserved);
             self.reserved = 0;
         }
     }
@@ -570,6 +595,10 @@ pub struct LargeCache {
     /// recreate a sidecar without its body (or vice versa).
     active: std::sync::Mutex<HashSet<String>>,
     fill_budget: Arc<FillBudget>,
+    /// Free bytes to preserve on the cache filesystem.
+    min_free_bytes: u64,
+    /// In-flight bytes reserved against filesystem free space.
+    fs_reserved_bytes: AtomicU64,
 }
 
 impl LargeCache {
@@ -595,6 +624,25 @@ impl LargeCache {
         max_object_bytes: u64,
         max_bytes: u64,
         fill_budget_bytes: u64,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::open_with_limits(
+            dir,
+            min_object_bytes,
+            max_object_bytes,
+            max_bytes,
+            fill_budget_bytes,
+            0,
+        )
+        .await
+    }
+
+    pub async fn open_with_limits(
+        dir: impl AsRef<Path>,
+        min_object_bytes: u64,
+        max_object_bytes: u64,
+        max_bytes: u64,
+        fill_budget_bytes: u64,
+        min_free_bytes: u64,
     ) -> anyhow::Result<Arc<Self>> {
         let root = dir.as_ref().to_path_buf();
         fs::create_dir_all(&root).await?;
@@ -627,6 +675,8 @@ impl LargeCache {
             range_locks: Mutex::new(HashMap::new()),
             active: std::sync::Mutex::new(HashSet::new()),
             fill_budget: Arc::new(FillBudget::new(fill_budget_bytes.max(1))),
+            min_free_bytes,
+            fs_reserved_bytes: AtomicU64::new(0),
         }))
     }
 
@@ -731,20 +781,112 @@ impl LargeCache {
         }
     }
 
-    fn release_reserved(&self, bytes: u64) {
+    pub fn fs_available_bytes(&self) -> Option<u64> {
+        filesystem_available_bytes(&self.root)
+    }
+
+    pub fn fs_reserved_bytes(&self) -> u64 {
+        self.fs_reserved_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn min_free_bytes(&self) -> u64 {
+        self.min_free_bytes
+    }
+
+    fn has_fs_headroom(&self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let Some(free) = filesystem_available_bytes(&self.root) else {
+            return true;
+        };
+        free.saturating_sub(self.fs_reserved_bytes.load(Ordering::Relaxed))
+            .saturating_sub(self.min_free_bytes)
+            >= bytes
+    }
+
+    /// Reserve `bytes` of future disk usage against the filesystem's current
+    /// free space. If statvfs is unavailable, logical accounting remains the
+    /// only guard.
+    fn reserve_fs(&self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let Some(free) = filesystem_available_bytes(&self.root) else {
+            return true;
+        };
+        let mut reserved = self.fs_reserved_bytes.load(Ordering::Relaxed);
+        loop {
+            let headroom = free
+                .saturating_sub(reserved)
+                .saturating_sub(self.min_free_bytes);
+            if headroom < bytes {
+                return false;
+            }
+            match self.fs_reserved_bytes.compare_exchange_weak(
+                reserved,
+                reserved.saturating_add(bytes),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => reserved = observed,
+            }
+        }
+    }
+
+    fn release_fs(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let _ =
+            self.fs_reserved_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |reserved| {
+                    Some(reserved.saturating_sub(bytes))
+                });
+    }
+
+    fn release_reservation(&self, bytes: u64) {
         self.release_bytes(bytes);
+        self.release_fs(bytes);
+    }
+
+    async fn evict_for_space(&self, required_free: u64) -> bool {
+        if filesystem_available_bytes(&self.root).is_none_or(|free| free >= required_free) {
+            return true;
+        }
+        self.evict_until(0, Some(required_free)).await;
+        filesystem_available_bytes(&self.root).is_none_or(|free| free >= required_free)
     }
 
     async fn reserve_or_evict(&self, bytes: u64) -> bool {
         if bytes > self.max_bytes {
             return false;
         }
-        if self.reserve_bytes(bytes) {
+        if !self.has_fs_headroom(bytes) {
+            let required = self
+                .fs_reserved_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(self.min_free_bytes)
+                .saturating_add(bytes);
+            self.evict_for_space(required).await;
+            if !self.has_fs_headroom(bytes) {
+                return false;
+            }
+        }
+        if !self.reserve_bytes(bytes) {
+            let target = self.max_bytes.saturating_sub(bytes);
+            self.evict_to(target).await;
+            if !self.reserve_bytes(bytes) {
+                return false;
+            }
+        }
+        if self.reserve_fs(bytes) {
             return true;
         }
-        let target = self.max_bytes.saturating_sub(bytes);
-        self.evict_to(target).await;
-        self.reserve_bytes(bytes)
+        // Filesystem headroom is insufficient; undo the logical reservation.
+        self.release_bytes(bytes);
+        false
     }
 
     fn release_bytes(&self, bytes: u64) {
@@ -1090,7 +1232,7 @@ impl LargeCache {
         let range_guard = match key_lock.try_lock_owned() {
             Ok(guard) => guard,
             Err(_) => {
-                self.release_reserved(reserved);
+                self.release_reservation(reserved);
                 return None;
             }
         };
@@ -1106,7 +1248,7 @@ impl LargeCache {
         };
         if let Some(meta) = &existing {
             if meta.covers(start, end) {
-                self.release_reserved(reserved);
+                self.release_reservation(reserved);
                 return None;
             }
         }
@@ -1145,17 +1287,17 @@ impl LargeCache {
         {
             Ok(file) => file,
             Err(_) => {
-                self.release_reserved(reserved);
+                self.release_reservation(reserved);
                 return None;
             }
         };
         if new_entry && file.set_len(content_length).await.is_err() {
-            self.release_reserved(reserved);
+            self.release_reservation(reserved);
             let _ = fs::remove_file(&data_path).await;
             return None;
         }
         if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-            self.release_reserved(reserved);
+            self.release_reservation(reserved);
             if new_entry {
                 let _ = fs::remove_file(&data_path).await;
             }
@@ -1306,12 +1448,33 @@ impl LargeCache {
     /// the 90% background target: a cache sitting just under 90% must still
     /// make room for one more object instead of rejecting every new fill.
     async fn evict_to(&self, target: u64) {
-        if self.max_bytes == 0 || self.used_bytes.load(Ordering::Relaxed) <= target {
+        self.evict_until(target, None).await;
+    }
+
+    /// Evict until committed usage is at or below `target`, or until the
+    /// filesystem has `required_free` bytes available. `evict_for_space` uses
+    /// the latter mode to recover cache space when the filesystem is full.
+    async fn evict_until(&self, target: u64, required_free: Option<u64>) {
+        if self.max_bytes == 0 {
+            return;
+        }
+        let space_ok = |required: u64| {
+            filesystem_available_bytes(&self.root).is_none_or(|free| free >= required)
+        };
+        if let Some(required) = required_free {
+            if space_ok(required) {
+                return;
+            }
+        } else if self.used_bytes.load(Ordering::Relaxed) <= target {
             return;
         }
         let _guard = self.evict_lock.lock().await;
         let used = self.used_bytes.load(Ordering::Relaxed);
-        if used <= target {
+        if let Some(required) = required_free {
+            if space_ok(required) {
+                return;
+            }
+        } else if used <= target {
             return;
         }
 
@@ -1384,7 +1547,11 @@ impl LargeCache {
         let mut freed = 0u64;
         let mut victims = 0usize;
         for (_, size, data, meta, key) in candidates {
-            if used.saturating_sub(freed) <= target || victims >= EVICT_VICTIM_BUDGET {
+            let done = match required_free {
+                Some(required) => space_ok(required),
+                None => used.saturating_sub(freed) <= target,
+            };
+            if done || victims >= EVICT_VICTIM_BUDGET {
                 break;
             }
             if !key.is_empty() && self.is_active(&key) {
@@ -1579,6 +1746,44 @@ mod tests {
             segments,
             chunk_bytes: 0,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_free_floor_rejects_fill() {
+        let dir = std::env::temp_dir().join(format!(
+            "lagran-large-fsfloor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let min = 1024 * 1024;
+        let cache = LargeCache::open_with_limits(
+            &dir,
+            min,
+            2 * min,
+            4 * min,
+            FillBudget::DEFAULT_MAX,
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cache
+                .begin("GET:fsfloor.test:/a.bin", 200, Vec::new(), min, 60, 0)
+                .await
+                .is_none(),
+            "an impossible filesystem floor must reject admission"
+        );
+        assert_eq!(
+            cache.used_bytes.load(Ordering::Relaxed),
+            0,
+            "the logical reservation must be rolled back when fs admission fails"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

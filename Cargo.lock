@@ -990,6 +990,7 @@ dependencies = [
  "hyper-util",
  "lagran-cache",
  "lagran-waf-dsl",
+ "libc",
  "maxminddb",
  "openssl",
  "pingora",
