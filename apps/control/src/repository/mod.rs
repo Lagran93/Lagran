@@ -112,6 +112,10 @@ pub struct NodeRow {
     pub weight: i32,
     #[sqlx(default)]
     pub max_bandwidth_mbps: i32,
+    /// Console-owned JSON text produced by the "add edge" wizard. Empty for
+    /// nodes registered before the wizard existed.
+    #[sqlx(default)]
+    pub edge_profile: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -596,7 +600,8 @@ pub async fn list_nodes(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
                COALESCE(province, '') AS province,
                COALESCE(city, '') AS city,
                COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
         FROM edge_nodes
         ORDER BY name
         "#,
@@ -618,7 +623,8 @@ pub async fn get_node(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<NodeRow>> 
                COALESCE(province, '') AS province,
                COALESCE(city, '') AS city,
                COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
         FROM edge_nodes WHERE id = $1
         "#,
     )
@@ -640,7 +646,8 @@ pub async fn get_node_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<
                COALESCE(province, '') AS province,
                COALESCE(city, '') AS city,
                COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
         FROM edge_nodes WHERE name = $1
         "#,
     )
@@ -662,7 +669,8 @@ pub async fn list_online_nodes_with_agent(pool: &PgPool) -> sqlx::Result<Vec<Nod
                COALESCE(province, '') AS province,
                COALESCE(city, '') AS city,
                COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
         FROM edge_nodes
         WHERE status = 'online' AND COALESCE(agent_url, '') <> ''
         ORDER BY name
@@ -695,7 +703,8 @@ pub async fn create_node(
                COALESCE(province, '') AS province,
                COALESCE(city, '') AS city,
                COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
         "#,
     )
     .bind(name)
@@ -729,7 +738,8 @@ pub async fn update_node(
                COALESCE(province, '') AS province,
                COALESCE(city, '') AS city,
                COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
         "#,
     )
     .bind(id)
@@ -769,7 +779,8 @@ pub async fn update_node_meta(
                   COALESCE(province, '') AS province,
                   COALESCE(city, '') AS city,
                   COALESCE(weight, 100) AS weight,
-                  COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+                  COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
         "#,
     )
     .bind(id)
@@ -788,6 +799,23 @@ pub async fn set_node_public_ip(pool: &PgPool, id: Uuid, public_ip: &str) -> sql
     sqlx::query("UPDATE edge_nodes SET public_ip = $2 WHERE id = $1")
         .bind(id)
         .bind(public_ip)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Store the console-generated hardware profile (opaque JSON text).
+///
+/// The console owns the shape; the control plane only round-trips it so the
+/// node detail drawer can rebuild the same `edge.env` the wizard produced.
+pub async fn update_node_edge_profile(
+    pool: &PgPool,
+    id: Uuid,
+    edge_profile: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE edge_nodes SET edge_profile = $2, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .bind(edge_profile)
         .execute(pool)
         .await?;
     Ok(())
@@ -813,7 +841,8 @@ pub async fn set_node_status(
                COALESCE(province, '') AS province,
                COALESCE(city, '') AS city,
                COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
         "#,
     )
     .bind(id)
@@ -884,7 +913,8 @@ pub async fn upsert_node_heartbeat(
                COALESCE(province, '') AS province,
                COALESCE(city, '') AS city,
                COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
         FROM edge_nodes WHERE name = $1
         "#,
     )
@@ -919,7 +949,8 @@ pub async fn upsert_node_heartbeat(
                COALESCE(province, '') AS province,
                COALESCE(city, '') AS city,
                COALESCE(weight, 100) AS weight,
-               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
             "#,
     )
     .bind(node.id)

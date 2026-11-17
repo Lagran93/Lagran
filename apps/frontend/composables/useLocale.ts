@@ -16,6 +16,7 @@ const DICT: Record<string, { zh: string; en: string }> = {
   'nav.prefetch': { zh: '缓存预热', en: 'Prefetch' },
   'nav.releases': { zh: '配置发布', en: 'Releases' },
   'nav.nodes': { zh: '边缘节点', en: 'Edge Nodes' },
+  'nav.nodeOnboard': { zh: '新增节点', en: 'Add Edge Wizard' },
   'nav.stats': { zh: '统计分析', en: 'Analytics' },
   'nav.monitor': { zh: '大屏监控', en: 'Monitor Wall' },
   'nav.alerts': { zh: '告警中心', en: 'Alerts' },

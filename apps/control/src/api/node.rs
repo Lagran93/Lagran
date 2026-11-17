@@ -36,6 +36,9 @@ pub struct NodeDto {
     pub city: String,
     pub weight: i32,
     pub max_bandwidth_mbps: i32,
+    /// Opaque JSON text produced by the console's "add edge" wizard. Empty when
+    /// the node was registered without one.
+    pub edge_profile: String,
 }
 
 fn to_dto(r: repository::NodeRow) -> NodeDto {
@@ -64,6 +67,7 @@ fn to_dto(r: repository::NodeRow) -> NodeDto {
         city: r.city,
         weight: r.weight,
         max_bandwidth_mbps: r.max_bandwidth_mbps,
+        edge_profile: r.edge_profile,
     }
 }
 
@@ -101,6 +105,8 @@ pub struct CreateNodeRequest {
     pub city: Option<String>,
     pub weight: Option<i32>,
     pub max_bandwidth_mbps: Option<i32>,
+    /// Hardware profile from the console wizard (JSON object, opaque here).
+    pub edge_profile: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -209,6 +215,8 @@ pub struct UpdateNodeRequest {
     pub city: Option<String>,
     pub weight: Option<i32>,
     pub max_bandwidth_mbps: Option<i32>,
+    /// Hardware profile from the console wizard (JSON object, opaque here).
+    pub edge_profile: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -395,6 +403,24 @@ fn shell_quote(value: &str) -> String {
 /// Region names are operator labels; anything outside this set is almost
 /// certainly a mistake or an injection attempt and is rejected up front instead
 /// of being quoted and stored.
+/// The console owns the profile shape; the control plane only enforces that it
+/// is a bounded JSON object, so a malformed blob cannot break the drawer.
+fn validate_edge_profile(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > 8192 {
+        return Err("edge_profile is too large".into());
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|_| "edge_profile must be valid JSON".to_string())?;
+    if !value.is_object() {
+        return Err("edge_profile must be a JSON object".into());
+    }
+    Ok(value.to_string())
+}
+
 fn validate_region(region: &str) -> Result<String, String> {
     let region = region.trim();
     if region.is_empty() {
@@ -556,6 +582,13 @@ pub async fn create(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
     let agent_url = validate_agent_url(req.agent_url.as_deref().unwrap_or(""))
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+    // Validated before the row is created: a malformed profile must not leave a
+    // half-configured node behind.
+    let edge_profile = match req.edge_profile.as_deref() {
+        Some(raw) => validate_edge_profile(raw)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?,
+        None => String::new(),
+    };
     let base = public_base(&state, &headers);
 
     let row = repository::create_node(
@@ -585,7 +618,7 @@ pub async fn create(
     })?;
 
     let country = normalize_country(req.country.as_deref().unwrap_or("CN"));
-    let row = repository::update_node_meta(
+    let mut row = repository::update_node_meta(
         &state.pool,
         row.id,
         req.public_ip.as_deref().unwrap_or(""),
@@ -599,6 +632,14 @@ pub async fn create(
     .await
     .map_err(|_| db_error())?
     .unwrap_or(row);
+
+    if !edge_profile.is_empty() {
+        repository::update_node_edge_profile(&state.pool, row.id, &edge_profile)
+            .await
+            .map_err(|_| db_error())?;
+        // Keep the response consistent with what was stored, without a re-read.
+        row.edge_profile = edge_profile;
+    }
 
     let _ = repository::insert_audit(
         &state.pool,
@@ -708,6 +749,12 @@ pub async fn update(
     }
     let region = req.region.unwrap_or(current.region);
     let agent_url = req.agent_url.unwrap_or(current.agent_url);
+    // Reject a malformed profile before touching any column.
+    let edge_profile = match req.edge_profile.as_deref() {
+        Some(raw) => validate_edge_profile(raw)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?,
+        None => String::new(),
+    };
 
     let row = repository::update_node(&state.pool, node_id, &name, &region, &agent_url)
         .await
@@ -739,6 +786,10 @@ pub async fn update(
             .max(0),
     )
     .await;
+    if !edge_profile.is_empty() {
+        // The re-read below refreshes `row`, so the response carries the profile.
+        let _ = repository::update_node_edge_profile(&state.pool, node_id, &edge_profile).await;
+    }
     let row = repository::get_node(&state.pool, node_id)
         .await
         .ok()

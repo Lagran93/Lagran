@@ -29,10 +29,10 @@
           <AppIcon name="search" :size="15" />
           DNS 测试
         </button>
-        <button class="btn btn-primary" type="button" @click="openCreate">
-          <AppIcon name="plus" :size="15" />
-          添加节点
-        </button>
+        <NuxtLink to="/nodes/onboard" class="btn btn-default">
+          <AppIcon name="zap" :size="15" />
+          新增 Edge 向导
+        </NuxtLink>
       </div>
     </div>
 
@@ -146,29 +146,23 @@
       </div>
 
       <EmptyState v-else-if="!nodes.length" icon="node" title="还没有边缘节点"
-        text="点击「添加节点」预注册一个节点，控制台会生成带一次性令牌的安装命令；在服务器上运行后约 15 秒出现在列表里。">
-        <button class="btn btn-primary btn-sm" type="button" @click="openCreate">
-          添加第一个节点
-        </button>
+        text="先用「新增 Edge 向导」按服务器硬件生成适配的 edge.env；注册节点后在服务器上应用该配置并启动，约 15 秒自动上线。">
+        <NuxtLink to="/nodes/onboard" class="btn btn-primary btn-sm">
+          打开新增 Edge 向导
+        </NuxtLink>
       </EmptyState>
     </div>
 
-    <!-- 新增 / 编辑 -->
-    <BaseModal v-model="formOpen" :title="editing ? '编辑节点' : '添加边缘节点'" :confirm-text="editing ? '保存修改' : '生成安装命令'"
-      :loading="saving" @confirm="submitForm">
+    <!-- 编辑节点（新增统一走「新增 Edge 向导」） -->
+    <BaseModal v-model="formOpen" title="编辑节点" confirm-text="保存修改" :loading="saving"
+      @confirm="submitForm">
       <div class="form-col">
-        <div v-if="!editing" class="alert alert-info">
-          <AppIcon name="info" :size="16" class="icon" />
-          <span>
-            预注册后节点处于「待接入」状态；在服务器上执行生成的命令并完成首次心跳后自动上线。
-          </span>
-        </div>
         <div class="form-grid">
           <div class="field span-2">
             <label class="field-label">节点名称 <span class="req">*</span></label>
-            <input v-model="form.name" class="input" placeholder="例如 edge-hk-01" :disabled="editing" />
+            <input v-model="form.name" class="input" placeholder="例如 edge-hk-01" disabled />
             <span class="field-hint">
-              {{ editing ? '名称用于心跳标识，修改后需同步调整节点环境变量 NODE_ID。' : '全局唯一，对应边缘端的 NODE_ID。' }}
+              名称用于心跳标识，无法修改；改名请删除节点后通过向导重新接入。
             </span>
           </div>
           <div class="field">
@@ -228,69 +222,6 @@
           </div>
         </div>
         <p v-if="formError" class="text-danger" style="font-size: 13px">{{ formError }}</p>
-      </div>
-    </BaseModal>
-
-    <!-- 安装命令 -->
-    <BaseModal v-model="installOpen" title="节点安装命令" width="720px" hide-footer>
-      <div v-if="created" class="form-col">
-        <div class="alert alert-warning">
-          <AppIcon name="alert" :size="16" class="icon" />
-          <span>
-            令牌等同于该节点的身份凭证，请通过安全通道传递；删除节点会立即吊销它。
-            命令中的 <code class="mono">AGENT_URL</code> 请替换成该节点的公网地址。
-          </span>
-        </div>
-
-        <div class="field">
-          <label class="field-label">节点令牌</label>
-          <div class="copy-row">
-            <input class="input mono" :value="created.token" readonly />
-            <button class="btn btn-default" type="button" @click="copy(created.token, '令牌')">
-              <AppIcon name="copy" :size="15" />
-              复制
-            </button>
-          </div>
-        </div>
-
-        <div class="segmented">
-          <button type="button" :class="{ active: installTab === 'binary' }" @click="installTab = 'binary'">
-            二进制
-          </button>
-          <button type="button" :class="{ active: installTab === 'docker' }" @click="installTab = 'docker'">
-            Docker
-          </button>
-        </div>
-
-        <div class="command-box">
-          <pre class="mono">{{ currentCommand }}</pre>
-          <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(currentCommand, '安装命令')">
-            <AppIcon name="copy" :size="14" />
-            复制
-          </button>
-        </div>
-
-        <div class="tips">
-          <div class="tip-row">
-            <span class="tip-index">1</span>
-            <span>把二进制 / 镜像传到节点服务器，或直接在代码目录运行。</span>
-          </div>
-          <div class="tip-row">
-            <span class="tip-index">2</span>
-            <span>确保节点能访问控制面地址，且 8081 端口对访客开放。</span>
-          </div>
-          <div class="tip-row">
-            <span class="tip-index">3</span>
-            <span>启动后约 15 秒节点会自动上线；命令可随时在「详情」里重新查看。</span>
-          </div>
-        </div>
-
-        <div class="flex-between mt-8">
-          <span class="text-muted" style="font-size: 12px">
-            {{ created.node.name }} · {{ created.node.region || '默认区域' }}
-          </span>
-          <button class="btn btn-primary" type="button" @click="installOpen = false">完成</button>
-        </div>
       </div>
     </BaseModal>
 
@@ -382,22 +313,145 @@
           </button>
         </div>
 
-        <div class="section-title">安装 / 启动命令</div>
-        <div class="segmented">
-          <button type="button" :class="{ active: installTab === 'binary' }" @click="installTab = 'binary'">
-            二进制
-          </button>
-          <button type="button" :class="{ active: installTab === 'docker' }" @click="installTab = 'docker'">
-            Docker
-          </button>
+        <div class="section-title">edge.env 配置文件</div>
+        <div v-if="!detailProfileStored" class="alert alert-info">
+          <AppIcon name="info" :size="16" class="icon" />
+          <span>
+            该节点没有硬件画像（未通过「新增 Edge 向导」接入），下面按默认画像生成。
+            在下方调整并保存后，详情页会按这台机器的实际配置复现文件。
+          </span>
         </div>
-        <div class="command-box">
-          <pre class="mono">{{ currentCommand }}</pre>
-          <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(currentCommand, '安装命令')">
+        <div class="env-head">
+          <span class="mono env-hardware">{{ detailHardwareSummary }}</span>
+          <span class="spacer" />
+          <button class="btn btn-text btn-sm" type="button" @click="copy(detailEnv, 'edge.env')">
             <AppIcon name="copy" :size="14" />
             复制
           </button>
+          <button class="btn btn-text btn-sm" type="button" @click="downloadDetailEnv">
+            下载 edge.env
+          </button>
         </div>
+        <div class="command-box env-box">
+          <pre class="mono">{{ detailEnv }}</pre>
+        </div>
+
+        <details class="drawer-details">
+          <summary>调整硬件画像（保存后写入节点）</summary>
+          <div class="profile-grid">
+            <label class="profile-field">
+              <span>CPU 核数</span>
+              <input v-model.number="detailProfile.hardware.cpuCores" class="input" type="number" min="1" max="128" />
+            </label>
+            <label class="profile-field">
+              <span>内存（GiB）</span>
+              <input v-model.number="detailProfile.hardware.memoryGb" class="input" type="number" min="1" max="512" />
+            </label>
+            <label class="profile-field">
+              <span>缓存磁盘（GiB）</span>
+              <input v-model.number="detailProfile.hardware.diskGb" class="input" type="number" min="0" max="100000" />
+            </label>
+            <label class="profile-field">
+              <span>磁盘类型</span>
+              <select
+                class="select"
+                :value="detailProfile.hardware.diskType"
+                @change="setDetailDiskType(($event.target as HTMLSelectElement).value)"
+              >
+                <option value="nvme">NVMe SSD</option>
+                <option value="sata-ssd">SATA SSD</option>
+                <option value="hdd">机械盘 HDD</option>
+              </select>
+            </label>
+            <label class="profile-field">
+              <span>出口带宽（Mbps）</span>
+              <input v-model.number="detailProfile.hardware.bandwidthMbps" class="input" type="number" min="0" max="100000" />
+            </label>
+            <label class="profile-field">
+              <span>业务类型</span>
+              <select
+                class="select"
+                :value="detailProfile.hardware.workload"
+                @change="setDetailWorkload(($event.target as HTMLSelectElement).value)"
+              >
+                <option value="web">网页 / 小文件</option>
+                <option value="mixed">混合业务</option>
+                <option value="video">视频 / 大文件点播</option>
+              </select>
+            </label>
+            <label class="profile-field span-2 checkbox">
+              <input v-model="detailProfile.hardware.sharedRedis" type="checkbox" />
+              <span>使用共享 Redis（区域实例即可）</span>
+            </label>
+            <label class="profile-field span-2 checkbox">
+              <input v-model="detailProfile.infra.httpsEnabled" type="checkbox" />
+              <span>启用 HTTPS 监听</span>
+            </label>
+            <label class="profile-field">
+              <span>CACHE_BACKEND</span>
+              <select
+                class="select"
+                :value="detailProfile.infra.cacheBackend"
+                @change="setDetailCacheBackend(($event.target as HTMLSelectElement).value)"
+              >
+                <option v-for="(label, value) in CACHE_BACKEND_LABEL" :key="value" :value="value">
+                  {{ label }}
+                </option>
+              </select>
+            </label>
+            <label class="profile-field">
+              <span>REDIS_URL</span>
+              <input
+                v-model="detailProfile.infra.redisUrl"
+                class="input mono"
+                placeholder="redis://127.0.0.1:6379/0"
+              />
+            </label>
+            <label class="profile-field span-2">
+              <span>CACHE_REDIS_URL（留空复用 REDIS_URL）</span>
+              <input
+                v-model="detailProfile.infra.cacheRedisUrl"
+                class="input mono"
+                placeholder="redis://127.0.0.1:6379/1"
+              />
+              <em class="profile-note">仅 CACHE_BACKEND=redis 时启用；含密码的地址会随画像存储。</em>
+            </label>
+            <label class="profile-field">
+              <span>CHALLENGE_SECRET</span>
+              <input
+                v-model="detailProfile.infra.challengeSecret"
+                class="input mono"
+                type="password"
+                autocomplete="off"
+                placeholder="各节点必须一致"
+              />
+            </label>
+            <label class="profile-field">
+              <span>WAF_RULEPACK_SECRET</span>
+              <input
+                v-model="detailProfile.infra.wafRulepackSecret"
+                class="input mono"
+                type="password"
+                autocomplete="off"
+                placeholder="与控制面一致"
+              />
+            </label>
+            <em class="profile-note span-2">
+              两个密钥都会随硬件画像存储在控制面，仅管理员可读取；留空则文件里保留注释占位。
+            </em>
+          </div>
+          <div class="flex-between profile-actions">
+            <span class="text-muted" style="font-size: 12px">
+              Sizing: {{ humanBytes(detailPlan.metrics.memoryCacheBytes) }} 内存缓存
+              <template v-if="detailPlan.metrics.largeCacheEnabled">
+                · {{ humanBytes(detailPlan.metrics.largeCacheBytes) }} 大对象缓存
+              </template>
+            </span>
+            <button class="btn btn-default btn-sm" type="button" :disabled="savingProfile" @click="saveDetailProfile">
+              {{ savingProfile ? '保存中…' : '保存画像' }}
+            </button>
+          </div>
+        </details>
       </div>
     </BaseDrawer>
     <!-- 调度测试 -->
@@ -555,15 +609,29 @@
 <script setup lang="ts">
 import { copyText } from '~/utils/clipboard'
 import { friendlyErrorMessage } from '~/utils/friendlyError'
+import {
+  CACHE_BACKEND_LABEL,
+  EDGE_PROFILE_DEFAULTS,
+  humanBytes,
+  parseEdgeProfile,
+  recommendEdgeConfig,
+  renderEdgeEnvFile,
+  serializeEdgeProfile,
+  summarizeHardware,
+  type EdgeCacheBackend,
+  type EdgeDiskType,
+  type EdgeProfile,
+  type EdgeWorkload,
+} from '~/utils/edgeSizing'
 
 const api = useApi()
 const toast = useToast()
 const { ask } = useConfirm()
 
-interface CreatedNode {
+/** Shape returned by GET /api/v1/nodes/:id. */
+interface NodeDetail {
   node: any
   token: string
-  commands: { binary: string; docker: string }
 }
 
 const nodes = ref<any[]>([])
@@ -579,7 +647,6 @@ const formError = ref('')
 const form = ref({
   name: '',
   region: '',
-  ip: '',
   agent_url: '',
   public_ip: '',
   country: 'CN',
@@ -599,12 +666,74 @@ const dnsLoading = ref(false)
 const dnsResult = ref<any>(null)
 const dnsForm = ref({ name: 'cname.lagranedge.com', ip: '' })
 
-const installOpen = ref(false)
-const installTab = ref<'binary' | 'docker'>('binary')
-const created = ref<CreatedNode | null>(null)
-
 const detailOpen = ref(false)
-const detail = ref<CreatedNode | null>(null)
+const detail = ref<NodeDetail | null>(null)
+
+// The wizard stores its hardware profile on the node, so the drawer can rebuild
+// the same edge.env. Nodes registered without one fall back to the defaults and
+// can be filled in here.
+const detailProfile = ref<EdgeProfile>(cloneProfile(EDGE_PROFILE_DEFAULTS))
+const detailProfileStored = ref(false)
+const savingProfile = ref(false)
+
+/**
+ * Deep copy of the default profile.
+ *
+ * `structuredClone` would do, but a typed factory keeps the copy in sync with
+ * the interface if a field is ever added, and it avoids relying on a global that
+ * is not available in every embedded webview the console is opened in.
+ */
+function cloneProfile(profile: EdgeProfile): EdgeProfile {
+  return {
+    hardware: { ...profile.hardware },
+    infra: { ...profile.infra },
+  }
+}
+
+/** `<select>` yields a plain string; narrow it back to the union it belongs to. */
+function setDetailDiskType(value: string) {
+  detailProfile.value.hardware.diskType = value as EdgeDiskType
+}
+
+function setDetailWorkload(value: string) {
+  detailProfile.value.hardware.workload = value as EdgeWorkload
+}
+
+function setDetailCacheBackend(value: string) {
+  detailProfile.value.infra.cacheBackend = value as EdgeCacheBackend
+}
+
+const detailPlan = computed(() =>
+  recommendEdgeConfig(detailProfile.value.hardware, {
+    cacheBackend: detailProfile.value.infra.cacheBackend,
+  }),
+)
+const detailHardwareSummary = computed(() => summarizeHardware(detailProfile.value.hardware))
+
+const detailEnv = computed(() => {
+  if (!detail.value) return ''
+  const node = detail.value.node || {}
+  return renderEdgeEnvFile({
+    nodeId: node.name || '',
+    region: node.region || '',
+    publicIp: node.public_ip || '',
+    agentUrl: node.agent_url || `http://${node.public_ip || '<节点公网IP>'}:8081`,
+    token: detail.value.token || '',
+    // The console runs on the same origin the edge must reach for callbacks.
+    controlUrl: import.meta.client ? window.location.origin : '',
+    adminListen: detailProfile.value.infra.adminListen,
+    httpsEnabled: detailProfile.value.infra.httpsEnabled,
+    httpsListen: detailProfile.value.infra.httpsListen,
+    // Every value that changes the file comes from the profile so the drawer
+    // matches the wizard; only AGENT_TOKEN comes from the node record.
+    redisUrl: detailProfile.value.infra.redisUrl,
+    cacheRedisUrl: detailProfile.value.infra.cacheRedisUrl,
+    challengeSecret: detailProfile.value.infra.challengeSecret,
+    wafRulepackSecret: detailProfile.value.infra.wafRulepackSecret,
+    hardware: detailProfile.value.hardware,
+    plan: detailPlan.value,
+  })
+})
 
 let timer: ReturnType<typeof setInterval> | null = null
 
@@ -647,12 +776,6 @@ const counts = computed(() => {
   return result
 })
 
-const currentCommand = computed(() => {
-  const source = created.value || detail.value
-  if (!source) return ''
-  return installTab.value === 'docker' ? source.commands.docker : source.commands.binary
-})
-
 function statusLabel(status: string) {
   return (
     {
@@ -690,31 +813,12 @@ async function load() {
   }
 }
 
-function openCreate() {
-  editing.value = null
-  formError.value = ''
-  form.value = {
-    name: '',
-    region: '',
-    ip: '',
-    agent_url: '',
-    public_ip: '',
-    country: 'CN',
-    province: '',
-    city: '',
-    isp: '',
-    weight: 100,
-  }
-  formOpen.value = true
-}
-
 function openEdit(node: any) {
   editing.value = node
   formError.value = ''
   form.value = {
     name: node.name,
     region: node.region || '',
-    ip: node.ip || '',
     agent_url: node.agent_url || '',
     public_ip: node.public_ip || '',
     country: node.country || 'CN',
@@ -790,23 +894,11 @@ async function submitForm() {
       isp: form.value.isp.trim(),
       weight: Number(form.value.weight) || 100,
     }
-    if (editing.value) {
-      await api.put(`/api/v1/nodes/${editing.value.id}`, payload)
-      formOpen.value = false
-      toast.success('节点信息已更新')
-      await load()
-    } else {
-      const res = await api.post<CreatedNode>('/api/v1/nodes', {
-        name: form.value.name.trim(),
-        ip: form.value.ip.trim(),
-        ...payload,
-      })
-      formOpen.value = false
-      created.value = res
-      installTab.value = 'binary'
-      installOpen.value = true
-      await load()
-    }
+    if (!editing.value) return
+    await api.put(`/api/v1/nodes/${editing.value.id}`, payload)
+    formOpen.value = false
+    toast.success('节点信息已更新')
+    await load()
   } catch (e: any) {
     const message = friendlyErrorMessage(e?.data?.error, '保存失败，请稍后重试')
     formError.value = message
@@ -817,15 +909,51 @@ async function submitForm() {
 }
 
 async function openDetail(node: any) {
-  installTab.value = 'binary'
   detail.value = null
   detailOpen.value = true
   try {
-    detail.value = await api.get<CreatedNode>(`/api/v1/nodes/${node.id}`)
+    const res = await api.get<NodeDetail>(`/api/v1/nodes/${node.id}`)
+    detail.value = res
+    // Parse the stored profile defensively; anything unreadable falls back to
+    // the defaults instead of breaking the drawer.
+    const stored = parseEdgeProfile((res.node as any)?.edge_profile)
+    detailProfile.value = stored ?? cloneProfile(EDGE_PROFILE_DEFAULTS)
+    detailProfileStored.value = stored !== null
   } catch (e: any) {
     detailOpen.value = false
     toast.error(e?.data?.error || '读取节点详情失败')
   }
+}
+
+/** Persist the drawer's hardware edits so the file survives a page reload. */
+async function saveDetailProfile() {
+  const node = detail.value?.node
+  if (!node?.id) return
+  savingProfile.value = true
+  try {
+    await api.put(`/api/v1/nodes/${node.id}`, {
+      edge_profile: serializeEdgeProfile(detailProfile.value),
+    })
+    detailProfileStored.value = true
+    toast.success('硬件画像已保存，配置已按新画像重算')
+    await load()
+  } catch (e: any) {
+    toast.error(e?.data?.error || '保存硬件画像失败')
+  } finally {
+    savingProfile.value = false
+  }
+}
+
+function downloadDetailEnv() {
+  if (!import.meta.client || !detailEnv.value) return
+  const name = detail.value?.node?.name || 'edge'
+  const blob = new Blob([detailEnv.value], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `edge-${name}.env`
+  a.click()
+  URL.revokeObjectURL(url)
 }
 
 async function upgrade(node: any) {
@@ -876,7 +1004,7 @@ async function toggle(node: any) {
     toast.success(enable ? '节点已启用，等待下一次心跳' : '节点已停用，边缘将在下一次心跳后停止代理')
     await load()
     if (detailOpen.value && detail.value?.node.id === node.id) {
-      detail.value = await api.get<CreatedNode>(`/api/v1/nodes/${node.id}`).catch(() => detail.value)
+      detail.value = await api.get<NodeDetail>(`/api/v1/nodes/${node.id}`).catch(() => detail.value)
     }
   } catch (e: any) {
     toast.error(e?.data?.error || '状态更新失败')
@@ -963,6 +1091,85 @@ onUnmounted(() => {
   font-size: 13px;
 }
 
+/* edge.env view in the node drawer: the file is long, so it scrolls inside a
+   fixed-height box instead of stretching the drawer. */
+.env-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.env-hardware {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.command-box.env-box {
+  max-height: 360px;
+  overflow: auto;
+}
+
+.drawer-details {
+  padding: 10px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+}
+
+.drawer-details summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-2);
+  user-select: none;
+}
+
+.drawer-details[open] summary {
+  margin-bottom: 10px;
+}
+
+.profile-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 10px;
+}
+
+.profile-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.profile-field .input,
+.profile-field .select {
+  height: 32px;
+}
+
+.profile-field.span-2 {
+  grid-column: span 2;
+}
+
+.profile-field.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.profile-note {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.4;
+}
+
+.profile-actions {
+  margin-top: 10px;
+}
+
 .command-box {
   position: relative;
   background: #0f172a;
@@ -978,52 +1185,6 @@ onUnmounted(() => {
   line-height: 1.7;
   white-space: pre-wrap;
   word-break: break-all;
-}
-
-.copy-float {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  background: rgba(255, 255, 255, 0.12);
-  border-color: rgba(255, 255, 255, 0.2);
-  color: #fff;
-}
-
-.copy-float:hover {
-  color: #fff;
-  border-color: #fff;
-}
-
-.tips {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 12px 14px;
-  background: #fafbfc;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-}
-
-.tip-row {
-  display: flex;
-  gap: 8px;
-  font-size: 12.5px;
-  color: var(--text-2);
-  line-height: 1.6;
-}
-
-.tip-index {
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: var(--brand-bg);
-  color: var(--brand);
-  font-size: 11px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-  margin-top: 1px;
 }
 
 .detail-grid {

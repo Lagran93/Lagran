@@ -34,6 +34,7 @@ const MENU: MenuGroup[] = [
     title: '运维监控',
     items: [
       { label: '边缘节点', to: '/nodes', icon: 'node', admin: true },
+      { label: '新增节点', to: '/nodes/onboard', icon: 'plus', admin: true },
       { label: '统计分析', to: '/stats', icon: 'stats' },
       { label: '大屏监控', to: '/monitor', icon: 'activity' },
       { label: '告警中心', to: '/alerts', icon: 'alert' },
@@ -71,6 +72,7 @@ const NAV_KEYS: Record<string, string> = {
   '/prefetch': 'nav.prefetch',
   '/config-releases': 'nav.releases',
   '/nodes': 'nav.nodes',
+  '/nodes/onboard': 'nav.nodeOnboard',
   '/stats': 'nav.stats',
   '/monitor': 'nav.monitor',
   '/alerts': 'nav.alerts',
@@ -112,6 +114,7 @@ const NAV_PERMISSIONS: Record<string, string> = {
   '/prefetch': 'prefetch:read',
   '/config-releases': 'config:read',
   '/nodes': 'node:read',
+  '/nodes/onboard': 'node:write',
   '/stats': 'analytics:read',
   '/monitor': 'analytics:read',
   '/alerts': 'alert:read',
@@ -141,6 +144,9 @@ function isActive(to: string): boolean {
   if (to === '/') return route.path === '/'
   if (to === '/domains') {
     return route.path === '/domains' || (route.path.startsWith('/domains/') && route.path !== '/domains/onboard')
+  }
+  if (to === '/nodes') {
+    return route.path === '/nodes' || (route.path.startsWith('/nodes/') && route.path !== '/nodes/onboard')
   }
   return route.path === to || route.path.startsWith(`${to}/`)
 }
@@ -222,15 +228,9 @@ onUnmounted(() => {
       <nav class="sidebar-nav">
         <div v-for="group in groups" :key="group.title" class="menu-group">
           <div class="menu-title">{{ group.title }}</div>
-          <NuxtLink
-            v-for="item in group.items"
-            :key="item.to"
-            :to="item.to"
-            class="menu-item"
-            :class="{ active: isActive(item.to) }"
-            :title="sidebarCollapsed ? item.label : undefined"
-            @click="closeSidebar"
-          >
+          <NuxtLink v-for="item in group.items" :key="item.to" :to="item.to" class="menu-item"
+            :class="{ active: isActive(item.to) }" :title="sidebarCollapsed ? item.label : undefined"
+            @click="closeSidebar">
             <AppIcon :name="item.icon" :size="18" class="icon" />
             <span class="menu-label">{{ item.label }}</span>
           </NuxtLink>
@@ -247,20 +247,12 @@ onUnmounted(() => {
 
     <div class="main">
       <header class="topbar">
-        <button
-          class="btn btn-icon btn-default topbar-menu-btn"
-          type="button"
-          aria-label="打开导航"
-          @click="sidebarOpen = !sidebarOpen"
-        >
+        <button class="btn btn-icon btn-default topbar-menu-btn" type="button" aria-label="打开导航"
+          @click="sidebarOpen = !sidebarOpen">
           <AppIcon name="menu" :size="18" />
         </button>
-        <button
-          class="btn btn-icon btn-default sidebar-toggle-btn"
-          type="button"
-          :title="sidebarCollapsed ? '展开导航' : '收起导航'"
-          @click="toggleSidebarCollapsed"
-        >
+        <button class="btn btn-icon btn-default sidebar-toggle-btn" type="button"
+          :title="sidebarCollapsed ? '展开导航' : '收起导航'" @click="toggleSidebarCollapsed">
           <AppIcon name="menu" :size="18" />
         </button>
 
@@ -273,20 +265,12 @@ onUnmounted(() => {
         </div>
 
         <div class="topbar-right">
-          <NuxtLink
-            v-if="auth.can('domain:write')"
-            to="/domains"
-            class="btn btn-primary btn-sm topbar-create"
-          >
+          <NuxtLink v-if="auth.can('domain:write')" to="/domains" class="btn btn-primary btn-sm topbar-create">
             <AppIcon name="plus" :size="14" />
             接入域名
           </NuxtLink>
-          <button
-            class="btn btn-icon btn-default"
-            type="button"
-            :title="i18n.t('common.theme')"
-            @click="theme.toggle()"
-          >
+          <button class="btn btn-icon btn-default" type="button" :title="i18n.t('common.theme')"
+            @click="theme.toggle()">
             <AppIcon :name="theme.mode.value === 'dark' ? 'sun' : 'moon'" :size="16" />
           </button>
           <button class="btn btn-default btn-sm locale-btn" type="button" @click="i18n.toggle()">
