@@ -340,8 +340,12 @@ pub async fn apply_update(
             .create_new(true)
             .open(&tmp)
             .map_err(|e| {
+                let dir = request
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "/var/lib/lagran".to_string());
                 internal(format!(
-                    "cannot write update request {}: {e} (the control service user must be able to write this directory)",
+                    "cannot write update request {}: {e} (the control service user must be able to write {dir}; run: sudo chgrp lagran {dir} && sudo chmod g+rwxs {dir}, or rerun install.sh control)",
                     tmp.display()
                 ))
             })?;

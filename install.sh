@@ -229,6 +229,12 @@ ensure_users() {
     useradd --system --gid lagran --home-dir "$DATA_DIR" --shell /usr/sbin/nologin lagran
   chown -R root:lagran "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
   chmod -R g+rwX "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
+  # The control plane queues updates by creating a file in DATA_DIR. Older
+  # releases left that directory root:lagran 0755 (or lagran:lagran), where the
+  # split lagran-control account can only read/traverse. Make the top level
+  # group-writable and setgid so newly queued files keep the shared group.
+  chgrp lagran "$DATA_DIR" 2>/dev/null || true
+  chmod g+rwxs "$DATA_DIR" 2>/dev/null || true
   # A previous control run as the legacy `lagran` user may have left the
   # update temp file owned by a uid the new service account cannot write.
   rm -f "$DATA_DIR"/update.request.tmp "$DATA_DIR"/update.request.tmp.* 2>/dev/null || true
@@ -373,6 +379,13 @@ Type=simple
 User=lagran-control
 Group=lagran
 EnvironmentFile=${CONF_DIR}/control.env
+# Repair the shared data directory before dropping privileges. Upgrades from
+# the legacy single-user layout can leave it root:lagran 0755, where the split
+# lagran-control account cannot create update.request. The + prefix runs these
+# helpers as root even though User= is set below.
+ExecStartPre=+/bin/mkdir -p ${DATA_DIR}
+ExecStartPre=+/bin/chgrp lagran ${DATA_DIR}
+ExecStartPre=+/bin/chmod g+rwxs ${DATA_DIR}
 ExecStart=${BIN_DIR}/lagran-control
 WorkingDirectory=${DATA_DIR}
 Restart=always
@@ -556,6 +569,12 @@ Type=simple
 User=lagran-edge
 Group=lagran
 EnvironmentFile=${CONF_DIR}/edge.env
+# The edge writes cache/cert files and (when asked by the control plane) an
+# edge-update.request inside the shared data directory. Repair the top-level
+# mode on every start so a legacy 0755 root:lagran directory does not block it.
+ExecStartPre=+/bin/mkdir -p ${DATA_DIR}
+ExecStartPre=+/bin/chgrp lagran ${DATA_DIR}
+ExecStartPre=+/bin/chmod g+rwxs ${DATA_DIR}
 ExecStart=${BIN_DIR}/lagran-edge
 WorkingDirectory=${DATA_DIR}
 Restart=always

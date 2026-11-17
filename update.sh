@@ -195,6 +195,15 @@ LICENSE_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name LICENSE -print -qu
 README_SRC="$(find "${STAGE_ROOT}" -maxdepth 3 -type f -name README.md -print -quit 2>/dev/null || true)"
 [[ -n "${README_SRC}" ]] && install -m 0644 "${README_SRC}" "${PREFIX}/README.md" 2>/dev/null || true
 
+# A previous release may have left DATA_DIR 0755 root:lagran, in which case
+# the split lagran-control account cannot queue the next update. Repair the
+# top-level mode before the restarted control writes its next request. (New
+# control units also run the same repair from ExecStartPre on every start.)
+if [[ -d "${DATA_DIR}" ]]; then
+  chgrp lagran "${DATA_DIR}" 2>/dev/null || true
+  chmod g+rwxs "${DATA_DIR}" 2>/dev/null || true
+fi
+
 for service in lagran-control lagran-edge lagran-dns; do
   if systemctl is-enabled --quiet "${service}.service" 2>/dev/null; then
     status "running" "${TAG}" "restarting ${service}"

@@ -1233,6 +1233,46 @@ sudo chown -R caddy:caddy /opt/lagran/web
 sudo systemctl reload caddy
 ```
 
+#### 升级按钮报 `cannot write update request`
+
+如果控制台点升级后返回：
+
+```text
+cannot write update request /var/lib/lagran/update.request.tmp.xxx:
+Permission denied (os error 13)
+(the control service user must be able to write ...)
+```
+
+说明控制面服务账号 `lagran-control` 无法在数据目录里创建更新请求。旧版本曾把
+`/var/lib/lagran` 留成 `root:lagran 0755`（或 `lagran:lagran 0755`），而当前服务以
+`lagran-control`、组 `lagran` 运行，只能读不能写。先修复权限并重启：
+
+```bash
+sudo chgrp lagran /var/lib/lagran
+sudo chmod g+rwxs /var/lib/lagran
+sudo systemctl restart lagran-control
+```
+
+这里关键是**属组**：`lagran-control` 由系统单元以 `Group=lagran` 运行，所以只要目录
+属组是 `lagran` 且组可写就够了；不需要把属主改成 `lagran-control`。如果目录属主也
+异常（例如仍是旧 `lagran` 用户），可以额外执行
+`sudo chown root:lagran /var/lib/lagran` 做一次归一化，让共享数据目录不属于任何
+单个服务账号；这不是权限修复的必需步骤。
+
+然后重新点击升级即可。若使用了自定义 `LAGRAN_DATA_DIR`，把上面的
+`/var/lib/lagran` 换成实际目录。
+
+永久修复：重新执行一次控制面安装器，它会重新生成带数据目录权限自修复
+（`ExecStartPre`）的 systemd 单元，并把数据目录设为组可写：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Lagran93/Lagran/main/install.sh \
+  | sudo env LAGRAN_REPO=Lagran93/Lagran bash -s -- control
+```
+
+`lagran-update.path` / `lagran-update.service` 也必须已安装；旧部署重跑上面的命令
+即可一并补齐。
+
 ### 备份
 
 ```bash
