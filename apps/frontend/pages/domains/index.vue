@@ -410,24 +410,27 @@
             </div>
             <div class="field">
               <label class="field-label">Origin Shield 地址</label>
-              <select v-model="settings.shield_url" class="select">
-                <option value="">关闭</option>
-                <option
-                  v-for="node in enabledShieldNodes"
-                  :key="node.id"
-                  :value="node.url"
-                >
-                  {{ node.name }} · {{ node.url }}
+              <!-- Name-only options keep the dropdown compact in the 480px
+                   drawer; the full URL is echoed right below the select. -->
+              <select v-model="settings.shield_url" class="select shield-select">
+                <option value="">关闭（直接回源普通源站）</option>
+                <option v-for="node in enabledShieldNodes" :key="node.id" :value="node.url">
+                  {{ shieldNodeLabel(node) }}
                 </option>
-                <option
-                  v-if="currentShieldUnregistered"
-                  :value="settings.shield_url"
-                >
-                  当前值（未登记或已停用）· {{ settings.shield_url }}
+                <option v-if="currentShieldUnregistered" :value="settings.shield_url">
+                  当前值（未登记或已停用）
                 </option>
               </select>
+              <div v-if="settings.shield_url" class="shield-current">
+                <span class="mono shield-current-url" :title="settings.shield_url">
+                  {{ settings.shield_url }}
+                </span>
+              </div>
+              <span v-if="currentShieldUnregistered" class="field-hint shield-warn">
+                当前地址未登记或已停用；保存前请重新选择可用节点，否则会被拒绝。
+              </span>
               <span class="field-hint">
-                只能从管理员配置的 Shield 节点中选择；不选择时直接回源普通源站。
+                不选择时直接回源普通源站。
               </span>
             </div>
           </div>
@@ -698,6 +701,18 @@ const enabledShieldNodes = computed(() => shieldNodes.value.filter((node) => nod
 
 function sameShieldUrl(a: string, b: string) {
   return a.replace(/\/+$/, '') === b.replace(/\/+$/, '')
+}
+
+/// Dropdown label for a Shield node: the administrator-given name only.
+///
+/// The URL is shown separately under the select, so options stay short enough
+/// for the narrow settings drawer. Names are trimmed on write, but a row saved
+/// before that trim existed could still carry padding, hence the trim here.
+function shieldNodeLabel(node: ShieldNode) {
+  const name = String(node?.name || '').trim()
+  if (name) return name
+  // Defensive: a nameless row would otherwise render an empty option row.
+  return String(node?.url || '').replace(/^https?:\/\//i, '').replace(/\/+$/, '')
 }
 
 async function loadShieldNodes() {
@@ -1933,6 +1948,44 @@ onMounted(() => {
 
 .settings-group .field-hint {
   margin-top: -4px;
+}
+
+/* Origin Shield selector: options show the node name only, and the full
+   address is echoed under the select instead of inside the option. */
+.shield-select {
+  text-overflow: ellipsis;
+}
+
+.shield-current {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--brand) 3%, var(--card));
+}
+
+.shield-current-label {
+  flex: none;
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.shield-current-url {
+  min-width: 0;
+  flex: 1;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.settings-group .shield-warn {
+  margin-top: -2px;
+  color: var(--warning);
 }
 
 /* Inline row of checkboxes, used for cache-key headers. */
