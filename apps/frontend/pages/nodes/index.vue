@@ -167,7 +167,7 @@
           </div>
           <div class="field">
             <label class="field-label">区域</label>
-            <input v-model="form.region" class="input" placeholder="例如 香港 / cn-hongkong" />
+            <input v-model="form.region" class="input" placeholder="例如 cn-hongkong" />
           </div>
           <div class="field">
             <label class="field-label">国家/地区代码</label>
@@ -214,10 +214,10 @@
           </div>
           <div class="field span-2">
             <label class="field-label">Agent 地址</label>
-            <input v-model="form.agent_url" class="input" placeholder="http://1.2.3.4:8081" />
+            <input :value="form.agent_url" class="input mono" readonly />
             <span class="field-hint">
-              控制面回调该节点的管理面地址（EDGE_ADMIN_LISTEN，如 8081），用于下发刷新、证书、ACME；
-              不要填 CDN 数据端口 80/443。留空可稍后再填。
+              控制面回调地址必须与 EDGE_ADMIN_LISTEN 成对修改；请到「详情 → 调整硬件画像」维护，
+              保存时会校验端口并同步更新节点。
             </span>
           </div>
         </div>
@@ -321,6 +321,10 @@
             在下方调整并保存后，详情页会按这台机器的实际配置复现文件。
           </span>
         </div>
+        <div v-if="detailListenerWarning || detailCallbackWarning" class="alert alert-warning">
+          <AppIcon name="alert" :size="16" class="icon" />
+          <span>{{ detailListenerWarning || detailCallbackWarning }}</span>
+        </div>
         <div class="env-head">
           <span class="mono env-hardware">{{ detailHardwareSummary }}</span>
           <span class="spacer" />
@@ -334,6 +338,13 @@
         </div>
         <div class="command-box env-box">
           <pre class="mono">{{ detailEnv }}</pre>
+        </div>
+
+        <div v-if="detailPlan.warnings.length" class="alert alert-warning">
+          <AppIcon name="alert" :size="16" class="icon" />
+          <div class="alert-list">
+            <span v-for="w in detailPlan.warnings" :key="w">{{ w }}</span>
+          </div>
         </div>
 
         <details class="drawer-details">
@@ -379,6 +390,17 @@
                 <option value="video">视频 / 大文件点播</option>
               </select>
             </label>
+            <label class="profile-field">
+              <span>节点角色</span>
+              <select
+                class="select"
+                :value="detailProfile.hardware.role"
+                @change="setDetailRole(($event.target as HTMLSelectElement).value)"
+              >
+                <option value="edge">普通边缘节点</option>
+                <option value="shield">Origin Shield</option>
+              </select>
+            </label>
             <label class="profile-field span-2 checkbox">
               <input v-model="detailProfile.hardware.sharedRedis" type="checkbox" />
               <span>使用共享 Redis（区域实例即可）</span>
@@ -386,6 +408,34 @@
             <label class="profile-field span-2 checkbox">
               <input v-model="detailProfile.infra.httpsEnabled" type="checkbox" />
               <span>启用 HTTPS 监听</span>
+            </label>
+            <label class="profile-field">
+              <span>HTTP 监听（EDGE_LISTEN）</span>
+              <input v-model="detailProfile.infra.httpListen" class="input mono" placeholder="0.0.0.0:80" />
+            </label>
+            <label class="profile-field">
+              <span>HTTPS 监听</span>
+              <input
+                v-model="detailProfile.infra.httpsListen"
+                class="input mono"
+                :disabled="!detailProfile.infra.httpsEnabled"
+                placeholder="0.0.0.0:443"
+              />
+            </label>
+            <label class="profile-field">
+              <span>管理面监听（EDGE_ADMIN_LISTEN）</span>
+              <input v-model="detailProfile.infra.adminListen" class="input mono" placeholder="0.0.0.0:8081" />
+            </label>
+            <label class="profile-field span-2">
+              <span>AGENT_URL（控制面回调）</span>
+              <input
+                v-model="detailProfile.infra.agentUrl"
+                class="input mono"
+                :placeholder="detail.node?.agent_url || 'http://<控制面可达地址>:8081'"
+              />
+              <em class="profile-note">
+                必须指向管理面端口且控制面可达；与 EDGE_ADMIN_LISTEN 端口不一致会让 purge / 证书 / ACME 回调失败。
+              </em>
             </label>
             <label class="profile-field">
               <span>CACHE_BACKEND</span>
@@ -613,13 +663,17 @@ import {
   CACHE_BACKEND_LABEL,
   EDGE_PROFILE_DEFAULTS,
   humanBytes,
+  isValidListen,
+  isValidSocketAddr,
   parseEdgeProfile,
   recommendEdgeConfig,
   renderEdgeEnvFile,
   serializeEdgeProfile,
+  splitListen,
   summarizeHardware,
   type EdgeCacheBackend,
   type EdgeDiskType,
+  type EdgeNodeRole,
   type EdgeProfile,
   type EdgeWorkload,
 } from '~/utils/edgeSizing'
@@ -632,6 +686,8 @@ const { ask } = useConfirm()
 interface NodeDetail {
   node: any
   token: string
+  /** Server-resolved control-plane base URL (CONTROL_PUBLIC_URL / Host). */
+  control_url?: string
 }
 
 const nodes = ref<any[]>([])
@@ -699,6 +755,10 @@ function setDetailWorkload(value: string) {
   detailProfile.value.hardware.workload = value as EdgeWorkload
 }
 
+function setDetailRole(value: string) {
+  detailProfile.value.hardware.role = value as EdgeNodeRole
+}
+
 function setDetailCacheBackend(value: string) {
   detailProfile.value.infra.cacheBackend = value as EdgeCacheBackend
 }
@@ -706,9 +766,59 @@ function setDetailCacheBackend(value: string) {
 const detailPlan = computed(() =>
   recommendEdgeConfig(detailProfile.value.hardware, {
     cacheBackend: detailProfile.value.infra.cacheBackend,
+    redisConfigured: Boolean(
+      detailProfile.value.infra.redisUrl.trim() || detailProfile.value.infra.cacheRedisUrl.trim(),
+    ),
   }),
 )
 const detailHardwareSummary = computed(() => summarizeHardware(detailProfile.value.hardware))
+
+/**
+ * The control plane calls `AGENT_URL`; the edge binds `EDGE_ADMIN_LISTEN`.
+ * A port mismatch keeps heartbeats green while purge/cert/ACME fail, so it is
+ * surfaced before the operator copies the file.
+ */
+const detailListenerWarning = computed(() => {
+  if (!isValidSocketAddr(detailProfile.value.infra.adminListen.trim())) {
+    return 'EDGE_ADMIN_LISTEN 必须是 IP:端口（不能写主机名），例如 0.0.0.0:8081。'
+  }
+  if (!isValidListen(detailProfile.value.infra.httpListen.trim())) {
+    return 'EDGE_LISTEN 格式应为 IP/主机:端口，例如 0.0.0.0:80。'
+  }
+  if (
+    detailProfile.value.infra.httpsEnabled &&
+    !isValidListen(detailProfile.value.infra.httpsListen.trim())
+  ) {
+    return 'HTTPS 监听地址格式应为 IP/主机:端口，例如 0.0.0.0:443。'
+  }
+  return ''
+})
+
+const detailCallbackWarning = computed(() => {
+  const agent = detailProfile.value.infra.agentUrl.trim()
+  const admin = splitListen(detailProfile.value.infra.adminListen)
+  if (!agent || !admin) return ''
+  try {
+    const url = new URL(agent)
+    const port = url.port || (url.protocol === 'https:' ? '443' : '80')
+    const agentHost = url.hostname.replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
+    const adminHost = admin.host.replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
+    const loopback = (host: string) =>
+      host === 'localhost' || host === '::1' || host.startsWith('127.')
+    if (port !== admin.port) {
+      return `AGENT_URL 端口 ${port} 与 EDGE_ADMIN_LISTEN 端口 ${admin.port} 不一致，purge / 证书 / ACME 回调会失败。`
+    }
+    if (loopback(adminHost) && !loopback(agentHost)) {
+      return '管理面只监听回环地址，但 AGENT_URL 使用非回环地址，控制面无法回调。'
+    }
+    if (!loopback(adminHost) && loopback(agentHost)) {
+      return 'AGENT_URL 指向回环地址，跨机控制面无法回调。'
+    }
+  } catch {
+    return 'AGENT_URL 不是合法的 http(s) 地址。'
+  }
+  return ''
+})
 
 const detailEnv = computed(() => {
   if (!detail.value) return ''
@@ -717,10 +827,18 @@ const detailEnv = computed(() => {
     nodeId: node.name || '',
     region: node.region || '',
     publicIp: node.public_ip || '',
-    agentUrl: node.agent_url || `http://${node.public_ip || '<节点公网IP>'}:8081`,
+    // Prefer the stored profile (the wizard derives it from EDGE_ADMIN_LISTEN);
+    // fall back to the value the node reported on its heartbeat.
+    agentUrl:
+      detailProfile.value.infra.agentUrl.trim() ||
+      node.agent_url ||
+      (node.public_ip ? `http://${node.public_ip}:8081` : ''),
     token: detail.value.token || '',
-    // The console runs on the same origin the edge must reach for callbacks.
-    controlUrl: import.meta.client ? window.location.origin : '',
+    // The API resolves CONTROL_PUBLIC_URL / the request Host; the browser
+    // origin is only a fallback for older control planes.
+    controlUrl:
+      detail.value.control_url || (import.meta.client ? window.location.origin : ''),
+    httpListen: detailProfile.value.infra.httpListen,
     adminListen: detailProfile.value.infra.adminListen,
     httpsEnabled: detailProfile.value.infra.httpsEnabled,
     httpsListen: detailProfile.value.infra.httpsListen,
@@ -886,7 +1004,8 @@ async function submitForm() {
   try {
     const payload = {
       region: form.value.region.trim(),
-      agent_url: form.value.agent_url.trim(),
+      // AGENT_URL is managed next to EDGE_ADMIN_LISTEN in the detail drawer;
+      // editing it here alone would silently disagree with the stored profile.
       public_ip: form.value.public_ip.trim(),
       country: form.value.country.trim().toUpperCase() || 'CN',
       province: form.value.province.trim(),
@@ -919,6 +1038,11 @@ async function openDetail(node: any) {
     const stored = parseEdgeProfile((res.node as any)?.edge_profile)
     detailProfile.value = stored ?? cloneProfile(EDGE_PROFILE_DEFAULTS)
     detailProfileStored.value = stored !== null
+    // Profiles written before `agentUrl` was stored fall back to the value the
+    // node already reported, so saving the drawer does not blank the callback.
+    if (!detailProfile.value.infra.agentUrl) {
+      detailProfile.value.infra.agentUrl = (res.node as any)?.agent_url || ''
+    }
   } catch (e: any) {
     detailOpen.value = false
     toast.error(e?.data?.error || '读取节点详情失败')
@@ -929,9 +1053,18 @@ async function openDetail(node: any) {
 async function saveDetailProfile() {
   const node = detail.value?.node
   if (!node?.id) return
+  const problem = detailListenerWarning.value || detailCallbackWarning.value
+  if (problem) {
+    toast.error(problem)
+    return
+  }
   savingProfile.value = true
   try {
     await api.put(`/api/v1/nodes/${node.id}`, {
+      // Keep the node's callback URL in agreement with the profile; otherwise
+      // the control plane keeps calling an address the edge no longer binds.
+      agent_url: detailProfile.value.infra.agentUrl.trim(),
+      max_bandwidth_mbps: Math.round(Number(detailProfile.value.hardware.bandwidthMbps) || 0),
       edge_profile: serializeEdgeProfile(detailProfile.value),
     })
     detailProfileStored.value = true

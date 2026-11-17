@@ -798,6 +798,40 @@ RUST_LOG=edge=info,tower_http=warn
 | `CC_SYNC_INTERVAL` | 否 | `5` | 跨节点共享 CC 封禁拉取间隔（秒，最小 2）。 |
 | `RUST_LOG` | 否 | `edge=debug,tower_http=info` | 日志级别。注意二进制自身的目标是 `lagran_edge`，只写 `edge=...` 会过滤掉它（启动摘要、CC 跨节点状态、优雅关闭都会消失，而 `edge::cache` 等库日志照常输出）。要看到全部，用 `lagran_edge=info,edge=info,tower_http=info`。 |
 
+### 5.2.1 用「新增 Edge 向导」生成 edge.env
+
+控制台左侧「边缘节点 → 新增节点」提供五步向导，按节点硬件生成一份可直接落地的
+`edge.env`，适合不想手算缓存容量和超时参数的运维者：
+
+1. **节点身份**：节点名称、区域、公网 IP 与部署方式。选择「控制面在另一台机器」时，
+   向导自动把 `EDGE_ADMIN_LISTEN` 设为 `0.0.0.0:8081`、`AGENT_URL` 设为
+   `http://<公网IP>:8081`；选择「同机」时两者都使用 `127.0.0.1:8081`。
+   这样控制面回调地址和边缘真正监听的地址不会再各写各的。
+2. **硬件画像**：CPU / 内存 / 磁盘 / 磁盘类型 / 出口带宽 / 业务类型，以及节点角色
+   （普通边缘或 Origin Shield）。Shield 会自动写入 `EDGE_SHIELD_DISABLED=true`。
+3. **容量规划**：展示每个容量参数的推导依据（L1/L2/L3 缓存、分片、回源超时等），
+   可按需覆盖工作线程、内存缓存和大缓存容量。
+4. **生成配置**：注册节点并展示节点令牌与 `edge.env`。`CONTROL_URL` 由控制面按
+   `CONTROL_PUBLIC_URL`（或请求 Host）解析，不会再误用浏览器地址。
+5. **上线验证**：轮询节点状态，并给出节点侧 `check-config` / 健康检查 / journalctl 命令。
+
+向导会：
+- 把每个值钳制到 `apps/edge/src/config/mod.rs` 接受的范围，避免 Edge 启动时静默改写；
+- 自动生成 `CHALLENGE_SECRET` 并写入节点画像，后续节点会复用它，避免跨节点质询失败；
+- 从已有节点复用 `REDIS_URL` / `CHALLENGE_SECRET` / `WAF_RULEPACK_SECRET`；
+- 在控制面没有配置 `WAF_RULEPACK_SECRET` 时给出明确警告（此时 Edge 会拒绝签名规则包）。
+
+生成的文件可以直接替换 `/etc/lagran/edge.env`：
+
+```bash
+sudo install -m 600 ./edge-<节点名>.env /etc/lagran/edge.env
+sudo sh -c 'set -a; . /etc/lagran/edge.env; set +a; exec /opt/lagran/bin/lagran-edge check-config'
+sudo systemctl restart lagran-edge
+```
+
+> 向导只负责生成文件；`install.sh edge` 在发现 `/etc/lagran/edge.env` 已存在时不会覆盖它，
+> 因此也可以先放配置再补装二进制。
+
 ### 5.3 systemd
 
 `/etc/systemd/system/lagran-edge.service`：

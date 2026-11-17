@@ -7,11 +7,25 @@
  * `apps/edge/src/config/mod.rs` accepts, so a generated file is never silently
  * re-clamped (or rejected) by the edge process.
  *
+ * The generator is also kept honest by the control plane:
+ *  - `CONTROL_URL` comes from the node API (`control_url`), which is resolved
+ *    server-side from `CONTROL_PUBLIC_URL` / the request Host header. The
+ *    browser origin is only a fallback, because the console and the control
+ *    API may live on different origins.
+ *  - `AGENT_URL` is derived from `EDGE_ADMIN_LISTEN` instead of being typed
+ *    independently: the edge parses the admin listener as a `SocketAddr`, and
+ *    a callback URL that disagrees with it makes purge/cert/ACME fail while
+ *    heartbeats still look healthy.
+ *
  * Nothing here talks to the network: the page only renders the result.
  */
 
 export type EdgeDiskType = 'hdd' | 'sata-ssd' | 'nvme'
 export type EdgeWorkload = 'web' | 'video' | 'mixed'
+/** Ordinary edge, or a dedicated Origin Shield aggregation node. */
+export type EdgeNodeRole = 'edge' | 'shield'
+/** Where the control plane sits relative to this node. */
+export type EdgeDeploymentMode = 'same-host' | 'remote' | 'custom'
 
 export interface EdgeHardware {
   /** vCPU cores available to the edge process. */
@@ -34,6 +48,12 @@ export interface EdgeHardware {
    * Redis in the region works — it does not have to be the control plane's.
    */
   sharedRedis: boolean
+  /**
+   * `shield` makes the node ignore the domain-level `shield_url`. That is the
+   * documented requirement for a dedicated Origin Shield; without it the shield
+   * can send cache misses back to itself and form an origin loop.
+   */
+  role: EdgeNodeRole
 }
 
 /** Operator overrides for the knobs that are worth hand-tuning. */
@@ -43,6 +63,12 @@ export interface EdgeSizingOverrides {
   largeCacheGiB?: number
   /** Pin `CACHE_BACKEND`; `auto` keeps the hardware-derived value. */
   cacheBackend?: EdgeCacheBackend
+  /**
+   * False when neither `REDIS_URL` nor `CACHE_REDIS_URL` is configured.
+   * `CACHE_BACKEND=redis` is then downgraded instead of emitting a backend the
+   * edge can only fall back from with a warning.
+   */
+  redisConfigured?: boolean
 }
 
 export type SizingGroup = 'runtime' | 'memory-cache' | 'large-cache' | 'origin' | 'logging'
@@ -83,11 +109,17 @@ export interface EdgeSizingPlan {
     workerThreads: number
     memoryCacheBytes: number
     cacheCapacity: number
+    /** Effective backend after validation/downgrades (never `auto`). */
     cacheBackend: string
+    /** Backend the operator asked for, including `auto`. */
+    requestedCacheBackend: EdgeCacheBackend
+    /** True when an explicit `redis` / disk backend had to be downgraded. */
+    backendDowngraded: boolean
     diskCacheBytes: number
     largeCacheEnabled: boolean
     largeCacheBytes: number
     chunkBytes: number
+    maxCacheableBody: number
   }
 }
 
@@ -150,15 +182,43 @@ export const WORKLOAD_LABEL: Record<EdgeWorkload, string> = {
   mixed: '混合业务',
 }
 
+export const NODE_ROLE_LABEL: Record<EdgeNodeRole, string> = {
+  edge: '普通边缘节点',
+  shield: 'Origin Shield',
+}
+
+export const NODE_ROLE_DESC: Record<EdgeNodeRole, string> = {
+  edge: '直接面向访客，按域名配置回源；可以叠加在区域 Shield 后面。',
+  shield: '区域汇聚层，缓存命中直接返回，未命中才替普通边缘回源；会自动忽略域名里的 shield_url。',
+}
+
+export const DEPLOYMENT_LABEL: Record<EdgeDeploymentMode, string> = {
+  remote: '控制面在另一台机器（生产推荐）',
+  'same-host': '控制面与本节点同机',
+  custom: '自定义管理面地址',
+}
+
+export const DEPLOYMENT_DESC: Record<EdgeDeploymentMode, string> = {
+  remote: '管理面监听 0.0.0.0:8081，AGENT_URL 指向本节点公网 IP；请用安全组只放行控制面访问 8081。',
+  'same-host': '管理面只监听 127.0.0.1:8081，控制面通过回环地址回调，最安全。',
+  custom: '手动填写管理面监听与控制面可达地址，适合内网专线、NAT 或独立管理网。',
+}
+
+const DEFAULT_ADMIN_PORT = '8081'
+
 /** One-line hardware summary used in the page header and in the env file. */
 export function summarizeHardware(hw: EdgeHardware): string {
-  return [
-    `${hw.cpuCores || 1} 核`,
-    `${hw.memoryGb || 1} GiB 内存`,
-    hw.diskGb > 0 ? `${hw.diskGb} GiB ${DISK_TYPE_LABEL[hw.diskType]}` : '未填写磁盘',
-    hw.bandwidthMbps > 0 ? `${hw.bandwidthMbps} Mbps` : '未填写带宽',
-    WORKLOAD_LABEL[hw.workload],
-  ].join(' / ')
+  const role = hw.role === 'shield' ? `${NODE_ROLE_LABEL.shield} / ` : ''
+  return (
+    role +
+    [
+      `${hw.cpuCores || 1} 核`,
+      `${hw.memoryGb || 1} GiB 内存`,
+      hw.diskGb > 0 ? `${hw.diskGb} GiB ${DISK_TYPE_LABEL[hw.diskType]}` : '未填写磁盘',
+      hw.bandwidthMbps > 0 ? `${hw.bandwidthMbps} Mbps` : '未填写带宽',
+      WORKLOAD_LABEL[hw.workload],
+    ].join(' / ')
+  )
 }
 
 /**
@@ -174,9 +234,19 @@ export function summarizeHardware(hw: EdgeHardware): string {
  * and is returned by the node detail endpoint.
  */
 export interface EdgeInfraProfile {
+  /** How `adminListen` / `agentUrl` were derived (drives the console form). */
+  deployment: EdgeDeploymentMode
+  /** Public HTTP listener, e.g. `0.0.0.0:80`. */
+  httpListen: string
   httpsEnabled: boolean
   httpsListen: string
+  /** Bind address for management endpoints (`EDGE_ADMIN_LISTEN`). */
   adminListen: string
+  /**
+   * Control-plane callback origin (`AGENT_URL`). Must point at `adminListen`
+   * and be reachable from the control plane.
+   */
+  agentUrl: string
   /** `REDIS_URL`: shared Redis for CC counters, flight locks and L2 fallback. */
   redisUrl: string
   /** `CACHE_REDIS_URL`: dedicated L2 endpoint; empty falls back to `redisUrl`. */
@@ -204,11 +274,15 @@ export const EDGE_PROFILE_DEFAULTS: EdgeProfile = {
     bandwidthMbps: 500,
     workload: 'web',
     sharedRedis: false,
+    role: 'edge',
   },
   infra: {
+    deployment: 'remote',
+    httpListen: '0.0.0.0:80',
     httpsEnabled: true,
     httpsListen: '0.0.0.0:443',
-    adminListen: '127.0.0.1:8081',
+    adminListen: `0.0.0.0:${DEFAULT_ADMIN_PORT}`,
+    agentUrl: '',
     redisUrl: '',
     cacheRedisUrl: '',
     cacheBackend: 'auto',
@@ -230,7 +304,8 @@ function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback
 /** Serialize a profile for `PUT /api/v1/nodes/:id { edge_profile }`. */
 export function serializeEdgeProfile(profile: EdgeProfile): string {
   return JSON.stringify({
-    version: 1,
+    // Bumped when fields were added; `parseEdgeProfile` accepts older shapes.
+    version: 2,
     hardware: profile.hardware,
     infra: profile.infra,
   })
@@ -242,6 +317,11 @@ export function serializeEdgeProfile(profile: EdgeProfile): string {
  * The column is opaque text written by an older build in the worst case, so
  * every field is re-validated and clamped instead of trusted; unrecognised
  * input yields `null` and the caller falls back to the defaults.
+ *
+ * Version 1 profiles predate `role`, `deployment`, `httpListen` and `agentUrl`.
+ * They keep working: the role is `edge`, the deployment is `custom` (so the
+ * drawer does not silently rewrite the bind address) and the HTTP listener is
+ * the production default.
  */
 export function parseEdgeProfile(raw: unknown): EdgeProfile | null {
   if (typeof raw !== 'string' || !raw.trim()) return null
@@ -266,8 +346,16 @@ export function parseEdgeProfile(raw: unknown): EdgeProfile | null {
       bandwidthMbps: boundedNumber(hardware.bandwidthMbps, 0, 100_000, fallback.hardware.bandwidthMbps),
       workload: oneOf(hardware.workload, ['web', 'video', 'mixed'] as const, fallback.hardware.workload),
       sharedRedis: hardware.sharedRedis === true,
+      role: oneOf(hardware.role, ['edge', 'shield'] as const, fallback.hardware.role),
     },
     infra: {
+      // Older profiles have no deployment concept; `custom` means "keep the
+      // stored addresses exactly as they are".
+      deployment: oneOf(infra.deployment, ['same-host', 'remote', 'custom'] as const, 'custom'),
+      httpListen:
+        typeof infra.httpListen === 'string' && infra.httpListen.trim()
+          ? infra.httpListen.trim()
+          : fallback.infra.httpListen,
       // Absent means "the wizard's default"; anything non-boolean falls back to
       // the default instead of being coerced from a truthy string.
       httpsEnabled:
@@ -280,6 +368,7 @@ export function parseEdgeProfile(raw: unknown): EdgeProfile | null {
       adminListen: typeof infra.adminListen === 'string' && infra.adminListen.trim()
         ? infra.adminListen.trim()
         : fallback.infra.adminListen,
+      agentUrl: typeof infra.agentUrl === 'string' ? infra.agentUrl.trim() : '',
       // Older profiles predate these fields; "" / "auto" keeps them working
       // and lets the drawer show its "fill in the Redis settings" hint.
       redisUrl: typeof infra.redisUrl === 'string' ? infra.redisUrl.trim() : '',
@@ -293,17 +382,141 @@ export function parseEdgeProfile(raw: unknown): EdgeProfile | null {
   }
 }
 
+// ---------------------------------------------------------------- addresses
+
+/** Split `host:port` / `[v6]:port` without throwing. */
+export function splitListen(value: string): { host: string; port: string } | null {
+  const raw = value.trim()
+  if (!raw) return null
+  if (raw.startsWith('[')) {
+    const end = raw.indexOf(']')
+    if (end < 0) return null
+    const rest = raw.slice(end + 1)
+    if (!rest.startsWith(':')) return null
+    return { host: raw.slice(1, end), port: rest.slice(1) }
+  }
+  const idx = raw.lastIndexOf(':')
+  if (idx <= 0) return null
+  return { host: raw.slice(0, idx), port: raw.slice(idx + 1) }
+}
+
+function isValidPort(port: string): boolean {
+  return /^\d{1,5}$/.test(port) && Number(port) >= 1 && Number(port) <= 65_535
+}
+
+function isIpv4(host: string): boolean {
+  const parts = host.split('.')
+  return (
+    parts.length === 4 &&
+    parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+  )
+}
+
+/**
+ * `EDGE_ADMIN_LISTEN` is parsed as a `SocketAddr` by the edge, so hostnames are
+ * rejected there even though `EDGE_LISTEN` accepts them. Mirror that check.
+ */
+export function isValidSocketAddr(value: string): boolean {
+  const parts = splitListen(value)
+  if (!parts || !isValidPort(parts.port)) return false
+  if (/^[0-9a-fA-F:.]+$/.test(parts.host) && parts.host.includes(':')) return true
+  return isIpv4(parts.host)
+}
+
+/** `EDGE_LISTEN` / `EDGE_HTTPS_LISTEN` are passed to Pingora, which resolves names. */
+export function isValidListen(value: string): boolean {
+  const parts = splitListen(value)
+  if (!parts || !isValidPort(parts.port)) return false
+  if (parts.host.startsWith('[')) return /^\[[0-9a-fA-F:.]+\]$/.test(parts.host)
+  return /^[A-Za-z0-9._-]+$/.test(parts.host)
+}
+
+/** Accept only a plain http(s) URL; used for `AGENT_URL` and the preview. */
+export function isValidHttpUrl(value: string, allowPath = false): boolean {
+  const raw = value.trim()
+  if (!raw) return false
+  // The control plane's `validate_agent_url` strips a lowercase prefix, so an
+  // uppercase scheme would be accepted here and rejected there.
+  if (!/^https?:\/\//.test(raw)) return false
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    if (!url.hostname) return false
+    if (!allowPath && ((url.pathname && url.pathname !== '/') || url.search || url.hash)) {
+      return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Bracket a bare IPv6 literal for use inside a URL authority. */
+export function hostForUrl(host: string): string {
+  const raw = host.trim()
+  if (!raw) return ''
+  if (raw.startsWith('[') || !raw.includes(':')) return raw
+  return `[${raw}]`
+}
+
+/**
+ * The pair the wizard derives for the two non-custom deployment modes.
+ *
+ * Keeping both values in one function is the whole point: `AGENT_URL` must be
+ * the address of `EDGE_ADMIN_LISTEN`, otherwise the control plane stores a
+ * callback URL nothing is listening on.
+ */
+export function resolveDeployment(
+  mode: EdgeDeploymentMode,
+  publicIp: string,
+): { adminListen: string; agentUrl: string } {
+  if (mode === 'same-host') {
+    return {
+      adminListen: `127.0.0.1:${DEFAULT_ADMIN_PORT}`,
+      agentUrl: `http://127.0.0.1:${DEFAULT_ADMIN_PORT}`,
+    }
+  }
+  if (mode === 'remote') {
+    const host = hostForUrl(publicIp)
+    return {
+      // The documented production shape: bind the management listener, then
+      // restrict it to the control-plane source IP with a security group.
+      adminListen: `0.0.0.0:${DEFAULT_ADMIN_PORT}`,
+      agentUrl: host ? `http://${host}:${DEFAULT_ADMIN_PORT}` : '',
+    }
+  }
+  return { adminListen: '', agentUrl: '' }
+}
+
+/** Random hex secret for `CHALLENGE_SECRET` (browser only). */
+export function generateSecret(bytes = 32): string {
+  const target = new Uint8Array(bytes)
+  const cryptoApi = globalThis.crypto
+  if (cryptoApi?.getRandomValues) {
+    cryptoApi.getRandomValues(target)
+  } else {
+    // `ssr: false` means this only runs in a browser; keep a fallback so an
+    // embedded webview without WebCrypto still produces a value.
+    for (let i = 0; i < target.length; i += 1) target[i] = Math.floor(Math.random() * 256)
+  }
+  return Array.from(target, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 /**
  * Derive the edge configuration for a piece of hardware.
  *
  * The rules, in short:
  *  - L1 memory cache gets 25% of RAM (capped at the edge's 8 GiB hard limit).
  *  - The large-object disk cache only turns on when the disk can hold a useful
- *    working set; otherwise it only adds failure modes.
+ *    working set; otherwise it only adds failure modes. A dedicated Origin
+ *    Shield always wants it.
  *  - `MAX_CACHEABLE_BODY` stays one byte below the large-cache threshold so no
  *    object size falls into the "cached by neither tier" gap documented in
  *    `edge.env.example`.
  *  - The chunk size follows the disk: HDD seeks force bigger chunks.
+ *  - A backend that cannot work (disk on a diskless node, `redis` without an
+ *    endpoint) is downgraded here instead of emitting a config the edge would
+ *    only warn about.
  */
 export function recommendEdgeConfig(
   hw: EdgeHardware,
@@ -313,6 +526,7 @@ export function recommendEdgeConfig(
   const memoryGb = clamp(hw.memoryGb || 1, 1, 512)
   const diskGb = clamp(hw.diskGb || 0, 0, 100_000)
   const bandwidth = clamp(hw.bandwidthMbps || 0, 0, 100_000)
+  const shield = hw.role === 'shield'
 
   const memoryBytes = memoryGb * GiB
   const diskBytes = diskGb * GiB
@@ -339,14 +553,16 @@ export function recommendEdgeConfig(
     memOverridden ? Number(overrides.memoryCacheMiB) * MiB : memoryBytes * 0.25,
     ...EDGE_LIMITS.cacheMaxBytes,
   )
-  // How many objects fit depends on the workload: a video node caches far
-  // fewer, much larger objects than a static site does.
-  const avgObject =
-    hw.workload === 'video' ? 2 * MiB : hw.workload === 'web' ? 64 * KiB : 256 * KiB
-  const cacheCapacity = clamp(memoryCacheBytes / avgObject, 1_000, 2_000_000)
-
-  const largeSuggested =
-    hw.workload === 'video' ? diskGb >= 20 : hw.workload === 'mixed' ? diskGb >= 50 : diskGb >= 200
+  // A shield exists to absorb origin traffic, so it always wants the large
+  // cache once the disk is non-trivial. Ordinary nodes need a working set that
+  // justifies the extra failure modes.
+  const largeSuggested = shield
+    ? diskGb >= 10
+    : hw.workload === 'video'
+      ? diskGb >= 20
+      : hw.workload === 'mixed'
+        ? diskGb >= 50
+        : diskGb >= 200
   const largeOverridden = overrides.largeCacheGiB !== undefined
   const wantLarge = largeOverridden ? Number(overrides.largeCacheGiB) > 0 : largeSuggested
   const largeCacheBytes = wantLarge
@@ -361,6 +577,19 @@ export function recommendEdgeConfig(
     : 0
   const largeCacheEnabled = largeCacheBytes > 0
 
+  // How many objects fit depends on the workload. Once the large-object tier is
+  // on, the memory cache only holds the small remainder, so a video node does
+  // not need to reserve for 2 MiB bodies it would send to L3 anyway.
+  const avgObject =
+    hw.workload === 'video'
+      ? largeCacheEnabled
+        ? 256 * KiB
+        : 2 * MiB
+      : hw.workload === 'web'
+        ? 64 * KiB
+        : 256 * KiB
+  const cacheCapacity = clamp(memoryCacheBytes / avgObject, 1_000, 2_000_000)
+
   const chunkBytes = clamp(hw.diskType === 'hdd' ? 4 * MiB : 1 * MiB, ...EDGE_LIMITS.largeCacheChunk)
   const fillQueueBytes = clamp(
     hw.diskType === 'nvme' ? 128 * MiB : hw.diskType === 'sata-ssd' ? 64 * MiB : 32 * MiB,
@@ -370,14 +599,31 @@ export function recommendEdgeConfig(
     Math.max(fillQueueBytes, memoryBytes * 0.05),
     ...EDGE_LIMITS.largeCacheFillQueueTotal,
   )
-  const minFreeBytes = clamp(Math.max(diskBytes * 0.05, GiB), ...EDGE_LIMITS.largeCacheMinFree)
+  // Keep a real free-space floor, but never reserve more than a quarter of the
+  // large cache itself: an override that enables a 1 GiB large cache on a 20 GiB
+  // disk must still be able to fill something.
+  const minFreeTarget = Math.min(
+    Math.max(diskBytes * 0.05, 256 * MiB),
+    Math.max(largeCacheBytes * 0.1, 64 * MiB),
+  )
+  const minFreeBytes = clamp(minFreeTarget, ...EDGE_LIMITS.largeCacheMinFree)
 
   const minObjectBytes = clamp(
-    hw.workload === 'web' ? 4 * MiB : 8 * MiB,
+    shield ? 1 * MiB : hw.workload === 'web' ? 4 * MiB : 8 * MiB,
     ...EDGE_LIMITS.largeCacheMinObject,
   )
+  const maxObjectTarget = shield
+    ? 4 * GiB
+    : hw.workload === 'video'
+      ? 2 * GiB
+      : hw.workload === 'web'
+        ? 256 * MiB
+        : GiB
+  // A maximum object larger than the whole cache can never be admitted.
   const maxObjectBytes = clamp(
-    hw.workload === 'video' ? 2 * GiB : hw.workload === 'web' ? 256 * MiB : GiB,
+    largeCacheEnabled
+      ? Math.min(maxObjectTarget, Math.max(largeCacheBytes, 1 * MiB))
+      : maxObjectTarget,
     ...EDGE_LIMITS.largeCacheMaxObject,
   )
   // Split the two tiers at one exact byte value, per edge.env.example.
@@ -394,16 +640,34 @@ export function recommendEdgeConfig(
     : diskGb >= 40
       ? clamp(usableDisk * 0.5, 2 * GiB, 200 * GiB)
       : 0
-  const backendOverride = overrides.cacheBackend ?? 'auto'
-  const cacheBackend =
-    backendOverride === 'auto' ? (derivedDiskCacheBytes > 0 ? 'hybrid' : 'memory') : backendOverride
+
+  const requestedCacheBackend = overrides.cacheBackend ?? 'auto'
+  const redisConfigured = overrides.redisConfigured !== false
+  let resolvedBackend: EdgeCacheBackend =
+    requestedCacheBackend === 'auto'
+      ? derivedDiskCacheBytes > 0
+        ? 'hybrid'
+        : 'memory'
+      : requestedCacheBackend
+  let backendDowngraded = false
+  if (resolvedBackend === 'redis' && !redisConfigured) {
+    // Emitting redis without an endpoint only produces a startup warning and a
+    // silent fallback, so derive the best local backend instead.
+    resolvedBackend = derivedDiskCacheBytes > 0 ? 'hybrid' : 'memory'
+    backendDowngraded = true
+  }
+  if (diskGb === 0 && (resolvedBackend === 'disk' || resolvedBackend === 'hybrid')) {
+    // `disk`/`hybrid` on a memory-only node falls back to `./data/cache` with a
+    // 1 GiB default, which is almost never what the operator intended.
+    resolvedBackend = 'memory'
+    backendDowngraded = true
+  }
+  const cacheBackend: EdgeCacheBackend = resolvedBackend
   const usesDiskTier = cacheBackend === 'disk' || cacheBackend === 'hybrid'
   const diskCacheBytes = usesDiskTier
     ? derivedDiskCacheBytes > 0
-      ? derivedDiskCacheBytes
-      : usableDisk > 0
-        ? clamp(usableDisk * 0.5, GiB, 200 * GiB)
-        : 0
+      ? clamp(derivedDiskCacheBytes, 0, usableDisk)
+      : clamp(usableDisk * 0.5, 0, 200 * GiB)
     : 0
   const cacheTtlSecs = hw.workload === 'video' ? 3600 : hw.workload === 'mixed' ? 300 : 60
   const compressedCacheBytes = clamp(Math.max(memoryBytes * 0.05, 16 * MiB), 0, 512 * MiB)
@@ -461,12 +725,21 @@ export function recommendEdgeConfig(
           : '默认 1000，足够覆盖常规 HTTP/1.1 复用',
     },
     {
+      key: 'EDGE_SHIELD_DISABLED',
+      value: shield ? 'true' : 'false',
+      group: 'runtime',
+      reason: shield
+        ? 'Origin Shield 必须忽略域名里的 shield_url，否则缓存未命中会回源到自己，形成回源环'
+        : '普通边缘节点必须为 false，才会使用管理员配置的 Shield 节点',
+    },
+    {
       key: 'CACHE_BACKEND',
       value: cacheBackend,
       group: 'memory-cache',
-      overridden: backendOverride !== 'auto',
-      reason:
-        backendOverride !== 'auto'
+      overridden: requestedCacheBackend !== 'auto' && !backendDowngraded,
+      reason: backendDowngraded
+        ? `请求的 ${requestedCacheBackend} 在当前硬件/Redis 条件下不可用，已降级为 ${cacheBackend}`
+        : requestedCacheBackend !== 'auto'
           ? `手工指定为 ${cacheBackend}${usesDiskTier ? `，磁盘缓存 ${humanBytes(diskCacheBytes)}` : ''}`
           : cacheBackend === 'hybrid'
             ? `磁盘可用 ${humanBytes(diskBytes)}，普通对象落盘做二级缓存`
@@ -486,7 +759,9 @@ export function recommendEdgeConfig(
       value: String(cacheCapacity),
       group: 'memory-cache',
       reason: `按 ${hw.workload === 'video'
-        ? '视频 2 MiB'
+        ? largeCacheEnabled
+          ? '视频小对象 256 KiB'
+          : '视频 2 MiB'
         : hw.workload === 'web'
           ? '小文件 64 KiB'
           : '混合 256 KiB'
@@ -536,8 +811,9 @@ export function recommendEdgeConfig(
         value: 'true',
         group: 'large-cache',
         overridden: largeOverridden,
-        reason:
-          hw.workload === 'video'
+        reason: shield
+          ? 'Origin Shield 必须缓存大对象，否则每个区域都要回源'
+          : hw.workload === 'video'
             ? '视频点播以大文件为主，不启用则每次回源'
             : '磁盘容量足够，启用后大对象流式落盘、不占内存',
       },
@@ -548,19 +824,25 @@ export function recommendEdgeConfig(
         overridden: largeOverridden,
         reason: largeOverridden
           ? `手工指定为 ${humanBytes(largeCacheBytes)}`
-          : `可用磁盘的 80%（${humanBytes(usableDisk)} × 80%）`,
+          : shield
+            ? `可用磁盘的 80%（${humanBytes(usableDisk)} × 80%），区域汇聚需要更大的热数据集`
+            : `可用磁盘的 80%（${humanBytes(usableDisk)} × 80%）`,
       },
       {
         key: 'LARGE_CACHE_MIN_OBJECT_BYTES',
         value: String(minObjectBytes),
         group: 'large-cache',
-        reason: `小于 ${humanBytes(minObjectBytes)} 的对象仍走内存 / 普通磁盘缓存`,
+        reason: shield
+          ? 'Shield 汇聚所有对象，小于 1 MiB 的才继续走普通缓存'
+          : `小于 ${humanBytes(minObjectBytes)} 的对象仍走内存 / 普通磁盘缓存`,
       },
       {
         key: 'LARGE_CACHE_MAX_OBJECT_BYTES',
         value: String(maxObjectBytes),
         group: 'large-cache',
-        reason: `超过 ${humanBytes(maxObjectBytes)} 的完整对象不缓存，但 Range 分片仍可缓存`,
+        reason: shield
+          ? 'Shield 需要覆盖超大视频/安装包，完整对象上限放宽到 4 GiB'
+          : `超过 ${humanBytes(maxObjectBytes)} 的完整对象不缓存，但 Range 分片仍可缓存`,
       },
       {
         key: 'LARGE_CACHE_CHUNK_BYTES',
@@ -587,7 +869,7 @@ export function recommendEdgeConfig(
         key: 'LARGE_CACHE_MIN_FREE_BYTES',
         value: String(minFreeBytes),
         group: 'large-cache',
-        reason: `至少保留 ${humanBytes(minFreeBytes)}（磁盘的 5%）空闲，写满后拒绝新填充`,
+        reason: `至少保留 ${humanBytes(minFreeBytes)} 空闲再拒绝新填充，避免写满系统盘`,
       },
     )
   } else {
@@ -599,8 +881,10 @@ export function recommendEdgeConfig(
       reason:
         diskGb === 0
           ? '未填写磁盘容量，按「仅内存缓存」生成'
-          : `磁盘 ${diskGb} GiB 未达 ${hw.workload === 'video' ? 20 : hw.workload === 'mixed' ? 50 : 200
-          } GiB 门槛，启用后只会频繁驱逐`,
+          : shield
+            ? 'Shield 磁盘小于 10 GiB，无法容纳有意义的热数据集'
+            : `磁盘 ${diskGb} GiB 未达 ${hw.workload === 'video' ? 20 : hw.workload === 'mixed' ? 50 : 200
+            } GiB 门槛，启用后只会频繁驱逐`,
     })
   }
 
@@ -682,15 +966,29 @@ export function recommendEdgeConfig(
   if (hw.workload === 'video' && diskGb > 0 && diskGb < 20) {
     warnings.push('视频业务磁盘小于 20 GiB：大对象缓存无法启用，命中率会很低。')
   }
+  if (shield && !largeCacheEnabled) {
+    warnings.push('Origin Shield 未启用大对象缓存：Shield 未命中时会频繁回源，建议至少 50 GiB 磁盘并启用大缓存。')
+  }
+  if (shield && diskGb > 0 && diskGb < 50) {
+    warnings.push(`Shield 磁盘只有 ${diskGb} GiB：区域汇聚的热数据集通常远大于此，建议扩容或降低 LARGE_CACHE_MAX_BYTES。`)
+  }
   if (bandwidth > 0 && bandwidth / cores > 2000) {
     warnings.push(
       `单核需承载约 ${Math.round(bandwidth / cores)} Mbps：带宽与核数不匹配，建议增加核数或降低单节点带宽。`,
     )
   }
-  if (diskGb === 0 && usesDiskTier) {
-    warnings.push(`CACHE_BACKEND=${cacheBackend} 需要磁盘，但未填写磁盘容量：Edge 会回落到 ./data/cache 并使用默认 1 GiB。`)
+  if (backendDowngraded) {
+    if (requestedCacheBackend === 'redis' && !redisConfigured) {
+      warnings.push(
+        'CACHE_BACKEND=redis 但 REDIS_URL / CACHE_REDIS_URL 都为空：已降级为本地缓存；如需 L2 共享缓存请先填写 Redis 地址。',
+      )
+    } else if (diskGb === 0) {
+      warnings.push(
+        `CACHE_BACKEND=${requestedCacheBackend} 需要磁盘，但未填写磁盘容量：已降级为仅内存缓存。`,
+      )
+    }
   }
-  if (diskGb === 0 && !usesDiskTier) {
+  if (diskGb === 0 && !usesDiskTier && cacheBackend !== 'redis') {
     warnings.push('未填写磁盘容量：已按「仅内存缓存」生成，重启后缓存全部丢失。')
   }
   if (cacheBackend === 'redis' && !hw.sharedRedis) {
@@ -698,6 +996,9 @@ export function recommendEdgeConfig(
       '未勾选「使用共享 Redis」只会让 CACHE_FLIGHT_TIMEOUT_MS / CC_REDIS_TIMEOUT_MS 保持默认值（250 / 50 ms）；' +
       'CACHE_BACKEND=redis 仍会使用 CACHE_REDIS_URL（留空则 REDIS_URL）跨节点共享 L2 缓存与合并锁。',
     )
+  }
+  if (largeCacheEnabled && maxObjectBytes < minObjectBytes) {
+    warnings.push('大缓存对象上限小于最小对象阈值：大缓存不会生效，请调大磁盘或降低门槛。')
   }
 
   return {
@@ -708,25 +1009,34 @@ export function recommendEdgeConfig(
       memoryCacheBytes,
       cacheCapacity,
       cacheBackend,
+      requestedCacheBackend,
+      backendDowngraded,
       diskCacheBytes,
       largeCacheEnabled,
       largeCacheBytes,
       chunkBytes: largeCacheEnabled ? chunkBytes : 0,
+      maxCacheableBody,
     },
   }
 }
 
-
+// ------------------------------------------------------------- env renderer
 
 /** Everything the generated `edge.env` needs beyond the sizing plan. */
 export interface EdgeEnvInput {
   nodeId: string
   region: string
   publicIp: string
-  /** Management-plane callback URL (EDGE_ADMIN_LISTEN behind it). */
+  /**
+   * Management-plane callback URL (`AGENT_URL`). Derive it from `adminListen`
+   * (`resolveDeployment`) instead of asking the operator independently.
+   */
   agentUrl: string
   token: string
+  /** Control-plane base URL reported by the node API, not the browser origin. */
   controlUrl: string
+  /** Public HTTP listener (`EDGE_LISTEN`). */
+  httpListen: string
   adminListen: string
   httpsEnabled: boolean
   httpsListen: string
@@ -766,6 +1076,10 @@ function stamp(date: Date): string {
   )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
+function portOf(listen: string): string {
+  return splitListen(listen)?.port ?? ''
+}
+
 /**
  * Render the complete `edge.env` for one node.
  *
@@ -775,15 +1089,25 @@ function stamp(date: Date): string {
  */
 export function renderEdgeEnvFile(input: EdgeEnvInput): string {
   const { hardware: hw, plan } = input
+  const shield = hw.role === 'shield'
   const lines: string[] = []
+
+  const httpListen = input.httpListen.trim() || '0.0.0.0:80'
+  const adminListen = input.adminListen.trim() || '127.0.0.1:8081'
+  const agentUrl = input.agentUrl.trim().replace(/\/+$/, '')
+  const controlUrl = input.controlUrl.trim().replace(/\/+$/, '')
+  const redisUrl = input.redisUrl.trim()
+  const cacheRedisUrl = input.cacheRedisUrl.trim()
+  const redisBackend = plan.metrics.cacheBackend === 'redis'
 
   lines.push(RULE)
   lines.push(`# Lagran 边缘节点环境配置 · ${input.nodeId}`)
-  lines.push(`# 由控制台「新增 Edge 向导」按硬件画像生成 · ${stamp(input.generatedAt ?? new Date())}`)
+  lines.push(`# 由控制台「新增 Edge 向导」按硬件与角色生成 · ${stamp(input.generatedAt ?? new Date())}`)
   lines.push(`# 硬件画像：${summarizeHardware(hw)}`)
   lines.push(
     `# 业务类型：${WORKLOAD_LABEL[hw.workload]}${hw.sharedRedis ? ' · 共享 Redis' : ' · 无共享 Redis'}`,
   )
+  lines.push(`# 角色：${shield ? 'Origin Shield（忽略域名 shield_url）' : '普通边缘节点'}`)
   lines.push('#')
   lines.push('# 应用方式：')
   lines.push('#   1. 把本文件保存为节点上的 /etc/lagran/edge.env')
@@ -796,21 +1120,33 @@ export function renderEdgeEnvFile(input: EdgeEnvInput): string {
 
   lines.push('# ----------------------------------- 节点身份与控制面')
   lines.push('# 这几项决定节点能否连上控制面，必须与控制台预注册的信息一致。')
-  lines.push(envLine('CONTROL_URL', input.controlUrl))
+  lines.push(envLine('CONTROL_URL', controlUrl || 'http://<控制面地址>:8080'))
   lines.push(envLine('NODE_ID', input.nodeId))
   lines.push(envLine('NODE_REGION', input.region || 'default'))
   lines.push(envLine('PUBLIC_IP', input.publicIp))
-  lines.push(envLine('AGENT_URL', input.agentUrl.replace(/\/+$/, '')))
+  if (agentUrl) {
+    lines.push('# 控制面回调本节点的地址，必须与下面的 EDGE_ADMIN_LISTEN 对应且控制面可达。')
+    lines.push(envLine('AGENT_URL', agentUrl))
+  } else {
+    lines.push('# 未设置 AGENT_URL：Edge 会推导为 http://127.0.0.1:<管理端口>，跨机部署时控制面无法回调。')
+    lines.push('# AGENT_URL=http://<控制面可达地址>:8081')
+  }
   lines.push(envLine('AGENT_TOKEN', input.token))
-  lines.push('# 管理面只监听回环；需要远程管理请走带鉴权的反向代理。')
-  lines.push(envLine('EDGE_ADMIN_LISTEN', input.adminListen))
+  lines.push('# 管理面监听：purge / 证书 / ACME 回调都走这里；只允许控制面来源访问，不要暴露给访客。')
+  lines.push(envLine('EDGE_ADMIN_LISTEN', adminListen))
   lines.push('')
 
   lines.push('# ---------------------------------------------- 监听')
-  lines.push(envLine('EDGE_LISTEN', '0.0.0.0:80'))
+  lines.push(envLine('EDGE_LISTEN', httpListen))
   if (input.httpsEnabled) {
+    const httpsListen = input.httpsListen.trim() || '0.0.0.0:443'
     lines.push('# 已启用 HTTPS：证书由控制面同步到 CERT_DIR，无需手工放置。')
-    lines.push(envLine('EDGE_HTTPS_LISTEN', input.httpsListen || '0.0.0.0:443'))
+    lines.push(envLine('EDGE_HTTPS_LISTEN', httpsListen))
+    const httpsPort = portOf(httpsListen)
+    if (httpsPort && httpsPort !== '443') {
+      lines.push('# HTTPS 不在 443 时，HTTP→HTTPS 跳转需要显式指定端口。')
+      lines.push(envLine('EDGE_HTTPS_REDIRECT_PORT', httpsPort))
+    }
   } else {
     lines.push('# 暂不启用 HTTPS；域名开启 HTTPS 后补上 EDGE_HTTPS_LISTEN 并重启。')
     lines.push('# EDGE_HTTPS_LISTEN=0.0.0.0:443')
@@ -829,51 +1165,56 @@ export function renderEdgeEnvFile(input: EdgeEnvInput): string {
   }
 
   lines.push('# ------------------------------------------- 数据目录')
+  lines.push('# 以下路径对应 install.sh 默认数据目录 /var/lib/lagran；自定义安装请同步修改。')
   lines.push('CERT_DIR=/var/lib/lagran/certs')
   lines.push('DISK_CACHE_DIR=/var/lib/lagran/cache')
   if (plan.metrics.largeCacheEnabled) {
     lines.push('LARGE_CACHE_DIR=/var/lib/lagran/large-cache')
   }
   lines.push('WAF_RULEPACK_CACHE_DIR=/var/lib/lagran/waf-rulepacks')
+  lines.push('# 如需 WAF Geo/ASN 名单，把 MaxMind 数据库放到下列路径（启动时加载）：')
+  lines.push('# GEOIP_COUNTRY_DB=/var/lib/lagran/maxmind/GeoLite2-Country.mmdb')
+  lines.push('# GEOIP_ASN_DB=/var/lib/lagran/maxmind/GeoLite2-ASN.mmdb')
   lines.push('')
 
   lines.push('# ---------------------------------- 共享 Redis 与密钥')
-  const redisBackend = plan.metrics.cacheBackend === 'redis'
-  if (input.redisUrl.trim()) {
+  if (redisUrl) {
     lines.push('# 共享 Redis：CC 计数与分布式限流用它跨节点共享；区域实例即可，无需与控制面同一台。')
-    lines.push(envLine('REDIS_URL', input.redisUrl.trim()))
-    if (redisBackend && !input.cacheRedisUrl.trim()) {
+    lines.push(envLine('REDIS_URL', redisUrl))
+    if (redisBackend && !cacheRedisUrl) {
       lines.push('# CACHE_BACKEND=redis 且未单独指定，L2 缓存与合并锁复用上面的 REDIS_URL。')
     }
   } else {
     lines.push('# 未配置 REDIS_URL：CC 计数与分布式限流为单节点状态；多节点部署请填写区域 Redis。')
     lines.push('# REDIS_URL=redis://127.0.0.1:6379/0')
   }
-  if (input.cacheRedisUrl.trim()) {
-    lines.push(
-      redisBackend
-        ? '# 专用于 L2 共享缓存。'
-        : '# 当前 CACHE_BACKEND 未使用 Redis L2，改为 redis 后生效。',
-    )
-    lines.push(envLine('CACHE_REDIS_URL', input.cacheRedisUrl.trim()))
+  if (cacheRedisUrl) {
+    if (redisBackend) {
+      lines.push('# 专用于 L2 共享缓存。')
+      lines.push(envLine('CACHE_REDIS_URL', cacheRedisUrl))
+    } else {
+      lines.push('# 当前 CACHE_BACKEND 未使用 Redis L2；改为 redis 后启用下面的地址。')
+      lines.push(`# CACHE_REDIS_URL=${cacheRedisUrl}`)
+    }
+  } else if (redisBackend) {
+    lines.push('# 留空则复用 REDIS_URL；想给缓存单独一个库时在这里填写。')
+    lines.push('# CACHE_REDIS_URL=')
   } else {
-    lines.push(
-      redisBackend
-        ? '# 留空则复用 REDIS_URL；想给缓存单独一个库时在这里填写。'
-        : '# 仅当 CACHE_BACKEND=redis 时启用；留空复用 REDIS_URL。',
-    )
+    lines.push('# 仅当 CACHE_BACKEND=redis 时启用；留空复用 REDIS_URL。')
     lines.push('# CACHE_REDIS_URL=')
   }
   if (input.challengeSecret.trim()) {
+    lines.push('# 多节点必须配置同一个 CHALLENGE_SECRET，否则质询无法跨节点通过。')
     lines.push(envLine('CHALLENGE_SECRET', input.challengeSecret.trim()))
   } else {
-    lines.push('# 多节点必须配置同一个 CHALLENGE_SECRET，否则质询无法跨节点通过。')
+    lines.push('# [多节点必填] 留空时由各节点自己的 AGENT_TOKEN 派生，跨节点质询会失败。')
     lines.push('# CHALLENGE_SECRET=')
   }
   if (input.wafRulepackSecret.trim()) {
+    lines.push('# 必须与控制面 /etc/lagran/control.env 的 WAF_RULEPACK_SECRET 完全一致。')
     lines.push(envLine('WAF_RULEPACK_SECRET', input.wafRulepackSecret.trim()))
   } else {
-    lines.push('# 需与控制面 WAF_RULEPACK_SECRET 完全一致，否则规则包验签失败。')
+    lines.push('# [生产必填] 需与控制面 WAF_RULEPACK_SECRET 完全一致，否则签名规则包验签失败。')
     lines.push('# WAF_RULEPACK_SECRET=')
   }
   lines.push('')
@@ -882,16 +1223,24 @@ export function renderEdgeEnvFile(input: EdgeEnvInput): string {
   lines.push('RUST_LOG=lagran_edge=info,edge=info,tower_http=info')
   lines.push('ACCESS_LOG_PATH=/var/lib/lagran/access.log')
   lines.push('')
+  lines.push('# 前置代理（可选）：只有 Edge 前面还有 SLB / Cloudflare 时才填写可信网段。')
+  lines.push('# TRUSTED_PROXIES=10.0.0.0/8,2400:cb00::/32')
   lines.push('# 未列出的参数保持 Edge 默认值；完整清单见仓库根目录 edge.env.example。')
+  lines.push('# 应用后可在节点上执行 `lagran-edge check-config` 校验 CONTROL_URL 与管理面监听。')
 
   return `${lines.join('\n')}\n`
 }
 
 /** Shell snippet that installs the generated file and restarts the service. */
 export const EDGE_ENV_INSTALL_STEPS = `# 1) 把 edge.env 上传到节点，落到固定路径并收紧权限
-sudo install -d -m 750 /etc/lagran
+sudo install -d -m 0750 /etc/lagran
 sudo install -m 600 ./edge.env /etc/lagran/edge.env
 
 # 2) 重启并确认启动摘要（首次心跳约 15 秒内出现）
 sudo systemctl restart lagran-edge
-sudo systemctl status lagran-edge --no-pager -l`
+sudo systemctl status lagran-edge --no-pager -l
+sudo journalctl -u lagran-edge -n 30 --no-pager`
+
+/** Check the file without binding any port. */
+export const EDGE_ENV_CHECK_STEPS = `# 只解析配置、不监听端口（在节点上执行；二进制路径按实际安装位置调整）
+sudo sh -c 'set -a; . /etc/lagran/edge.env; set +a; exec /opt/lagran/bin/lagran-edge check-config'`

