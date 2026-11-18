@@ -13,6 +13,7 @@ use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::net::IpAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -565,7 +566,7 @@ pub struct NodeRef {
     pub weight: i32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Candidate {
     pub name: String,
     pub public_ip: String,
@@ -701,6 +702,29 @@ fn score_node(node: &repository::NodeRow, geo: &GeoInfo) -> (i32, String) {
     (score, reasons.join(" "))
 }
 
+/// Pick primary/backup indexes from a score-descending candidate list.
+///
+/// The top-scoring tie group is walked round-robin using `rotation`; the backup
+/// is the next member of that group. When the top score is unique the sorted
+/// order is used unchanged. `scores` must be sorted by descending score.
+fn rotated_primary_backup(scores: &[i32], rotation: u64) -> (Option<usize>, Option<usize>, usize) {
+    let Some(&top) = scores.first() else {
+        return (None, None, 0);
+    };
+    let tied = scores.iter().take_while(|&&score| score == top).count();
+    // `tied` is at least one because `scores` is non-empty.
+    let start = (rotation % tied as u64) as usize;
+    let primary = Some(start);
+    let backup = if tied > 1 {
+        Some((start + 1) % tied)
+    } else if scores.len() > 1 {
+        Some(1)
+    } else {
+        None
+    };
+    (primary, backup, tied)
+}
+
 /// Resolve an answer for a DNS query.
 ///
 /// `trust_overrides` controls whether the caller may supply `country` /
@@ -742,6 +766,18 @@ pub async fn resolve(
         .collect();
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
 
+    let scores: Vec<i32> = candidates.iter().map(|(score, _)| *score).collect();
+    // Compute the tie size first: only tied answers should advance the shared
+    // ticket. A unique top score keeps the sorted order and does not churn the
+    // counter on every DNS miss.
+    let (_, _, tied) = rotated_primary_backup(&scores, 0);
+    let rotation = if tied > 1 {
+        state.schedule_rotation.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
+    let (primary_idx, backup_idx, _) = rotated_primary_backup(&scores, rotation);
+
     let to_ref = |c: &Candidate| NodeRef {
         name: c.name.clone(),
         public_ip: c.public_ip.clone(),
@@ -751,14 +787,37 @@ pub async fn resolve(
         isp: c.isp.clone(),
         weight: c.weight,
     };
-    let primary = candidates.first().map(|(_, c)| to_ref(c));
-    let backup = candidates.get(1).map(|(_, c)| to_ref(c));
+    let primary = primary_idx
+        .and_then(|idx| candidates.get(idx))
+        .map(|(_, c)| to_ref(c));
+    let backup = backup_idx
+        .and_then(|idx| candidates.get(idx))
+        .map(|(_, c)| to_ref(c));
     let note = if candidates.is_empty() {
         "没有可调度的在线节点（需状态 online 且填写 public_ip）".to_string()
+    } else if tied > 1 {
+        format!(
+            "共 {} 个候选节点，最高分并列 {} 个（按请求轮询）",
+            candidates.len(),
+            tied
+        )
     } else {
         format!("共 {} 个候选节点", candidates.len())
     };
-    let top: Vec<Candidate> = candidates.into_iter().take(5).map(|(_, c)| c).collect();
+    let mut top: Vec<Candidate> = candidates.iter().take(5).map(|(_, c)| c.clone()).collect();
+    // The response is capped at five candidates; keep the rotated primary and
+    // backup visible when a large tie group pushes them past that cap.
+    for idx in [primary_idx, backup_idx].into_iter().flatten() {
+        if idx >= 5 {
+            let candidate = &candidates[idx].1;
+            if !top
+                .iter()
+                .any(|c| c.name == candidate.name && c.public_ip == candidate.public_ip)
+            {
+                top.push(candidate.clone());
+            }
+        }
+    }
 
     // `debug`, not `info`. With a 5 s DNS cache this fires at roughly DNS QPS, and
     // the fmt layer writes to stdout synchronously from the async runtime: at high
@@ -772,6 +831,8 @@ pub async fn resolve(
         province = %client.province,
         city = %client.city,
         isp = %client.isp,
+        tie_count = tied,
+        rotation,
         primary = ?primary.as_ref().map(|p| p.name.as_str()),
         "scheduling decision"
     );
@@ -1059,5 +1120,36 @@ mod tests {
         );
         // The masked form must not contain the original host bits.
         assert!(!mask_log_ip(Some("198.51.100.9".parse().unwrap())).contains("100.9"));
+    }
+
+    #[test]
+    fn tied_candidates_rotate_round_robin() {
+        let scores = [100, 100, 100, 90];
+        assert_eq!(rotated_primary_backup(&scores, 0), (Some(0), Some(1), 3));
+        assert_eq!(rotated_primary_backup(&scores, 1), (Some(1), Some(2), 3));
+        assert_eq!(rotated_primary_backup(&scores, 2), (Some(2), Some(0), 3));
+        assert_eq!(rotated_primary_backup(&scores, 3), (Some(0), Some(1), 3));
+        assert_eq!(rotated_primary_backup(&scores, 4), (Some(1), Some(2), 3));
+    }
+
+    #[test]
+    fn unique_top_score_keeps_sorted_primary() {
+        let scores = [100, 90, 80];
+        assert_eq!(rotated_primary_backup(&scores, 0), (Some(0), Some(1), 1));
+        assert_eq!(rotated_primary_backup(&scores, 1), (Some(0), Some(1), 1));
+        assert_eq!(rotated_primary_backup(&scores, 99), (Some(0), Some(1), 1));
+    }
+
+    #[test]
+    fn single_and_empty_candidate_lists_are_safe() {
+        assert_eq!(rotated_primary_backup(&[100], 7), (Some(0), None, 1));
+        assert_eq!(rotated_primary_backup(&[], 7), (None, None, 0));
+    }
+
+    #[test]
+    fn backup_uses_next_tie_member_even_with_lower_scores_present() {
+        let scores = [100, 100, 95, 90];
+        assert_eq!(rotated_primary_backup(&scores, 0), (Some(0), Some(1), 2));
+        assert_eq!(rotated_primary_backup(&scores, 1), (Some(1), Some(0), 2));
     }
 }

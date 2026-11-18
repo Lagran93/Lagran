@@ -3,6 +3,7 @@
 use crate::config::AppConfig;
 use crate::middleware::login_limit::LoginLimiter;
 use sqlx::PgPool;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -14,6 +15,9 @@ pub struct AppState {
     pub schedule_ttl: u64,
     /// Short-lived snapshot of the node table used by GeoDNS scheduling.
     pub nodes: Arc<crate::scheduler::NodeSnapshotCache>,
+    /// Monotonic ticket used to rotate among equally-scored nodes.
+    /// Per control process: multiple replicas rotate independently.
+    pub schedule_rotation: Arc<AtomicU64>,
     pub login_limiter: Arc<LoginLimiter>,
     pub captcha: Arc<crate::service::captcha::CaptchaStore>,
     pub config_cache: Arc<crate::service::config_cache::ConfigCache>,
@@ -39,6 +43,7 @@ impl AppState {
             geo,
             schedule_ttl,
             nodes,
+            schedule_rotation: Arc::new(AtomicU64::new(0)),
             login_limiter: Arc::new(LoginLimiter::new()),
             captcha: Arc::new(crate::service::captcha::CaptchaStore::new()),
             config_cache: Arc::new(crate::service::config_cache::ConfigCache::new(
