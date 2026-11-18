@@ -812,7 +812,10 @@ RUST_LOG=edge=info,tower_http=warn
 3. **容量规划**：展示每个容量参数的推导依据（L1/L2/L3 缓存、分片、回源超时等），
    可按需覆盖工作线程、内存缓存和大缓存容量。
 4. **生成配置**：注册节点并展示节点令牌与 `edge.env`。`CONTROL_URL` 由控制面按
-   `CONTROL_PUBLIC_URL`（或请求 Host）解析，不会再误用浏览器地址。
+   `CONTROL_PUBLIC_URL`（或请求 Host）解析，不会再误用浏览器地址。该步骤还会生成
+   一段可直接粘贴到节点 root shell 的「一键安装脚本」：先写入 `edge.env`，再执行
+   `curl ... install.sh | sudo env LAGRAN_REPO=... AGENT_TOKEN=... NODE_ID=... bash -s -- edge`，
+   最后重启服务；令牌和节点名已经替换成本节点的值。
 5. **上线验证**：轮询节点状态，并给出节点侧 `check-config` / 健康检查 / journalctl 命令。
 
 向导会：

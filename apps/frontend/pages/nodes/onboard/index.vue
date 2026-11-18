@@ -20,12 +20,7 @@
 
     <template v-else>
       <div class="wizard-steps">
-        <div
-          v-for="(s, i) in steps"
-          :key="s"
-          class="wizard-step"
-          :class="{ active: step === i, done: step > i }"
-        >
+        <div v-for="(s, i) in steps" :key="s" class="wizard-step" :class="{ active: step === i, done: step > i }">
           <span class="wizard-index">{{ step > i ? '✓' : i + 1 }}</span>
           <span>{{ s }}</span>
         </div>
@@ -52,7 +47,9 @@
           <!-- 步骤 1：节点身份 -->
           <div v-if="step === 0" class="form-col">
             <div class="wizard-hero">
-              <div class="wizard-icon"><AppIcon name="node" :size="24" /></div>
+              <div class="wizard-icon">
+                <AppIcon name="node" :size="24" />
+              </div>
               <div>
                 <div class="wizard-title">这个节点叫什么、放在哪里？</div>
                 <div class="wizard-desc">
@@ -64,44 +61,26 @@
             <div class="form-grid">
               <div class="field span-2">
                 <label class="field-label">节点名称 <span class="req">*</span></label>
-                <input
-                  v-model="form.name"
-                  class="input mono"
-                  placeholder="edge-hk-01"
-                  :disabled="nodeLocked"
-                  @keyup.enter="next"
-                />
+                <input v-model="form.name" class="input mono" placeholder="edge-hk-01" :disabled="nodeLocked"
+                  @keyup.enter="next" />
                 <span class="field-hint">
                   仅允许字母、数字、点、下划线与连字符，最长 64 字符；它会原样写入 edge.env 的 NODE_ID。
                 </span>
               </div>
               <div class="field">
                 <label class="field-label">区域标签</label>
-                <input
-                  v-model="form.region"
-                  class="input multi"
-                  placeholder="cn-hongkong"
-                  :disabled="nodeLocked"
-                />
+                <input v-model="form.region" class="input multi" placeholder="cn-hongkong" :disabled="nodeLocked" />
                 <span class="field-hint">只用字母 / 数字 / . / _ / -，用于展示与排障分组。</span>
               </div>
               <div class="field">
                 <label class="field-label">公网 IP <span class="req">*</span></label>
-                <input
-                  v-model="form.public_ip"
-                  class="input multi"
-                  placeholder="203.0.113.21"
-                  :disabled="nodeLocked"
-                />
+                <input v-model="form.public_ip" class="input multi" placeholder="203.0.113.21" :disabled="nodeLocked" />
                 <span class="field-hint">GeoDNS 返回这个地址，必须是对访客可达的 IP。</span>
               </div>
               <div class="field span-2">
                 <label class="field-label">部署方式</label>
-                <select
-                  class="select"
-                  :value="infra.deployment"
-                  @change="setDeployment(($event.target as HTMLSelectElement).value)"
-                >
+                <select class="select" :value="infra.deployment"
+                  @change="setDeployment(($event.target as HTMLSelectElement).value)">
                   <option v-for="(label, value) in DEPLOYMENT_LABEL" :key="value" :value="value">
                     {{ label }}
                   </option>
@@ -149,14 +128,8 @@
               <div class="form-grid">
                 <div class="field">
                   <label class="field-label">国家/地区代码</label>
-                  <input
-                    v-model="form.country"
-                    class="input"
-                    list="edge-country-codes"
-                    maxlength="2"
-                    placeholder="CN"
-                    :disabled="nodeLocked"
-                  />
+                  <input v-model="form.country" class="input" list="edge-country-codes" maxlength="2" placeholder="CN"
+                    :disabled="nodeLocked" />
                   <datalist id="edge-country-codes">
                     <option value="CN">中国大陆</option>
                     <option value="HK">中国香港</option>
@@ -176,41 +149,20 @@
                 </div>
                 <div class="field">
                   <label class="field-label">省份</label>
-                  <input
-                    v-model="form.province"
-                    class="input multi"
-                    placeholder="广东"
-                    :disabled="nodeLocked"
-                  />
+                  <input v-model="form.province" class="input multi" placeholder="广东" :disabled="nodeLocked" />
                 </div>
                 <div class="field">
                   <label class="field-label">城市</label>
-                  <input
-                    v-model="form.city"
-                    class="input multi"
-                    placeholder="深圳"
-                    :disabled="nodeLocked"
-                  />
+                  <input v-model="form.city" class="input multi" placeholder="深圳" :disabled="nodeLocked" />
                 </div>
                 <div class="field">
                   <label class="field-label">运营商</label>
-                  <input
-                    v-model="form.isp"
-                    class="input multi"
-                    placeholder="电信 / BGP"
-                    :disabled="nodeLocked"
-                  />
+                  <input v-model="form.isp" class="input multi" placeholder="电信 / BGP" :disabled="nodeLocked" />
                 </div>
                 <div class="field">
                   <label class="field-label">调度权重</label>
-                  <input
-                    v-model.number="form.weight"
-                    class="input"
-                    type="number"
-                    min="0"
-                    max="1000"
-                    :disabled="nodeLocked"
-                  />
+                  <input v-model.number="form.weight" class="input" type="number" min="0" max="1000"
+                    :disabled="nodeLocked" />
                   <span class="field-hint">数值越大越优先，默认 100。</span>
                 </div>
               </div>
@@ -222,7 +174,9 @@
           <!-- 步骤 2：硬件画像 -->
           <div v-else-if="step === 1" class="form-col">
             <div class="wizard-hero">
-              <div class="wizard-icon"><AppIcon name="zap" :size="24" /></div>
+              <div class="wizard-icon">
+                <AppIcon name="zap" :size="24" />
+              </div>
               <div>
                 <div class="wizard-title">这台机器的硬件与业务画像</div>
                 <div class="wizard-desc">
@@ -249,11 +203,8 @@
               </div>
               <div class="field">
                 <label class="field-label">磁盘类型</label>
-                <select
-                  class="select"
-                  :value="hw.diskType"
-                  @change="setDiskType(($event.target as HTMLSelectElement).value)"
-                >
+                <select class="select" :value="hw.diskType"
+                  @change="setDiskType(($event.target as HTMLSelectElement).value)">
                   <option value="nvme">NVMe SSD</option>
                   <option value="sata-ssd">SATA SSD</option>
                   <option value="hdd">机械盘 HDD</option>
@@ -267,11 +218,8 @@
               </div>
               <div class="field">
                 <label class="field-label">主要业务类型</label>
-                <select
-                  class="select"
-                  :value="hw.workload"
-                  @change="setWorkload(($event.target as HTMLSelectElement).value)"
-                >
+                <select class="select" :value="hw.workload"
+                  @change="setWorkload(($event.target as HTMLSelectElement).value)">
                   <option value="web">网页 / 小文件</option>
                   <option value="mixed">混合业务</option>
                   <option value="video">视频 / 大文件点播</option>
@@ -283,11 +231,7 @@
             <div class="form-grid">
               <div class="field span-2">
                 <label class="field-label">节点角色</label>
-                <select
-                  class="select"
-                  :value="hw.role"
-                  @change="setRole(($event.target as HTMLSelectElement).value)"
-                >
+                <select class="select" :value="hw.role" @change="setRole(($event.target as HTMLSelectElement).value)">
                   <option v-for="(label, value) in NODE_ROLE_LABEL" :key="value" :value="value">
                     {{ label }}（{{ value }}）
                   </option>
@@ -319,12 +263,8 @@
               </div>
               <div class="field">
                 <label class="field-label">HTTPS 监听地址</label>
-                <input
-                  v-model="infra.httpsListen"
-                  class="input mono"
-                  :disabled="!infra.httpsEnabled"
-                  placeholder="0.0.0.0:443"
-                />
+                <input v-model="infra.httpsListen" class="input mono" :disabled="!infra.httpsEnabled"
+                  placeholder="0.0.0.0:443" />
                 <span class="field-hint">非 443 端口会自动写入 EDGE_HTTPS_REDIRECT_PORT。</span>
               </div>
             </div>
@@ -334,11 +274,8 @@
               <div class="form-grid">
                 <div class="field">
                   <label class="field-label">CACHE_BACKEND</label>
-                  <select
-                    class="select"
-                    :value="infra.cacheBackend"
-                    @change="setCacheBackend(($event.target as HTMLSelectElement).value)"
-                  >
+                  <select class="select" :value="infra.cacheBackend"
+                    @change="setCacheBackend(($event.target as HTMLSelectElement).value)">
                     <option v-for="(label, value) in CACHE_BACKEND_LABEL" :key="value" :value="value">
                       {{ label }}
                     </option>
@@ -349,22 +286,14 @@
                 </div>
                 <div class="field">
                   <label class="field-label">REDIS_URL（共享 Redis）</label>
-                  <input
-                    v-model="infra.redisUrl"
-                    class="input mono"
-                    placeholder="redis://127.0.0.1:6379/0"
-                  />
+                  <input v-model="infra.redisUrl" class="input mono" placeholder="redis://127.0.0.1:6379/0" />
                   <span class="field-hint">
                     CC 计数、跨节点合并锁与 L2 回退共用；留空则这些能力只在单节点进程内生效。
                   </span>
                 </div>
                 <div class="field span-2">
                   <label class="field-label">CACHE_REDIS_URL（L2 专用，可选）</label>
-                  <input
-                    v-model="infra.cacheRedisUrl"
-                    class="input mono"
-                    placeholder="留空复用 REDIS_URL"
-                  />
+                  <input v-model="infra.cacheRedisUrl" class="input mono" placeholder="留空复用 REDIS_URL" />
                   <span class="field-hint">
                     仅 CACHE_BACKEND=redis 时启用；地址含密码时会随硬件画像一并存储。
                   </span>
@@ -385,21 +314,13 @@
                 <div class="field">
                   <label class="field-label">CHALLENGE_SECRET</label>
                   <div class="secret-row">
-                    <input
-                      v-model="infra.challengeSecret"
-                      class="input mono"
-                      autocomplete="off"
-                      placeholder="多节点必须完全一致"
-                    />
+                    <input v-model="infra.challengeSecret" class="input mono" autocomplete="off"
+                      placeholder="多节点必须完全一致" />
                     <button class="btn btn-default btn-sm" type="button" @click="randomizeChallengeSecret">
                       生成
                     </button>
-                    <button
-                      class="btn btn-default btn-sm"
-                      type="button"
-                      :disabled="!infra.challengeSecret"
-                      @click="copy(infra.challengeSecret, 'CHALLENGE_SECRET')"
-                    >
+                    <button class="btn btn-default btn-sm" type="button" :disabled="!infra.challengeSecret"
+                      @click="copy(infra.challengeSecret, 'CHALLENGE_SECRET')">
                       复制
                     </button>
                   </div>
@@ -411,18 +332,9 @@
                 <div class="field">
                   <label class="field-label">WAF_RULEPACK_SECRET</label>
                   <div class="secret-row">
-                    <input
-                      v-model="infra.wafRulepackSecret"
-                      class="input mono"
-                      type="password"
-                      autocomplete="off"
-                    />
-                    <button
-                      class="btn btn-default btn-sm"
-                      type="button"
-                      :disabled="!infra.wafRulepackSecret"
-                      @click="copy(infra.wafRulepackSecret, 'WAF_RULEPACK_SECRET')"
-                    >
+                    <input v-model="infra.wafRulepackSecret" class="input mono" type="password" autocomplete="off" />
+                    <button class="btn btn-default btn-sm" type="button" :disabled="!infra.wafRulepackSecret"
+                      @click="copy(infra.wafRulepackSecret, 'WAF_RULEPACK_SECRET')">
                       复制
                     </button>
                   </div>
@@ -439,7 +351,9 @@
           <!-- 步骤 3：容量规划 -->
           <div v-else-if="step === 2" class="form-col">
             <div class="wizard-hero">
-              <div class="wizard-icon"><AppIcon name="stats" :size="24" /></div>
+              <div class="wizard-icon">
+                <AppIcon name="stats" :size="24" />
+              </div>
               <div>
                 <div class="wizard-title">按硬件推导出的容量规划</div>
                 <div class="wizard-desc">
@@ -497,34 +411,18 @@
               <div class="override-grid">
                 <label class="override-field">
                   <span>工作线程</span>
-                  <input
-                    v-model.number="overrides.workerThreads"
-                    class="input"
-                    type="number"
-                    min="1"
-                    max="256"
-                    :placeholder="String(plan.metrics.workerThreads)"
-                  />
+                  <input v-model.number="overrides.workerThreads" class="input" type="number" min="1" max="256"
+                    :placeholder="String(plan.metrics.workerThreads)" />
                 </label>
                 <label class="override-field">
                   <span>内存缓存（MiB）</span>
-                  <input
-                    v-model.number="overrides.memoryCacheMiB"
-                    class="input"
-                    type="number"
-                    min="16"
-                    :placeholder="String(Math.round(plan.metrics.memoryCacheBytes / 1048576))"
-                  />
+                  <input v-model.number="overrides.memoryCacheMiB" class="input" type="number" min="16"
+                    :placeholder="String(Math.round(plan.metrics.memoryCacheBytes / 1048576))" />
                 </label>
                 <label class="override-field">
                   <span>大对象缓存（GiB，0 = 关闭）</span>
-                  <input
-                    v-model.number="overrides.largeCacheGiB"
-                    class="input"
-                    type="number"
-                    min="0"
-                    :placeholder="String(Math.round(plan.metrics.largeCacheBytes / 1073741824))"
-                  />
+                  <input v-model.number="overrides.largeCacheGiB" class="input" type="number" min="0"
+                    :placeholder="String(Math.round(plan.metrics.largeCacheBytes / 1073741824))" />
                 </label>
               </div>
             </div>
@@ -557,7 +455,9 @@
           <!-- 步骤 4：生成配置 -->
           <div v-else-if="step === 3" class="form-col">
             <div class="wizard-hero">
-              <div class="wizard-icon"><AppIcon name="logs" :size="24" /></div>
+              <div class="wizard-icon">
+                <AppIcon name="logs" :size="24" />
+              </div>
               <div>
                 <div class="wizard-title">把配置和安装命令带到节点上</div>
                 <div class="wizard-desc">
@@ -598,12 +498,8 @@
             <div class="field">
               <div class="field-label">节点令牌</div>
               <div class="copy-row">
-                <input
-                  class="input mono"
-                  :type="tokenVisible ? 'text' : 'password'"
-                  :value="created?.token || ''"
-                  readonly
-                />
+                <input class="input mono" :type="tokenVisible ? 'text' : 'password'" :value="created?.token || ''"
+                  readonly />
                 <button class="btn btn-default" type="button" @click="tokenVisible = !tokenVisible">
                   <AppIcon :name="tokenVisible ? 'eye-off' : 'eye'" :size="15" />
                   {{ tokenVisible ? '隐藏' : '显示' }}
@@ -616,14 +512,44 @@
             </div>
 
             <div class="field">
-              <div class="field-label">edge.env（按当前硬件与角色生成）</div>
+              <div class="field-label">一键安装脚本（写入 edge.env、安装并重启）</div>
               <div class="command-box">
+                <pre class="mono">{{ oneClickInstallScript }}</pre>
+                <button class="btn btn-default btn-sm copy-float" type="button"
+                  @click="copy(oneClickInstallScript, '一键安装脚本')">
+                  <AppIcon name="copy" :size="14" />
+                  复制
+                </button>
+              </div>
+              <span class="field-hint">
+                脚本包含节点令牌，请通过安全通道粘贴到节点上的 root shell 执行，不要提交到仓库或工单系统。
+                它会在安装前写入本页的 edge.env，因此不会再被安装器的默认配置覆盖。
+              </span>
+            </div>
+
+            <details class="optional-block">
+              <summary>只执行安装器（适合已手动放好 edge.env）</summary>
+              <div class="command-box sub">
+                <pre class="mono">{{ installCommand }}</pre>
+                <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(installCommand, '安装命令')">
+                  <AppIcon name="copy" :size="14" />
+                  复制
+                </button>
+              </div>
+              <span class="field-hint">
+                安装器需要 root，命令用 sudo env 传递 AGENT_TOKEN / NODE_ID；节点上必须先存在本页的 edge.env。
+              </span>
+            </details>
+
+            <div class="field">
+              <div class="field-label">edge.env（按当前硬件与角色生成）</div>
+              <!-- <div class="command-box">
                 <pre class="mono">{{ envText }}</pre>
                 <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(envText, 'edge.env')">
                   <AppIcon name="copy" :size="14" />
                   复制
                 </button>
-              </div>
+              </div> -->
             </div>
 
             <div class="flex-between">
@@ -636,7 +562,7 @@
             </div>
 
             <div class="field">
-              <div class="field-label">落位与重启</div>
+              <div class="field-label">手动落位与重启（不用一键脚本时）</div>
               <div class="command-box sub">
                 <pre class="mono">{{ installSteps }}</pre>
                 <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(installSteps, '安装命令')">
@@ -691,7 +617,9 @@
           <!-- 步骤 5：上线验证 -->
           <div v-else class="form-col">
             <div class="wizard-hero">
-              <div class="wizard-icon"><AppIcon name="activity" :size="24" /></div>
+              <div class="wizard-icon">
+                <AppIcon name="activity" :size="24" />
+              </div>
               <div>
                 <div class="wizard-title">等待节点首次心跳</div>
                 <div class="wizard-desc">
@@ -719,7 +647,8 @@
               <div class="field-label">节点侧自检</div>
               <div class="command-box sub">
                 <pre class="mono">{{ verificationSteps }}</pre>
-                <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(verificationSteps, '自检命令')">
+                <button class="btn btn-default btn-sm copy-float" type="button"
+                  @click="copy(verificationSteps, '自检命令')">
                   <AppIcon name="copy" :size="14" />
                   复制
                 </button>
@@ -769,13 +698,7 @@
             下一步
             <AppIcon name="chevron-right" :size="15" />
           </button>
-          <button
-            v-else-if="step === 2"
-            class="btn btn-primary"
-            type="button"
-            :disabled="creating"
-            @click="next"
-          >
+          <button v-else-if="step === 2" class="btn btn-primary" type="button" :disabled="creating" @click="next">
             {{ creating ? '注册中…' : (nodeLocked ? '保存并生成配置' : '注册节点并生成配置') }}
             <AppIcon v-if="!creating" name="chevron-right" :size="15" />
           </button>
@@ -1026,7 +949,7 @@ const infraWarnings = computed(() => {
   if (infra.value.cacheBackend !== 'redis' && redisEndpoint) {
     warnings.push(
       `已填写 REDIS_URL 但 CACHE_BACKEND=${infra.value.cacheBackend}：CC 计数与分布式限流仍会跨节点共享，` +
-        '而合并锁与 L2 缓存需要 CACHE_BACKEND=redis 才启用。',
+      '而合并锁与 L2 缓存需要 CACHE_BACKEND=redis 才启用。',
     )
   }
   if (infra.value.cacheBackend !== 'redis' && cacheEndpoint && !redisEndpoint) {
@@ -1037,7 +960,7 @@ const infraWarnings = computed(() => {
   if (redisEndpoint && !hw.value.sharedRedis) {
     warnings.push(
       '已填写 REDIS_URL：CC 计数与分布式限流会用该 Redis 跨节点共享（区域实例即可）；' +
-        '勾选「使用共享 Redis」只会额外输出 Redis 超时调优参数。',
+      '勾选「使用共享 Redis」只会额外输出 Redis 超时调优参数。',
     )
   }
   for (const url of [infra.value.redisUrl, infra.value.cacheRedisUrl]) {
@@ -1097,6 +1020,54 @@ const envText = computed(() => {
     hardware: hw.value,
     plan: plan.value,
   })
+})
+
+/** Public installer repository; keep it in sync with README / install.sh. */
+const INSTALL_REPO = 'Lagran93/Lagran'
+
+/** Quote a value for a POSIX shell single-quoted context. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`
+}
+
+/**
+ * The installer requires root. `sudo env VAR=... bash` is deliberate: passing
+ * the variables to `env` after sudo survives sudo's default env_reset, while
+ * `sudo bash` alone would drop AGENT_TOKEN/NODE_ID.
+ */
+const installCommand = computed(() => {
+  const token = created.value?.token || ''
+  const name = form.value.name.trim()
+  if (!token || !name) return ''
+  return (
+    `curl -fsSL https://raw.githubusercontent.com/${INSTALL_REPO}/main/install.sh ` +
+    `| sudo env LAGRAN_REPO=${INSTALL_REPO} AGENT_TOKEN=${shellQuote(token)} ` +
+    `NODE_ID=${shellQuote(name)} bash -s -- edge`
+  )
+})
+
+/**
+ * One copy-paste block for a fresh node.
+ *
+ * It writes the generated edge.env *before* running install.sh, because
+ * `install.sh edge` keeps an existing /etc/lagran/edge.env instead of
+ * overwriting it with its low-detail default. The heredoc is single-quoted so
+ * the env file is written literally and no shell expansion touches secrets.
+ */
+const oneClickInstallScript = computed(() => {
+  if (!created.value || !envText.value) return ''
+  return `# 1) 写入本页生成的 edge.env（含节点令牌；安装器发现文件已存在会保留它）
+# 注意：会覆盖节点上现有的 /etc/lagran/edge.env；如需保留旧配置请先备份。
+sudo install -d -m 0750 /etc/lagran
+sudo sh -c 'umask 077; cat > /etc/lagran/edge.env' <<'LAGRAN_EDGE_ENV_EOF'
+${envText.value.trimEnd()}
+LAGRAN_EDGE_ENV_EOF
+
+# 2) 安装/更新 lagran-edge，并让新配置生效
+${installCommand.value} && sudo systemctl restart lagran-edge
+
+# 3) 可选：不监听端口的配置自检
+sudo sh -c 'set -a; . /etc/lagran/edge.env; set +a; exec /opt/lagran/bin/lagran-edge check-config'`
 })
 
 const installSteps = EDGE_ENV_INSTALL_STEPS
