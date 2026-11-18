@@ -24,6 +24,7 @@ fn is_agent_endpoint(method: &str, path: &str) -> bool {
         ("POST", "/api/v1/nodes/heartbeat") => true,
         ("POST", "/api/v1/metrics/report") => true,
         ("POST", "/api/v1/metrics/report/batch") => true,
+        ("GET", "/api/v1/edge/config") => true,
         ("GET", "/api/v1/certs/edge-sync") => true,
         ("POST", "/api/v1/access-logs/report") => true,
         ("POST", "/api/v1/config/apply-report") => true,

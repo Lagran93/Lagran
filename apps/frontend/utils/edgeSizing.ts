@@ -61,6 +61,12 @@ export interface EdgeSizingOverrides {
   workerThreads?: number
   memoryCacheMiB?: number
   largeCacheGiB?: number
+  /**
+   * Raw values the operator edited directly in the capacity table, keyed by
+   * env variable name. Only keys with an entry in [`ITEM_EDIT_RULES`] (plus the
+   * special `LARGE_CACHE_ENABLED` toggle) are accepted.
+   */
+  itemValues?: Record<string, string>
   /** Pin `CACHE_BACKEND`; `auto` keeps the hardware-derived value. */
   cacheBackend?: EdgeCacheBackend
   /**
@@ -72,6 +78,15 @@ export interface EdgeSizingOverrides {
 }
 
 export type SizingGroup = 'runtime' | 'memory-cache' | 'large-cache' | 'origin' | 'logging'
+
+/** Display titles shared by the wizard table and the env renderer. */
+export const SIZING_GROUP_LABEL: Record<SizingGroup, string> = {
+  runtime: '进程与连接',
+  'memory-cache': '内存与普通缓存',
+  'large-cache': '大对象缓存',
+  origin: '回源',
+  logging: '日志',
+}
 
 /**
  * `CACHE_BACKEND` as accepted by `apps/edge/src/cache/mod.rs`.
@@ -206,6 +221,124 @@ export const DEPLOYMENT_DESC: Record<EdgeDeploymentMode, string> = {
 
 const DEFAULT_ADMIN_PORT = '8081'
 
+export type ItemEditUnit = 'bytes' | 'ms' | 'count'
+
+export interface ItemEditRule {
+  min: number
+  max: number
+  unit: ItemEditUnit
+}
+
+/**
+ * Parameters that can be edited in the capacity table.
+ *
+ * Keep these in sync with the clamps in `apps/edge/src/config/mod.rs`; the
+ * table writes the raw value, so every rule is an integer range.
+ */
+export const ITEM_EDIT_RULES: Record<string, ItemEditRule> = {
+  EDGE_WORKER_THREADS: { min: EDGE_LIMITS.workerThreads[0], max: EDGE_LIMITS.workerThreads[1], unit: 'count' },
+  EDGE_COMPRESSION_LEVEL: { min: EDGE_LIMITS.compressionLevel[0], max: EDGE_LIMITS.compressionLevel[1], unit: 'count' },
+  DOWNSTREAM_KEEPALIVE_REQUESTS: { min: 1, max: 100_000, unit: 'count' },
+  CACHE_MAX_BYTES: { min: EDGE_LIMITS.cacheMaxBytes[0], max: EDGE_LIMITS.cacheMaxBytes[1], unit: 'bytes' },
+  CACHE_CAPACITY: { min: 1, max: 10_000_000, unit: 'count' },
+  CACHE_TTL: { min: 0, max: 31_536_000, unit: 'count' },
+  MAX_CACHEABLE_BODY: { min: EDGE_LIMITS.maxCacheableBody[0], max: EDGE_LIMITS.maxCacheableBody[1], unit: 'bytes' },
+  DISK_CACHE_MAX_BYTES: { min: 0, max: 1_125_899_906_842_624, unit: 'bytes' },
+  EDGE_COMPRESSED_CACHE_MAX_BYTES: { min: 0, max: 4 * GiB, unit: 'bytes' },
+  LARGE_CACHE_MAX_BYTES: { min: 0, max: 1_125_899_906_842_624, unit: 'bytes' },
+  LARGE_CACHE_MIN_OBJECT_BYTES: { min: EDGE_LIMITS.largeCacheMinObject[0], max: EDGE_LIMITS.largeCacheMinObject[1], unit: 'bytes' },
+  LARGE_CACHE_MAX_OBJECT_BYTES: { min: EDGE_LIMITS.largeCacheMaxObject[0], max: EDGE_LIMITS.largeCacheMaxObject[1], unit: 'bytes' },
+  LARGE_CACHE_CHUNK_BYTES: { min: EDGE_LIMITS.largeCacheChunk[0], max: EDGE_LIMITS.largeCacheChunk[1], unit: 'bytes' },
+  LARGE_CACHE_FILL_QUEUE_BYTES: { min: EDGE_LIMITS.largeCacheFillQueue[0], max: EDGE_LIMITS.largeCacheFillQueue[1], unit: 'bytes' },
+  LARGE_CACHE_FILL_QUEUE_TOTAL_BYTES: { min: EDGE_LIMITS.largeCacheFillQueueTotal[0], max: EDGE_LIMITS.largeCacheFillQueueTotal[1], unit: 'bytes' },
+  LARGE_CACHE_MIN_FREE_BYTES: { min: EDGE_LIMITS.largeCacheMinFree[0], max: EDGE_LIMITS.largeCacheMinFree[1], unit: 'bytes' },
+  ORIGIN_CONNECT_TIMEOUT_MS: { min: EDGE_LIMITS.originConnectTimeout[0], max: EDGE_LIMITS.originConnectTimeout[1], unit: 'ms' },
+  ORIGIN_READ_TIMEOUT_MS: { min: EDGE_LIMITS.originReadTimeout[0], max: EDGE_LIMITS.originReadTimeout[1], unit: 'ms' },
+  ORIGIN_STREAM_READ_TIMEOUT_MS: { min: EDGE_LIMITS.originStreamReadTimeout[0], max: EDGE_LIMITS.originStreamReadTimeout[1], unit: 'ms' },
+  RANGE_FILL_MAX_BYTES: { min: EDGE_LIMITS.rangeFillMax[0], max: EDGE_LIMITS.rangeFillMax[1], unit: 'bytes' },
+  ACCESS_LOG_BUFFER: { min: EDGE_LIMITS.accessLogBuffer[0], max: EDGE_LIMITS.accessLogBuffer[1], unit: 'count' },
+  CACHE_FLIGHT_TIMEOUT_MS: { min: EDGE_LIMITS.cacheFlightTimeout[0], max: EDGE_LIMITS.cacheFlightTimeout[1], unit: 'ms' },
+  CC_REDIS_TIMEOUT_MS: { min: EDGE_LIMITS.ccRedisTimeout[0], max: EDGE_LIMITS.ccRedisTimeout[1], unit: 'ms' },
+}
+
+/** `LARGE_CACHE_ENABLED` is a boolean toggle handled specially by the wizard. */
+export function isItemEditable(key: string): boolean {
+  return key === 'LARGE_CACHE_ENABLED' || key in ITEM_EDIT_RULES
+}
+
+const BYTE_UNITS: Record<string, number> = {
+  '': 1,
+  b: 1,
+  k: KiB,
+  kb: KiB,
+  kib: KiB,
+  m: MiB,
+  mb: MiB,
+  mib: MiB,
+  g: GiB,
+  gb: GiB,
+  gib: GiB,
+  t: 1024 * GiB,
+  tb: 1024 * GiB,
+  tib: 1024 * GiB,
+}
+
+/** Parse `1048576`, `1M`, `4MiB`, `1.5G` into a byte count. */
+function parseByteInput(value: string): number | null {
+  const match = /^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$/.exec(value.trim())
+  if (!match) return null
+  const multiplier = BYTE_UNITS[match[2].toLowerCase()]
+  if (multiplier === undefined) return null
+  const bytes = Math.round(Number(match[1]) * multiplier)
+  return Number.isSafeInteger(bytes) ? bytes : null
+}
+
+/** Compact, exact-enough value for the edit box (1M, 4M, 1G, or raw bytes). */
+export function formatItemInput(key: string, value: string): string {
+  const rule = ITEM_EDIT_RULES[key]
+  if (!rule || rule.unit !== 'bytes') return value
+  const bytes = Number(value)
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) return value
+  if (bytes % GiB === 0) return `${bytes / GiB}G`
+  if (bytes % MiB === 0) return `${bytes / MiB}M`
+  if (bytes % KiB === 0) return `${bytes / KiB}K`
+  return value
+}
+
+/** Normalize a raw table edit; returns `null` when the value is not valid. */
+export function normalizeItemValue(key: string, raw: string): string | null {
+  const value = String(raw).trim()
+  if (key === 'LARGE_CACHE_ENABLED') {
+    const lowered = value.toLowerCase()
+    if (lowered === 'true' || lowered === '1') return 'true'
+    if (lowered === 'false' || lowered === '0') return 'false'
+    return null
+  }
+  const rule = ITEM_EDIT_RULES[key]
+  if (!rule) return null
+  if (rule.unit === 'bytes') {
+    const bytes = parseByteInput(value)
+    if (bytes === null || bytes < rule.min || bytes > rule.max) return null
+    return String(bytes)
+  }
+  if (!/^\d+$/.test(value)) return null
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed < rule.min || parsed > rule.max) return null
+  return String(parsed)
+}
+
+/** Human-readable validation text for an editable item. */
+export function itemRuleHint(key: string): string {
+  if (key === 'LARGE_CACHE_ENABLED') return '请输入 true 或 false'
+  const rule = ITEM_EDIT_RULES[key]
+  if (!rule) return '该参数不可手工修改'
+  if (rule.unit === 'bytes') {
+    return `请输入 ${humanBytes(rule.min)} – ${humanBytes(rule.max)}；支持 1M / 4M / 1G 等写法`
+  }
+  if (rule.unit === 'ms') return `请输入 ${rule.min}–${rule.max} 之间的整数（毫秒）`
+  return `请输入 ${rule.min}–${rule.max} 之间的整数`
+}
+
 /** One-line hardware summary used in the page header and in the env file. */
 export function summarizeHardware(hw: EdgeHardware): string {
   const role = hw.role === 'shield' ? `${NODE_ROLE_LABEL.shield} / ` : ''
@@ -263,6 +396,13 @@ export interface EdgeInfraProfile {
 export interface EdgeProfile {
   hardware: EdgeHardware
   infra: EdgeInfraProfile
+  /** Capacity-table overrides; absent for profiles written before this field. */
+  sizing?: EdgeSizingOverrides
+  /**
+   * Rendered edge.env stored so the node token can fetch it through
+   * `GET /api/v1/edge/config`. Empty for nodes not created by the wizard.
+   */
+  env?: string
 }
 
 export const EDGE_PROFILE_DEFAULTS: EdgeProfile = {
@@ -305,9 +445,12 @@ function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback
 export function serializeEdgeProfile(profile: EdgeProfile): string {
   return JSON.stringify({
     // Bumped when fields were added; `parseEdgeProfile` accepts older shapes.
-    version: 2,
+    version: 3,
     hardware: profile.hardware,
     infra: profile.infra,
+    sizing: profile.sizing ?? {},
+    // The rendered file is stored verbatim so the edge can fetch it by token.
+    env: profile.env || undefined,
   })
 }
 
@@ -336,6 +479,24 @@ export function parseEdgeProfile(raw: unknown): EdgeProfile | null {
   const hardware = parsed.hardware ?? {}
   const infra = parsed.infra ?? {}
   const fallback = EDGE_PROFILE_DEFAULTS
+
+  const sizing = parsed.sizing ?? {}
+  const itemValues: Record<string, string> = {}
+  if (sizing.itemValues && typeof sizing.itemValues === 'object' && !Array.isArray(sizing.itemValues)) {
+    for (const [key, value] of Object.entries(sizing.itemValues)) {
+      // `LARGE_CACHE_ENABLED` is represented by `largeCacheGiB`; accepting it
+      // here would enable a tier without its dependent rows.
+      if (key === 'LARGE_CACHE_ENABLED' || typeof value !== 'string') continue
+      const normalized = normalizeItemValue(key, value)
+      if (normalized !== null) itemValues[key] = normalized
+    }
+  }
+  const largeCacheGiB =
+    typeof sizing.largeCacheGiB === 'number' &&
+    Number.isFinite(sizing.largeCacheGiB) &&
+    sizing.largeCacheGiB >= 0
+      ? Math.round(sizing.largeCacheGiB)
+      : undefined
 
   return {
     hardware: {
@@ -379,6 +540,11 @@ export function parseEdgeProfile(raw: unknown): EdgeProfile | null {
       wafRulepackSecret:
         typeof infra.wafRulepackSecret === 'string' ? infra.wafRulepackSecret.trim() : '',
     },
+    sizing: {
+      itemValues,
+      ...(largeCacheGiB !== undefined ? { largeCacheGiB } : {}),
+    },
+    env: typeof parsed.env === 'string' ? parsed.env : '',
   }
 }
 
@@ -950,6 +1116,33 @@ export function recommendEdgeConfig(
     )
   }
 
+  // ------------------------------------------------- per-item overrides
+  // The capacity table lets the operator edit a value in place. Apply those
+  // edits before warnings/metrics so the summary matches the rendered file.
+  const itemValues = overrides.itemValues ?? {}
+  for (const [key, raw] of Object.entries(itemValues)) {
+    if (key === 'LARGE_CACHE_ENABLED') continue
+    const item = items.find((candidate) => candidate.key === key)
+    if (!item) continue
+    const normalized = normalizeItemValue(key, raw)
+    if (normalized === null) continue
+    item.value = normalized
+    item.overridden = true
+    const shown = /_BYTES$/.test(key)
+      ? `${normalized}（${humanBytes(Number(normalized))}）`
+      : normalized
+    item.reason = `手工指定为 ${shown}；请确认与硬件和其他参数匹配`
+  }
+
+  const finalItemValue = (key: string, fallbackValue: string) =>
+    items.find((candidate) => candidate.key === key)?.value ?? fallbackValue
+  const finalItemNumber = (key: string, fallbackValue: number) => {
+    const parsed = Number(items.find((candidate) => candidate.key === key)?.value)
+    return Number.isFinite(parsed) ? parsed : fallbackValue
+  }
+  const finalLargeCacheEnabled =
+    finalItemValue('LARGE_CACHE_ENABLED', largeCacheEnabled ? 'true' : 'false') === 'true'
+
   // ------------------------------------------------------------ warnings
   const warnings: string[] = []
   if (memoryGb < 2) {
@@ -997,25 +1190,43 @@ export function recommendEdgeConfig(
       'CACHE_BACKEND=redis 仍会使用 CACHE_REDIS_URL（留空则 REDIS_URL）跨节点共享 L2 缓存与合并锁。',
     )
   }
-  if (largeCacheEnabled && maxObjectBytes < minObjectBytes) {
-    warnings.push('大缓存对象上限小于最小对象阈值：大缓存不会生效，请调大磁盘或降低门槛。')
+  if (finalLargeCacheEnabled) {
+    const finalMinObject = finalItemNumber('LARGE_CACHE_MIN_OBJECT_BYTES', minObjectBytes)
+    const finalMaxObject = finalItemNumber('LARGE_CACHE_MAX_OBJECT_BYTES', maxObjectBytes)
+    const finalMaxBody = finalItemNumber('MAX_CACHEABLE_BODY', maxCacheableBody)
+    const finalMaxBytes = finalItemNumber('LARGE_CACHE_MAX_BYTES', largeCacheBytes)
+    if (finalMaxBody >= finalMinObject) {
+      warnings.push(
+        'MAX_CACHEABLE_BODY 应比 LARGE_CACHE_MIN_OBJECT_BYTES 小 1 字节，否则两层缓存会重叠或出现不缓存空洞；请调整这两个手工值。',
+      )
+    }
+    if (finalMaxObject < finalMinObject) {
+      warnings.push('大缓存对象上限小于最小对象阈值：大缓存不会生效，请调大磁盘或降低门槛。')
+    }
+    if (finalMaxBytes <= 0) {
+      warnings.push('LARGE_CACHE_MAX_BYTES 为 0：大对象缓存不会写入任何对象。')
+    }
   }
 
   return {
     items,
     warnings,
     metrics: {
-      workerThreads,
-      memoryCacheBytes,
-      cacheCapacity,
-      cacheBackend,
+      workerThreads: finalItemNumber('EDGE_WORKER_THREADS', workerThreads),
+      memoryCacheBytes: finalItemNumber('CACHE_MAX_BYTES', memoryCacheBytes),
+      cacheCapacity: finalItemNumber('CACHE_CAPACITY', cacheCapacity),
+      cacheBackend: finalItemValue('CACHE_BACKEND', cacheBackend),
       requestedCacheBackend,
       backendDowngraded,
-      diskCacheBytes,
-      largeCacheEnabled,
-      largeCacheBytes,
-      chunkBytes: largeCacheEnabled ? chunkBytes : 0,
-      maxCacheableBody,
+      diskCacheBytes: finalItemNumber('DISK_CACHE_MAX_BYTES', diskCacheBytes),
+      largeCacheEnabled: finalLargeCacheEnabled,
+      largeCacheBytes: finalLargeCacheEnabled
+        ? finalItemNumber('LARGE_CACHE_MAX_BYTES', largeCacheBytes)
+        : 0,
+      chunkBytes: finalLargeCacheEnabled
+        ? finalItemNumber('LARGE_CACHE_CHUNK_BYTES', chunkBytes)
+        : 0,
+      maxCacheableBody: finalItemNumber('MAX_CACHEABLE_BODY', maxCacheableBody),
     },
   }
 }
@@ -1051,13 +1262,7 @@ export interface EdgeEnvInput {
   generatedAt?: Date
 }
 
-const GROUP_TITLE: Record<SizingGroup, string> = {
-  runtime: '进程与连接',
-  'memory-cache': '内存与普通缓存',
-  'large-cache': '大对象缓存',
-  origin: '回源',
-  logging: '日志',
-}
+const GROUP_TITLE = SIZING_GROUP_LABEL
 
 const GROUP_ORDER: SizingGroup[] = ['runtime', 'memory-cache', 'large-cache', 'origin', 'logging']
 

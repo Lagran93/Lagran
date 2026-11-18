@@ -4,13 +4,15 @@
       <div>
         <div class="page-title">新增 Edge 节点</div>
         <div class="page-desc">
-          按节点硬件与业务类型推导容量参数，生成可直接落地的 edge.env；节点注册与控制台预注册一步完成
+          按节点硬件与业务画像推导容量参数，自动生成 edge.env；注册、安装与上线验证在同一个向导里完成
         </div>
       </div>
-      <NuxtLink to="/nodes" class="btn btn-default">
-        <AppIcon name="chevron-left" :size="15" />
-        返回节点列表
-      </NuxtLink>
+      <div class="page-actions">
+        <NuxtLink to="/nodes" class="btn btn-default">
+          <AppIcon name="chevron-left" :size="15" />
+          返回节点列表
+        </NuxtLink>
+      </div>
     </div>
 
     <div v-if="!auth.isAdmin" class="alert alert-warning">
@@ -19,31 +21,62 @@
     </div>
 
     <template v-else>
-      <div class="wizard-steps">
-        <div v-for="(s, i) in steps" :key="s" class="wizard-step" :class="{ active: step === i, done: step > i }">
-          <span class="wizard-index">{{ step > i ? '✓' : i + 1 }}</span>
-          <span>{{ s }}</span>
+      <div class="wizard-progress">
+        <div class="wizard-progress-head">
+          <div>
+            <div class="wizard-progress-kicker">接入流程</div>
+            <div class="wizard-progress-title">{{ steps[step] }}</div>
+          </div>
+          <div class="wizard-progress-meta">
+            <span class="wizard-progress-summary">
+              {{ form.name || '未命名节点' }} · {{ hw.cpuCores }}C / {{ hw.memoryGb }}G ·
+              {{ plan.metrics.cacheBackend }}
+            </span>
+            <span class="wizard-progress-count">{{ step + 1 }}<span>/{{ steps.length }}</span></span>
+          </div>
+        </div>
+        <div class="wizard-progress-track">
+          <span :style="{ width: `${progressPercent}%` }" />
+        </div>
+        <div class="wizard-steps-top">
+          <div
+            v-for="(s, i) in steps"
+            :key="s"
+            class="top-step"
+            :class="{ active: step === i, done: step > i }"
+          >
+            <span class="top-step-index">{{ step > i ? '✓' : i + 1 }}</span>
+            <span class="top-step-text">
+              <span class="top-step-title">{{ s }}</span>
+              <span class="top-step-hint">{{ STEP_HINTS[i] }}</span>
+            </span>
+          </div>
         </div>
       </div>
 
-      <div v-if="nodeLocked" class="alert alert-info">
-        <AppIcon name="info" :size="16" class="icon" />
-        <span>
-          节点 <b>{{ created?.node?.name }}</b> 已在控制台注册，身份（名称 / 区域 / 公网 IP）已锁定；
-          硬件与网络参数仍可调整，保存后只会重新生成 edge.env，不会重复注册。需要改名请删除该节点后重新接入。
-        </span>
-      </div>
+      <section class="wizard-main">
+          <div v-if="nodeLocked" class="alert alert-info">
+            <AppIcon name="info" :size="16" class="icon" />
+            <span>
+              节点 <b>{{ created?.node?.name }}</b> 已在控制台注册，身份（名称 / 区域 / 公网 IP）已锁定；
+              硬件与网络参数仍可调整，保存后只会重新生成 edge.env，不会重复注册。需要改名请删除该节点后重新接入。
+            </span>
+          </div>
 
-      <div v-if="reusedFrom.length" class="alert alert-info">
-        <AppIcon name="info" :size="16" class="icon" />
-        <span>
-          已从节点 <b>{{ reusedFrom.join('、') }}</b> 复用共享 Redis / CHALLENGE_SECRET / WAF_RULEPACK_SECRET，
-          避免多节点配置不一致。请确认新节点与它在同一区域网络，并按需覆盖。
-        </span>
-      </div>
+          <div v-if="reusedFrom.length" class="alert alert-info">
+            <AppIcon name="info" :size="16" class="icon" />
+            <span>
+              已从节点 <b>{{ reusedFrom.join('、') }}</b> 复用共享 Redis / CHALLENGE_SECRET / WAF_RULEPACK_SECRET，
+              避免多节点配置不一致。请确认新节点与它在同一区域网络，并按需覆盖。
+            </span>
+          </div>
 
-      <div class="card">
-        <div class="card-body">
+          <div class="card wizard-card">
+            <div class="card-body wizard-body">
+              <div class="step-eyebrow">
+                <span class="step-eyebrow-index">STEP {{ stepLabel }}</span>
+                <span class="step-eyebrow-label">{{ steps[step] }}</span>
+              </div>
           <!-- 步骤 1：节点身份 -->
           <div v-if="step === 0" class="form-col">
             <div class="wizard-hero">
@@ -57,6 +90,10 @@
                   部署方式决定管理面监听和控制面回调地址，二者由向导自动保持一致。
                 </div>
               </div>
+            </div>
+            <div class="section-head">
+              <span class="section-title">基础信息</span>
+              <span class="section-sub">名称、区域与公网地址</span>
             </div>
             <div class="form-grid">
               <div class="field span-2">
@@ -89,6 +126,10 @@
               </div>
             </div>
 
+            <div class="section-head">
+              <span class="section-title">回调地址</span>
+              <span class="section-sub">由部署方式自动推导，避免两处不一致</span>
+            </div>
             <div class="derived-box">
               <div class="derived-title">由部署方式推导的回调地址</div>
               <div class="derived-row">
@@ -185,6 +226,10 @@
               </div>
             </div>
 
+            <div class="section-head">
+              <span class="section-title">计算与存储</span>
+              <span class="section-sub">用于推导线程、缓存与分片</span>
+            </div>
             <div class="form-grid">
               <div class="field">
                 <label class="field-label">CPU 核数 <span class="req">*</span></label>
@@ -228,6 +273,10 @@
               </div>
             </div>
 
+            <div class="section-head">
+              <span class="section-title">角色与网络</span>
+              <span class="section-sub">角色决定回源方式与缓存策略</span>
+            </div>
             <div class="form-grid">
               <div class="field span-2">
                 <label class="field-label">节点角色</label>
@@ -269,6 +318,10 @@
               </div>
             </div>
 
+            <div class="section-head">
+              <span class="section-title">高级选项</span>
+              <span class="section-sub">通常保持默认，多节点部署时再调整</span>
+            </div>
             <details class="optional-block">
               <summary>高级：缓存后端与共享 Redis（当前推导：{{ plan.metrics.cacheBackend }}）</summary>
               <div class="form-grid">
@@ -362,26 +415,42 @@
               </div>
             </div>
 
+            <div class="section-head">
+              <span class="section-title">容量摘要</span>
+              <span class="section-sub">改动参数后即时重算</span>
+            </div>
             <div class="metric-grid">
               <div class="metric-card">
-                <div class="metric-label">工作线程</div>
+                <div class="metric-head">
+                  <span class="metric-icon"><AppIcon name="zap" :size="14" /></span>
+                  <span class="metric-label">工作线程</span>
+                </div>
                 <div class="metric-value">{{ plan.metrics.workerThreads }}</div>
                 <div class="metric-sub">建议等于 CPU 核数</div>
               </div>
               <div class="metric-card">
-                <div class="metric-label">L1 内存缓存</div>
+                <div class="metric-head">
+                  <span class="metric-icon"><AppIcon name="stats" :size="14" /></span>
+                  <span class="metric-label">L1 内存缓存</span>
+                </div>
                 <div class="metric-value">{{ humanBytes(plan.metrics.memoryCacheBytes) }}</div>
                 <div class="metric-sub">约 {{ plan.metrics.cacheCapacity.toLocaleString('zh-CN') }} 个对象</div>
               </div>
               <div class="metric-card">
-                <div class="metric-label">普通磁盘缓存</div>
+                <div class="metric-head">
+                  <span class="metric-icon"><AppIcon name="logs" :size="14" /></span>
+                  <span class="metric-label">普通磁盘缓存</span>
+                </div>
                 <div class="metric-value">
                   {{ plan.metrics.diskCacheBytes > 0 ? humanBytes(plan.metrics.diskCacheBytes) : '—' }}
                 </div>
                 <div class="metric-sub">{{ plan.metrics.cacheBackend }} 后端</div>
               </div>
               <div class="metric-card">
-                <div class="metric-label">大对象缓存</div>
+                <div class="metric-head">
+                  <span class="metric-icon"><AppIcon name="activity" :size="14" /></span>
+                  <span class="metric-label">大对象缓存</span>
+                </div>
                 <div class="metric-value">
                   {{ plan.metrics.largeCacheEnabled ? humanBytes(plan.metrics.largeCacheBytes) : '已关闭' }}
                 </div>
@@ -406,45 +475,69 @@
               </div>
             </div>
 
-            <div class="override-block">
-              <div class="override-title">手工微调（留空则使用推荐值）</div>
-              <div class="override-grid">
-                <label class="override-field">
-                  <span>工作线程</span>
-                  <input v-model.number="overrides.workerThreads" class="input" type="number" min="1" max="256"
-                    :placeholder="String(plan.metrics.workerThreads)" />
-                </label>
-                <label class="override-field">
-                  <span>内存缓存（MiB）</span>
-                  <input v-model.number="overrides.memoryCacheMiB" class="input" type="number" min="16"
-                    :placeholder="String(Math.round(plan.metrics.memoryCacheBytes / 1048576))" />
-                </label>
-                <label class="override-field">
-                  <span>大对象缓存（GiB，0 = 关闭）</span>
-                  <input v-model.number="overrides.largeCacheGiB" class="input" type="number" min="0"
-                    :placeholder="String(Math.round(plan.metrics.largeCacheBytes / 1073741824))" />
-                </label>
-              </div>
+            <div class="plan-toolbar">
+              <span class="plan-toolbar-meta">
+                <AppIcon name="edit" :size="14" />
+                {{ plan.items.length }} 项参数 · 双击「取值」编辑；字节类支持 1M / 4M / 1G。
+                点击外部或 Enter 确认，Esc 取消。
+              </span>
+              <button
+                class="btn btn-text btn-sm"
+                type="button"
+                :disabled="!hasOverrides"
+                @click="resetOverrides"
+              >
+                <AppIcon name="refresh" :size="14" />
+                恢复推荐值
+              </button>
             </div>
 
-            <div class="table-wrap">
+            <div class="table-wrap plan-table-wrap">
               <table class="table plan-table">
                 <thead>
                   <tr>
                     <th style="min-width: 210px">参数</th>
-                    <th style="min-width: 130px">取值</th>
+                    <th style="min-width: 150px">取值</th>
                     <th style="min-width: 260px">推导依据</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="item in plan.items" :key="item.key">
-                    <td>
-                      <span class="mono plan-key">{{ item.key }}</span>
-                      <span v-if="item.overridden" class="tag-manual">手工</span>
-                    </td>
-                    <td class="mono plan-value">{{ displayValue(item) }}</td>
-                    <td class="text-2 plan-reason">{{ item.reason }}</td>
-                  </tr>
+                  <template v-for="group in planGroups" :key="group.key">
+                    <tr class="plan-group-row">
+                      <td colspan="3">{{ group.label }}</td>
+                    </tr>
+                    <tr v-for="item in group.items" :key="item.key">
+                      <td>
+                        <span class="mono plan-key">{{ item.key }}</span>
+                        <span v-if="item.overridden" class="tag-manual">手工</span>
+                      </td>
+                      <td
+                        class="mono plan-value plan-value-cell"
+                        :class="{ 'plan-editable': canEditItem(item.key) }"
+                        :title="canEditItem(item.key) ? '双击编辑' : ''"
+                        @dblclick="startEdit(item)"
+                      >
+                        <span
+                          class="plan-value-text"
+                          :class="{ 'is-editing': editingKey === item.key }"
+                        >
+                          {{ displayValue(item) }}
+                        </span>
+                        <input
+                          v-if="editingKey === item.key"
+                          :ref="setEditInput"
+                          v-model="editingValue"
+                          class="input mono plan-edit-input"
+                          :class="{ 'is-invalid': editError }"
+                          :title="editError || '双击编辑'"
+                          @keyup.enter="commitEdit(item)"
+                          @keyup.esc="cancelEdit"
+                          @blur="commitEdit(item)"
+                        />
+                      </td>
+                      <td class="text-2 plan-reason">{{ item.reason }}</td>
+                    </tr>
+                  </template>
                 </tbody>
               </table>
             </div>
@@ -462,6 +555,16 @@
                 <div class="wizard-title">把配置和安装命令带到节点上</div>
                 <div class="wizard-desc">
                   令牌只在注册时展示一次；edge.env 已按 {{ hardwareSummary }} 生成完毕。
+                </div>
+              </div>
+            </div>
+
+            <div class="result-banner">
+              <span class="result-check"><AppIcon name="check" :size="18" /></span>
+              <div>
+                <div class="result-title">节点已注册，配置已同步</div>
+                <div class="result-desc">
+                  {{ created?.node?.name }} · {{ created?.node?.id?.slice(0, 8) }}
                 </div>
               </div>
             </div>
@@ -495,6 +598,10 @@
               </div>
             </div>
 
+            <div class="section-head">
+              <span class="section-title">节点凭证</span>
+              <span class="section-sub">只展示一次，请先保存</span>
+            </div>
             <div class="field">
               <div class="field-label">节点令牌</div>
               <div class="copy-row">
@@ -511,95 +618,29 @@
               </div>
             </div>
 
+            <div class="section-head">
+              <span class="section-title">一键安装</span>
+              <span class="section-sub">拉取配置、安装服务并重启</span>
+            </div>
             <div class="field">
-              <div class="field-label">一键安装脚本（写入 edge.env、安装并重启）</div>
+              <div class="field-label">一键安装命令（拉取配置 + 安装 + 重启）</div>
               <div class="command-box">
                 <pre class="mono">{{ oneClickInstallScript }}</pre>
                 <button class="btn btn-default btn-sm copy-float" type="button"
-                  @click="copy(oneClickInstallScript, '一键安装脚本')">
+                  @click="copy(oneClickInstallScript, '一键安装命令')">
                   <AppIcon name="copy" :size="14" />
                   复制
                 </button>
               </div>
-              <span class="field-hint">
-                脚本包含节点令牌，请通过安全通道粘贴到节点上的 root shell 执行，不要提交到仓库或工单系统。
-                它会在安装前写入本页的 edge.env，因此不会再被安装器的默认配置覆盖。
-              </span>
-            </div>
-
-            <details class="optional-block">
-              <summary>只执行安装器（适合已手动放好 edge.env）</summary>
-              <div class="command-box sub">
-                <pre class="mono">{{ installCommand }}</pre>
-                <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(installCommand, '安装命令')">
-                  <AppIcon name="copy" :size="14" />
-                  复制
-                </button>
-              </div>
-              <span class="field-hint">
-                安装器需要 root，命令用 sudo env 传递 AGENT_TOKEN / NODE_ID；节点上必须先存在本页的 edge.env。
-              </span>
-            </details>
-
-            <div class="field">
-              <div class="field-label">edge.env（按当前硬件与角色生成）</div>
-              <!-- <div class="command-box">
-                <pre class="mono">{{ envText }}</pre>
-                <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(envText, 'edge.env')">
-                  <AppIcon name="copy" :size="14" />
-                  复制
-                </button>
-              </div> -->
-            </div>
-
-            <div class="flex-between">
-              <span class="text-muted" style="font-size: 12px">
-                {{ envText.split('\n').length }} 行 · 含硬件推导注释 · 权限 600
-              </span>
-              <button class="btn btn-default btn-sm" type="button" @click="downloadEnv">
-                下载 edge.env
-              </button>
-            </div>
-
-            <div class="field">
-              <div class="field-label">手动落位与重启（不用一键脚本时）</div>
-              <div class="command-box sub">
-                <pre class="mono">{{ installSteps }}</pre>
-                <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(installSteps, '安装命令')">
-                  <AppIcon name="copy" :size="14" />
-                  复制
-                </button>
-              </div>
-            </div>
-
-            <details class="optional-block">
-              <summary>先做一次配置校验（不监听端口）</summary>
-              <div class="command-box sub">
-                <pre class="mono">{{ checkSteps }}</pre>
-                <button class="btn btn-default btn-sm copy-float" type="button" @click="copy(checkSteps, '校验命令')">
-                  <AppIcon name="copy" :size="14" />
-                  复制
-                </button>
-              </div>
-            </details>
-
-            <div class="tips">
-              <div class="tip-row">
-                <span class="tip-index">1</span>
-                <span>
-                  把 edge.env 与 lagran-edge 二进制一起上传到节点，配置放到 /etc/lagran/edge.env；
-                  若尚未安装二进制，可先执行 install.sh edge（已存在 edge.env 时不会覆盖）。
+              <div class="flex-between">
+                <span class="field-hint" style="max-width: 70%">
+                  命令会用节点令牌从控制面的 <span class="mono">/api/v1/edge/config</span> 拉取本节点配置到
+                  <span class="mono">/etc/lagran/edge.env</span>，再执行 install.sh edge 并重启。
+                  节点必须能访问 {{ controlUrl || '控制面地址' }}；令牌等同密码，请通过安全通道执行。
                 </span>
-              </div>
-              <div class="tip-row">
-                <span class="tip-index">2</span>
-                <span>确认节点能访问控制面 {{ controlUrl || '（控制面地址）' }}，且 EDGE_LISTEN 端口对访客开放。</span>
-              </div>
-              <div class="tip-row">
-                <span class="tip-index">3</span>
-                <span>
-                  确认控制面能访问管理面 {{ effectiveAdminHostPort }}；跨机部署请在防火墙只放行控制面来源。
-                </span>
+                <button class="btn btn-default btn-sm" type="button" @click="downloadEnv">
+                  下载 edge.env
+                </button>
               </div>
             </div>
 
@@ -608,6 +649,14 @@
               <span>
                 控制面地址是回环地址 {{ controlUrl }}：如果 Edge 不在控制面同机，心跳会失败。
                 请在控制面设置 CONTROL_PUBLIC_URL 后重新打开向导。
+              </span>
+            </div>
+
+            <div v-if="controlUrlIsInsecure" class="alert alert-warning">
+              <AppIcon name="alert" :size="16" class="icon" />
+              <span>
+                控制面地址使用 HTTP：节点令牌和配置文件会以明文经过网络。
+                生产环境请为 {{ controlUrl }} 配置 HTTPS（或通过内网/TLS 反向代理）后再执行安装命令。
               </span>
             </div>
 
@@ -630,6 +679,7 @@
 
             <div class="status-panel" :class="liveTone">
               <div class="status-main">
+                <span class="status-pulse" :class="{ live: isLive }" />
                 <StatusTag :tone="liveStatusObject.tone" dot>
                   {{ liveStatusObject.label }}
                 </StatusTag>
@@ -640,6 +690,11 @@
                 <span v-if="liveNode?.version">版本 {{ liveNode.version }}</span>
                 <span v-if="liveNode?.last_heartbeat">最后心跳 {{ fromNow(liveNode.last_heartbeat) }}</span>
                 <span v-else>尚未收到心跳</span>
+              </div>
+              <div class="live-steps">
+                <span class="live-step done">注册</span>
+                <span class="live-step" :class="{ done: Boolean(liveNode) }">启动</span>
+                <span class="live-step" :class="{ done: isLive }">在线</span>
               </div>
             </div>
 
@@ -718,6 +773,7 @@
           </template>
         </div>
       </div>
+      </section>
     </template>
   </div>
 </template>
@@ -726,17 +782,20 @@ import {
   CACHE_BACKEND_LABEL,
   DEPLOYMENT_DESC,
   DEPLOYMENT_LABEL,
-  EDGE_ENV_CHECK_STEPS,
-  EDGE_ENV_INSTALL_STEPS,
   EDGE_PROFILE_DEFAULTS,
   NODE_ROLE_DESC,
   NODE_ROLE_LABEL,
+  SIZING_GROUP_LABEL,
+  formatItemInput,
   generateSecret,
   hostForUrl,
   humanBytes,
   isValidHttpUrl,
   isValidListen,
   isValidSocketAddr,
+  isItemEditable,
+  itemRuleHint,
+  normalizeItemValue,
   parseEdgeProfile,
   recommendEdgeConfig,
   renderEdgeEnvFile,
@@ -749,7 +808,9 @@ import {
   type EdgeDiskType,
   type EdgeHardware,
   type EdgeNodeRole,
+  type EdgeSizingItem,
   type EdgeSizingOverrides,
+  type SizingGroup,
   type EdgeWorkload,
 } from '~/utils/edgeSizing'
 import { copyText } from '~/utils/clipboard'
@@ -762,6 +823,14 @@ const { ask } = useConfirm()
 
 const steps = ['节点身份', '硬件画像', '容量规划', '生成配置', '上线验证']
 
+const STEP_HINTS = [
+  '命名、区域与回调地址',
+  'CPU / 内存 / 磁盘与角色',
+  '按硬件推导容量参数',
+  '节点令牌与一键安装',
+  '等待首次心跳',
+]
+
 interface CreatedNode {
   node: any
   token: string
@@ -772,6 +841,8 @@ interface CreatedNode {
 }
 
 const step = ref(0)
+const stepLabel = computed(() => String(step.value + 1).padStart(2, '0'))
+const progressPercent = computed(() => Math.round(((step.value + 1) / steps.length) * 100))
 const stepError = ref('')
 const creating = ref(false)
 const created = ref<CreatedNode | null>(null)
@@ -793,11 +864,12 @@ const hw = ref<EdgeHardware>({ ...EDGE_PROFILE_DEFAULTS.hardware })
 
 const infra = ref({ ...EDGE_PROFILE_DEFAULTS.infra })
 
-// `undefined` means "use the recommendation"; the inputs bind to these so an
-// empty box never silently becomes 0.
+const GIB = 1024 * 1024 * 1024
+
+// `largeCacheGiB` is still used internally by the table's large-cache toggle;
+// numeric table edits live in `itemValues`.
 const overrides = ref<EdgeSizingOverrides>({
-  workerThreads: undefined,
-  memoryCacheMiB: undefined,
+  itemValues: {},
   largeCacheGiB: undefined,
 })
 
@@ -811,10 +883,103 @@ function optionalNumber(value: unknown): number | undefined {
 }
 
 const cleanOverrides = computed<EdgeSizingOverrides>(() => ({
-  workerThreads: optionalNumber(overrides.value.workerThreads),
-  memoryCacheMiB: optionalNumber(overrides.value.memoryCacheMiB),
+  itemValues: { ...(overrides.value.itemValues ?? {}) },
   largeCacheGiB: optionalNumber(overrides.value.largeCacheGiB),
 }))
+
+const editingKey = ref('')
+const editingValue = ref('')
+const editError = ref('')
+const editInput = ref<HTMLInputElement | null>(null)
+
+function setEditInput(el: unknown) {
+  editInput.value = (el as HTMLInputElement) || null
+}
+
+function canEditItem(key: string): boolean {
+  return isItemEditable(key)
+}
+
+function startEdit(item: EdgeSizingItem) {
+  if (!isItemEditable(item.key)) return
+  editingKey.value = item.key
+  editingValue.value = formatItemInput(item.key, item.value)
+  editError.value = ''
+  const pageX = window.scrollX
+  const pageY = window.scrollY
+  nextTick(() => {
+    const input = editInput.value
+    if (!input) return
+    const wrap = input.closest('.plan-table-wrap') as HTMLElement | null
+    const wrapLeft = wrap?.scrollLeft ?? 0
+    const wrapTop = wrap?.scrollTop ?? 0
+    // preventScroll keeps the table/page from jumping when the input mounts;
+    // the value is selected without select()'s implicit scroll. The explicit
+    // restore is a fallback for webviews that ignore preventScroll.
+    input.focus({ preventScroll: true })
+    input.setSelectionRange(0, input.value.length)
+    window.scrollTo(pageX, pageY)
+    if (wrap) {
+      wrap.scrollLeft = wrapLeft
+      wrap.scrollTop = wrapTop
+    }
+  })
+}
+
+function cancelEdit() {
+  editingKey.value = ''
+  editingValue.value = ''
+  editError.value = ''
+}
+
+/** Sensible large-cache size when the operator switches the tier on. */
+function recommendedLargeCacheGiB(): number {
+  const current = plan.value.metrics
+  if (current.largeCacheEnabled && current.largeCacheBytes > 0) {
+    return Math.max(1, Math.round(current.largeCacheBytes / GIB))
+  }
+  const usable = Math.max(0, Number(hw.value.diskGb) || 0) * 0.85
+  return Math.floor(usable * 0.8)
+}
+
+function commitEdit(item: EdgeSizingItem) {
+  if (editingKey.value !== item.key) return
+  const key = item.key
+
+  if (key === 'LARGE_CACHE_ENABLED') {
+    const normalized = normalizeItemValue(key, editingValue.value)
+    if (normalized === null) {
+      editError.value = itemRuleHint(key)
+      toast.error(editError.value)
+      return
+    }
+    if (normalized === 'true') {
+      const gb = recommendedLargeCacheGiB()
+      if (gb <= 0) {
+        editError.value = '未填写磁盘容量，无法启用大对象缓存'
+        toast.error(editError.value)
+        return
+      }
+      overrides.value.largeCacheGiB = gb
+    } else {
+      overrides.value.largeCacheGiB = 0
+    }
+    cancelEdit()
+    return
+  }
+
+  const normalized = normalizeItemValue(key, editingValue.value)
+  if (normalized === null) {
+    editError.value = itemRuleHint(key)
+    toast.error(editError.value)
+    return
+  }
+  overrides.value.itemValues = {
+    ...(overrides.value.itemValues ?? {}),
+    [key]: normalized,
+  }
+  cancelEdit()
+}
 
 /** Parse an http(s) URL into host/port without throwing. */
 function parseHttpUrl(value: string): { host: string; port: string } | null {
@@ -863,6 +1028,12 @@ const controlUrl = computed(() => created.value?.control_url || fallbackControlU
 const controlUrlLooksLoopback = computed(() => {
   const host = parseHttpUrl(controlUrl.value)?.host
   return Boolean(host && isLoopbackAddress(host))
+})
+
+const controlUrlIsInsecure = computed(() => {
+  const raw = controlUrl.value.trim()
+  const host = parseHttpUrl(raw)?.host
+  return /^http:\/\//i.test(raw) && Boolean(host && !isLoopbackAddress(host))
 })
 
 function applyDeployment() {
@@ -1000,6 +1171,29 @@ const plan = computed(() =>
 )
 const hardwareSummary = computed(() => summarizeHardware(hw.value))
 
+const planGroups = computed(() => {
+  const groups: { key: SizingGroup; label: string; items: EdgeSizingItem[] }[] = []
+  for (const item of plan.value.items) {
+    let group = groups.find((entry) => entry.key === item.group)
+    if (!group) {
+      group = { key: item.group, label: SIZING_GROUP_LABEL[item.group], items: [] }
+      groups.push(group)
+    }
+    group.items.push(item)
+  }
+  return groups
+})
+
+const hasOverrides = computed(() => {
+  const values = overrides.value.itemValues ?? {}
+  return Object.keys(values).length > 0 || overrides.value.largeCacheGiB !== undefined
+})
+
+function resetOverrides() {
+  cancelEdit()
+  overrides.value = { itemValues: {}, largeCacheGiB: undefined }
+}
+
 const envText = computed(() => {
   if (!created.value) return ''
   return renderEdgeEnvFile({
@@ -1030,48 +1224,44 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`
 }
 
-/**
- * The installer requires root. `sudo env VAR=... bash` is deliberate: passing
- * the variables to `env` after sudo survives sudo's default env_reset, while
- * `sudo bash` alone would drop AGENT_TOKEN/NODE_ID.
- */
-const installCommand = computed(() => {
-  const token = created.value?.token || ''
+/** Control-plane endpoint the node uses to fetch its rendered edge.env. */
+const edgeConfigUrl = computed(() => {
+  const base = controlUrl.value.trim().replace(/\/+$/, '')
   const name = form.value.name.trim()
-  if (!token || !name) return ''
-  return (
-    `curl -fsSL https://raw.githubusercontent.com/${INSTALL_REPO}/main/install.sh ` +
-    `| sudo env LAGRAN_REPO=${INSTALL_REPO} AGENT_TOKEN=${shellQuote(token)} ` +
-    `NODE_ID=${shellQuote(name)} bash -s -- edge`
-  )
+  if (!base || !name) return ''
+  return `${base}/api/v1/edge/config?edge=${encodeURIComponent(name)}`
 })
 
 /**
- * One copy-paste block for a fresh node.
+ * The edge.env is already on disk when this runs, so `install.sh edge` keeps
+ * it and never reaches the branch that needs AGENT_TOKEN/NODE_ID. The node
+ * token therefore appears only once, in the config-fetch header.
+ */
+const installCommand = computed(
+  () =>
+    `curl -fsSL https://raw.githubusercontent.com/${INSTALL_REPO}/main/install.sh ` +
+    `| sudo env LAGRAN_REPO=${INSTALL_REPO} bash -s -- edge`,
+)
+
+/**
+ * One single-line copy-paste command for a fresh node.
  *
- * It writes the generated edge.env *before* running install.sh, because
- * `install.sh edge` keeps an existing /etc/lagran/edge.env instead of
- * overwriting it with its low-detail default. The heredoc is single-quoted so
- * the env file is written literally and no shell expansion touches secrets.
+ * The config is fetched first (so install.sh keeps it) and written as root with
+ * `umask 077`, so the token-bearing file is never briefly world-readable. The
+ * fetch is a direct curl (not a pipe), so an HTTP error stops the && chain
+ * instead of feeding an empty file to `install`.
  */
 const oneClickInstallScript = computed(() => {
-  if (!created.value || !envText.value) return ''
-  return `# 1) 写入本页生成的 edge.env（含节点令牌；安装器发现文件已存在会保留它）
-# 注意：会覆盖节点上现有的 /etc/lagran/edge.env；如需保留旧配置请先备份。
-sudo install -d -m 0750 /etc/lagran
-sudo sh -c 'umask 077; cat > /etc/lagran/edge.env' <<'LAGRAN_EDGE_ENV_EOF'
-${envText.value.trimEnd()}
-LAGRAN_EDGE_ENV_EOF
-
-# 2) 安装/更新 lagran-edge，并让新配置生效
-${installCommand.value} && sudo systemctl restart lagran-edge
-
-# 3) 可选：不监听端口的配置自检
-sudo sh -c 'set -a; . /etc/lagran/edge.env; set +a; exec /opt/lagran/bin/lagran-edge check-config'`
+  if (!created.value || !edgeConfigUrl.value) return ''
+  const authHeader = shellQuote(`X-Lagran-Agent-Token: ${created.value.token}`)
+  return (
+    'sudo install -d -m 0750 /etc/lagran' +
+    ` && sudo sh -c 'umask 077; exec curl -fsSL -H "$1" -o "$2" "$3"' _ ${authHeader} /etc/lagran/edge.env ${shellQuote(edgeConfigUrl.value)}` +
+    ' && sudo chmod 600 /etc/lagran/edge.env' +
+    ` && ${installCommand.value}` +
+    ' && sudo systemctl restart lagran-edge'
+  )
 })
-
-const installSteps = EDGE_ENV_INSTALL_STEPS
-const checkSteps = EDGE_ENV_CHECK_STEPS
 
 const healthUrl = computed(() => {
   const admin = splitListen(infra.value.adminListen)
@@ -1293,6 +1483,12 @@ function validateStep(index: number): string {
 
 async function next() {
   stepError.value = ''
+  // A blur normally commits the current cell, but an invalid value keeps the
+  // editor open; do not silently advance with the old value.
+  if (step.value === 2 && editingKey.value) {
+    stepError.value = '请先确认或取消正在编辑的参数'
+    return
+  }
   const message = validateStep(step.value)
   if (message) {
     stepError.value = message
@@ -1310,6 +1506,9 @@ async function next() {
 
 function prev() {
   stepError.value = ''
+  // Leaving the capacity step abandons an invalid in-place edit instead of
+  // leaving a stale editor behind.
+  if (step.value === 2) cancelEdit()
   step.value = Math.max(step.value - 1, 0)
 }
 
@@ -1337,14 +1536,17 @@ function currentProfile() {
       challengeSecret: infra.value.challengeSecret.trim(),
       wafRulepackSecret: infra.value.wafRulepackSecret.trim(),
     },
+    sizing: cleanOverrides.value,
+    env: envText.value,
   }
 }
 
 /** Register the node exactly once; later visits only re-sync the profile. */
 async function ensureNode(): Promise<boolean> {
   if (created.value) {
-    await syncProfile()
-    return true
+    const synced = await syncProfile()
+    if (!synced) stepError.value = '同步节点配置失败；请稍后重试“下一步”。'
+    return synced
   }
   creating.value = true
   try {
@@ -1365,7 +1567,14 @@ async function ensureNode(): Promise<boolean> {
       edge_profile: serializeEdgeProfile(currentProfile()),
     })
     created.value = res
-    toast.success('节点已注册，配置已按硬件生成')
+    // The one-click command fetches this stored file by node token. Refuse to
+    // advance if the sync failed, otherwise the API would answer 409.
+    const synced = await syncProfile()
+    if (!synced) {
+      stepError.value = '节点已注册，但配置同步到控制面失败；请重试“下一步”或重新打开向导。'
+      return false
+    }
+    toast.success('节点已注册，配置已生成并同步到控制面')
     return true
   } catch (e: any) {
     const message = friendlyErrorMessage(e?.data?.error, '注册节点失败，请稍后重试')
@@ -1384,21 +1593,24 @@ async function ensureNode(): Promise<boolean> {
  * untouched, so a node that is already serving traffic cannot be renamed or
  * re-pointed by a late "next" click.
  */
-async function syncProfile() {
+async function syncProfile(): Promise<boolean> {
   const id = created.value?.node?.id
-  if (!id) return
+  if (!id) return false
   try {
     await api.put(`/api/v1/nodes/${id}`, {
       agent_url: effectiveAgentUrl.value,
       max_bandwidth_mbps: Math.round(Number(hw.value.bandwidthMbps) || 0),
       edge_profile: serializeEdgeProfile(currentProfile()),
     })
-  } catch {
-    // Non-fatal: the local profile still renders the file the operator needs.
+    return true
+  } catch (e: any) {
+    toast.error(friendlyErrorMessage(e?.data?.error, '同步节点配置失败，请重试'))
+    return false
   }
 }
 
 async function restart() {
+  cancelEdit()
   const ok = await ask({
     title: '换一台机器重来',
     message: created.value
@@ -1417,8 +1629,7 @@ async function restart() {
   // should start from its own recommendation. Shared secrets stay: they must
   // remain identical across the fleet.
   overrides.value = {
-    workerThreads: undefined,
-    memoryCacheMiB: undefined,
+    itemValues: {},
     largeCacheGiB: undefined,
   }
   const keep = {
@@ -1544,86 +1755,323 @@ const footHint = computed(() => {
 
 <style scoped>
 /* ------------------------------------------------------------- wizard shell */
-.wizard-steps {
-  display: flex;
-  gap: 8px;
+/* ------------------------------------------------------- wizard progress */
+.wizard-progress {
+  padding: 16px 18px;
   margin-bottom: 16px;
-  flex-wrap: wrap;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow: var(--shadow-sm);
 }
 
-.wizard-step {
+.wizard-progress-head {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
-  border-radius: 20px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  font-size: 13px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.wizard-progress-kicker {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
   color: var(--text-3);
 }
 
-.wizard-step.active {
-  border-color: var(--brand);
+.wizard-progress-title {
+  margin-top: 4px;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.wizard-progress-meta {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: none;
+}
+
+.wizard-progress-summary {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.wizard-progress-count {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1;
   color: var(--brand);
-  background: var(--brand-bg);
+  font-variant-numeric: tabular-nums;
 }
 
-.wizard-step.done {
-  color: var(--success);
-  border-color: var(--success-border);
+.wizard-progress-count span {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-3);
 }
 
-.wizard-index {
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
+.wizard-progress-track {
+  height: 4px;
+  margin: 12px 0 14px;
+  border-radius: 999px;
   background: var(--bg);
+  overflow: hidden;
+}
+
+.wizard-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--brand), #52a8ff);
+  transition: width 0.25s ease;
+}
+
+.wizard-steps-top {
+  display: flex;
+  gap: 8px;
+}
+
+.top-step {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: var(--text-3);
+}
+
+.top-step.active {
+  border-color: color-mix(in srgb, var(--brand) 22%, var(--border));
+  background: var(--brand-bg);
+  color: var(--brand);
+}
+
+.top-step.done {
+  color: var(--text-2);
+}
+
+.top-step-index {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--card);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 11px;
   flex: none;
+  font-size: 11px;
+  font-weight: 600;
 }
 
+.top-step.active .top-step-index {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: #fff;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 16%, transparent);
+}
+
+.top-step.done .top-step-index {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.top-step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.top-step-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.top-step-hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
+.wizard-main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.wizard-card {
+  overflow: visible;
+}
+
+.wizard-body {
+  padding: 22px 24px 24px;
+}
+
+.step-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.step-eyebrow-index {
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: var(--brand-bg);
+  color: var(--brand);
+  font-weight: 700;
+}
+
+.step-eyebrow-label {
+  color: var(--text-3);
+}
+
+.wizard-card .form-grid {
+  gap: 16px 18px;
+}
+
+.wizard-card .field-label {
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.wizard-card .field-hint {
+  line-height: 1.55;
+}
+
+/* ------------------------------------------------------------- step */
 .wizard-hero {
   display: flex;
-  gap: 14px;
   align-items: flex-start;
-  margin-bottom: 8px;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--divider);
 }
 
 .wizard-icon {
-  width: 48px;
-  height: 48px;
+  width: 44px;
+  height: 44px;
   border-radius: 12px;
-  background: var(--brand-bg);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--brand) 18%, var(--card)),
+    var(--brand-bg)
+  );
   color: var(--brand);
   display: flex;
   align-items: center;
   justify-content: center;
   flex: none;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand) 14%, transparent);
 }
 
 .wizard-title {
-  font-size: 17px;
-  font-weight: 600;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text);
 }
 
 .wizard-desc {
-  margin-top: 4px;
+  margin-top: 5px;
+  max-width: 760px;
   font-size: 13px;
-  line-height: 1.6;
+  line-height: 1.65;
   color: var(--text-3);
 }
 
+.section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 4px 0 12px;
+}
+
+.section-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+
+.section-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+/* ----------------------------------------------------------- result */
+.result-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--success-border);
+  border-radius: var(--radius-lg);
+  background: var(--success-bg);
+}
+
+.result-check {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--success);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  box-shadow: 0 5px 12px color-mix(in srgb, var(--success) 28%, transparent);
+}
+
+.result-title {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.result-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-3);
+  word-break: break-all;
+}
+
+/* ------------------------------------------------------------- footer */
 .wizard-foot {
+  position: sticky;
+  bottom: 0;
+  z-index: 4;
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 14px 20px;
+  padding: 13px 24px;
   border-top: 1px solid var(--divider);
-  background: #fbfdff;
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  backdrop-filter: blur(10px);
 }
 
 .foot-hint {
@@ -1637,10 +2085,10 @@ const footHint = computed(() => {
 
 /* Optional groups collapse so the main path stays short. */
 .optional-block {
-  padding: 10px 12px;
+  padding: 11px 13px;
   border: 1px dashed var(--border-strong);
   border-radius: var(--radius);
-  background: transparent;
+  background: color-mix(in srgb, var(--bg) 65%, transparent);
 }
 
 .optional-block summary {
@@ -1720,27 +2168,68 @@ const footHint = computed(() => {
 }
 
 .metric-card {
-  padding: 12px;
+  position: relative;
+  padding: 13px 14px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: color-mix(in srgb, var(--brand) 3%, var(--card));
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--brand) 6%, var(--card)),
+    var(--card) 65%
+  );
+  overflow: hidden;
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.metric-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--brand);
+  opacity: 0.75;
+}
+
+.metric-card:hover {
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.07);
+  transform: translateY(-1px);
+}
+
+.metric-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.metric-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: var(--brand-bg);
+  color: var(--brand);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
 }
 
 .metric-label {
   font-size: 11px;
   color: var(--text-3);
+  letter-spacing: 0.02em;
 }
 
 .metric-value {
-  margin-top: 4px;
-  font-size: 18px;
+  margin-top: 8px;
+  font-size: 20px;
   font-weight: 600;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+  line-height: 1.2;
 }
 
 .metric-sub {
-  margin-top: 2px;
+  margin-top: 3px;
   font-size: 11px;
   color: var(--text-3);
 }
@@ -1751,35 +2240,80 @@ const footHint = computed(() => {
   gap: 4px;
 }
 
-.override-block {
-  padding: 12px;
+/* ---------------------------------------------------- capacity table */
+.plan-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg);
 }
 
-.override-title {
-  font-size: 12.5px;
-  color: var(--text-2);
-  margin-bottom: 10px;
-}
-
-.override-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.override-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 11.5px;
+.plan-toolbar-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
   color: var(--text-3);
+  min-width: 0;
+}
+
+.plan-table-wrap {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-height: 560px;
+  overflow: auto;
+  overflow-anchor: none;
+  background: var(--card);
+  scrollbar-width: thin;
+}
+
+.plan-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.plan-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--bg) 82%, var(--card));
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--text-3);
+  text-align: left;
 }
 
 .plan-table td {
+  padding: 8px 12px;
   vertical-align: top;
+  border-bottom: 1px solid var(--divider);
+}
+
+.plan-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.plan-table tbody tr:not(.plan-group-row):hover td {
+  background: color-mix(in srgb, var(--brand) 3%, transparent);
+}
+
+.plan-group-row td {
+  padding: 6px 12px;
+  background: color-mix(in srgb, var(--brand) 5%, var(--bg));
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
 .plan-key {
@@ -1790,7 +2324,48 @@ const footHint = computed(() => {
 .plan-value {
   font-size: 12px;
   color: var(--brand);
+}
+
+.plan-value-cell {
+  position: relative;
+  min-width: 130px;
+  user-select: none;
+}
+
+.plan-value-text {
+  display: inline-block;
+  max-width: 100%;
   word-break: break-all;
+}
+
+.plan-value-text.is-editing {
+  visibility: hidden;
+}
+
+.plan-editable {
+  cursor: text;
+}
+
+.plan-editable:hover {
+  background: color-mix(in srgb, var(--brand) 4%, transparent);
+}
+
+.plan-edit-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 4px;
+  background: var(--card);
+  box-shadow: inset 0 0 0 1px var(--brand);
+  user-select: text;
+}
+
+.plan-edit-input.is-invalid {
+  box-shadow: inset 0 0 0 1px var(--danger);
 }
 
 .plan-reason {
@@ -1863,7 +2438,7 @@ const footHint = computed(() => {
   flex-direction: column;
   gap: 8px;
   padding: 12px 14px;
-  background: #fafbfc;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
@@ -1928,20 +2503,114 @@ const footHint = computed(() => {
   color: var(--text-3);
 }
 
+.status-pulse {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+
+.status-pulse.live {
+  background: var(--success);
+  animation: status-pulse 1.8s ease-out infinite;
+}
+
+@keyframes status-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 45%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.live-steps {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.live-step {
+  flex: 1;
+  padding: 5px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-3);
+  font-size: 11px;
+  text-align: center;
+}
+
+.live-step.done {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+  color: var(--success);
+}
+
 .text-multi {
   min-width: 0;
 }
 
+@media (max-width: 1024px) {
+  .wizard-progress-summary {
+    display: none;
+  }
+
+  .wizard-steps-top {
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+
+  .top-step {
+    flex: 0 0 190px;
+  }
+}
+
 @media (max-width: 720px) {
+  .wizard-progress {
+    padding: 14px;
+  }
+
+  .top-step {
+    flex-basis: 160px;
+  }
+
+  .top-step-hint {
+    display: none;
+  }
+
+  .wizard-body {
+    padding: 16px;
+  }
+
+  .wizard-foot {
+    flex-wrap: wrap;
+    padding: 12px 16px;
+  }
+
+  .wizard-card .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .wizard-card .form-grid .span-2 {
+    grid-column: auto;
+  }
+
+  .section-head {
+    flex-direction: column;
+    gap: 2px;
+  }
+
   .metric-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .override-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .wizard-foot {
+  .plan-toolbar {
+    align-items: flex-start;
     flex-wrap: wrap;
   }
 }

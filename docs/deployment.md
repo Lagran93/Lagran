@@ -809,13 +809,15 @@ RUST_LOG=edge=info,tower_http=warn
    这样控制面回调地址和边缘真正监听的地址不会再各写各的。
 2. **硬件画像**：CPU / 内存 / 磁盘 / 磁盘类型 / 出口带宽 / 业务类型，以及节点角色
    （普通边缘或 Origin Shield）。Shield 会自动写入 `EDGE_SHIELD_DISABLED=true`。
-3. **容量规划**：展示每个容量参数的推导依据（L1/L2/L3 缓存、分片、回源超时等），
-   可按需覆盖工作线程、内存缓存和大缓存容量。
-4. **生成配置**：注册节点并展示节点令牌与 `edge.env`。`CONTROL_URL` 由控制面按
-   `CONTROL_PUBLIC_URL`（或请求 Host）解析，不会再误用浏览器地址。该步骤还会生成
-   一段可直接粘贴到节点 root shell 的「一键安装脚本」：先写入 `edge.env`，再执行
-   `curl ... install.sh | sudo env LAGRAN_REPO=... AGENT_TOKEN=... NODE_ID=... bash -s -- edge`，
-   最后重启服务；令牌和节点名已经替换成本节点的值。
+3. **容量规划**：展示每个容量参数的推导依据（L1/L2/L3 缓存、分片、回源超时等）。
+   双击「取值」列可直接修改数值参数或大对象缓存开关；字节类参数支持 `1M` / `4M` / `1G`
+   写法（1M = 1024×1024 字节）。点击输入框外部或按 Enter 确认，Esc 取消。修改值会随
+   节点画像保存，详情页和后续生成的配置都会沿用。
+4. **生成配置**：注册节点并展示节点令牌。`CONTROL_URL` 由控制面按
+   `CONTROL_PUBLIC_URL`（或请求 Host）解析，不会再误用浏览器地址。该步骤只保留
+   一个「一键安装命令」和「下载 edge.env」按钮：命令用节点令牌从
+   `GET /api/v1/edge/config?edge=<NODE_ID>` 拉取配置到 `/etc/lagran/edge.env`，
+   再执行 `install.sh edge` 并重启；令牌和节点名已经替换成本节点的值。
 5. **上线验证**：轮询节点状态，并给出节点侧 `check-config` / 健康检查 / journalctl 命令。
 
 向导会：
@@ -834,6 +836,31 @@ sudo systemctl restart lagran-edge
 
 > 向导只负责生成文件；`install.sh edge` 在发现 `/etc/lagran/edge.env` 已存在时不会覆盖它，
 > 因此也可以先放配置再补装二进制。
+
+#### 节点拉取自身配置
+
+向导保存节点画像时，会把渲染好的 `edge.env` 一并存入该节点的 `edge_profile`。
+节点可以用自己的令牌拉取：
+
+```bash
+curl -fsSL   -H "X-Lagran-Agent-Token: <节点令牌>"   "https://console.example.com/api/v1/edge/config?edge=<NODE_ID>"   -o /etc/lagran/edge.env
+```
+
+接口行为：
+
+| 情况 | 返回 |
+|---|---|
+| 令牌有效且 `edge` 与令牌绑定的节点一致 | `200 text/plain`，响应带 `Cache-Control: no-store` |
+| 缺少/无效令牌 | `401` |
+| `edge` 与令牌绑定的节点不一致 | `403` |
+| 节点不存在 | `404` |
+| 节点没有保存过渲染后的配置文件 | `409`（重新保存一次节点画像即可） |
+
+返回内容包含节点令牌和共享 WAF/质询密钥，必须只通过受控通道传输。控制台的节点
+列表/详情接口不再返回渲染后的 `env`，只有这个按节点令牌鉴权的接口会返回，且响应带
+`Cache-Control: no-store`；节点侧安装命令用 `umask 077` 写文件，避免配置文件短暂
+处于全局可读状态。旧节点如果没有保存过渲染配置，在控制台节点详情里点一次
+「保存画像」，或重新走一遍向导即可补齐。
 
 ### 5.3 systemd
 

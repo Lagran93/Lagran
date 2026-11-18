@@ -180,6 +180,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/nodes/:id/upgrade", post(node::upgrade))
                 .route("/nodes/heartbeat", post(node::heartbeat))
                 .route("/nodes/:id/heartbeat", post(node::heartbeat_by_path))
+                .route("/edge/config", get(node::edge_config))
                 .route("/metrics/report", post(metrics::report))
                 .route("/metrics/report/batch", post(metrics::report_batch))
                 .route("/certs", get(cert::list).post(cert::create))

