@@ -1,6 +1,7 @@
 //! Security helpers
 
 pub mod header_guard;
+pub mod loop_guard;
 pub mod origin_auth;
 pub mod signed_url;
 pub mod trusted_proxy;

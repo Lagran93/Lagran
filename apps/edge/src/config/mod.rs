@@ -3,6 +3,19 @@
 pub mod registry;
 
 use serde::Deserialize;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+/// Internal prefetch always talks to loopback, even when the public data-plane
+/// listener is bound to a specific address. The loopback listener is opened
+/// separately by the Pingora service.
+pub fn local_http_listen_addr(listen: SocketAddr) -> SocketAddr {
+    let ip = if listen.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        IpAddr::V6(Ipv6Addr::LOCALHOST)
+    };
+    SocketAddr::new(ip, listen.port())
+}
 
 fn normalize_control_url(raw: &str) -> String {
     let value = raw.trim().trim_end_matches('/');
@@ -560,5 +573,20 @@ mod tests {
         assert_eq!(EdgeConfig::load().cache_flight_timeout_ms, 250);
 
         std::env::remove_var("CACHE_FLIGHT_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn internal_prefetch_always_targets_loopback() {
+        let v4 = local_http_listen_addr("0.0.0.0:8080".parse().unwrap());
+        assert_eq!(v4, "127.0.0.1:8080".parse().unwrap());
+
+        let public_v4 = local_http_listen_addr("203.0.113.10:8080".parse().unwrap());
+        assert_eq!(public_v4, "127.0.0.1:8080".parse().unwrap());
+
+        let v6 = local_http_listen_addr("[::]:8080".parse().unwrap());
+        assert_eq!(v6, "[::1]:8080".parse().unwrap());
+
+        let public_v6 = local_http_listen_addr("[2001:db8::1]:8080".parse().unwrap());
+        assert_eq!(public_v6, "[::1]:8080".parse().unwrap());
     }
 }

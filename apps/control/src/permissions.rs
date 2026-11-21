@@ -43,6 +43,11 @@ pub fn required_for_path(method: &str, path: &str) -> Option<&'static str> {
     let module = rest.split('/').next().unwrap_or("");
     let read = method == "GET" || method == "HEAD" || method == "OPTIONS";
     let suffix = if read { "read" } else { "write" };
+    // Any authenticated console user may read the sanitized node summary; the
+    // full `/nodes` inventory remains behind `node:read` and `admin()`.
+    if rest == "nodes/public-summary" && read {
+        return None;
+    }
     let module = if rest.starts_with("domains/") && rest.contains("/waf") {
         "waf"
     } else {
@@ -122,6 +127,14 @@ mod tests {
         assert_eq!(
             required_for_path("GET", "/api/v1/config"),
             Some("config:read")
+        );
+        assert_eq!(
+            required_for_path("GET", "/api/v1/nodes/public-summary"),
+            None
+        );
+        assert_eq!(
+            required_for_path("GET", "/api/v1/nodes"),
+            Some("node:read")
         );
         assert_eq!(required_for_path("GET", "/api/v1/auth/me"), None);
         assert!(is_valid("domain:write"));

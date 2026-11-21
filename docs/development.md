@@ -531,7 +531,8 @@ bash tests/integration/cache-rules.sh
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET/POST | `/api/v1/nodes` | 列表 / 预注册 |
+| GET/POST | `/api/v1/nodes` | 管理员节点列表 / 预注册（含 agent_url、令牌状态） |
+| GET | `/api/v1/nodes/public-summary` | 任意登录用户的脱敏节点摘要（名称、区域、城市、状态、负载；无地址/令牌） |
 | GET/PUT/DELETE | `/api/v1/nodes/{id}` | 详情（含令牌与命令）/ 编辑 / 删除 |
 | POST | `/api/v1/nodes/{id}/status` | `{"enabled":false}` 停用，`true` 启用 |
 | POST | `/api/v1/nodes/heartbeat` | 边缘心跳（agent token） |

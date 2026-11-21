@@ -309,12 +309,12 @@ function totals(points: any[]) {
 }
 
 async function load() {
-  const [rt, ts, bd, nodeRows, endpoints, hs, ws, we, als, ale] = await Promise.all([
+  const [rt, ts, bd, nodeRows, nodeSummary, hs, ws, we, als, ale] = await Promise.all([
     api.get<any>('/api/v1/stats/realtime?minutes=5').catch(() => null),
     api.get<any>('/api/v1/stats/timeseries?hours=1&bucket=60&compare=true').catch(() => null),
     api.get<any[]>('/api/v1/stats/by-domain?hours=1').catch(() => []),
     api.get<any[]>('/api/v1/stats/by-node?hours=1').catch(() => []),
-    api.get<any>('/api/v1/edge-endpoints').catch(() => null),
+    api.get<any[]>('/api/v1/nodes/public-summary').catch(() => []),
     api.get<any[]>('/api/v1/origin-health').catch(() => []),
     api.get<any>('/api/v1/waf/stats?days=1').catch(() => null),
     api.get<any[]>('/api/v1/waf/events?limit=20').catch(() => []),
@@ -326,7 +326,7 @@ async function load() {
   previousSeries.value = ts?.previous || []
   byDomain.value = bd || []
   nodeStatsRaw.value = nodeRows || []
-  nodes.value = endpoints?.nodes || []
+  nodes.value = nodeSummary || []
   health.value = hs || []
   if (ws) wafStats.value = ws
   wafEvents.value = we || []

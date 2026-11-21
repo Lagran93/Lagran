@@ -148,6 +148,16 @@ pub async fn diagnose(
 
     // Fallback for deployments where the control plane can reach the public
     // domain directly (or no agents are registered yet).
+    // Ensure the destination does not resolve to loopback, link-local, private,
+    // or other disallowed internal addresses (SSRF defense).
+    if let Err(reason) = crate::service::net_guard::validate_http_url(&url).await {
+        let mut message = format!("fallback request rejected: {reason}");
+        if !dispatch_errors.is_empty() {
+            message = format!("{message}; edge dispatch: {}", dispatch_errors.join(" | "));
+        }
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": message}))));
+    }
+
     let mut headers: Vec<(&str, &str)> = vec![("user-agent", "lagran-cache-diagnose/1.0")];
     let cookie_value;
     if req.simulate_cookie {

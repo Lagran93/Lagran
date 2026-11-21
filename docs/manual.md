@@ -986,7 +986,7 @@ DSL 仍然只检查 path/query/UA/Referer/Method/Header/IP，不读取请求体�
 - 按 `Surrogate-Key` / `Cache-Tag`
 - 全量清理（谨慎）
 
-控制面会把 purge 请求下发到在线 Edge；Edge 同时清理普通缓存和大对象缓存。
+控制面会把 purge 请求下发到在线 Edge；Edge 同时清理普通缓存和大对象缓存。控制面最多并行联系 16 个 Edge，慢节点或离线节点不会阻塞后续节点分发。
 
 #### 缓存预热
 
@@ -2296,15 +2296,15 @@ Range: bytes=0-1,4-5
 
 缓存命中时：
 
-1. 计算所有段的最小 start 和最大 end，得到首尾包络；
-2. 对包络内的分片执行 `ChunkPlan`；
+1. 按 start 排序，合并重叠/相邻段；间隔不超过 2 个 chunk 的段也合并，超过 2 个 chunk 的间隔不填充；
+2. 对每个合并区间分别执行 `ChunkPlan`；
 3. 已缓存分片读磁盘，缺失分片按分片回源并写入；
 4. 从磁盘读取各段，构造 `multipart/byteranges` 响应。
 
 冷缓存时：
 
 - 先通过 HEAD（不支持时用 `bytes=0-0`）获取对象总长度；
-- 在首尾包络内做 chunk-aligned fill；
+- 对每个合并区间分别做 chunk-aligned fill，相隔较远的段不会拉成一个大回源区间；
 - 填充完成后再从磁盘构造 multipart 响应。
 
 响应格式：
@@ -2337,7 +2337,8 @@ Content-Range: bytes 0-1/<total>
 
 限制：
 
-- 冷请求的多段 Range 会填充首尾包络之间的所有缺失分片；如果两段相隔很远，可能触发填充上限并回退源站；
+- 冷请求的多段 Range 只填充各合并区间；间隔超过 2 个 chunk 不会填充中间空洞，避免为两个小段拉取超大回源区间；
+- 单个合并区间仍受 `LARGE_CACHE_FILL_MAX_BYTES` 和单对象上限约束，超过时回退源站；
 - `If-Range` 请求仍交给源站处理，不参与 large cache 多段拼接；
 - 普通小对象/未启用 large cache 时仍由源站处理多段请求。
 
@@ -2720,6 +2721,8 @@ POST /api/v1/prefetch
 
 - 控制面任务队列
 - 下发到在线 Edge
+- Edge 从本机 loopback 发起真实 GET；当 `EDGE_LISTEN` 绑定具体 IP 时，Pingora 会额外监听同端口的 loopback 地址
+- 内部预热请求即使 `TRUST_PROXY_HEADERS=false` 也会保留自己的 HTTPS 语义，不会被强制跳转成 301
 - Edge 执行真实 GET
 - 大对象会写入大缓存
 - 普通对象写入普通缓存
@@ -3317,7 +3320,7 @@ Accept-Ranges: bytes
 检查是否：
 
 - 请求带 `If-Range`
-- 多段 Range 的首尾包络超过填充上限（会透传）
+- 多段 Range 的某个合并区间超过填充上限（会透传）
 - 对象低于大缓存阈值
 - 规则 bypass
 - 带 Cookie/Authorization/no-store
@@ -3455,6 +3458,17 @@ invalid peer certificate: UnknownIssuer
 - 证书已过期
 - 前置代理终止 TLS
 
+其中「中间证书链未发送」会被单独识别为**警告**而不是失败：控制面仍报告无法用系统根证书完成校验，
+但检测到证书里存在可用的 AIA 补全地址时，会把该项标记为 `warning`，界面显示为黄色警告卡：
+
+```text
+警告：证书链缺少中间证书，已检测到可用的 AIA 补全地址。
+浏览器可能自动补全，但部分移动端/API 客户端仍会失败，建议在源站配置完整证书链。
+```
+
+控制面**不会**把 AIA 下载到的中间证书塞进 `RootCertStore` 后重试：中间证书不是信任锚点，
+这样做在 Rustls 下仍然会报 `UnknownIssuer`，只会掩盖真实问题。正确做法是让源站发送完整证书链。
+
 检查：
 
 ```bash
@@ -3489,12 +3503,21 @@ openssl s_client -connect cdn.example.com:443 -servername cdn.example.com \
 
 普通用户请求管理员接口会返回 403：
 
-- `/api/v1/nodes`
+- `/api/v1/nodes`（完整节点列表；含 agent_url、令牌状态和节点地址）
 - `/api/v1/audit`
 - 节点离线告警
 - 全局节点/用户管理
 
 控制台会按角色隐藏入口，但 API 仍会校验。
+
+大屏监控和配置发布只需要节点名称/区域/城市/在线状态/负载，不再调用管理员节点列表，
+而是使用任意登录用户可读的脱敏接口：
+
+```text
+GET /api/v1/nodes/public-summary
+```
+
+该响应不包含 `agent_url`、`auth_token`、`edge_profile`、`ip`、`public_ip`，避免普通用户看到基础设施凭证。
 
 ### 9.14 数据库/迁移
 
@@ -3642,7 +3665,7 @@ cd apps/frontend && npm run generate
 
 - 普通缓存以完整对象为单位；大对象支持 partial Range segment，但仅覆盖已请求区间。
 - 大对象完整 GET 需要 `complete=true`；partial 不能拼接为完整响应。
-- 大对象多段 Range 已在 large cache 支持 multipart 缓存响应；冷请求的填充范围是首尾包络，跨度过大或超过填充上限时回退源站透传。
+- 大对象多段 Range 已在 large cache 支持 multipart 缓存响应；冷请求按离散区间填充，间隔超过 2 个 chunk 不会合并，某个区间超过填充上限时回退源站透传。
 - `no-cache` 响应不进入共享缓存；请求 no-cache、`max-age=0` 有 validator 时走条件请求 304 复用，无 validator 时回源。
 - `only-if-cached`、`min-fresh`、`max-stale`、`stale-if-error` 尚未完整实现；请求 no-cache 选择直接回源。
 - 修改缓存规则/配置不会自动删除旧缓存。

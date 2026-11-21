@@ -5,11 +5,12 @@ use crate::repository;
 use crate::state::AppState;
 use crate::utils::{issue_token, verify_password};
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header::USER_AGENT, HeaderMap, StatusCode},
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -186,16 +187,8 @@ fn log_value(value: &str, max: usize) -> String {
         .to_string()
 }
 
-fn login_client_ip(headers: &HeaderMap) -> String {
-    for name in ["x-forwarded-for", "x-real-ip"] {
-        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
-            let first = value.split(',').next().unwrap_or("").trim();
-            if !first.is_empty() {
-                return log_value(first, 64);
-            }
-        }
-    }
-    String::new()
+fn login_client_ip(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> String {
+    state.client_ip_resolver.resolve(peer, headers).to_string()
 }
 
 fn login_user_agent(headers: &HeaderMap) -> String {
@@ -232,11 +225,12 @@ async fn record_login(
 
 pub async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorBody>)> {
     let email = normalize_email(&req.email);
-    let client_ip = login_client_ip(&headers);
+    let client_ip = login_client_ip(&state, peer, &headers);
     let user_agent = login_user_agent(&headers);
 
     if let Err(err) = check_captcha(&state, &req.captcha_id, &req.captcha_code).await {
@@ -442,6 +436,7 @@ pub async fn login(
 
 pub async fn register(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<LoginResponse>), (StatusCode, Json<ErrorBody>)> {
@@ -454,7 +449,7 @@ pub async fn register(
         ));
     }
     let email = normalize_email(&req.email);
-    let client_ip = login_client_ip(&headers);
+    let client_ip = login_client_ip(&state, peer, &headers);
     let user_agent = login_user_agent(&headers);
     check_captcha(&state, &req.captcha_id, &req.captcha_code).await?;
     if let Err(msg) = validate_email(&email) {

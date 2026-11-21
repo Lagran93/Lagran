@@ -3720,16 +3720,29 @@ pub async fn delete_cc_ban(pool: &PgPool, domain: &str, ip: &str) -> sqlx::Resul
     Ok(r.rows_affected())
 }
 
-/// Delete access_logs and edge_metrics older than `days` days.
-pub async fn purge_old_telemetry(pool: &PgPool, days: i64) -> sqlx::Result<(u64, u64)> {
+/// `access_logs` is indexed on `ts`, not on `created_at`.
+///
+/// This predicate must use `ts` so the retention DELETE can use
+/// `idx_access_logs_ts` instead of scanning the whole table every hour.
+const PURGE_ACCESS_LOGS_SQL: &str =
+    r#"DELETE FROM access_logs WHERE ts < NOW() - ($1::text || ' days')::interval"#;
+/// `waf_events` has no `created_at` column at all; its indexed time is `ts`.
+const PURGE_WAF_EVENTS_SQL: &str =
+    r#"DELETE FROM waf_events WHERE ts < NOW() - ($1::text || ' days')::interval"#;
+
+/// Delete access_logs, edge_metrics and waf_events older than `days` days.
+///
+/// The WAF delete is not best-effort: a schema mismatch used to be swallowed by
+/// `let _ = ...`, which made `waf_events` grow forever while the hourly task
+/// still reported success. Returning the third count also makes the purge
+/// visible in the retention log.
+pub async fn purge_old_telemetry(pool: &PgPool, days: i64) -> sqlx::Result<(u64, u64, u64)> {
     let days = days.max(1);
-    let a = sqlx::query(
-        r#"DELETE FROM access_logs WHERE created_at < NOW() - ($1::text || ' days')::interval"#,
-    )
-    .bind(days.to_string())
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let a = sqlx::query(PURGE_ACCESS_LOGS_SQL)
+        .bind(days.to_string())
+        .execute(pool)
+        .await?
+        .rows_affected();
     let m = sqlx::query(
         r#"DELETE FROM edge_metrics WHERE reported_at < NOW() - ($1::text || ' days')::interval"#,
     )
@@ -3737,13 +3750,12 @@ pub async fn purge_old_telemetry(pool: &PgPool, days: i64) -> sqlx::Result<(u64,
     .execute(pool)
     .await?
     .rows_affected();
-    let _ = sqlx::query(
-        r#"DELETE FROM waf_events WHERE created_at < NOW() - ($1::text || ' days')::interval"#,
-    )
-    .bind(days.to_string())
-    .execute(pool)
-    .await;
-    Ok((a, m))
+    let w = sqlx::query(PURGE_WAF_EVENTS_SQL)
+        .bind(days.to_string())
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok((a, m, w))
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -4077,4 +4089,17 @@ pub async fn defer_purge_retry(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod telemetry_purge_tests {
+    use super::*;
+
+    #[test]
+    fn retention_uses_the_indexed_timestamp_columns() {
+        assert!(PURGE_ACCESS_LOGS_SQL.contains("access_logs WHERE ts <"));
+        assert!(!PURGE_ACCESS_LOGS_SQL.contains("created_at"));
+        assert!(PURGE_WAF_EVENTS_SQL.contains("waf_events WHERE ts <"));
+        assert!(!PURGE_WAF_EVENTS_SQL.contains("created_at"));
+    }
 }

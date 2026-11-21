@@ -230,14 +230,15 @@
     <BaseModal v-model="diagOpen" title="域名诊断" width="760px" hide-footer>
       <div v-if="diagLoading" class="text-muted">正在检查 DNS、证书、源站和缓存…</div>
       <template v-else-if="diag">
-        <div class="alert" :class="diag.overall ? 'alert-success' : 'alert-warning'">
-          <AppIcon :name="diag.overall ? 'check' : 'alert'" :size="16" class="icon" />
-          <span>{{ diag.overall ? '域名接入检查通过' : '存在需要处理的接入问题' }}</span>
+        <div class="alert" :class="diagOverallClass">
+          <AppIcon :name="diagOverallIcon" :size="16" class="icon" />
+          <span>{{ diagOverallText }}</span>
         </div>
         <div class="diag-grid">
-          <div v-for="c in diag.checks" :key="c.key" class="diag-card" :class="{ bad: !c.ok }">
+          <div v-for="c in diag.checks" :key="c.key" class="diag-card"
+            :class="{ bad: !c.ok, warning: c.warning }">
             <div class="diag-head">
-              <AppIcon :name="c.ok ? 'check' : 'close'" :size="16" />
+              <AppIcon :name="c.warning ? 'alert' : (c.ok ? 'check' : 'close')" :size="16" />
               <strong>{{ c.label }}</strong>
               <span class="text-muted">{{ c.latency_ms }} ms</span>
             </div>
@@ -268,6 +269,23 @@ const projects = ref<any[]>([])
 const diagOpen = ref(false)
 const diagLoading = ref(false)
 const diag = ref<any>(null)
+
+const diagHasWarning = computed(() =>
+  Array.isArray(diag.value?.checks) && diag.value.checks.some((c: any) => c.warning),
+)
+const diagOverallClass = computed(() =>
+  diag.value?.overall && !diagHasWarning.value ? 'alert-success' : 'alert-warning',
+)
+const diagOverallIcon = computed(() =>
+  diag.value?.overall && !diagHasWarning.value ? 'check' : 'alert',
+)
+const diagOverallText = computed(() => {
+  if (!diag.value) return ''
+  if (diag.value.overall && diagHasWarning.value) {
+    return '接入检查通过，但存在需要关注的证书链警告'
+  }
+  return diag.value.overall ? '域名接入检查通过' : '存在需要处理的接入问题'
+})
 
 async function runDiagnose() {
   diagOpen.value = true
@@ -390,6 +408,11 @@ onMounted(load)
 .diag-card.bad {
   border-color: var(--danger-border);
   background: var(--danger-bg);
+}
+
+.diag-card.warning {
+  border-color: var(--warning-border);
+  background: var(--warning-bg);
 }
 
 .diag-head {

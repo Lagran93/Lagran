@@ -8,7 +8,7 @@ use edge::server::access_log::AccessLog;
 use edge::server::handler::AppState;
 use edge::server::inflight::Inflight;
 use edge::server::{listener, tls};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -21,6 +21,23 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 fn is_http_url(value: &str) -> bool {
     (value.starts_with("http://") || value.starts_with("https://"))
         && !value.chars().any(char::is_whitespace)
+}
+
+/// Random per-process token for the loopback-only prefetch worker. It stays in
+/// memory and is never written to a config file.
+fn generate_prefetch_token() -> String {
+    use ring::rand::SecureRandom;
+    use std::fmt::Write;
+
+    let mut bytes = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("system random is available");
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
 }
 
 #[tokio::main]
@@ -247,19 +264,17 @@ async fn main() -> anyhow::Result<()> {
         config.cache_key_ignore_headers.clone(),
     );
     let listen_addr: SocketAddr = config.listen_addr.parse()?;
-    let local_http_addr = SocketAddr::new(
-        if listen_addr.ip().is_unspecified() {
-            if listen_addr.is_ipv4() {
-                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            } else {
-                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-            }
-        } else {
-            listen_addr.ip()
-        },
-        listen_addr.port(),
-    );
+    // The internal prefetch request must originate from loopback: Pingora only
+    // treats the `x-lagran-prefetch` marker as trusted for a loopback peer, and
+    // `prepare_proxy_headers` only preserves its `https` scheme for a trusted
+    // hop. Binding the public address directly (common when EDGE_LISTEN uses a
+    // concrete IP) made `local_http_addr` non-loopback and every prefetch took
+    // the HTTPS redirect path (301).
+    let local_http_addr = edge::config::local_http_listen_addr(listen_addr);
+    let prefetch_token = generate_prefetch_token();
     let state = Arc::new(AppState {
+        node_id: config.node_id.clone(),
+        prefetch_token,
         cache,
         flight,
         // 128 concurrent background revalidations: enough to refresh a large

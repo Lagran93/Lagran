@@ -6,6 +6,14 @@ use crate::service::agent_http;
 use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+
+/// Maximum number of edge agents contacted at once. A purge should not wait
+/// for a slow/offline node before starting the next one, but an unbounded
+/// fan-out could exhaust sockets or the control-plane connection pool.
+const PURGE_CONCURRENCY: usize = 16;
 
 #[derive(Deserialize, Clone)]
 pub struct PurgeRequest {
@@ -124,61 +132,105 @@ pub async fn purge(
         }
     };
 
-    let mut results = Vec::new();
-    let mut total = 0u64;
-    let mut any_fail = false;
+    let expected = nodes.len();
+    let concurrency = PURGE_CONCURRENCY.min(expected.max(1));
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut set = JoinSet::new();
 
-    for (name, agent_url, auth_token) in nodes {
+    for (index, (name, agent_url, auth_token)) in nodes.into_iter().enumerate() {
         let url = format!("{}/__lagran/purge", agent_url.trim_end_matches('/'));
         let token = if auth_token.is_empty() {
             state.config.agent_token.clone()
         } else {
-            auth_token.clone()
+            auth_token
         };
-        let result = dispatch_one(&url, &body, &token).await;
-        match result {
-            Ok(reply) => {
-                total += reply.purged_count;
-                if !reply.success {
-                    any_fail = true;
+        let body = body.clone();
+        let payload = payload.clone();
+        let state = state.clone();
+        let semaphore = semaphore.clone();
+
+        set.spawn(async move {
+            let _permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return (
+                        index,
+                        NodePurgeResult {
+                            node: name,
+                            agent_url,
+                            success: false,
+                            purged_count: 0,
+                            message: "purge concurrency gate closed".into(),
+                        },
+                    );
+                }
+            };
+
+            match dispatch_one(&url, &body, &token).await {
+                Ok(reply) => {
+                    if !reply.success {
+                        let _ = repository::enqueue_purge_retry(
+                            &state.pool,
+                            &name,
+                            &agent_url,
+                            &payload,
+                            &reply.message,
+                        )
+                        .await;
+                    }
+                    (
+                        index,
+                        NodePurgeResult {
+                            node: name,
+                            agent_url,
+                            success: reply.success,
+                            purged_count: reply.purged_count,
+                            message: reply.message,
+                        },
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(node = %name, error = %e, "purge dispatch failed; queued for retry");
                     let _ = repository::enqueue_purge_retry(
                         &state.pool,
                         &name,
                         &agent_url,
                         &payload,
-                        &reply.message,
+                        &e,
                     )
                     .await;
+                    (
+                        index,
+                        NodePurgeResult {
+                            node: name,
+                            agent_url,
+                            success: false,
+                            purged_count: 0,
+                            message: e,
+                        },
+                    )
                 }
-                results.push(NodePurgeResult {
-                    node: name.clone(),
-                    agent_url: agent_url.clone(),
-                    success: reply.success,
-                    purged_count: reply.purged_count,
-                    message: reply.message,
-                });
             }
-            Err(e) => {
+        });
+    }
+
+    let mut completed = Vec::with_capacity(expected);
+    let mut any_fail = false;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(item) => completed.push(item),
+            Err(error) => {
+                // A panicking worker must not leave the endpoint hanging.
                 any_fail = true;
-                tracing::warn!(node = %name, error = %e, "purge dispatch failed; queued for retry");
-                let _ = repository::enqueue_purge_retry(
-                    &state.pool,
-                    &name,
-                    &agent_url,
-                    &payload,
-                    &e,
-                )
-                .await;
-                results.push(NodePurgeResult {
-                    node: name,
-                    agent_url,
-                    success: false,
-                    purged_count: 0,
-                    message: e,
-                });
+                tracing::error!(error = %error, "purge worker failed");
             }
         }
     }
+    completed.sort_by_key(|(index, _)| *index);
+    let results: Vec<NodePurgeResult> = completed.into_iter().map(|(_, result)| result).collect();
+    let total: u64 = results.iter().map(|result| result.purged_count).sum();
+    any_fail |= results.iter().any(|result| !result.success);
+    any_fail |= results.len() < expected;
 
     let detail = format!(
         "domain={} total={} nodes={}",

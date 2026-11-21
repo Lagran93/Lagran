@@ -50,15 +50,45 @@ fn hex(bytes: &[u8]) -> String {
 fn hmac_hex(secret: &str, message: &str) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
     let tag = hmac::sign(&key, message.as_bytes());
-    hex(&tag.as_ref()[..16])
+    hex(tag.as_ref())
 }
 
 fn hmac_ok(secret: &str, message: &str, signature: &str) -> bool {
+    // Decode the hex signature back to raw bytes so that ring's constant-time
+    // `hmac::verify` can be used directly.  This is the only ring-approved way
+    // to do HMAC verification without a timing side-channel; `hmac::sign` +
+    // string `==` leaks the position of the first differing nibble.
+    let sig_bytes = match decode_hex(signature) {
+        Some(b) => b,
+        None => return false,
+    };
     let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
-    let expected = hmac::sign(&key, message.as_bytes());
-    hex(&expected.as_ref()[..16]) == signature
+    hmac::verify(&key, message.as_bytes(), &sig_bytes).is_ok()
 }
 
+/// Decode a lowercase hex string into bytes; returns `None` on invalid input.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    s.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let hi = hex_nibble(pair[0])?;
+            let lo = hex_nibble(pair[1])?;
+            Some((hi << 4) | lo)
+        })
+        .collect()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
 fn random_hex() -> String {
     let mut buf = [0u8; 8];
     if ring::rand::SystemRandom::new().fill(&mut buf).is_ok() {
@@ -693,5 +723,34 @@ mod tests {
     fn safe_next_trims_before_deciding() {
         assert_eq!(safe_next("  /a  "), "/a");
         assert_eq!(safe_next("\t//evil.test\t"), "/");
+    }
+
+    /// `hmac_ok` must accept exactly the right signature and reject everything
+    /// else – including a signature that shares a common prefix, which would
+    /// cause an early-exit `==` to return at different loop iterations (the
+    /// timing side-channel this fix closes).
+    #[test]
+    fn hmac_ok_accepts_valid_and_rejects_tampered() {
+        let secret = "test-secret";
+        let message = "challenge|cdn.test|1700000000|abcdef01";
+        // Compute the canonical signature the same way hmac_hex does (full 32-byte hex).
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+        let tag = hmac::sign(&key, message.as_bytes());
+        let valid_sig = hex(tag.as_ref());
+
+        assert!(hmac_ok(secret, message, &valid_sig), "correct signature must be accepted");
+
+        // Flip the last nibble – same length, shares a 63-char prefix.
+        let mut tampered = valid_sig.clone();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == '0' { '1' } else { '0' });
+        assert!(!hmac_ok(secret, message, &tampered), "tampered signature must be rejected");
+
+        // Wrong length must also be rejected (would panic an indexing comparison).
+        assert!(!hmac_ok(secret, message, ""), "empty signature must be rejected");
+        assert!(!hmac_ok(secret, message, "00"), "short signature must be rejected");
+        // Old truncated format (32 chars) must also fail – guards against downgrade.
+        let old_truncated = hex(&tag.as_ref()[..16]);
+        assert!(!hmac_ok(secret, message, &old_truncated), "truncated old-format signature must be rejected");
     }
 }

@@ -146,9 +146,10 @@
           </div>
 
           <div v-if="diag" class="diag-grid">
-            <div v-for="c in diag.checks" :key="c.key" class="diag-card" :class="{ bad: !c.ok }">
+            <div v-for="c in diag.checks" :key="c.key" class="diag-card"
+              :class="{ bad: !c.ok, warning: c.warning }">
               <div class="diag-head">
-                <AppIcon :name="c.ok ? 'check' : 'close'" :size="16" />
+                <AppIcon :name="c.warning ? 'alert' : (c.ok ? 'check' : 'close')" :size="16" />
                 <strong>{{ c.label }}</strong>
                 <span class="text-muted">{{ c.latency_ms }} ms</span>
               </div>
@@ -419,6 +420,11 @@ onMounted(async () => {
   background: var(--success-bg);
   border-radius: var(--radius);
   padding: 12px;
+}
+
+.diag-card.warning {
+  border-color: var(--warning-border);
+  background: var(--warning-bg);
 }
 
 .diag-card.bad {

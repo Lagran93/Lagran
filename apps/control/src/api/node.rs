@@ -634,6 +634,59 @@ pub async fn list(
     Ok(Json(rows.into_iter().map(to_dto).collect()))
 }
 
+/// Sanitized node view for every authenticated console user.
+///
+/// The dashboard and monitor wall need node names, regions, status and load for
+/// every logged-in user. The admin inventory above also carries `agent_url`,
+/// `auth_token` and the rendered edge profile, so it must not be opened up.
+/// This DTO deliberately omits every secret and the node's network addresses.
+#[derive(Serialize)]
+pub struct NodeSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub region: String,
+    pub country: String,
+    pub province: String,
+    pub city: String,
+    pub status: String,
+    pub cpu_usage: Option<f64>,
+    pub memory_usage: Option<f64>,
+    pub active_connections: Option<i64>,
+    pub last_heartbeat: Option<String>,
+}
+
+fn to_summary_dto(r: repository::NodeRow) -> NodeSummaryDto {
+    NodeSummaryDto {
+        id: r.id.to_string(),
+        name: r.name,
+        region: r.region,
+        country: if r.country.is_empty() {
+            "CN".into()
+        } else {
+            r.country
+        },
+        province: r.province,
+        city: r.city,
+        status: r.status,
+        cpu_usage: r.cpu_usage,
+        memory_usage: r.memory_usage,
+        active_connections: r.active_connections,
+        last_heartbeat: r.last_heartbeat.map(|t| t.to_rfc3339()),
+    }
+}
+
+/// Authenticated, non-admin node summary used by the dashboard/monitor wall.
+pub async fn public_summary(
+    State(state): State<AppState>,
+    _actor: Actor,
+) -> Result<Json<Vec<NodeSummaryDto>>, (StatusCode, Json<ErrorBody>)> {
+    let rows = repository::list_nodes(&state.pool).await.map_err(|e| {
+        tracing::error!(error = %e, "list node summary");
+        db_error()
+    })?;
+    Ok(Json(rows.into_iter().map(to_summary_dto).collect()))
+}
+
 pub async fn create(
     State(state): State<AppState>,
     actor: Actor,
@@ -965,6 +1018,12 @@ pub async fn update(
     )
     .await;
     state.nodes.invalidate().await;
+    // A rename changes the node name the token resolves to. Drop the cached
+    // mapping immediately on this process; other replicas expire it by TTL.
+    state
+        .agent_tokens
+        .invalidate(state.redis.as_deref(), &current.auth_token)
+        .await;
     Ok(Json(to_dto(row)))
 }
 
@@ -1003,6 +1062,12 @@ pub async fn set_status(
     .await;
     // Stop (or resume) scheduling this node immediately.
     state.nodes.invalidate().await;
+    // Disabling a node must invalidate its token, not merely its scheduling
+    // snapshot; otherwise cached auth would keep accepting heartbeats.
+    state
+        .agent_tokens
+        .invalidate(state.redis.as_deref(), &row.auth_token)
+        .await;
     Ok(Json(to_dto(row)))
 }
 
@@ -1029,6 +1094,10 @@ pub async fn delete(
         .map_err(|_| db_error())?;
     let _ = repository::insert_audit(&state.pool, &actor.email, "node.delete", &row.name, "").await;
     state.nodes.invalidate().await;
+    state
+        .agent_tokens
+        .invalidate(state.redis.as_deref(), &row.auth_token)
+        .await;
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 
@@ -1220,6 +1289,48 @@ mod tests {
         let huge = "A=1\n".repeat(100_000);
         let raw = serde_json::json!({ "env": huge }).to_string();
         assert!(validate_edge_profile(&raw).is_err());
+    }
+
+    #[test]
+    fn public_summary_omits_agent_credentials_and_addresses() {
+        let row = repository::NodeRow {
+            id: uuid::Uuid::nil(),
+            name: "edge-1".into(),
+            region: "cn-north".into(),
+            ip: "10.0.0.10".into(),
+            status: "online".into(),
+            last_heartbeat: None,
+            agent_url: "http://10.0.0.10:8081".into(),
+            auth_token: "secret-token".into(),
+            cpu_usage: Some(12.5),
+            memory_usage: Some(40.0),
+            active_connections: Some(3),
+            version: "1.2.3".into(),
+            created_at: chrono::Utc::now(),
+            public_ip: "203.0.113.7".into(),
+            isp: "example".into(),
+            country: String::new(),
+            province: "Beijing".into(),
+            city: "Beijing".into(),
+            weight: 1,
+            max_bandwidth_mbps: 1000,
+            edge_profile: r#"{"env":"SECRET=1"}"#.into(),
+        };
+        let json = serde_json::to_value(to_summary_dto(row)).unwrap();
+        assert_eq!(json["name"], "edge-1");
+        assert_eq!(json["city"], "Beijing");
+        assert_eq!(json["country"], "CN");
+        assert_eq!(json["cpu_usage"], 12.5);
+        for secret in [
+            "agent_url",
+            "auth_token",
+            "edge_profile",
+            "ip",
+            "public_ip",
+            "isp",
+        ] {
+            assert!(json.get(secret).is_none(), "{secret} leaked in summary");
+        }
     }
 
     #[test]

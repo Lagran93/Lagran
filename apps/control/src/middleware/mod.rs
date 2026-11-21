@@ -1,6 +1,8 @@
 //! Auth middleware / extractors
 
 pub mod agent_auth;
+pub mod agent_token_cache;
+pub mod client_ip;
 pub mod login_limit;
 pub mod authz;
 pub mod permission;

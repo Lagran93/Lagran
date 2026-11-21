@@ -76,6 +76,13 @@ fn fetch_wait(origin_timeout_ms: u64) -> Duration {
 
 #[derive(Clone)]
 pub struct AppState {
+    /// This edge's node id, used in the CDN-Loop chain.
+    pub node_id: String,
+    /// Random token attached to internal prefetch requests. The loopback peer
+    /// check is necessary but not sufficient when a local reverse proxy accepts
+    /// public traffic; this token prevents a client from claiming the internal
+    /// prefetch marker.
+    pub prefetch_token: String,
     pub cache: SharedCache,
     /// Cross-node cold-miss coalescing; None when Redis L2 is disabled.
     pub flight: Option<Arc<RedisFlight>>,
@@ -281,7 +288,27 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     response
 }
 
-async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+async fn proxy_handler_inner(
+    State(state): State<Arc<AppState>>,
+    mut req: Request<Body>,
+) -> Response {
+    // The native Pingora filter already checked and stamped this request. A
+    // direct caller (cache diagnostics) has not, so it needs the same guard.
+    // Stamping twice would make every fallback request look like a loop.
+    if req.extensions().get::<host_util::FromPingora>().is_none() {
+        if let Some(reason) =
+            crate::security::loop_guard::detect(req.headers(), &state.node_id)
+        {
+            tracing::debug!(
+                node_id = %state.node_id,
+                reason = reason.as_str(),
+                path = %req.uri().path(),
+                "origin shield loop detected"
+            );
+            return (StatusCode::LOOP_DETECTED, "loop detected").into_response();
+        }
+        crate::security::loop_guard::stamp(req.headers_mut(), &state.node_id);
+    }
     let start = Instant::now();
     let method = req.method().clone();
     let path_and_query = req

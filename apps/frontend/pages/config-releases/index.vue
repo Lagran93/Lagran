@@ -408,7 +408,7 @@ async function load() {
   try {
     const [d, n, v, r] = await Promise.all([
       api.get<any[]>('/api/v1/domains').catch(() => []),
-      api.get<any[]>('/api/v1/nodes').catch(() => []),
+      api.get<any[]>('/api/v1/nodes/public-summary').catch(() => []),
       api.get<any[]>('/api/v1/config/versions?limit=200').catch(() => []),
       api.get<any[]>('/api/v1/config/releases').catch(() => []),
     ])

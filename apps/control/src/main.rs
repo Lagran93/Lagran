@@ -140,10 +140,11 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tick.tick().await;
                 match control::repository::purge_old_telemetry(&pool, days).await {
-                    Ok((a, m)) if a > 0 || m > 0 => {
+                    Ok((a, m, w)) if a > 0 || m > 0 || w > 0 => {
                         tracing::info!(
                             access_logs = a,
                             metrics = m,
+                            waf_events = w,
                             days,
                             "telemetry retention purge"
                         )
@@ -249,9 +250,12 @@ async fn main() -> anyhow::Result<()> {
     // Serve until the OS asks us to stop, then finish in-flight requests instead of
     // dropping their connections. `axum` closes the listener on the signal and waits
     // for active handlers, so a restart no longer truncates a response mid-body.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(control::service::shutdown::wait_async())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(control::service::shutdown::wait_async())
+    .await?;
     tracing::info!("control plane stopped accepting connections; flushing telemetry");
     if let Some(provider) = tracer_provider {
         let _ = provider.shutdown();

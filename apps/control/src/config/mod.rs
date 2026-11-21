@@ -64,6 +64,14 @@ pub struct AppConfig {
     /// are normally served from the same origin, in which case CORS is not
     /// involved at all and setting this list only tightens things.
     pub cors_allowed_origins: Vec<String>,
+    /// Reverse proxies allowed to supply `X-Forwarded-For` / `X-Real-IP`.
+    ///
+    /// Entries are IP addresses or CIDRs. Headers from any other peer are
+    /// ignored and the TCP peer address is used instead, so a direct client
+    /// cannot spoof its way into a fresh login-rate-limit bucket. Defaults to
+    /// loopback for the documented same-host Caddy setup; set this explicitly
+    /// when the proxy runs in another container or host.
+    pub trusted_proxies: Vec<String>,
     /// When false, POST /auth/register is disabled (default: false).
     pub allow_register: bool,
     /// Seed demo@lagran.dev on startup (default: false). The account is a
@@ -157,6 +165,14 @@ impl Default for AppConfig {
             allow_register: env_bool("ALLOW_REGISTER", false),
             captcha_enabled: env_bool("CAPTCHA_ENABLED", true),
             cors_allowed_origins: env_list("CORS_ALLOWED_ORIGINS"),
+            trusted_proxies: {
+                let configured = env_list("TRUSTED_PROXIES");
+                if configured.is_empty() {
+                    vec!["127.0.0.1".into(), "::1".into()]
+                } else {
+                    configured
+                }
+            },
             // Off by default: the demo account ships with a published password.
             seed_demo: env_bool("SEED_DEMO", false),
             require_secure_secrets: env_bool("REQUIRE_SECURE_SECRETS", false),
@@ -195,8 +211,8 @@ fn env_bool(name: &str, default: bool) -> bool {
 
 /// Parse a comma-separated list, dropping empty entries.
 ///
-/// Used for `CORS_ALLOWED_ORIGINS`; surrounding whitespace is trimmed so
-/// `https://a.test, https://b.test` works as typed.
+/// Used for `CORS_ALLOWED_ORIGINS` and `TRUSTED_PROXIES`; surrounding
+/// whitespace is trimmed so `https://a.test, https://b.test` works as typed.
 fn env_list(name: &str) -> Vec<String> {
     std::env::var(name)
         .unwrap_or_default()

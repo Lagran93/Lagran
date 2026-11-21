@@ -126,11 +126,22 @@ fn cacheable_forward_headers(headers: &HeaderMap) -> Vec<(&'static str, HeaderVa
         "referer",
         "if-none-match",
         "if-modified-since",
+        // Loop protection must survive the cacheable-header allowlist. These
+        // headers are internal and are stamped on the incoming request by the
+        // edge before any cacheable/revalidation origin fetch.
+        "cdn-loop",
+        "x-lagran-shield-hops",
     ];
     let mut out = Vec::with_capacity(ALLOW.len());
     for name in ALLOW {
-        if let Some(v) = headers.get(*name) {
-            out.push((*name, v.clone()));
+        if *name == "cdn-loop" {
+            // Every hop appends its own CDN-Loop value. Forwarding only the
+            // first would truncate the chain on cacheable/revalidation fetches.
+            for value in headers.get_all(*name) {
+                out.push((*name, value.clone()));
+            }
+        } else if let Some(value) = headers.get(*name) {
+            out.push((*name, value.clone()));
         }
     }
     out
@@ -663,5 +674,23 @@ mod tests {
             Duration::from_millis(2_500),
         );
         assert_eq!(client.connect_timeout_ms(), 2_500);
+    }
+
+    #[test]
+    fn cacheable_forward_headers_keep_loop_protection() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "cdn-loop",
+            HeaderValue::from_static("lagran; id=edge-1"),
+        );
+        headers.append(
+            "cdn-loop",
+            HeaderValue::from_static("lagran; id=edge-2"),
+        );
+        headers.insert("x-lagran-shield-hops", HeaderValue::from_static("2"));
+        let forwarded = cacheable_forward_headers(&headers);
+        let names: Vec<&str> = forwarded.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names.iter().filter(|name| **name == "cdn-loop").count(), 2);
+        assert!(names.contains(&"x-lagran-shield-hops"));
     }
 }

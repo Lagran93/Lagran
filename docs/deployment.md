@@ -247,6 +247,7 @@ RUST_LOG=control=info,tower_http=warn,sqlx=warn
 | `CONTROL_BIND` | 是 | `0.0.0.0:8080` | 控制面监听地址。生产放在 Caddy 后面时用 `127.0.0.1:8080`，只让本机访问。 |
 | `AGENT_TOKEN` | 生产必填 | 空 | DNS 调度接口的全局令牌，也是旧节点回调的兜底令牌。**边缘心跳/配置必须使用节点 `auth_token`，不能使用该全局令牌**；为空只影响调度接口，不会放行未注册边缘。详见 4.3。 |
 | `CONTROL_PUBLIC_URL` | 推荐 | 空 | 控制台公网地址，用于生成节点安装命令。为空时按请求 Host 推导；反向代理场景建议显式设置。 |
+| `TRUSTED_PROXIES` | 否 | `127.0.0.1,::1` | 可信反向代理 IP/CIDR，逗号分隔。只有来自这些地址的 `X-Forwarded-For` / `X-Real-IP` 才会被登录限流和登录日志采信；直连请求使用 TCP 对端地址。Caddy 不在本机或前面还有 CDN 时，把对应回源网段加入这里。 |
 | `GEOIP_PATH` | 调度必填 | `./data/ip2region_v4.xdb` | 地理位置库：推荐 ip2region XDB；兼容 V2Ray/Loyalsoldier `geoip.dat` 与旧版 CIDR JSON。缺失时按权重/负载调度；启动时加载，修改后需重启。 |
 | `GEOIP_IPV6_PATH` | 否 | 空 | 可选 ip2region IPv6 XDB（`ip2region_v6.xdb`）。 |
 | `GEOIP_JSON_PATH` | 否 | 空 | 兼容旧配置的 JSON 路径别名；设置了 `GEOIP_PATH` 时以 `GEOIP_PATH` 为准。 |
@@ -291,6 +292,7 @@ sudo chown root:lagran /etc/lagran/control.env
 - 未在控制台添加节点，即使知道其他节点的 token，也不能注册新节点
 - 心跳里的 `NODE_ID` 必须等于该 token 所属节点名，否则返回 403
 - 控制面不再自动创建未知节点
+- 节点 token 验证带 30 秒正向缓存（进程内 + 可选 Redis）：同一控制面在节点改名/禁用/删除时立即失效；其他控制副本最多延迟 30 秒。缓存键使用 token 的 SHA-256，不把原始 token 写入 Redis。
 
 ### DNS → 控制面
 
@@ -545,7 +547,7 @@ Caddyfile 参数说明：
 | `handle @api` | API 请求走反代；`handle` 之间互斥，顺序影响匹配。 |
 | `reverse_proxy 127.0.0.1:8080` | 转发到控制面。 |
 | `header_up Host {host}` | 保留原始 Host；`CONTROL_PUBLIC_URL` 未设置时安装命令依赖它。 |
-| `header_up X-Real-IP {remote_host}` | 传真实客户端 IP；Caddy 会自动设置 `X-Forwarded-For`/`X-Forwarded-Proto`。 |
+| `header_up X-Real-IP {remote_host}` | 传真实客户端 IP；Caddy 会自动设置 `X-Forwarded-For`/`X-Forwarded-Proto`。控制面默认信任本机回环代理；Caddy 不在本机时需设置 `TRUSTED_PROXIES`。 |
 | `root * /opt/lagran/web` | 前端静态文件根目录。 |
 | `try_files {path} /index.html` | SPA 路由回退；避免刷新 `/domains` 等路径 404。 |
 | `file_server` | 提供静态文件。 |
@@ -777,7 +779,7 @@ RUST_LOG=edge=info,tower_http=warn
 | `NODE_REGION` | 否 | `local` | 区域标签，首次心跳写入；控制台已填非空区域时不会被心跳覆盖。 |
 | `PUBLIC_IP` | 调度必填 | 空 | 节点公网 IP，随心跳上报，DNS 调度返回这个地址。必须是对用户可访问的 IP。 |
 | `AGENT_URL` | 是 | 根据 `EDGE_ADMIN_LISTEN` / `EDGE_LISTEN` 推导 | 控制面回调边缘的地址（purge、证书、ACME）。应指向 **`EDGE_ADMIN_LISTEN` 管理端口**，例如 `http://IP:8081`；控制面必须能访问。 |
-| `EDGE_LISTEN` | 是 | `0.0.0.0:8081` | Pingora 公共 HTTP 监听：CDN 用户流量、WAF challenge verify、ACME HTTP-01 challenge。生产用 80。 |
+| `EDGE_LISTEN` | 是 | `0.0.0.0:8081` | Pingora 公共 HTTP 监听：CDN 用户流量、WAF challenge verify、ACME HTTP-01 challenge。生产用 80。绑定具体 IP 时，Edge 会额外监听同端口的 loopback 地址，供内部缓存预热使用。 |
 | `EDGE_ADMIN_LISTEN` | 推荐 | 空 | 管理面监听：purge、证书加载、ACME challenge 下发、access-log。与控制面通信使用此端口；**不要对公网开放**，只允许控制面来源 IP。为空时兼容旧模式，管理接口仍留在数据面。 |
 | `EDGE_HTTPS_LISTEN` | 否 | 空 | Pingora 公共 HTTPS 监听。生产用 `0.0.0.0:443`，需要已同步证书。为空表示不启用 TLS。 |
 | `EDGE_HTTPS_REDIRECT_PORT` | 否 | 从 HTTPS 监听推导 | 域名开启 HTTPS 后，HTTP→HTTPS 跳转使用的端口。`443` 可省略；开发 8443 时写 8443。它只影响跳转 URL，不改变监听。 |
@@ -1038,7 +1040,7 @@ RUST_LOG=lagran_dns=info
 | `DNS_SOA_MNAME` | 否 | 第一个 NS | SOA 主 NS 名。 |
 | `DNS_SOA_RNAME` | 否 | `hostmaster.$zone` | SOA 管理员邮箱，格式用点代替 `@`。 |
 | `DNS_TTL` | 否 | `30` | 调度 A 记录 TTL，范围 5–300。最终 TTL 取 `min(调度 TTL, DNS_TTL)`。 |
-| `DNS_CACHE_SECS` | 否 | `5` | 调度结果本地缓存时间。每次缓存过期才调控制面；建议 10–30，降低 A 查询延迟。 |
+| `DNS_CACHE_SECS` | 否 | `30` | 调度结果本地缓存时间。每次缓存过期才调控制面；建议 10–30，降低 A 查询延迟。 |
 | `DNS_STALE_SECS` | 否 | `300` | 控制面故障时允许使用旧缓存的最长时间。 |
 | `DNS_FALLBACK_IP` | 否 | 空 | 控制面不可用且无缓存时返回的兜底 IP；为空则 SERVFAIL。应填一个可用边缘 IP。 |
 | `DNS_WORKERS` | 否 | `8` | UDP 工作线程数。 |

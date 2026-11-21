@@ -1,6 +1,8 @@
 //! Shared application state
 
 use crate::config::AppConfig;
+use crate::middleware::agent_token_cache::SharedAgentTokenCache;
+use crate::middleware::client_ip::ClientIpResolver;
 use crate::middleware::login_limit::LoginLimiter;
 use sqlx::PgPool;
 use std::sync::atomic::AtomicU64;
@@ -18,6 +20,10 @@ pub struct AppState {
     /// Monotonic ticket used to rotate among equally-scored nodes.
     /// Per control process: multiple replicas rotate independently.
     pub schedule_rotation: Arc<AtomicU64>,
+    /// Trusted reverse-proxy chain used for login/register client IPs.
+    pub client_ip_resolver: Arc<ClientIpResolver>,
+    /// Cached per-node agent token -> node name mapping.
+    pub agent_tokens: SharedAgentTokenCache,
     pub login_limiter: Arc<LoginLimiter>,
     pub captcha: Arc<crate::service::captcha::CaptchaStore>,
     pub config_cache: Arc<crate::service::config_cache::ConfigCache>,
@@ -37,6 +43,7 @@ impl AppState {
         let nodes = Arc::new(crate::scheduler::NodeSnapshotCache::new(
             config.schedule_node_cache_secs,
         ));
+        let client_ip_resolver = Arc::new(ClientIpResolver::from_config(&config.trusted_proxies));
         Self {
             pool,
             config: Arc::new(config),
@@ -44,6 +51,8 @@ impl AppState {
             schedule_ttl,
             nodes,
             schedule_rotation: Arc::new(AtomicU64::new(0)),
+            client_ip_resolver,
+            agent_tokens: Arc::new(crate::middleware::agent_token_cache::AgentTokenCache::new()),
             login_limiter: Arc::new(LoginLimiter::new()),
             captcha: Arc::new(crate::service::captcha::CaptchaStore::new()),
             config_cache: Arc::new(crate::service::config_cache::ConfigCache::new(

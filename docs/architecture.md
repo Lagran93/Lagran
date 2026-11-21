@@ -55,7 +55,7 @@
 11. 缓存标签：源站 `Surrogate-Key` / `Cache-Tag` 随缓存对象保存，按标签刷新时只清理匹配对象；
     标签仅匹配这些响应头，不会退化为域名全量清理
 12. Range：小段 Range 命中完整对象时切片；开放/大范围 Range 由 Pingora 流式透传，避免视频整包下载；
-    多段 Range 透传源站
+    多段 Range 在 large cache 支持 multipart，其他情况透传源站
 
 响应统一带 `X-Cache` / `X-Cache-Status` / `X-Lagran-Cache-Reason`（仅未命中缓存时）/ `Age` /
 `X-Lagran-Cache-TTL`（剩余新鲜寿命，区别于已存活时间 `Age`）/ `ETag`

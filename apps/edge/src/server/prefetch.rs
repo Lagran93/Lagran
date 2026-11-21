@@ -75,6 +75,11 @@ pub async fn prefetch_handler(
             HeaderValue::from_static("lagran-prefetch/1.0"),
         );
         headers.insert("x-lagran-prefetch", HeaderValue::from_static("1"));
+        headers.insert(
+            "x-lagran-prefetch-token",
+            HeaderValue::from_str(&state.prefetch_token)
+                .expect("prefetch token is valid header text"),
+        );
         headers.insert("accept-encoding", HeaderValue::from_static("identity"));
         for (name, value) in &req.headers {
             let name = name.trim().to_ascii_lowercase();

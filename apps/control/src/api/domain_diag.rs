@@ -33,6 +33,9 @@ pub struct Check {
     pub key: String,
     pub label: String,
     pub ok: bool,
+    /// True for a non-fatal condition that should be surfaced (for example an
+    /// incomplete certificate chain that browsers may repair via AIA).
+    pub warning: bool,
     pub detail: String,
     pub latency_ms: u64,
 }
@@ -169,9 +172,10 @@ pub async fn diagnose(
         )
     };
 
-    let (tls_ok, tls_detail) = match tls_result {
+    let (tls_ok, tls_warning, tls_detail) = match tls_result {
         Ok(value) => value,
         Err(_) => (
+            false,
             false,
             "TLS 检查超时。请检查 CNAME 是否指向可从控制面访问的 HTTPS 地址，或证书服务器是否响应 443。".to_string(),
         ),
@@ -193,6 +197,7 @@ pub async fn diagnose(
             key: "dns".into(),
             label: "DNS 解析".into(),
             ok: dns_ok && dns_match,
+            warning: false,
             detail: dns_detail,
             latency_ms: dns_start.elapsed().as_millis() as u64,
         },
@@ -200,6 +205,7 @@ pub async fn diagnose(
             key: "cert".into(),
             label: "HTTPS 证书".into(),
             ok: tls_ok,
+            warning: tls_warning,
             detail: tls_detail,
             latency_ms: tls_start.elapsed().as_millis() as u64,
         },
@@ -207,6 +213,7 @@ pub async fn diagnose(
             key: "origin".into(),
             label: "回源可达".into(),
             ok: origin_ok,
+            warning: false,
             detail: origin_detail,
             latency_ms: origin_start.elapsed().as_millis() as u64,
         },
@@ -214,6 +221,7 @@ pub async fn diagnose(
             key: "cache".into(),
             label: "缓存命中".into(),
             ok: cache_ok,
+            warning: false,
             detail: cache_detail,
             latency_ms: cache_start.elapsed().as_millis() as u64,
         },
@@ -228,38 +236,46 @@ pub async fn diagnose(
     }))
 }
 
-async fn check_tls(domain: &str) -> (bool, String) {
+async fn check_tls(domain: &str) -> (bool, bool, String) {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let (ok, detail) = strict_tls(domain, roots.clone()).await;
+    let (ok, detail) = strict_tls(domain, roots).await;
     if ok || !detail.contains("UnknownIssuer") {
-        return (ok, detail);
+        return (ok, false, detail);
     }
 
-    // Some servers omit the intermediate certificate from the TLS chain.
-    // Browsers repair this through the certificate's AIA URL; do the same so a
-    // working public certificate is not reported as invalid.
+    // A server that omits its intermediate certificate makes a public,
+    // otherwise-valid certificate look like `UnknownIssuer`. Do NOT add the
+    // downloaded AIA certificate to `RootCertStore`: it is an intermediate CA,
+    // not a trust anchor, and it does not change the chain Rustls saw during
+    // the handshake. Report a warning instead, and only when at least one AIA
+    // URL passes the same public-destination guard used elsewhere (we never
+    // fetch the URL here, so this cannot become an SSRF primitive).
     let urls = insecure_leaf_aia(domain).await;
+    let mut public_aia = false;
     for url in urls {
-        let (status, _headers, body) = match agent_http::get_response(&url, &[]).await {
-            Ok(result) => result,
-            Err(_) => continue,
-        };
-        if !(200..300).contains(&status) || body.is_empty() {
-            continue;
+        if crate::service::net_guard::validate_http_url(&url)
+            .await
+            .is_ok()
+        {
+            public_aia = true;
+            break;
         }
-        let cert = CertificateDer::from(body.to_vec());
-        if roots.add(cert).is_err() {
-            continue;
-        }
-        let (ok, repaired) = strict_tls(domain, roots.clone()).await;
-        if ok {
-            return (true, format!("{repaired}（已通过 AIA 补全中间证书）"));
-        }
+        tracing::debug!(aia_url = %url, "AIA URL rejected by net_guard (non-public destination)");
     }
-    (false, detail)
+
+    if public_aia {
+        return (
+            true,
+            true,
+            format!(
+                "{detail}；警告：证书链缺少中间证书，已检测到可用的 AIA 补全地址。浏览器可能自动补全，但部分移动端/API 客户端仍会失败，建议在源站配置完整证书链。"
+            ),
+        );
+    }
+    (false, false, detail)
 }
 
 async fn strict_tls(domain: &str, roots: RootCertStore) -> (bool, String) {
@@ -488,5 +504,79 @@ async fn check_cache(
             (ok, detail)
         }
         Err(e) => (false, format!("边缘探测失败：{e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aia_urls;
+
+    /// Build a minimal DER snippet that embeds a URI in an AIA extension.
+    /// Layout: 0x86 <len> <url bytes>  (GeneralName URI tag)
+    fn make_aia_der(url: &str) -> Vec<u8> {
+        let url_bytes = url.as_bytes();
+        let len = url_bytes.len() as u8;
+        let mut der = vec![0x86, len];
+        der.extend_from_slice(url_bytes);
+        der
+    }
+
+    #[test]
+    fn extracts_public_aia_url() {
+        let url = "http://crt.example.com/issuer.crt";
+        let der = make_aia_der(url);
+        let urls = aia_urls(&der);
+        assert_eq!(urls, vec![url.to_string()]);
+    }
+
+    #[test]
+    fn extracts_multiple_distinct_aia_urls() {
+        let u1 = "http://ca.example.com/a.crt";
+        let u2 = "https://ca.example.com/b.crt";
+        let mut der = make_aia_der(u1);
+        der.extend_from_slice(&make_aia_der(u2));
+        let urls = aia_urls(&der);
+        assert!(urls.contains(&u1.to_string()));
+        assert!(urls.contains(&u2.to_string()));
+    }
+
+    #[test]
+    fn deduplicates_repeated_aia_urls() {
+        let url = "http://ca.example.com/issuer.crt";
+        let mut der = make_aia_der(url);
+        der.extend_from_slice(&make_aia_der(url));
+        let urls = aia_urls(&der);
+        assert_eq!(urls.len(), 1);
+    }
+
+    #[test]
+    fn rejects_no_scheme_or_garbage() {
+        // Raw binary with no recognisable http(s):// prefix → empty list.
+        let der = vec![0x30, 0x0a, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a];
+        assert!(aia_urls(&der).is_empty());
+    }
+
+    /// The AIA certificate must never be added to `RootCertStore` as a workaround
+    /// for an incomplete chain: an intermediate CA is not a trust anchor, so the
+    /// handshake still fails with `UnknownIssuer`. Guard the source so the old
+    /// "repair" cannot quietly come back.
+    #[test]
+    fn tls_check_does_not_treat_aia_certificates_as_roots() {
+        let source = include_str!("domain_diag.rs");
+        // Build the needle at runtime: writing it literally here would match this
+        // test's own source and make the guard fail on itself.
+        let forbidden = format!("roots.{}{}", "add", "(cert)");
+        assert!(
+            !source.contains(&forbidden),
+            "AIA certificates must not be registered as root anchors"
+        );
+        assert!(
+            source.contains("证书链缺少中间证书"),
+            "an incomplete chain must surface a warning instead"
+        );
+        assert!(
+            source.contains("async fn check_tls(domain: &str) -> (bool, bool, String)"),
+            "check_tls must report a warning flag alongside ok"
+        );
     }
 }

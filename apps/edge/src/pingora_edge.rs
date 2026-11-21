@@ -464,7 +464,12 @@ impl ProxyHttp for DataPlaneProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        prepare_proxy_headers(session, self.trust_proxy, &self.trusted_proxies)?;
+        prepare_proxy_headers(
+            session,
+            self.trust_proxy,
+            &self.trusted_proxies,
+            &self.state.prefetch_token,
+        )?;
 
         let req = session.req_header();
         let (authority, host) = (
@@ -603,6 +608,38 @@ impl ProxyHttp for DataPlaneProxy {
             return self.handle_management(session, &path).await;
         }
 
+        // Origin Shield loop protection. The request is stamped once here, so
+        // every downstream origin path (native proxy, revalidation, streaming,
+        // and the in-process fallback) forwards the same chain. The in-process
+        // fallback receives the FromPingora marker and therefore does not stamp
+        // again.
+        if let Some(reason) =
+            crate::security::loop_guard::detect(&session.req_header().headers, &self.state.node_id)
+        {
+            ctx.cache_label = "BYPASS";
+            ctx.cache_reason = Some(reason.as_str());
+            ctx.status = 508;
+            tracing::debug!(
+                node_id = %self.state.node_id,
+                reason = reason.as_str(),
+                host = %ctx.host,
+                path = %ctx.path,
+                "origin shield loop detected"
+            );
+            write_plain(
+                session,
+                508,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"loop detected"),
+            )
+            .await;
+            return Ok(true);
+        }
+        crate::security::loop_guard::stamp_pingora(
+            session.req_header_mut(),
+            &self.state.node_id,
+        );
+
         // The hotlink marker is internal; never trust a client-supplied value.
         session
             .req_header_mut()
@@ -617,14 +654,28 @@ impl ProxyHttp for DataPlaneProxy {
             .get("x-lagran-prefetch")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value == "1")
+            && session
+                .req_header()
+                .headers
+                .get("x-lagran-prefetch-token")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == self.state.prefetch_token)
             && ctx
                 .client_ip
                 .parse::<std::net::IpAddr>()
                 .map(|ip| ip.is_loopback())
                 .unwrap_or(false);
         if internal_prefetch {
-            session.req_header_mut().remove_header("x-lagran-prefetch");
+            // If this request falls back to the in-process engine, it must not
+            // run the public preflight (HTTPS redirect/WAF) a second time.
+            ctx.preflight_done = true;
         }
+        // Internal prefetch headers never reach the origin, even when the
+        // marker/token combination is invalid.
+        session.req_header_mut().remove_header("x-lagran-prefetch");
+        session
+            .req_header_mut()
+            .remove_header("x-lagran-prefetch-token");
 
         // WebSocket is intentionally legacy-only: Pingora's HTTP proxy does
         // not tunnel upgraded connections on this path.
@@ -1282,6 +1333,10 @@ impl ProxyHttp for DataPlaneProxy {
         upstream_request: &mut pingora::http::RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        crate::security::loop_guard::ensure_stamped_pingora(
+            upstream_request,
+            &self.state.node_id,
+        );
         upstream_request.remove_header(signed_url::HOTLINK_OK_HEADER);
         if let Some(plan) = ctx.plan.as_ref() {
             // Keep HTTP Host aligned with the peer actually selected.
@@ -3100,13 +3155,20 @@ impl DataPlaneProxy {
         if ranges.is_empty() {
             return false;
         }
-        let start = ranges.iter().map(|(start, _)| *start).min().unwrap_or(0);
-        let end = ranges.iter().map(|(_, end)| *end).max().unwrap_or(0);
-        if !self
-            .fill_large_span(session, native_plan, start, end, total)
-            .await
-        {
+        // Do not fetch the whole min..max envelope for two tiny ranges at
+        // opposite ends of a video. Merge only ranges whose gap is at most two
+        // chunks; wider gaps are filled as independent chunk-aligned spans.
+        let spans = merge_multipart_spans(ranges, self.state.large_cache_chunk_bytes);
+        if spans.is_empty() {
             return false;
+        }
+        for (start, end) in spans {
+            if !self
+                .fill_large_span(session, native_plan, start, end, total)
+                .await
+            {
+                return false;
+            }
         }
         let Some(large) = self.state.large_cache.as_ref() else {
             return false;
@@ -5409,6 +5471,29 @@ fn parse_multi_ranges(raw: &str, total: u64) -> Option<Vec<(u64, u64)>> {
     Some(ranges)
 }
 
+/// Keep multipart fills narrow: merge overlapping/adjacent ranges and gaps of
+/// at most two chunks, but leave wider gaps unfetched.
+fn merge_multipart_spans(ranges: &[(u64, u64)], chunk_bytes: u64) -> Vec<(u64, u64)> {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|(start, _)| *start);
+    let merge_gap = chunk_bytes.saturating_mul(2);
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        if start > end {
+            continue;
+        }
+        if let Some(last) = spans.last_mut() {
+            // Merge when the ranges overlap or the gap is within the budget.
+            if start <= last.1.saturating_add(merge_gap).saturating_add(1) {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        spans.push((start, end));
+    }
+    spans
+}
+
 fn range_is_small_bounded(headers: &HeaderMap) -> bool {
     const MAX_SLICE: u64 = 1024 * 1024;
     let Some(raw) = headers.get("range").and_then(|v| v.to_str().ok()) else {
@@ -5601,10 +5686,18 @@ fn is_hop_by_hop(name: &str) -> bool {
 /// enabled, a direct client could send `X-Forwarded-For: 1.2.3.4` and
 /// `X-Forwarded-Proto: https` and be believed, which defeated WAF IP deny lists,
 /// CC bans and the HTTPS redirect at once.
+/// A wildcard public bind already accepts loopback on the same port. A
+/// concrete public address does not, so an explicit loopback listener is needed
+/// for internal prefetch.
+fn needs_loopback_listener(public: SocketAddr, local: SocketAddr) -> bool {
+    !public.ip().is_unspecified() && public.ip() != local.ip()
+}
+
 fn prepare_proxy_headers(
     session: &mut Session,
     trust_proxy: bool,
     trusted: &crate::security::trusted_proxy::TrustedProxies,
+    prefetch_token: &str,
 ) -> Result<()> {
     let peer = session.client_addr().and_then(|addr| addr.as_inet());
     let is_https = session
@@ -5626,6 +5719,22 @@ fn prepare_proxy_headers(
         .headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok());
+    // The prefetch worker connects to the loopback listener and sets this
+    // marker plus `x-forwarded-proto: https` when the domain enforces HTTPS.
+    // It must not depend on TRUST_PROXY_HEADERS: that setting is for a real
+    // external SLB, and its default `false` would rewrite the prefetch scheme
+    // to http and trigger the 301 redirect this path exists to avoid.
+    let internal_prefetch = peer.is_some_and(|addr| addr.ip().is_loopback())
+        && req
+            .headers
+            .get("x-lagran-prefetch")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "1")
+        && req
+            .headers
+            .get("x-lagran-prefetch-token")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == prefetch_token);
 
     // `trust_proxy_headers` is the legacy switch. When true but no CIDR list is
     // configured, trust the immediate peer: that is only sane for the loopback
@@ -5647,8 +5756,18 @@ fn prepare_proxy_headers(
         &effective_trusted
     };
 
-    let identity =
-        crate::security::trusted_proxy::resolve(trusted, peer.copied(), xff, xfp, is_https);
+    let identity = if internal_prefetch {
+        // A loopback peer carrying the internal prefetch marker is this Edge's
+        // own worker, not a public client. Preserve the HTTPS intent it came
+        // with even when external proxy-trust is disabled.
+        crate::security::trusted_proxy::ClientIdentity {
+            ip: peer.map(|addr| addr.ip()),
+            is_https: xfp.is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https")),
+            trusted_chain: true,
+        }
+    } else {
+        crate::security::trusted_proxy::resolve(trusted, peer.copied(), xff, xfp, is_https)
+    };
 
     let client_ip = identity.ip.map(|ip| ip.to_string()).unwrap_or_default();
     let req = session.req_header_mut();
@@ -5712,6 +5831,7 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
     let mut server = Server::new_with_opt_and_conf(Some(opt), conf);
     server.bootstrap();
 
+    let local_http_addr = state.local_http_addr;
     let storage = Some(leak_storage_with_large(
         state.cache.clone(),
         state.max_cacheable_body,
@@ -5756,6 +5876,26 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
         .server_options(downstream_options)
         .build();
     service.add_tcp(&config.listen_addr);
+    let public_addr: SocketAddr = config.listen_addr.parse()?;
+    if needs_loopback_listener(public_addr, local_http_addr) {
+        let local = local_http_addr.to_string();
+        match std::net::TcpListener::bind(&local) {
+            Ok(probe) => {
+                drop(probe);
+                service.add_tcp(&local);
+                tracing::info!(listen = %local, "Pingora internal prefetch listener");
+            }
+            Err(error) => {
+                // Do not abort the public listener if the loopback port is
+                // occupied; prefetch will log its own connection failure.
+                tracing::warn!(
+                    listen = %local,
+                    error = %error,
+                    "could not bind internal prefetch listener"
+                );
+            }
+        }
+    }
 
     if let Some(ref https) = config.https_listen_addr {
         match std::net::TcpListener::bind(https) {
@@ -5785,7 +5925,8 @@ mod tests {
     use super::{
         DataPlaneProxy, ResponsePolicySlot, cached_response_policy, compressed_variant_key,
         effective_connect_timeout_ms, fill_window, gzip_engine_body,
-        head_content_length_for_protocol, parse_multi_ranges, parse_single_range,
+        head_content_length_for_protocol, merge_multipart_spans, needs_loopback_listener,
+        parse_multi_ranges, parse_single_range,
         range_fill_is_candidate, valid_release_tag, vary_on_accept_encoding, weaken_etag,
     };
     use crate::cache::policy::ResolvedPolicy;
@@ -6162,5 +6303,68 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn multipart_spans_do_not_bridge_wide_gaps() {
+        let chunk = 1024u64;
+        let ranges = [(0u64, 10u64), (3 * chunk, 3 * chunk + 10)];
+        assert_eq!(
+            merge_multipart_spans(&ranges, chunk),
+            vec![(0, 10), (3 * chunk, 3 * chunk + 10)]
+        );
+    }
+
+    #[test]
+    fn multipart_spans_merge_overlaps_and_small_gaps() {
+        let chunk = 1024u64;
+        let ranges = [(100u64, 200u64), (0, 50), (2 * chunk, 2 * chunk + 10)];
+        assert_eq!(
+            merge_multipart_spans(&ranges, chunk),
+            vec![(0, 2 * chunk + 10)]
+        );
+    }
+
+    #[test]
+    fn multipart_spans_merge_overlapping_unsorted_ranges() {
+        let ranges = [(150u64, 250u64), (0, 50), (100, 200)];
+        assert_eq!(merge_multipart_spans(&ranges, 1024), vec![(0, 250)]);
+    }
+
+    #[test]
+    fn multipart_spans_respect_the_two_chunk_gap() {
+        let chunk = 1024u64;
+        let end = 10u64;
+        let at_limit = [(0u64, end), (end + 2 * chunk + 1, end + 2 * chunk + 20)];
+        assert_eq!(
+            merge_multipart_spans(&at_limit, chunk),
+            vec![(0, end + 2 * chunk + 20)]
+        );
+        let over_limit = [(0u64, end), (end + 2 * chunk + 2, end + 2 * chunk + 20)];
+        assert_eq!(
+            merge_multipart_spans(&over_limit, chunk),
+            vec![(0, end), (end + 2 * chunk + 2, end + 2 * chunk + 20)]
+        );
+    }
+
+    #[test]
+    fn multipart_spans_are_empty_for_no_ranges() {
+        assert!(merge_multipart_spans(&[], 1024).is_empty());
+    }
+
+    #[test]
+    fn internal_prefetch_listener_is_added_only_for_a_concrete_public_bind() {
+        let loopback_v4: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let wildcard_v4: std::net::SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let public_v4: std::net::SocketAddr = "203.0.113.10:8080".parse().unwrap();
+        let loopback_v6: std::net::SocketAddr = "[::1]:8080".parse().unwrap();
+        let wildcard_v6: std::net::SocketAddr = "[::]:8080".parse().unwrap();
+        let public_v6: std::net::SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+
+        assert!(!needs_loopback_listener(wildcard_v4, loopback_v4));
+        assert!(!needs_loopback_listener(loopback_v4, loopback_v4));
+        assert!(needs_loopback_listener(public_v4, loopback_v4));
+        assert!(!needs_loopback_listener(wildcard_v6, loopback_v6));
+        assert!(needs_loopback_listener(public_v6, loopback_v6));
     }
 }

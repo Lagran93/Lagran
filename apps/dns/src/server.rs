@@ -6,9 +6,12 @@ use crate::wire::{
     a_record, aaaa_record, encode_response, ns_record, parse_query, soa_record, Query, Record,
     RCODE_NOERROR, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA, TYPE_ANY, TYPE_NS, TYPE_SOA,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use lru::LruCache;
+use std::collections::hash_map::RandomState;
+use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,10 +22,49 @@ struct CacheEntry {
     at: Instant,
 }
 
+/// Hard cap on cached names. A PRSD flood must not be able to grow this map
+/// without bound; when full, the least-recently-used entry is evicted in O(1)
+/// by the LRU implementation.
+const MAX_CACHE_ENTRIES: usize = 20_000;
+
+struct DnsCache {
+    // `RandomState` matters here: the default `lru` hasher is deterministic,
+    // and PRSD clients choose the keys. Randomised hashing keeps a crafted
+    // collision set from turning cache lookups into linear scans.
+    inner: LruCache<String, CacheEntry, RandomState>,
+}
+
+impl DnsCache {
+    fn new() -> Self {
+        Self::with_capacity(MAX_CACHE_ENTRIES)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        let capacity = NonZeroUsize::new(capacity.max(1)).expect("cache capacity is non-zero");
+        Self {
+            inner: LruCache::with_hasher(capacity, RandomState::new()),
+        }
+    }
+
+    /// A hit updates recency; a miss does not insert.
+    fn get(&mut self, key: &str) -> Option<&CacheEntry> {
+        self.inner.get(key)
+    }
+
+    /// Inserts and, when at capacity, evicts the least-recently-used entry.
+    fn insert(&mut self, key: String, entry: CacheEntry) {
+        self.inner.put(key, entry);
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
 pub struct Service {
     cfg: DnsConfig,
     control: ControlClient,
-    cache: Mutex<HashMap<String, CacheEntry>>,
+    cache: Mutex<DnsCache>,
     /// Keys currently being fetched from the control plane.
     ///
     /// A hot name missed by every worker at once used to produce one control-plane
@@ -60,7 +102,7 @@ impl Service {
         Self {
             cfg,
             control,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(DnsCache::new()),
             in_flight: Mutex::new(HashSet::new()),
             flight_done: Condvar::new(),
             hits: AtomicU64::new(0),
@@ -115,32 +157,6 @@ impl Service {
             .collect()
     }
 
-    /// Evict up to `budget` expired entries with a single bounded pass.
-    ///
-    /// HashMap iteration order is arbitrary but stable while nothing is inserted,
-    /// which is enough here: the goal is to keep the table near the cap, not to
-    /// sweep it exactly. Anything still live that this pass misses is caught on the
-    /// next insert.
-    fn evict_expired(
-        cache: &mut HashMap<String, CacheEntry>,
-        now: Instant,
-        stale_secs: u64,
-        budget: usize,
-    ) {
-        let mut expired: Vec<String> = Vec::new();
-        for (key, entry) in cache.iter() {
-            if expired.len() >= budget {
-                break;
-            }
-            if now.duration_since(entry.at).as_secs() > stale_secs {
-                expired.push(key.clone());
-            }
-        }
-        for key in expired {
-            cache.remove(&key);
-        }
-    }
-
     fn fallback_ip(&self) -> Option<IpAddr> {
         self.cfg
             .fallback_ip
@@ -156,7 +172,7 @@ impl Service {
     /// pre-single-flight behaviour — degraded, not stuck.
     /// A fresh cached answer for `key`, if there is one.
     fn cached_answer(&self, key: &str, now: Instant) -> Option<Option<(IpAddr, u32)>> {
-        let cache = self.cache.lock().ok()?;
+        let mut cache = self.cache.lock().ok()?;
         let entry = cache.get(key)?;
         if now.duration_since(entry.at).as_secs() > self.cfg.cache_secs {
             return None;
@@ -192,7 +208,7 @@ impl Service {
     ) -> Option<Option<(IpAddr, u32)>> {
         let now = Instant::now();
         {
-            let cache = self.cache.lock().ok()?;
+            let mut cache = self.cache.lock().ok()?;
             if let Some(entry) = cache.get(key) {
                 let age = now.duration_since(entry.at).as_secs();
                 if age <= self.cfg.cache_secs {
@@ -240,6 +256,9 @@ impl Service {
             Ok(reply) => {
                 let ip = reply.ip.or(reply.backup);
                 if let Ok(mut cache) = self.cache.lock() {
+                    // `put` is O(1) and evicts the least-recently-used entry
+                    // when the hard cap is reached, so a random-subdomain flood
+                    // cannot grow memory or trigger a map-wide scan.
                     cache.insert(
                         key.to_string(),
                         CacheEntry {
@@ -248,22 +267,12 @@ impl Service {
                             at: now,
                         },
                     );
-                    // Bound the table without a full sweep under the write lock.
-                    //
-                    // The old `retain` walked every entry the moment the map passed
-                    // 20k — a millisecond-scale stall on the worker thread, repeated
-                    // every time a random-subdomain flood refilled the table. Here a
-                    // bounded number of expired entries is evicted per insert
-                    // instead, so no single query pays for the whole map.
-                    if cache.len() > 20_000 {
-                        Self::evict_expired(&mut cache, now, self.cfg.stale_secs, 256);
-                    }
                 }
                 Some(ip.map(|ip| (ip, reply.ttl)))
             }
             Err(e) => {
                 tracing::warn!(error = %e, qname, "scheduler lookup failed");
-                if let Ok(cache) = self.cache.lock() {
+                if let Ok(mut cache) = self.cache.lock() {
                     if let Some(entry) = cache.get(key) {
                         let age = now.duration_since(entry.at).as_secs();
                         if age <= self.cfg.stale_secs {
@@ -1033,5 +1042,39 @@ mod queue_tests {
             claim_flight(&in_flight, "GET:a.test"),
             "a duplicate fetch beats no answer"
         );
+    }
+
+    fn cache_entry(ip: &str) -> CacheEntry {
+        CacheEntry {
+            ip: Some(ip.parse().expect("valid test IP")),
+            ttl: 30,
+            at: Instant::now(),
+        }
+    }
+
+    /// A PRSD flood must not be able to grow the answer cache past its cap.
+    #[test]
+    fn cache_stays_hard_bounded_under_many_inserts() {
+        let mut cache = DnsCache::with_capacity(8);
+        for i in 0..1_000 {
+            cache.insert(format!("rand-{i}.example.test"), cache_entry("192.0.2.1"));
+        }
+        assert_eq!(cache.len(), 8);
+        assert!(cache.get("rand-0.example.test").is_none());
+        assert!(cache.get("rand-999.example.test").is_some());
+    }
+
+    /// A hit refreshes recency; the true least-recently-used entry is evicted.
+    #[test]
+    fn cache_evicts_the_least_recently_used_entry() {
+        let mut cache = DnsCache::with_capacity(2);
+        cache.insert("a".into(), cache_entry("192.0.2.1"));
+        cache.insert("b".into(), cache_entry("192.0.2.2"));
+        assert!(cache.get("a").is_some(), "touch a so b becomes LRU");
+        cache.insert("c".into(), cache_entry("192.0.2.3"));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("c").is_some());
+        assert!(cache.get("b").is_none());
     }
 }

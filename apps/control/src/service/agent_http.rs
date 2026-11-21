@@ -213,11 +213,30 @@ pub async fn post_json_with_headers<B: Serialize>(
     Ok((status, body))
 }
 
+/// Maximum body bytes collected for diagnostic requests (64 KiB).
+/// Prevents large streaming responses (e.g. video files) from exhausting memory.
+pub const MAX_DIAGNOSTIC_BODY_BYTES: usize = 64 * 1024;
+
 /// Diagnostic GET: returns status/headers/body for cache troubleshooting.
+///
+/// Body consumption is capped at [`MAX_DIAGNOSTIC_BODY_BYTES`] (64 KiB).  Large
+/// responses (video streams, downloads, etc.) are truncated rather than buffered
+/// whole, preventing OOM in the control plane.
 pub async fn get_response(
     url: &str,
     headers: &[(&str, &str)],
 ) -> Result<(u16, HeaderMap, Bytes), String> {
+    get_response_limited(url, headers, MAX_DIAGNOSTIC_BODY_BYTES).await
+}
+
+/// Diagnostic GET with an explicit cap on how many body bytes are buffered.
+pub async fn get_response_limited(
+    url: &str,
+    headers: &[(&str, &str)],
+    max_bytes: usize,
+) -> Result<(u16, HeaderMap, Bytes), String> {
+    use http_body_util::BodyExt as _;
+
     let mut builder = Request::builder().method("GET").uri(url);
     for (k, v) in headers {
         builder = builder.header(*k, *v);
@@ -230,14 +249,38 @@ pub async fn get_response(
         .map_err(|_| "diagnostic request timed out".to_string())?
         .map_err(|e| format!("diagnostic request failed: {e}"))?;
     let status = response.status().as_u16();
-    let headers = response.headers().clone();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| format!("diagnostic body error: {e}"))?
-        .to_bytes();
-    Ok((status, headers, body))
+    let resp_headers = response.headers().clone();
+
+    // Stream frames up to `max_bytes`; drop the rest to avoid OOM. The read
+    // loop also has its own deadline: a malicious origin can send headers and
+    // then stall forever, which the request timeout above does not cover.
+    let mut body = response.into_body();
+    let mut buf: Vec<u8> = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if buf.len() >= max_bytes {
+                break;
+            }
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        let take = data.len().min(max_bytes.saturating_sub(buf.len()));
+                        buf.extend_from_slice(&data[..take]);
+                    }
+                }
+                Some(Err(e)) => return Err(format!("diagnostic body error: {e}")),
+                None => break,
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .await;
+    match read {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("diagnostic body timed out".into()),
+    }
+    Ok((status, resp_headers, Bytes::from(buf)))
 }
 
 fn preview(bytes: &Bytes) -> String {
@@ -252,6 +295,34 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
+
+    #[tokio::test]
+    async fn caps_diagnostic_body_at_limit() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    // Serve a 1 MiB body; the client must truncate it at 1024 bytes.
+                    let large = vec![b'X'; 1024 * 1024];
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        large.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&large);
+                });
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/large");
+        let (status, _hdrs, body) = get_response_limited(&url, &[], 1024).await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 1024, "body must be capped at 1024 bytes");
+    }
 
     #[tokio::test]
     async fn retries_a_transient_5xx_once() {

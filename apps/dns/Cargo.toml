@@ -20,3 +20,4 @@ dotenvy = { workspace = true }
 rustls = { workspace = true }
 ctrlc = { workspace = true }
 webpki-roots = { workspace = true }
+lru = { workspace = true }

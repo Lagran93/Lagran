@@ -11,7 +11,6 @@
 //! This prevents an unregistered edge from joining just by knowing the global
 //! token, and prevents one edge from checking in as a different node.
 
-use crate::repository;
 use crate::state::AppState;
 use axum::{
     async_trait,
@@ -77,9 +76,20 @@ impl FromRequestParts<AppState> for AgentAuth {
         if got.is_empty() {
             return Err(AgentAuthError);
         }
-        match repository::node_name_for_token(&state.pool, got).await {
+        match state
+            .agent_tokens
+            .resolve(&state.pool, state.redis.as_deref(), got)
+            .await
+        {
             Ok(Some(node_name)) => Ok(Self { node_name }),
-            _ => Err(AgentAuthError),
+            Ok(None) => Err(AgentAuthError),
+            Err(error) => {
+                // A database outage should not be reported as a bad token to
+                // the edge; the status stays 401 for compatibility, but the
+                // control-plane log carries the real reason.
+                tracing::debug!(error = %error, "agent token lookup failed");
+                Err(AgentAuthError)
+            }
         }
     }
 }
@@ -112,9 +122,13 @@ impl FromRequestParts<AppState> for ScheduleAuth {
         if got == expected {
             return Ok(ScheduleAuth);
         }
-        if repository::node_token_exists(&state.pool, got)
+        if state
+            .agent_tokens
+            .resolve(&state.pool, state.redis.as_deref(), got)
             .await
-            .unwrap_or(false)
+            .ok()
+            .flatten()
+            .is_some()
         {
             return Ok(ScheduleAuth);
         }

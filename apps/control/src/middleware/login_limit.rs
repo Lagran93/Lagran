@@ -82,7 +82,39 @@ impl LoginLimiter {
                 .incr_with_ttl(&format!("lagran:rl:{key}"), WINDOW.as_secs())
                 .await;
         } else {
-            let _ = self.check(key);
+            self.record_failure(key);
+        }
+    }
+
+    /// Increment a local failure counter without applying `MAX_ATTEMPTS`.
+    ///
+    /// `check` is the registration gate and stops incrementing at 20. Reusing it
+    /// here capped the IP bucket at 20, so `peek(key, LOGIN_IP_LIMIT)` kept
+    /// returning true after the 20th failure and never enforced the 60/min IP
+    /// budget. The login handler applies its own limit via `peek`.
+    fn record_failure(&self, key: &str) {
+        let mut map = match self.inner.lock() {
+            Ok(map) => map,
+            Err(_) => return,
+        };
+        let now = Instant::now();
+        if map.len() > 10_000 {
+            map.retain(|_, bucket| {
+                bucket
+                    .window_start
+                    .map(|start| now.duration_since(start) < WINDOW * 2)
+                    .unwrap_or(false)
+            });
+        }
+        let bucket = map.entry(key.to_string()).or_default();
+        match bucket.window_start {
+            Some(start) if now.duration_since(start) < WINDOW => {
+                bucket.count = bucket.count.saturating_add(1);
+            }
+            _ => {
+                bucket.window_start = Some(now);
+                bucket.count = 1;
+            }
         }
     }
 
@@ -130,5 +162,39 @@ impl LoginLimiter {
 impl Default for LoginLimiter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The local fallback must be able to count past the 20-attempt
+    /// registration limit; otherwise the 60/min IP budget is never reached.
+    #[tokio::test]
+    async fn local_failures_reach_the_ip_budget() {
+        let limiter = LoginLimiter::new();
+        let key = "login-ip:203.0.113.9";
+        for _ in 0..MAX_ATTEMPTS {
+            limiter.record_failure_shared(None, key).await;
+        }
+        assert!(limiter.peek(key, LOGIN_IP_LIMIT));
+
+        for _ in MAX_ATTEMPTS..LOGIN_IP_LIMIT {
+            limiter.record_failure_shared(None, key).await;
+        }
+        assert!(!limiter.peek(key, LOGIN_IP_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn cleared_bucket_starts_over() {
+        let limiter = LoginLimiter::new();
+        let key = "login:test@example.com";
+        for _ in 0..MAX_ATTEMPTS {
+            limiter.record_failure_shared(None, key).await;
+        }
+        assert!(!limiter.peek(key, MAX_ATTEMPTS));
+        limiter.clear_shared(None, key).await;
+        assert!(limiter.peek(key, MAX_ATTEMPTS));
     }
 }

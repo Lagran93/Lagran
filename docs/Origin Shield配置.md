@@ -21,6 +21,19 @@ Origin Shield 是一个区域级大缓存层：
 
 Origin Shield 不是“任意节点互相取对象”。它是一台指定的缓存节点或一组 Shield 节点。
 
+### 循环防护
+
+每个 Edge 向源站或 Shield 转发请求时会追加：
+
+```text
+CDN-Loop: lagran; id=<本节点 NODE_ID>
+X-Lagran-Shield-Hops: <跳数>
+```
+
+接收端如果发现 `CDN-Loop` 已包含自己的 `NODE_ID`，或 `X-Lagran-Shield-Hops` 已达到 3，
+会直接返回 `508 Loop Detected`，避免 Shield A → Shield B → Shield A 这类误配置无限回源。
+该防护同时覆盖 native Pingora、legacy 回退、条件回源和 Range 流式回源。
+
 ---
 
 ## 1. 架构

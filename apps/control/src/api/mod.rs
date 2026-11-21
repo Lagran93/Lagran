@@ -172,6 +172,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/schedule/test", post(crate::scheduler::test))
                 .route("/dns/test", post(dns_test::test))
                 .route("/nodes", get(node::list).post(node::create))
+                .route("/nodes/public-summary", get(node::public_summary))
                 .route(
                     "/nodes/:id",
                     get(node::detail).put(node::update).delete(node::delete),
