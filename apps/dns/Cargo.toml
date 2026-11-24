@@ -21,3 +21,7 @@ rustls = { workspace = true }
 ctrlc = { workspace = true }
 webpki-roots = { workspace = true }
 lru = { workspace = true }
+# RFC 7766 connection reuse needs event-driven sockets: one OS thread per TCP
+# connection (the previous model) cannot keep thousands of mostly-idle
+# connections alive. The UDP path stays synchronous.
+tokio = { workspace = true }

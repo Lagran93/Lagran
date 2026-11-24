@@ -71,10 +71,14 @@ for name in dns-gd dns-bj; do
 done
 
 create_node() {
-  local name=$1 public_ip=$2 province=$3 city=$4 isp=$5
+  local name=$1 public_ip=$2 province=$3 city=$4 isp=$5 region=$6
   local resp id token
+  # `region` is an ASCII label (letters, digits, '-', '_', '.'); the Chinese
+  # province/city names belong in their own columns. Sending the province as the
+  # region made node creation fail with 400, so every scheduling assertion below
+  # saw an empty answer.
   resp=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
-    -d "{\"name\":\"$name\",\"region\":\"$province\",\"public_ip\":\"$public_ip\",\"province\":\"$province\",\"city\":\"$city\",\"isp\":\"$isp\",\"weight\":100,\"agent_url\":\"http://127.0.0.1:19000\"}")
+    -d "{\"name\":\"$name\",\"region\":\"$region\",\"public_ip\":\"$public_ip\",\"province\":\"$province\",\"city\":\"$city\",\"isp\":\"$isp\",\"weight\":100,\"agent_url\":\"http://127.0.0.1:19000\"}")
   id=$(printf '%s' "$resp" | jq -r '.node.id')
   token=$(printf '%s' "$resp" | jq -r '.token')
   printf '%s|%s\n' "$id" "$token"
@@ -86,8 +90,11 @@ beat() {
     -d "{\"node_id\":\"$1\",\"region\":\"test\",\"ip\":\"127.0.0.1\",\"agent_url\":\"http://127.0.0.1:19000\",\"public_ip\":\"$2\",\"version\":\"0.1.0\"}" >/dev/null
 }
 
-IFS='|' read -r GD GD_TOKEN <<< "$(create_node "dns-gd" "203.0.113.10" "广东" "深圳" "电信")"
-IFS='|' read -r BJ BJ_TOKEN <<< "$(create_node "dns-bj" "203.0.113.12" "北京" "北京" "电信")"
+IFS='|' read -r GD GD_TOKEN <<< "$(create_node "dns-gd" "203.0.113.10" "广东" "深圳" "电信" "cn-gd")"
+IFS='|' read -r BJ BJ_TOKEN <<< "$(create_node "dns-bj" "203.0.113.12" "北京" "北京" "电信" "cn-bj")"
+# An empty id means node creation failed; without nodes every scheduling check
+# below would silently see an empty answer.
+[[ -n "$GD" && -n "$BJ" ]] || { echo "node creation failed (region must be ASCII)"; exit 1; }
 NODE_IDS+=("$GD" "$BJ")
 beat "dns-gd" "203.0.113.10" "$GD_TOKEN"
 beat "dns-bj" "203.0.113.12" "$BJ_TOKEN"

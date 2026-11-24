@@ -141,6 +141,7 @@ fn check_config(cfg: &DnsConfig) -> Result<(), String> {
     );
     println!("workers: {}", cfg.workers);
     println!("tcp: {}", cfg.tcp_enabled);
+    println!("tcp_idle_secs: {}", cfg.tcp_idle_secs);
     println!(
         "fallback_ip: {}",
         cfg.fallback_ip.as_deref().unwrap_or("(none)")

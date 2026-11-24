@@ -1864,6 +1864,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "webpki-roots 1.0.11",

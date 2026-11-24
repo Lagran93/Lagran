@@ -30,8 +30,14 @@ pub struct DnsConfig {
     pub stale_secs: u64,
     pub workers: usize,
     pub tcp_enabled: bool,
-    /// Maximum concurrent TCP connections (one thread each).
+    /// Maximum concurrent TCP connections (one async task each).
     pub max_tcp_connections: usize,
+    /// Idle timeout for a persistent TCP connection.
+    ///
+    /// RFC 7766 requires keeping the connection open for further queries and
+    /// allows closing it when idle. Long enough for a resolver's retry burst,
+    /// short enough that a stalled client cannot pin a slot forever.
+    pub tcp_idle_secs: u64,
     /// Per-source query budget.
     pub rate_limit: crate::ratelimit::RateLimitConfig,
     pub fallback_ip: Option<String>,
@@ -119,6 +125,11 @@ impl DnsConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(512)
                 .clamp(16, 65_536),
+            tcp_idle_secs: std::env::var("DNS_TCP_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(5)
+                .clamp(1, 300),
             rate_limit: crate::ratelimit::RateLimitConfig {
                 // 0 disables limiting, which is only sensible behind a scrubber.
                 per_source: std::env::var("DNS_RATE_LIMIT_PER_SOURCE")

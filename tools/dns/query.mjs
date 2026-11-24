@@ -202,19 +202,31 @@ function tcpQuery(packet) {
       len.writeUInt16BE(packet.length, 0)
       sock.write(Buffer.concat([len, packet]))
     })
-    const chunks = []
-    sock.on('data', (c) => chunks.push(c))
-    sock.on('end', () => {
-      const all = Buffer.concat(chunks)
-      if (all.length < 2) return reject(new Error('short tcp response'))
-      const len = all.readUInt16BE(0)
-      resolve(all.subarray(2, 2 + len))
-    })
-    sock.on('error', reject)
-    setTimeout(() => {
+    let collected = Buffer.alloc(0)
+    let settled = false
+    const finish = (err, value) => {
+      if (settled) return
+      settled = true
       sock.destroy()
-      reject(new Error('tcp timeout'))
-    }, 3000)
+      if (err) reject(err)
+      else resolve(value)
+    }
+    // RFC 7766 §6.2: the server keeps the connection open for further queries,
+    // so a response is delimited by its 16-bit length prefix, NOT by the server
+    // closing the socket. Waiting for `end` here made every TCP query time out
+    // once the server stopped dropping the connection after one answer.
+    sock.on('data', (chunk) => {
+      collected = Buffer.concat([collected, chunk])
+      if (collected.length < 2) return
+      const len = collected.readUInt16BE(0)
+      if (collected.length < 2 + len) return
+      finish(null, collected.subarray(2, 2 + len))
+    })
+    sock.on('end', () => {
+      finish(new Error('connection closed before a full response'))
+    })
+    sock.on('error', (err) => finish(err))
+    setTimeout(() => finish(new Error('tcp timeout')), 3000)
   })
 }
 

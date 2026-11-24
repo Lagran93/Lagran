@@ -9,12 +9,14 @@ use crate::wire::{
 use lru::LruCache;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashSet, VecDeque};
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::io::ErrorKind;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
 struct CacheEntry {
     ip: Option<IpAddr>,
@@ -472,18 +474,27 @@ impl Queue {
 /// what actually arrives instead of with what was announced.
 const TCP_READ_CHUNK: usize = 4096;
 
+/// Answering a cache miss blocks on the control plane (HTTP timeout plus
+/// single-flight waiting), so it runs on `spawn_blocking`. This caps how many
+/// such jobs may be queued: without it, 65k accepted connections could enqueue
+/// 65k blocking jobs at once.
+const TCP_MAX_BLOCKING: usize = 256;
+
 /// Read exactly `len` bytes without pre-allocating the announced size.
 ///
 /// A client may announce 65535 bytes and then send nothing; committing that up
-/// front would hold the memory for the whole read timeout on every connection
-/// thread. Growth follows what actually arrives.
-fn read_framed_body(stream: &mut dyn Read, len: usize) -> Option<Vec<u8>> {
+/// front would hold the memory for the whole idle timeout on every connection.
+/// Growth follows what actually arrives.
+async fn read_framed_body<R>(reader: &mut R, len: usize) -> Option<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut buf = Vec::with_capacity(len.min(TCP_READ_CHUNK));
     let mut remaining = len;
     let mut chunk = [0u8; TCP_READ_CHUNK];
     while remaining > 0 {
         let want = remaining.min(TCP_READ_CHUNK);
-        stream.read_exact(&mut chunk[..want]).ok()?;
+        reader.read_exact(&mut chunk[..want]).await.ok()?;
         buf.extend_from_slice(&chunk[..want]);
         remaining -= want;
     }
@@ -501,17 +512,111 @@ enum FramedRead {
 
 /// Read one length-prefixed message, applying the acceptance policy.
 ///
-/// Kept separate from `handle_tcp` so the policy is testable: the previous
-/// version rejected anything over 4096 bytes here, which silently closed the
-/// connection for queries the protocol allows.
-fn read_framed_message(stream: &mut dyn Read, announced: usize) -> FramedRead {
+/// Kept separate from the connection loop so the policy is testable: the
+/// previous version rejected anything over 4096 bytes here, which silently
+/// closed the connection for queries the protocol allows.
+async fn read_framed_message<R>(reader: &mut R, announced: usize) -> FramedRead
+where
+    R: AsyncRead + Unpin,
+{
     if announced == 0 {
         return FramedRead::Drop;
     }
-    match read_framed_body(stream, announced) {
+    match read_framed_body(reader, announced).await {
         Some(body) => FramedRead::Body(body),
         None => FramedRead::Drop,
     }
+}
+
+/// Write one length-prefixed DNS message.
+///
+/// The response must fit the 16-bit length field; an oversized body is reported
+/// as an error so the caller can answer FORMERR instead of writing a truncated
+/// frame the client would parse as a shorter message.
+async fn write_framed_message<W>(writer: &mut W, body: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let len = u16::try_from(body.len()).map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "DNS/TCP response exceeds the 65535-byte frame limit",
+        )
+    })?;
+    let mut out = Vec::with_capacity(2 + body.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(body);
+    writer.write_all(&out).await
+}
+
+/// Serve DNS-over-TCP messages on one connection until it ends.
+///
+/// This is the RFC 7766 connection-management rule: the server must not close
+/// the connection after answering one query, it should keep it open for further
+/// queries until the client closes it or the idle timeout expires. The previous
+/// implementation read exactly one frame, wrote one answer and dropped the
+/// stream, so every query after a truncated-UDP (`TC`) fallback paid for a fresh
+/// three-way handshake and a resolver could not pipeline at all.
+///
+/// `handle` is a closure rather than a direct `Service` call so the loop can be
+/// driven without a control plane in tests. Returning `None` closes the
+/// connection (the handler could not produce an answer).
+async fn serve_messages<S, H, Fut>(stream: &mut S, idle: Duration, mut handle: H) -> usize
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    H: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    let mut answered = 0usize;
+    let mut len_buf = [0u8; 2];
+    loop {
+        // The idle timer applies only while waiting for the *next* message: a
+        // client that keeps querying is never disconnected mid-stream.
+        match timeout(idle, stream.read_exact(&mut len_buf)).await {
+            Err(_) => break,
+            Ok(Err(error)) => {
+                // EOF at a message boundary is the normal end of a kept-alive
+                // connection; anything else is a broken or hostile peer.
+                if error.kind() != ErrorKind::UnexpectedEof {
+                    tracing::debug!(%error, "TCP DNS connection ended");
+                }
+                break;
+            }
+            Ok(Ok(_)) => {}
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let buf = match timeout(idle, read_framed_message(stream, len)).await {
+            // A stalled body must not hold the connection (or its slot) open.
+            Err(_) => break,
+            Ok(FramedRead::Drop) => break,
+            Ok(FramedRead::Body(body)) => body,
+        };
+        // Keep the query ID for the FORMERR fallback below: the handler takes
+        // ownership of the buffer.
+        let id = (buf.len() >= 2).then(|| [buf[0], buf[1]]);
+        let Some(resp) = handle(buf).await else {
+            break;
+        };
+        // Cannot be framed in a 16-bit length field: answer FORMERR echoing the
+        // original ID rather than closing silently, and keep the connection
+        // usable for the next query.
+        let resp = if resp.len() > 65_535 {
+            formerr(&id.unwrap_or_default())
+        } else {
+            resp
+        };
+        match timeout(idle, write_framed_message(stream, &resp)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "TCP DNS write failed");
+                break;
+            }
+            // A client that stops reading must not pin the connection.
+            Err(_) => break,
+        }
+        answered += 1;
+    }
+    answered
 }
 
 /// Best-effort text for a panic payload.
@@ -528,54 +633,151 @@ fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
     "non-string panic payload".to_string()
 }
 
-fn handle_tcp(mut stream: TcpStream, service: Arc<Service>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let peer = stream.peer_addr().ok();
-    let mut len_buf = [0u8; 2];
-    if stream.read_exact(&mut len_buf).is_err() {
-        return;
+/// One claimed TCP connection slot.
+///
+/// The claim is a single `fetch_update`, so the check-then-increment window the
+/// old code closed by relying on a single-threaded accept loop cannot reappear.
+/// Dropping the guard returns the slot, whatever path ends the connection.
+struct ConnectionSlot(Arc<AtomicU64>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
-    let len = u16::from_be_bytes(len_buf) as usize;
-    // A TCP DNS message is length-prefixed with a 16-bit field, and RFC 7766
-    // expects the server to read what the client announced. The previous 4096
-    // cap silently dropped larger queries: the connection was closed without a
-    // response, so the client saw a timeout rather than an error, and a resolver
-    // retrying over TCP (which is what a truncated UDP answer leads to) never got
-    // an answer at all. `Service::handle` already treats TCP as good for 65535
-    // bytes, so the two limits disagreed.
-    if len == 0 {
-        // Zero-length is not a message; nothing to answer with an ID.
-        return;
-    }
-    // Read into a fixed-size stack buffer in chunks rather than pre-allocating
-    // `len` up front: a client may announce 65535 bytes and then send nothing, and
-    // `vec![0u8; len]` would have committed that memory for the whole 5 s read
-    // timeout on every one of the (default 512) connection threads.
-    let buf = match read_framed_message(&mut stream, len) {
-        FramedRead::Body(body) => body,
-        FramedRead::Drop => return,
-    };
-    let client_ip = peer
-        .map(|p| p.ip())
+}
+
+/// Claim a connection slot, or `None` when the limit is reached.
+fn claim_slot(active: &Arc<AtomicU64>, max: usize) -> Option<ConnectionSlot> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < max as u64).then_some(current + 1)
+        })
+        .ok()
+        .map(|_| ConnectionSlot(active.clone()))
+}
+
+/// Answer one query for a TCP connection.
+///
+/// `Service::handle` blocks (control-plane HTTP, single-flight `Condvar`), so it
+/// must not run on a runtime worker: a few slow lookups would stall every other
+/// connection. The semaphore bounds how many blocking jobs can be queued.
+async fn answer_on_blocking(
+    service: Arc<Service>,
+    body: Vec<u8>,
+    client_ip: IpAddr,
+    blocking: Arc<tokio::sync::Semaphore>,
+) -> Option<Vec<u8>> {
+    let permit = blocking.acquire_owned().await.ok()?;
+    let joined = tokio::task::spawn_blocking(move || {
+        let resp = service.handle(&body, client_ip, true);
+        // The permit is released when the job finishes, not when the caller
+        // wakes: holding it across the join is what bounds the pool's queue.
+        drop(permit);
+        resp
+    })
+    .await;
+    joined.ok()
+}
+
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    service: Arc<Service>,
+    idle: Duration,
+    blocking: Arc<tokio::sync::Semaphore>,
+) {
+    // DNS responses are small and latency-sensitive; Nagle plus delayed ACK adds
+    // ~40 ms to a request/response pair every so often.
+    let _ = stream.set_nodelay(true);
+    let client_ip = stream
+        .peer_addr()
+        .map(|peer| peer.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    let resp = service.handle(&buf, client_ip, true);
-    if resp.len() > 65_535 {
-        // The response cannot be framed in a 16-bit length field. Answer with
-        // FORMERR echoing the original ID instead of closing silently, so the
-        // client can distinguish "refused" from "server unreachable".
-        let id = &buf[..buf.len().min(2)];
-        let formerr = formerr(id);
-        let mut out = Vec::with_capacity(2 + formerr.len());
-        out.extend_from_slice(&(formerr.len() as u16).to_be_bytes());
-        out.extend_from_slice(&formerr);
-        let _ = stream.write_all(&out);
-        return;
+    let mut stream = stream;
+    let answered = serve_messages(&mut stream, idle, |body| {
+        answer_on_blocking(service.clone(), body, client_ip, blocking.clone())
+    })
+    .await;
+    tracing::debug!(client = %client_ip, answered, "TCP DNS connection closed");
+}
+
+/// Accept and serve persistent DNS/TCP connections until the listener fails.
+///
+/// Each connection is a task, not an OS thread: a resolver keeping hundreds of
+/// mostly-idle connections open costs a few kilobytes per task instead of a
+/// thread stack each, which is what makes the RFC 7766 keep-alive affordable.
+async fn serve_tcp(
+    listener: tokio::net::TcpListener,
+    max_conns: usize,
+    idle: Duration,
+    service: Arc<Service>,
+) {
+    let active = Arc::new(AtomicU64::new(0));
+    let blocking = Arc::new(tokio::sync::Semaphore::new(max_conns.min(TCP_MAX_BLOCKING)));
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _peer)) => stream,
+            Err(error) => {
+                // `EMFILE` or a transient accept failure would otherwise spin a
+                // core; the listener stays up and the next accept retries.
+                tracing::warn!(%error, "DNS TCP accept failed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        let Some(slot) = claim_slot(&active, max_conns) else {
+            // Dropping the stream closes the connection immediately.
+            tracing::debug!("TCP connection limit reached, dropping");
+            continue;
+        };
+        let service = service.clone();
+        let blocking = blocking.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            serve_connection(stream, service, idle, blocking).await;
+        });
     }
-    let mut out = Vec::with_capacity(2 + resp.len());
-    out.extend_from_slice(&(resp.len() as u16).to_be_bytes());
-    out.extend_from_slice(&resp);
-    let _ = stream.write_all(&out);
+}
+
+/// Bind and run the TCP listener on its own async runtime.
+fn spawn_tcp_listener(cfg: &DnsConfig, service: Arc<Service>) {
+    let listen = cfg.listen.clone();
+    let max_conns = cfg.max_tcp_connections;
+    let idle = Duration::from_secs(cfg.tcp_idle_secs);
+    // Two workers are enough: connections are mostly idle, and every blocking
+    // piece of work leaves the runtime via `spawn_blocking`.
+    let spawned = std::thread::Builder::new()
+        .name("dns-tcp".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("dns-tcp-worker")
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(%error, "cannot build the DNS TCP runtime");
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                match tokio::net::TcpListener::bind(&listen).await {
+                    Ok(listener) => {
+                        tracing::info!(
+                            listen,
+                            max_conns,
+                            idle_secs = idle.as_secs(),
+                            "DNS TCP listener started (persistent connections, RFC 7766)"
+                        );
+                        serve_tcp(listener, max_conns, idle, service).await;
+                    }
+                    Err(error) => tracing::error!(%error, listen, "DNS TCP bind failed"),
+                }
+            });
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "cannot start the DNS TCP thread");
+    }
 }
 
 pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
@@ -592,40 +794,10 @@ pub fn run(cfg: DnsConfig) -> anyhow::Result<()> {
     );
 
     if cfg.tcp_enabled {
-        let tcp_service = service.clone();
-        let listen = cfg.listen.clone();
-        // One thread per connection: without a cap a client can exhaust threads
-        // and file descriptors just by opening sockets.
-        let max_conns = cfg.max_tcp_connections;
-        let active = Arc::new(AtomicU64::new(0));
-        std::thread::spawn(move || match TcpListener::bind(&listen) {
-            Ok(listener) => {
-                tracing::info!(listen, max_conns, "DNS TCP listener started");
-                for stream in listener.incoming().flatten() {
-                    // Claim a slot and test the limit in one atomic step. The
-                    // previous check-then-increment was safe only because this
-                    // accept loop is single-threaded — an invariant nothing states
-                    // and any future second acceptor would silently break.
-                    let claimed = active
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                            (current < max_conns as u64).then_some(current + 1)
-                        })
-                        .is_ok();
-                    if !claimed {
-                        // Dropping the stream closes the connection immediately.
-                        tracing::debug!("TCP connection limit reached, dropping");
-                        continue;
-                    }
-                    let svc = tcp_service.clone();
-                    let active = active.clone();
-                    std::thread::spawn(move || {
-                        handle_tcp(stream, svc);
-                        active.fetch_sub(1, Ordering::AcqRel);
-                    });
-                }
-            }
-            Err(e) => tracing::error!(error = %e, "DNS TCP bind failed"),
-        });
+        // TCP runs on its own small async runtime: persistent, mostly-idle
+        // connections need an event loop, not one OS thread each. UDP below keeps
+        // its synchronous socket and worker pool.
+        spawn_tcp_listener(&cfg, service.clone());
     }
 
     let queue = Arc::new(Queue::new());
@@ -851,54 +1023,207 @@ mod queue_tests {
     /// read what was announced. The previous 4096 limit closed the connection
     /// without a response, so a resolver retrying over TCP after a truncated UDP
     /// answer got a timeout instead of an answer.
-    #[test]
-    fn tcp_reads_queries_larger_than_the_old_cap() {
+    #[tokio::test]
+    async fn tcp_reads_queries_larger_than_the_old_cap() {
         for size in [4097usize, 8192, 65_535] {
             let payload = vec![0xABu8; size];
-            let mut cursor = std::io::Cursor::new(payload.clone());
-            match read_framed_message(&mut cursor, size) {
+            let body = framed_body(payload, size).await;
+            match body {
                 FramedRead::Body(body) => assert_eq!(body.len(), size),
                 FramedRead::Drop => panic!("{size}-byte query must be read, not dropped"),
             }
         }
     }
 
+    /// Feed `bytes` to `read_framed_message` through an async pipe.
+    async fn framed_body(bytes: Vec<u8>, announced: usize) -> FramedRead {
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len().max(1));
+        tokio::spawn(async move {
+            let _ = writer.write_all(&bytes).await;
+        });
+        read_framed_message(&mut reader, announced).await
+    }
+
     /// The announced size is not pre-allocated: a client that announces 65535 and
-    /// sends nothing must not cause a 64 KiB allocation.
-    #[test]
-    fn tcp_read_does_not_preallocate_the_announced_size() {
-        let mut cursor = std::io::Cursor::new(Vec::new());
+    /// sends nothing must not produce a padded body.
+    #[tokio::test]
+    async fn tcp_read_does_not_preallocate_the_announced_size() {
         assert_eq!(
-            read_framed_message(&mut cursor, 65_535),
+            framed_body(Vec::new(), 65_535).await,
             FramedRead::Drop,
             "a short body must be dropped, not padded"
         );
     }
 
     /// A body that stops mid-message is rejected rather than returned truncated.
-    #[test]
-    fn tcp_read_rejects_a_truncated_body() {
-        let mut cursor = std::io::Cursor::new(vec![1u8; 100]);
-        assert_eq!(read_framed_message(&mut cursor, 200), FramedRead::Drop);
+    #[tokio::test]
+    async fn tcp_read_rejects_a_truncated_body() {
+        assert_eq!(framed_body(vec![1u8; 100], 200).await, FramedRead::Drop);
     }
 
     /// A zero-length frame has no ID to answer, so it is dropped.
-    #[test]
-    fn tcp_read_drops_zero_length_frames() {
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        assert_eq!(read_framed_message(&mut cursor, 0), FramedRead::Drop);
+    #[tokio::test]
+    async fn tcp_read_drops_zero_length_frames() {
+        assert_eq!(framed_body(Vec::new(), 0).await, FramedRead::Drop);
     }
 
     /// Small bodies round-trip unchanged.
-    #[test]
-    fn tcp_read_handles_small_bodies() {
+    #[tokio::test]
+    async fn tcp_read_handles_small_bodies() {
         let payload = b"hello".to_vec();
-        let mut cursor = std::io::Cursor::new(payload.clone());
         assert_eq!(
-            read_framed_message(&mut cursor, payload.len()),
+            framed_body(payload.clone(), payload.len()).await,
             FramedRead::Body(payload)
         );
     }
+
+    /// Write one length-prefixed frame from a test client.
+    async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) {
+        writer
+            .write_all(&(body.len() as u16).to_be_bytes())
+            .await
+            .expect("write length");
+        writer.write_all(body).await.expect("write body");
+    }
+
+    /// Read one length-prefixed frame from a test client.
+    async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut len = [0u8; 2];
+        reader.read_exact(&mut len).await.expect("read length");
+        let len = u16::from_be_bytes(len) as usize;
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body).await.expect("read body");
+        body
+    }
+
+    /// THE RFC 7766 regression: two queries on *one* connection must both be
+    /// answered on that same connection.
+    ///
+    /// The old `handle_tcp` read one frame, wrote one answer and dropped the
+    /// stream, so a second query hit a closed socket. A resolver that fell back to
+    /// TCP after a truncated UDP answer had to re-handshake for every query and
+    /// could not pipeline.
+    #[tokio::test]
+    async fn two_queries_on_one_connection_are_both_answered() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let served = tokio::spawn(async move {
+            serve_messages(&mut server, Duration::from_secs(5), |body| async move {
+                Some(body)
+            })
+            .await
+        });
+
+        for query in [b"first-query".to_vec(), b"second-query".to_vec()] {
+            write_frame(&mut client, &query).await;
+            let answer = read_frame(&mut client).await;
+            assert_eq!(answer, query, "each query must be answered in place");
+        }
+        // Closing the write half is the normal end of a kept-alive connection.
+        drop(client);
+
+        assert_eq!(served.await.expect("connection task"), 2);
+    }
+
+    /// An idle connection is closed by the server after the idle timeout instead
+    /// of pinning its slot forever.
+    #[tokio::test]
+    async fn idle_connection_is_closed_after_the_timeout() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let started = Instant::now();
+        let served = tokio::spawn(async move {
+            serve_messages(
+                &mut server,
+                Duration::from_millis(100),
+                |body| async move { Some(body) },
+            )
+            .await
+        });
+
+        write_frame(&mut client, b"only-query").await;
+        assert_eq!(read_frame(&mut client).await, b"only-query");
+
+        // No second query: the loop must end on the idle timer, not hang.
+        let answered = served.await.expect("connection task");
+        assert_eq!(answered, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the idle timeout must close the connection promptly"
+        );
+    }
+
+    /// A response that cannot fit the 16-bit length field becomes FORMERR with the
+    /// query's ID, and the connection stays usable afterwards.
+    ///
+    /// The old code answered FORMERR and then closed the connection; keeping it
+    /// open is the RFC 7766 behaviour.
+    #[tokio::test]
+    async fn oversized_answer_becomes_formerr_and_the_connection_survives() {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let served = tokio::spawn(async move {
+            serve_messages(&mut server, Duration::from_secs(5), |body| async move {
+                // The first query asks for an impossible answer; the second is a
+                // normal one and must still be answered on this connection.
+                if body.len() == 4 {
+                    Some(vec![0u8; 70_000])
+                } else {
+                    Some(body)
+                }
+            })
+            .await
+        });
+
+        // Query ID 0x1234 plus two more bytes.
+        write_frame(&mut client, &[0x12, 0x34, 0x01, 0x02]).await;
+        let answer = read_frame(&mut client).await;
+        assert_eq!(answer.len(), 12, "FORMERR is a bare 12-byte header");
+        assert_eq!(&answer[..2], &[0x12, 0x34], "the query ID must be echoed");
+        assert_eq!(
+            u16::from_be_bytes([answer[2], answer[3]]) & 0x000F,
+            1,
+            "rcode must be FORMERR"
+        );
+
+        write_frame(&mut client, b"still-alive").await;
+        assert_eq!(read_frame(&mut client).await, b"still-alive");
+        drop(client);
+        assert_eq!(served.await.expect("connection task"), 2);
+    }
+
+    /// A zero-length frame is not a message: the connection ends instead of being
+    /// answered with bytes that belong to no query.
+    #[tokio::test]
+    async fn zero_length_frame_ends_the_connection() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let served = tokio::spawn(async move {
+            serve_messages(&mut server, Duration::from_secs(5), |body| async move {
+                Some(body)
+            })
+            .await
+        });
+
+        client
+            .write_all(&0u16.to_be_bytes())
+            .await
+            .expect("write frame");
+        assert_eq!(served.await.expect("connection task"), 0);
+    }
+
+    /// A handler that cannot answer closes the connection instead of writing a
+    /// frame with stale bytes.
+    #[tokio::test]
+    async fn a_failing_handler_closes_the_connection() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let served = tokio::spawn(async move {
+            serve_messages(&mut server, Duration::from_secs(5), |_body| async move {
+                None
+            })
+            .await
+        });
+
+        write_frame(&mut client, b"query").await;
+        assert_eq!(served.await.expect("connection task"), 0);
+    }
+
     /// A panicking request handler must not permanently lose a worker.
     ///
     /// `catch_unwind` is what the worker loop wraps around `handle`. If it did
@@ -940,7 +1265,8 @@ mod queue_tests {
         assert_eq!(panic_reason(string_panic.as_ref()), "owned reason");
     }
 
-    /// The slot claim never exceeds the limit.
+    /// The slot claim never exceeds the limit, and releasing a guard returns the
+    /// slot.
     ///
     /// This checks the *counting* behaviour of the claim, not its atomicity: a
     /// single-threaded loop cannot distinguish `fetch_update` from a read-then-write
@@ -950,23 +1276,35 @@ mod queue_tests {
     /// single-acceptor invariant to close.
     #[test]
     fn connection_slots_never_exceed_the_limit() {
-        let active = std::sync::atomic::AtomicU64::new(0);
-        let max = 3u64;
-        let mut claimed = 0;
+        let active = Arc::new(AtomicU64::new(0));
+        let max = 3usize;
+        // Hold the guards: dropping them is what releases a slot, so collecting
+        // them into a `Vec` is what makes the limit observable at all.
+        let mut held = Vec::new();
         for _ in 0..10 {
-            let got = active
-                .fetch_update(
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                    |current| (current < max).then_some(current + 1),
-                )
-                .is_ok();
-            if got {
-                claimed += 1;
+            if let Some(slot) = claim_slot(&active, max) {
+                held.push(slot);
             }
         }
-        assert_eq!(claimed, 3, "exactly `max` slots may be claimed");
-        assert_eq!(active.load(std::sync::atomic::Ordering::Acquire), 3);
+        assert_eq!(held.len(), 3, "exactly `max` slots may be claimed");
+        assert_eq!(active.load(Ordering::Acquire), 3);
+        assert!(claim_slot(&active, max).is_none(), "still at the limit");
+
+        // Dropping one guard must free exactly one slot: a connection that ends
+        // (idle timeout, reset, error) must not leak capacity.
+        held.pop();
+        assert_eq!(active.load(Ordering::Acquire), 2);
+        let reclaimed = claim_slot(&active, max);
+        assert!(
+            reclaimed.is_some(),
+            "a released slot must be reusable"
+        );
+        drop(reclaimed);
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            2,
+            "dropping the reclaimed guard must free that slot again"
+        );
     }
     /// Only one caller may lead the fetch for a key.
     ///

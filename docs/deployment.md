@@ -1045,6 +1045,8 @@ RUST_LOG=lagran_dns=info
 | `DNS_FALLBACK_IP` | 否 | 空 | 控制面不可用且无缓存时返回的兜底 IP；为空则 SERVFAIL。应填一个可用边缘 IP。 |
 | `DNS_WORKERS` | 否 | `8` | UDP 工作线程数。 |
 | `DNS_TCP` | 否 | `1` | 是否启用 TCP 53（截断回退）。建议开启。 |
+| `DNS_MAX_TCP_CONNECTIONS` | 否 | `512` | TCP 最大并发连接数（每连接一个异步任务，不是 OS 线程），范围 16–65536。超出后新连接直接关闭。 |
+| `DNS_TCP_IDLE_SECS` | 否 | `5` | TCP 连接空闲超时（秒），范围 1–300。RFC 7766 要求应答后保持连接以便复用，空闲超过该值才关闭。 |
 | `DNS_CONTROL_TIMEOUT_MS` | 否 | `800` | 调控制面 `/api/v1/schedule` 的超时（毫秒）。 |
 | `CONTROL_URL` | 是 | `http://127.0.0.1:8080` | 控制面地址，DNS 用它查调度。 |
 | `AGENT_TOKEN` | 生产必填 | 空 | DNS 出站令牌。DNS 不是节点，建议使用控制面全局 `AGENT_TOKEN`；用节点令牌也能通过，但删除该节点后会失效。 |
