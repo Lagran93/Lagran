@@ -458,24 +458,53 @@ pub async fn register(
             Json(ErrorBody { error: msg.into() }),
         ));
     }
+    // Validate the password before spending any rate-limit budget: a weak
+    // password is a caller error, and letting it consume a slot would let a
+    // fuzzing client lock itself (and its NAT neighbours) out for a minute
+    // without ever attempting a real registration.
+    if let Err(msg) = validate_password(&req.password) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody { error: msg.into() }),
+        ));
+    }
+    // Two buckets, for the same reason login has two.
+    //
+    // `register:{email}` alone bounds only repeats of the *same* address. An
+    // attacker scripting `bot_1@…`, `bot_2@…` lands in a fresh bucket on every
+    // request and is never limited, while each request still costs a bcrypt hash
+    // and an INSERT. The per-IP bucket is what bounds that: it is consumed by
+    // every attempt regardless of the address, so one source cannot create
+    // unbounded accounts. Both are consumed only after captcha and syntax checks
+    // pass, so a malformed request cannot burn a legitimate client's budget.
     let limit_key = format!("register:{email}");
-    if !state
+    let ip_limit_key = format!("register-ip:{client_ip}");
+    let email_allowed = state
         .login_limiter
         .check_shared(state.redis.as_deref(), &limit_key)
-        .await
-    {
+        .await;
+    // Evaluate both so a refused email bucket does not skip the IP counter, but
+    // report a single message: which bucket tripped is not the caller's business.
+    let ip_allowed = state
+        .login_limiter
+        .check_shared_with_limit(
+            state.redis.as_deref(),
+            &ip_limit_key,
+            crate::middleware::login_limit::REGISTER_IP_LIMIT,
+        )
+        .await;
+    if !email_allowed || !ip_allowed {
+        tracing::warn!(
+            ip = %client_ip,
+            email = %log_value(&email, 120),
+            email_bucket = email_allowed,
+            ip_bucket = ip_allowed,
+            "registration rate limited"
+        );
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorBody {
                 error: "too many registration attempts, try again later".into(),
-            }),
-        ));
-    }
-    if let Err(msg) = validate_password(&req.password) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody {
-                error: msg.into(),
             }),
         ));
     }
@@ -945,4 +974,82 @@ pub(crate) fn validate_password(password: &str) -> Result<(), &'static str> {
         return Err("密码必须同时包含字母和数字");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::middleware::login_limit::{LoginLimiter, LOGIN_IP_LIMIT, REGISTER_IP_LIMIT};
+
+    /// The wiring itself, not just the limiter: a distinct address must consume
+    /// the shared per-IP bucket.
+    ///
+    /// `register` builds `register-ip:{client_ip}` and charges it for every
+    /// attempt. This test pins that wiring down, because the limiter's own tests
+    /// cannot catch a handler that forgets to use it — which is exactly how
+    /// SEC-NEW-02 arose (the IP was resolved, then only logged).
+    #[tokio::test]
+    async fn distinct_emails_from_one_ip_share_the_registration_bucket() {
+        let limiter = LoginLimiter::new();
+        // Same expression the handler builds; a change to either key format is a
+        // deliberate decision that should have to update this test too.
+        let client_ip = "203.0.113.9";
+        let ip_key = format!("register-ip:{client_ip}");
+
+        for n in 0..REGISTER_IP_LIMIT {
+            let email_allowed = limiter
+                .check_shared(None, &format!("register:bot{n}@example.test"))
+                .await;
+            assert!(
+                email_allowed,
+                "a fresh address is always under the email budget"
+            );
+            assert!(
+                limiter
+                    .check_shared_with_limit(None, &ip_key, REGISTER_IP_LIMIT)
+                    .await,
+                "attempt {n} should still fit the per-IP budget"
+            );
+        }
+
+        // The next request uses yet another brand-new address, so the email
+        // bucket passes again; only the shared IP bucket can stop it.
+        assert!(
+            limiter
+                .check_shared(
+                    None,
+                    &format!("register:bot{REGISTER_IP_LIMIT}@example.test")
+                )
+                .await
+        );
+        assert!(
+            !limiter
+                .check_shared_with_limit(None, &ip_key, REGISTER_IP_LIMIT)
+                .await,
+            "distinct addresses must not grant unlimited registrations from one IP"
+        );
+    }
+
+    /// A refused registration must leave the same client's login budget intact:
+    /// the two buckets exist for different threats and must not interfere.
+    #[tokio::test]
+    async fn exhausting_the_registration_bucket_does_not_block_login() {
+        let limiter = LoginLimiter::new();
+        let ip_key = "register-ip:198.51.100.4";
+        for _ in 0..=REGISTER_IP_LIMIT {
+            let _ = limiter
+                .check_shared_with_limit(None, ip_key, REGISTER_IP_LIMIT)
+                .await;
+        }
+        assert!(
+            !limiter
+                .check_shared_with_limit(None, ip_key, REGISTER_IP_LIMIT)
+                .await
+        );
+        assert!(
+            limiter
+                .peek_shared(None, "login-ip:198.51.100.4", LOGIN_IP_LIMIT)
+                .await,
+            "an IP blocked from registering must still be able to log in"
+        );
+    }
 }

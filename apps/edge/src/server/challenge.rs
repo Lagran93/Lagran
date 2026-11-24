@@ -68,7 +68,7 @@ fn hmac_ok(secret: &str, message: &str, signature: &str) -> bool {
 
 /// Decode a lowercase hex string into bytes; returns `None` on invalid input.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     s.as_bytes()

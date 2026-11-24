@@ -207,7 +207,7 @@ async fn reporter_loop(
                 failures = failures.saturating_add(1);
                 // Log the first failure and then every 100th, so a control plane
                 // outage does not flood the log at one line per target per round.
-                if failures == 1 || failures % 100 == 0 {
+                if failures == 1 || failures.is_multiple_of(100) {
                     tracing::warn!(
                         error = %e,
                         failures,

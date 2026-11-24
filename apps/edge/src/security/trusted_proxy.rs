@@ -32,6 +32,16 @@ impl TrustedProxies {
     /// Returns an error naming the offending entry so a typo in
     /// `TRUSTED_PROXIES` fails at startup instead of silently trusting nothing.
     pub fn parse(spec: &str) -> Result<Self, String> {
+        Self::parse_named(spec, "TRUSTED_PROXIES")
+    }
+
+    /// Same as [`TrustedProxies::parse`] but reports the given setting name.
+    ///
+    /// `TRUSTED_EDGES` uses the same CIDR syntax for a different question
+    /// (which peers may supply the internal loop headers), and an error that
+    /// blamed `TRUSTED_PROXIES` for it would send the operator to the wrong
+    /// line of the env file.
+    pub fn parse_named(spec: &str, setting: &str) -> Result<Self, String> {
         let mut nets = Vec::new();
         for raw in spec.split(',') {
             let entry = raw.trim();
@@ -42,7 +52,7 @@ impl TrustedProxies {
                 Some(net) => nets.push(net),
                 None => {
                     return Err(format!(
-                        "invalid TRUSTED_PROXIES entry {entry:?}: expected an IP or CIDR"
+                        "invalid {setting} entry {entry:?}: expected an IP or CIDR"
                     ))
                 }
             }

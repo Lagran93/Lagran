@@ -1,5 +1,6 @@
 //! Edge node configuration
 
+pub mod identity;
 pub mod registry;
 
 use serde::Deserialize;
@@ -60,7 +61,33 @@ pub struct EdgeConfig {
     pub cache_backend: String,
     pub disk_cache_dir: String,
     pub disk_cache_max_bytes: u64,
+    /// Control-plane identity reported to the control plane (`NODE_ID`).
+    ///
+    /// When `NODE_ID` is unset this is a generated machine id, which the control
+    /// plane will not recognise; registration then fails loudly instead of two
+    /// hosts silently sharing one name.
     pub node_id: String,
+    /// Identity stamped into `CDN-Loop` / `X-Lagran-Shield-Hops`.
+    ///
+    /// This is [`Self::node_id`] plus a per-machine instance token, so two hosts
+    /// that were given the same `NODE_ID` (a copied env file, or the old shared
+    /// `"edge-001"` default) still have distinct loop ids and cannot mistake each
+    /// other for themselves in an Origin Shield chain. See
+    /// [`crate::config::identity`].
+    pub loop_id: String,
+    /// Networks whose loop headers are trusted (`TRUSTED_EDGES`).
+    ///
+    /// Empty by default: a forwarded loop chain is then treated as client input
+    /// and stripped. Multi-tier Origin Shield deployments must list their
+    /// Edge/Shield interconnect here, otherwise each tier's chain is discarded and
+    /// the hop budget restarts at one edge per tier.
+    #[serde(skip)]
+    pub trusted_edges: crate::security::trusted_proxy::TrustedProxies,
+    /// File holding the per-machine instance token for [`Self::loop_id`].
+    pub node_id_file: String,
+    /// False when `NODE_ID` was unset and [`Self::node_id`] is a generated
+    /// machine identity the control plane will not recognise.
+    pub node_id_configured: bool,
     /// On a dedicated Origin Shield node, ignore domain-level `shield_url`.
     /// Otherwise the shield would send its own cache misses back to itself.
     pub origin_shield_disabled: bool,
@@ -204,6 +231,18 @@ pub struct EdgeConfig {
 
 impl Default for EdgeConfig {
     fn default() -> Self {
+        // Split the control-plane name from the loop identity. The old code used
+        // one value for both with a shared `"edge-001"` fallback, so every host
+        // that did not set NODE_ID stamped the same id and the second tier of an
+        // Origin Shield chain answered 508 to valid traffic.
+        let node_id_file = std::env::var("NODE_ID_FILE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| crate::config::identity::DEFAULT_NODE_ID_FILE.to_string());
+        let explicit = std::env::var("NODE_ID").ok();
+        let identity = crate::config::identity::resolve(explicit.as_deref(), &node_id_file);
+
         let listen = std::env::var("EDGE_LISTEN").unwrap_or_else(|_| "0.0.0.0:8081".into());
         let admin_listen_addr = std::env::var("EDGE_ADMIN_LISTEN")
             .ok()
@@ -283,7 +322,11 @@ impl Default for EdgeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1_073_741_824), // 1 GiB
-            node_id: std::env::var("NODE_ID").unwrap_or_else(|_| "edge-001".into()),
+            node_id: identity.node_id.clone(),
+            loop_id: identity.loop_id.clone(),
+            trusted_edges: crate::security::trusted_proxy::TrustedProxies::default(),
+            node_id_file,
+            node_id_configured: identity.node_id_configured,
             origin_shield_disabled: std::env::var("EDGE_SHIELD_DISABLED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -516,7 +559,103 @@ impl EdgeConfig {
         let mut config = Self::default();
         let spec = std::env::var("TRUSTED_PROXIES").unwrap_or_default();
         config.trusted_proxies = crate::security::trusted_proxy::TrustedProxies::parse(&spec)?;
+        let edges = std::env::var("TRUSTED_EDGES").unwrap_or_default();
+        // `parse_named` so a typo is reported against TRUSTED_EDGES rather than
+        // sending the operator to the TRUSTED_PROXIES line.
+        config.trusted_edges =
+            crate::security::trusted_proxy::TrustedProxies::parse_named(&edges, "TRUSTED_EDGES")?;
+
+        if !config.node_id_configured {
+            tracing::warn!(
+                node_id = %config.node_id,
+                file = %config.node_id_file,
+                "NODE_ID is not set; this edge uses a generated machine identity and \
+                 the control plane will not recognise it until NODE_ID is configured"
+            );
+        }
+        if config.trusted_edges.is_empty() {
+            tracing::info!(
+                "TRUSTED_EDGES is empty: CDN-Loop / X-Lagran-Shield-Hops from every peer are \
+                 stripped as client input. Set it to your Edge/Shield interconnect networks \
+                 to enable multi-tier Origin Shield loop detection"
+            );
+        }
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod identity_wiring_tests {
+    //! Wiring tests for SEC-NEW-04.
+    //!
+    //! These deliberately go through `EdgeConfig::default()` rather than calling
+    //! `identity::resolve()` directly: the defect was that the *configuration*
+    //! still used one shared literal for both identities, so a test of `resolve`
+    //! alone would pass while the shipped default stayed broken.
+
+    /// The default must not be the old shared `"edge-001"` literal.
+    #[test]
+    fn default_identity_is_not_the_shared_literal() {
+        let config = super::EdgeConfig::default();
+        assert_ne!(
+            config.node_id, "edge-001",
+            "the shared default node id is the topology-deadlock bug"
+        );
+        assert!(
+            !config.node_id.is_empty(),
+            "an empty node id silently disables self-reference detection"
+        );
+    }
+
+    /// With `NODE_ID` unset, the machine identity is already unique, so the loop
+    /// id may equal it. With `NODE_ID` set, the loop id must extend it with a
+    /// per-machine suffix; otherwise two hosts sharing that `NODE_ID` collide.
+    #[test]
+    fn loop_id_is_unique_provenance_appropriate() {
+        let unset = super::EdgeConfig::default();
+        if !unset.node_id_configured {
+            // Generated from the instance token: unique by construction.
+            assert!(unset.node_id.starts_with("edge-"));
+        }
+
+        let a = crate::config::identity::resolve(Some("edge-001"), "/tmp/lg-wire-a2/edge-node-id");
+        let b = crate::config::identity::resolve(Some("edge-001"), "/tmp/lg-wire-b2/edge-node-id");
+        assert!(a.node_id_configured && b.node_id_configured);
+        assert!(
+            a.loop_id.starts_with("edge-001-") && a.loop_id.len() > "edge-001-".len(),
+            "loop_id {:?} must extend the configured name",
+            a.loop_id
+        );
+        assert_ne!(
+            a.loop_id, b.loop_id,
+            "two hosts sharing NODE_ID must differ"
+        );
+        assert_ne!(a.loop_id, a.node_id);
+        let _ = std::fs::remove_dir_all("/tmp/lg-wire-a2");
+        let _ = std::fs::remove_dir_all("/tmp/lg-wire-b2");
+    }
+
+    /// Two independent resolutions of the same explicit `NODE_ID` produce
+    /// different loop ids, which is the property the guard relies on.
+    #[test]
+    fn identical_node_ids_yield_distinct_loop_ids() {
+        let a = crate::config::identity::resolve(Some("edge-001"), "/tmp/lg-wire-a/edge-node-id");
+        let b = crate::config::identity::resolve(Some("edge-001"), "/tmp/lg-wire-b/edge-node-id");
+        assert_eq!(a.node_id, b.node_id);
+        assert_ne!(a.loop_id, b.loop_id);
+        let _ = std::fs::remove_dir_all("/tmp/lg-wire-a");
+        let _ = std::fs::remove_dir_all("/tmp/lg-wire-b");
+    }
+
+    /// Trusted-edge networks default to empty (plan A): a forwarded chain is
+    /// client input until the operator names the interconnect.
+    #[test]
+    fn trusted_edges_defaults_to_empty() {
+        let config = super::EdgeConfig::default();
+        assert!(
+            config.trusted_edges.is_empty(),
+            "an empty TRUSTED_EDGES must not silently trust any peer"
+        );
     }
 }
 

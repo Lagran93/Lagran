@@ -428,26 +428,24 @@ async fn publish_challenge(
     if nodes.is_empty() {
         return Err("没有在线边缘节点，无法完成 HTTP-01 校验".into());
     }
-    let mut ok = 0usize;
-    for node in &nodes {
-        let url = format!(
-            "{}/__lagran/acme/challenge",
-            node.agent_url.trim_end_matches('/')
-        );
-        let body = json!({
-            "token": token,
-            "key_authorization": key_auth,
-        });
-        let token_header = if node.auth_token.is_empty() {
-            &state.config.agent_token
-        } else {
-            &node.auth_token
-        };
-        match agent_http::put_json_ok(&url, &body, token_header).await {
-            Ok(()) => ok += 1,
-            Err(e) => tracing::warn!(node = %node.name, error = %e, "ACME challenge push failed"),
-        }
+    // Bounded fan-out: the serial loop made this the sum of every node's latency,
+    // and an unreachable node blocked issuance for its full 5 s + retry while the
+    // ACME request stayed open.
+    let targets = agent_http::owned_nodes(&nodes, &state.config.agent_token);
+    let body = json!({
+        "token": token,
+        "key_authorization": key_auth,
+    });
+    let (ok, failures) = agent_http::fan_out_edge(&targets, move |node| {
+        let url = node.endpoint("/__lagran/acme/challenge");
+        let body = body.clone();
+        async move { agent_http::put_json_ok(&url, &body, &node.token).await }
+    })
+    .await;
+    for (node, error) in failures {
+        tracing::warn!(node = %node, error = %error, "ACME challenge push failed");
     }
+    let ok = ok as usize;
     if ok == 0 {
         return Err(
             "ACME challenge 推送失败：没有可达的边缘节点（检查 AGENT_URL/AGENT_TOKEN）".into(),
@@ -656,26 +654,22 @@ pub async fn push_certificate_to_edges(
     let nodes = repository::list_online_nodes_with_agent(&state.pool)
         .await
         .unwrap_or_default();
-    let mut pushed = 0u32;
-    for node in &nodes {
-        let url = format!(
-            "{}/__lagran/certs/load",
-            node.agent_url.trim_end_matches('/')
-        );
-        let body = json!({
-            "names": [domain],
-            "cert_pem": cert_pem,
-            "key_pem": key_pem,
-        });
-        let token = if node.auth_token.is_empty() {
-            &state.config.agent_token
-        } else {
-            &node.auth_token
-        };
-        match agent_http::post_json_ok(&url, &body, token).await {
-            Ok(()) => pushed += 1,
-            Err(e) => tracing::warn!(node = %node.name, error = %e, "cert push failed"),
-        }
+    // Renewal runs on a background timer, but it still must not serialise: a
+    // slow fleet would stall the renewal loop for every domain it walks.
+    let targets = agent_http::owned_nodes(&nodes, &state.config.agent_token);
+    let body = json!({
+        "names": [domain],
+        "cert_pem": cert_pem,
+        "key_pem": key_pem,
+    });
+    let (pushed, failures) = agent_http::fan_out_edge(&targets, move |node| {
+        let url = node.endpoint("/__lagran/certs/load");
+        let body = body.clone();
+        async move { agent_http::post_json_ok(&url, &body, &node.token).await }
+    })
+    .await;
+    for (node, error) in failures {
+        tracing::warn!(node = %node, error = %error, "cert push failed");
     }
     pushed
 }

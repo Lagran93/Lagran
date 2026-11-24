@@ -148,8 +148,12 @@ pub async fn diagnose(
 
     // Fallback for deployments where the control plane can reach the public
     // domain directly (or no agents are registered yet).
-    // Ensure the destination does not resolve to loopback, link-local, private,
-    // or other disallowed internal addresses (SSRF defense).
+    //
+    // Two layers here, and both are needed. This pre-flight check gives the
+    // console a precise error message; `get_response` below runs on the guarded
+    // connector, which re-checks the address it actually dials. A name that
+    // resolves to a public address here and to an internal one milliseconds
+    // later is refused at connect time (SEC-NEW-01).
     if let Err(reason) = crate::service::net_guard::validate_http_url(&url).await {
         let mut message = format!("fallback request rejected: {reason}");
         if !dispatch_errors.is_empty() {

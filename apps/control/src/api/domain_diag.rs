@@ -1,9 +1,14 @@
 //! Domain onboarding diagnostics: DNS, TLS certificate, origin reachability,
 //! and an actual edge cache probe.
+//!
+//! Every outbound probe here targets something a tenant chose, so each one
+//! follows the same rule: resolve once through [`net_guard`], verify the answer,
+//! and connect to that exact address. Re-resolving inside the transport would
+//! reintroduce the DNS-rebinding window that `SEC-NEW-01` describes.
 
 use crate::middleware::authz::Actor;
 use crate::repository;
-use crate::service::agent_http;
+use crate::service::{agent_http, net_guard};
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
@@ -12,6 +17,7 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -110,23 +116,20 @@ pub async fn diagnose(
         }
     }
 
+    // One lookup feeds the DNS check *and* the TLS probes below, so a rebinding
+    // server cannot answer differently between the two.
+    let tls_addrs =
+        net_guard::resolve_allowed(&domain, 443, net_guard::is_probeable_ip, "domain TLS probe")
+            .await;
     let dns_start = Instant::now();
-    let lookup_name = domain.clone();
-    let dns_future = async move {
-        let resolved = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::lookup_host((lookup_name.as_str(), 443)),
-        )
-        .await;
-        match resolved {
-            Ok(Ok(addrs)) => {
-                let mut out: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
-                out.sort();
-                out.dedup();
-                out
-            }
-            _ => Vec::new(),
+    let resolved_ips: Vec<String> = match &tls_addrs {
+        Ok(addrs) => {
+            let mut out: Vec<String> = addrs.iter().map(|a| a.ip().to_string()).collect();
+            out.sort();
+            out.dedup();
+            out
         }
+        Err(_) => Vec::new(),
     };
 
     let tls_start = Instant::now();
@@ -134,9 +137,8 @@ pub async fn diagnose(
     let cache_start = Instant::now();
     // Run all independent probes concurrently so a wrong CNAME/timeout cannot
     // make the whole diagnostic API exceed the control-plane proxy timeout.
-    let (resolved_ips, tls_result, origin_result, cache_result) = tokio::join!(
-        dns_future,
-        tokio::time::timeout(Duration::from_secs(9), check_tls(&domain)),
+    let (tls_result, origin_result, cache_result) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(9), check_tls(&domain, &tls_addrs)),
         tokio::time::timeout(
             Duration::from_secs(7),
             check_origin(&row.origin_host, row.origin_port.max(0) as u16)
@@ -156,7 +158,6 @@ pub async fn diagnose(
             .any(|ip| edge_ips.iter().any(|edge| edge == ip));
     let dns_detail = if !dns_ok {
         format!("DNS 未解析出任何地址。请检查 CNAME {} 是否填写正确、是否存在 CNAME 循环、CNAME 目标是否已生效，以及权威 DNS 是否可达。", cname)
-        // "DNS 未解析出任何地址。请检查 CNAME 是否填写正确、是否存在 CNAME 循环、CNAME 目标是否已生效，以及权威 DNS 是否可达。".to_string()
     } else if edge_ips.is_empty() {
         format!(
             "解析到 {}；当前没有在线 Edge 节点（或节点未填写 public_ip），无法判断 CNAME 是否正确。请先在控制台启用节点并填写公网 IP。",
@@ -236,12 +237,37 @@ pub async fn diagnose(
     }))
 }
 
-async fn check_tls(domain: &str) -> (bool, bool, String) {
+/// Open a TCP connection to one of the addresses the guard already approved.
+async fn connect_validated(addrs: &[SocketAddr]) -> Result<TcpStream, String> {
+    let mut last = String::from("no address to connect to");
+    for addr in addrs {
+        match tokio::time::timeout(Duration::from_secs(6), TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last = e.to_string(),
+            Err(_) => last = "连接超时".into(),
+        }
+    }
+    Err(last)
+}
+
+async fn check_tls(domain: &str, addrs: &Result<Vec<SocketAddr>, String>) -> (bool, bool, String) {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let (ok, detail) = strict_tls(domain, roots).await;
+    let checked = match addrs {
+        Ok(addrs) if !addrs.is_empty() => addrs,
+        Ok(_) => {
+            return (
+                false,
+                false,
+                "DNS 未解析出任何地址，无法进行 TLS 检查。".into(),
+            )
+        }
+        Err(reason) => return (false, false, format!("域名解析被拒绝或失败：{reason}")),
+    };
+
+    let (ok, detail) = strict_tls(domain, roots, checked).await;
     if ok || !detail.contains("UnknownIssuer") {
         return (ok, false, detail);
     }
@@ -253,7 +279,7 @@ async fn check_tls(domain: &str) -> (bool, bool, String) {
     // the handshake. Report a warning instead, and only when at least one AIA
     // URL passes the same public-destination guard used elsewhere (we never
     // fetch the URL here, so this cannot become an SSRF primitive).
-    let urls = insecure_leaf_aia(domain).await;
+    let urls = insecure_leaf_aia(domain, checked).await;
     let mut public_aia = false;
     for url in urls {
         if crate::service::net_guard::validate_http_url(&url)
@@ -278,7 +304,7 @@ async fn check_tls(domain: &str) -> (bool, bool, String) {
     (false, false, detail)
 }
 
-async fn strict_tls(domain: &str, roots: RootCertStore) -> (bool, String) {
+async fn strict_tls(domain: &str, roots: RootCertStore, addrs: &[SocketAddr]) -> (bool, String) {
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -286,12 +312,11 @@ async fn strict_tls(domain: &str, roots: RootCertStore) -> (bool, String) {
     let Ok(name) = ServerName::try_from(domain.to_string()) else {
         return (false, "域名不能用于 TLS SNI".into());
     };
-    let tcp = match tokio::time::timeout(Duration::from_secs(6), TcpStream::connect((domain, 443)))
-        .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => return (false, format!("无法连接 443：{e}")),
-        Err(_) => return (false, "连接 443 超时".into()),
+    // SNI and certificate verification still use the real name; only the socket
+    // is pinned to the validated address.
+    let tcp = match connect_validated(addrs).await {
+        Ok(stream) => stream,
+        Err(e) => return (false, format!("无法连接 443：{e}")),
     };
     match tokio::time::timeout(Duration::from_secs(8), connector.connect(name, tcp)).await {
         Ok(Ok(stream)) => {
@@ -308,7 +333,7 @@ async fn strict_tls(domain: &str, roots: RootCertStore) -> (bool, String) {
     }
 }
 
-async fn insecure_leaf_aia(domain: &str) -> Vec<String> {
+async fn insecure_leaf_aia(domain: &str, addrs: &[SocketAddr]) -> Vec<String> {
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
@@ -317,9 +342,7 @@ async fn insecure_leaf_aia(domain: &str) -> Vec<String> {
     let Ok(name) = ServerName::try_from(domain.to_string()) else {
         return Vec::new();
     };
-    let Ok(Ok(tcp)) =
-        tokio::time::timeout(Duration::from_secs(6), TcpStream::connect((domain, 443))).await
-    else {
+    let Ok(tcp) = connect_validated(addrs).await else {
         return Vec::new();
     };
     let Ok(Ok(stream)) =
@@ -432,17 +455,21 @@ async fn check_origin(host: &str, port: u16) -> (bool, String) {
     // A tenant controls this host/port. Refuse loopback/link-local targets so
     // diagnosis cannot be used to probe the control host or the cloud metadata
     // service, and never return the raw OS error (that was a port-scan oracle).
-    if let Err(reason) = crate::service::net_guard::validate_origin_probe(host, port).await {
-        tracing::debug!(%reason, "origin probe rejected");
-        return (false, "源站地址不可探测".into());
-    }
-    match tokio::time::timeout(Duration::from_secs(6), TcpStream::connect((host, port))).await {
-        Ok(Ok(_)) => (true, format!("TCP 连接 {host}:{port} 成功")),
-        Ok(Err(e)) => {
+    // The same resolution is then dialled: connecting to the name again would
+    // let a rebinding answer point the probe somewhere the guard refused.
+    let addrs = match net_guard::resolve_origin_probe(host, port).await {
+        Ok(addrs) => addrs,
+        Err(reason) => {
+            tracing::debug!(%reason, "origin probe rejected");
+            return (false, "源站地址不可探测".into());
+        }
+    };
+    match connect_validated(&addrs).await {
+        Ok(_) => (true, format!("TCP 连接 {host}:{port} 成功")),
+        Err(e) => {
             tracing::debug!(error = %e, %host, port, "origin probe failed");
             (false, "TCP 连接失败".into())
         }
-        Err(_) => (false, "TCP 连接超时".into()),
     }
 }
 
@@ -552,7 +579,9 @@ mod tests {
     #[test]
     fn rejects_no_scheme_or_garbage() {
         // Raw binary with no recognisable http(s):// prefix → empty list.
-        let der = vec![0x30, 0x0a, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a];
+        let der = vec![
+            0x30, 0x0a, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+        ];
         assert!(aia_urls(&der).is_empty());
     }
 
@@ -575,8 +604,8 @@ mod tests {
             "an incomplete chain must surface a warning instead"
         );
         assert!(
-            source.contains("async fn check_tls(domain: &str) -> (bool, bool, String)"),
-            "check_tls must report a warning flag alongside ok"
+            source.contains("async fn check_tls(domain: &str, addrs: &Result<Vec<SocketAddr>, String>)"),
+            "check_tls must take the addresses resolved by the guard, so its TLS\n               probes connect to a checked address instead of re-resolving"
         );
     }
 }

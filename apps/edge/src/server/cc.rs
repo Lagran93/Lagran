@@ -15,7 +15,62 @@ use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WINDOW: Duration = Duration::from_secs(1);
+/// Absolute backstop. An entry with no activity for this long is dropped
+/// regardless of strikes, so nothing can be pinned indefinitely.
 const STATE_TTL: Duration = Duration::from_secs(600);
+
+/// How long an entry must be quiet before it may be reclaimed, beyond the
+/// current window. One extra window means a request that is still inside its
+/// counting window is never dropped mid-flight; two windows is enough and keeps
+/// the table tight under a rotating-address flood.
+const EVICT_IDLE_AFTER: Duration = Duration::from_secs(2);
+
+/// Hard cap on the client-state table.
+///
+/// The old sweep only ran above 50_000 entries and could free *nothing* while
+/// every entry was recent and unbanned, so the table was bounded by traffic
+/// rather than by a limit. This is a real cap: once reached, the least recently
+/// seen entries are dropped until the table fits again, whatever their state
+/// (active bans excepted).
+pub const CC_STATE_HARD_CAP: usize = 50_000;
+
+/// Sweep the state tables every N requests. `DashMap::retain` takes a write lock
+/// on every shard in turn, so running it inline makes request latency follow the
+/// table size; the background task does the sweeping instead and this counter
+/// only decides when the cheap, single-pass fallback runs.
+const MAINTENANCE_INTERVAL_REQUESTS: u64 = 256;
+
+/// Whether a client-state entry can be dropped without changing behaviour.
+///
+/// The rule this replaces was
+/// `last_seen.elapsed() < STATE_TTL && banned_until.map(|u| u > now).unwrap_or(true)`.
+/// For a client that was never banned the second conjunct is *always* true, so
+/// eviction required `STATE_TTL` (10 minutes) of total silence. A scanner that
+/// touches each address once a minute therefore stayed resident forever, which is
+/// exactly the leak in the finding.
+///
+/// The corrected rule drops an entry only when nothing about it still matters:
+///
+/// * it carries no unexpired ban — a banned client sends nothing, so `last_seen`
+///   is frozen for the whole ban and a quiet entry is *not* a safe one;
+/// * it has no unresolved violation strikes — those are what eventually ban a
+///   slow-drip client, and discarding them between windows would make
+///   `ban_after` unreachable;
+/// * its counting window has passed, plus one window of margin.
+fn state_is_reclaimable(state: &ClientState, now: Instant) -> bool {
+    if state.banned_until.is_some_and(|until| until > now) {
+        return false;
+    }
+    if state.violations > 0 {
+        return false;
+    }
+    if state.window_over {
+        return false;
+    }
+    // Absolute backstop: nothing is retained for longer than `STATE_TTL`.
+    let idle = now.saturating_duration_since(state.last_seen);
+    idle >= EVICT_IDLE_AFTER || idle >= STATE_TTL
+}
 /// Budget for one shared-budget Redis round trip.
 ///
 /// Default budget for one Redis round trip, overridable with
@@ -573,6 +628,10 @@ pub struct CcProtector {
     maintenance_tick: Arc<AtomicU64>,
     /// Optional shared sliding-window counters.
     redis: Option<RedisCc>,
+    /// When set, eviction reproduces the pre-fix rule: the legacy predicate and no
+    /// capacity cap. Measurement seam only. Never set in production; [`Self::new`]
+    /// leaves it off, and no data-plane caller can reach the setter.
+    legacy_eviction: bool,
 }
 
 impl CcProtector {
@@ -661,25 +720,111 @@ impl CcProtector {
         self.shared.len()
     }
 
-    /// Run table maintenance occasionally instead of on every request.
-    fn maybe_maintain(&self, now: Instant) {
-        if !self
-            .maintenance_tick
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(256)
-        {
-            return;
-        }
-        if self.inner.len() > 50_000 {
+    /// Whether the cheap inline path should run for this request.
+    ///
+    /// Split from [`Self::maintain`] deliberately: the request path must never
+    /// pay for a full-table write-locked sweep, which is what made latency track
+    /// table size and ultimately queued the proxy threads.
+    pub(crate) fn maintenance_due(&self) -> bool {
+        // `fetch_add` returns the *previous* value, so `+ 1` makes the first
+        // sweep land on request 256 rather than on request 1 (0 divides
+        // everything, which would put a full sweep on the very first request).
+        (self.maintenance_tick.fetch_add(1, Ordering::Relaxed) + 1)
+            .is_multiple_of(MAINTENANCE_INTERVAL_REQUESTS)
+    }
+
+    /// Drop entries that can no longer affect a decision, and enforce the cap.
+    ///
+    /// Returns how many client entries were removed. This touches every shard in
+    /// turn, so it belongs on the background task ([`Self::spawn_maintenance`]),
+    /// not in a request.
+    pub(crate) fn maintain(&self, now: Instant) -> usize {
+        let before = self.inner.len();
+        if self.legacy_eviction {
+            // Measurement only: the pre-fix predicate, which keeps an unbanned
+            // entry for `STATE_TTL` however idle it actually is.
             self.inner.retain(|_, state| {
-                state.last_seen.elapsed() < STATE_TTL
+                now.saturating_duration_since(state.last_seen) < STATE_TTL
                     && state.banned_until.map(|until| until > now).unwrap_or(true)
             });
+            return before.saturating_sub(self.inner.len());
         }
+        // Keep an entry only while it can still affect a decision. The idle
+        // margin inside `state_is_reclaimable` is far below `STATE_TTL`, so the
+        // absolute backstop is folded into the predicate rather than repeated
+        // here as a second condition that could never disagree with it.
+        self.inner
+            .retain(|_, state| !state_is_reclaimable(state, now));
+
+        // A sweep alone cannot bound the table when every entry is legitimately
+        // live (a broad rotating-address flood). Once over the cap, drop the
+        // least recently seen entries until it fits, skipping active bans so a
+        // ban is never lifted early.
+        let mut len = self.inner.len();
+        if !self.legacy_eviction && len > CC_STATE_HARD_CAP {
+            let mut seen: Vec<(Instant, String)> = self
+                .inner
+                .iter()
+                .filter(|e| !e.value().banned_until.is_some_and(|until| until > now))
+                .map(|e| (e.value().last_seen, e.key().clone()))
+                .collect();
+            seen.sort_unstable_by_key(|(last_seen, _)| *last_seen);
+            let excess = len - CC_STATE_HARD_CAP;
+            for (_, key) in seen.into_iter().take(excess) {
+                if self.inner.remove(&key).is_some() {
+                    len -= 1;
+                }
+            }
+        }
+
         if self.global.len() > 10_000 {
             self.global
                 .retain(|_, state| now.duration_since(state.window_start) < STATE_TTL);
         }
+        before.saturating_sub(len)
+    }
+
+    /// Number of tracked client entries. Measurement/debug only.
+    pub fn tracked_clients(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Run one maintenance pass eagerly. Measurement/debug only.
+    ///
+    /// The scheduled sweep is private, because nothing outside this module should
+    /// drive it; a benchmark needs to observe what a single pass removes, so this
+    /// exposes exactly that and nothing more.
+    pub fn run_maintenance_now_for_measurement(&self) -> usize {
+        self.maintain(Instant::now())
+    }
+
+    /// Reproduce the pre-fix eviction rule. Measurement/debug only.
+    ///
+    /// Used exclusively by `examples/cc_rss_probe.rs`. It disables both halves of
+    /// the fix (the predicate and the capacity cap) so a benchmark can measure
+    /// what the old code actually did, instead of the comparison being asserted.
+    /// Not reachable from request handling: the only callers are tests and the
+    /// measurement example.
+    pub fn set_legacy_eviction_for_measurement(&mut self, legacy: bool) {
+        self.legacy_eviction = legacy;
+    }
+
+    /// Run the removal once per second on its own task.
+    ///
+    /// Off the request path, a full sweep is affordable, so eviction can be
+    /// driven by the state itself rather than by a request counter.
+    pub fn spawn_maintenance(&self) {
+        let me = self.clone();
+        crate::agent::spawn_supervised("cc-maintenance", move || {
+            let me = me.clone();
+            async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    me.maintain(Instant::now());
+                }
+            }
+        });
     }
 
     fn nets(&self) -> std::sync::RwLockReadGuard<'_, Vec<(String, IpNet, Instant)>> {
@@ -706,7 +851,13 @@ impl CcProtector {
             }
         }
         let now = Instant::now();
-        self.maybe_maintain(now);
+        // Same rule as the per-client path: a request may run the cheap due-check
+        // but never the full write-locked sweep. `global` is bounded separately
+        // below and carried by the background task.
+        if self.maintenance_due() {
+            self.global
+                .retain(|_, state| now.duration_since(state.window_start) < STATE_TTL);
+        }
         if let Some(mut state) = self.global.get_mut(host) {
             return bump_global(&mut state, now) > limit;
         }
@@ -813,7 +964,12 @@ impl CcProtector {
             }
         }
 
-        self.maybe_maintain(now);
+        // Cheap inline path only when the background task may not be running
+        // (unit tests, or an embedding that never spawned it). The full sweep is
+        // deliberately not reachable from a request.
+        if self.maintenance_due() {
+            self.maintain(now);
+        }
         let mut entry = self.inner.entry(key).or_insert_with(|| ClientState {
             window_start: now,
             count: 0,
@@ -894,7 +1050,9 @@ impl CcProtector {
     /// request is over the limit. Local state only tracks ban strikes, not the
     /// request count.
     async fn note_over_limit(&self, key: &str, cfg: &CcConfig, now: Instant) -> CcDecision {
-        self.maybe_maintain(now);
+        if self.maintenance_due() {
+            self.maintain(now);
+        }
         let mut entry = self
             .inner
             .entry(key.to_string())
@@ -1328,6 +1486,310 @@ mod tests {
         assert!(
             timeout + error > 0,
             "the failure must be recorded somewhere (timeout={timeout}, error={error})"
+        );
+    }
+
+    // --- PERF-NEW-01: state-table eviction ------------------------------------
+
+    /// A normal client is never banned, so `banned_until` is `None` forever.
+    ///
+    /// The original predicate was
+    /// `last_seen.elapsed() < STATE_TTL && banned_until.map(|u| u > now).unwrap_or(true)`,
+    /// whose second conjunct is *always* true for an unbanned client. Eviction
+    /// therefore required 10 minutes of total silence, so a scanning fleet that
+    /// touches each address once per window could grow the table without bound.
+    #[test]
+    fn an_idle_unbanned_entry_is_reclaimable_long_before_state_ttl() {
+        let now = Instant::now();
+        // Active once, then quiet for a couple of windows, never banned.
+        let state = ClientState {
+            window_start: now - Duration::from_secs(30),
+            count: 3,
+            window_over: false,
+            violations: 0,
+            banned_until: None,
+            last_seen: now - Duration::from_secs(30),
+            reported: false,
+        };
+        assert!(
+            state_is_reclaimable(&state, now),
+            "a client quiet for 30s must be droppable; waiting STATE_TTL (600s) is the defect"
+        );
+    }
+
+    /// An entry still inside its sliding window must survive: dropping it would
+    /// reset that client's count and let them through for free.
+    #[test]
+    fn a_client_inside_the_current_window_is_kept() {
+        let now = Instant::now();
+        let state = ClientState {
+            window_start: now,
+            count: 1,
+            window_over: false,
+            violations: 0,
+            banned_until: None,
+            last_seen: now,
+            reported: false,
+        };
+        assert!(!state_is_reclaimable(&state, now));
+    }
+
+    /// An entry carrying violation strikes must survive the current window: the
+    /// strikes are what eventually ban a slow-drip attacker, and resetting them
+    /// on every window roll would make `ban_after` unreachable.
+    #[test]
+    fn a_client_with_pending_violations_is_kept() {
+        let now = Instant::now();
+        let state = ClientState {
+            window_start: now - Duration::from_secs(30),
+            count: 1,
+            window_over: false,
+            violations: 2,
+            banned_until: None,
+            last_seen: now - Duration::from_secs(30),
+            reported: false,
+        };
+        assert!(
+            !state_is_reclaimable(&state, now),
+            "pending ban strikes must not be discarded between windows"
+        );
+    }
+
+    /// An unexpired ban must survive regardless of how quiet the client is. In
+    /// particular a banned client *stops sending requests*, so `last_seen` is
+    /// frozen for the whole ban; dropping the entry would lift the ban early.
+    #[test]
+    fn an_active_ban_is_never_evicted() {
+        let now = Instant::now();
+        let state = ClientState {
+            window_start: now - Duration::from_secs(3600),
+            count: 0,
+            window_over: false,
+            violations: 0,
+            banned_until: Some(now + Duration::from_secs(3600)),
+            last_seen: now - Duration::from_secs(3600),
+            reported: false,
+        };
+        assert!(!state_is_reclaimable(&state, now));
+    }
+
+    /// Once a ban lapses the entry is ordinary again and may be reclaimed.
+    #[test]
+    fn an_expired_ban_does_not_pin_an_entry_forever() {
+        let now = Instant::now();
+        let state = ClientState {
+            window_start: now - Duration::from_secs(3600),
+            count: 0,
+            window_over: false,
+            violations: 0,
+            banned_until: Some(now - Duration::from_secs(60)),
+            last_seen: now - Duration::from_secs(3600),
+            reported: false,
+        };
+        assert!(state_is_reclaimable(&state, now));
+    }
+
+    /// A long-running, well-behaved client is reclaimed after it goes quiet,
+    /// even though it was active for hours. Nothing about it needs remembering.
+    #[test]
+    fn a_slow_but_open_client_is_reclaimed_once_idle() {
+        let now = Instant::now();
+        let mut state = ClientState {
+            window_start: now - Duration::from_secs(2),
+            count: 1,
+            window_over: false,
+            violations: 0,
+            banned_until: None,
+            last_seen: now - Duration::from_secs(2),
+            reported: false,
+        };
+        // Two windows of silence is the documented safety margin.
+        assert!(state_is_reclaimable(&state, now));
+        // One window of silence is not: the request may be mid-window.
+        state.last_seen = now - Duration::from_secs(1);
+        assert!(!state_is_reclaimable(&state, now));
+    }
+
+    /// Maintenance must remove idle entries and keep live ones, in one pass.
+    #[tokio::test]
+    async fn the_sweep_drops_idle_entries_and_keeps_live_ones() {
+        let cc = CcProtector::new();
+        let now = Instant::now();
+        let idle = ClientState {
+            window_start: now - Duration::from_secs(60),
+            count: 2,
+            window_over: false,
+            violations: 0,
+            banned_until: None,
+            last_seen: now - Duration::from_secs(60),
+            reported: false,
+        };
+        let live = ClientState {
+            window_start: now,
+            count: 1,
+            window_over: false,
+            violations: 0,
+            banned_until: None,
+            last_seen: now,
+            reported: false,
+        };
+        let banned = ClientState {
+            window_start: now,
+            count: 0,
+            window_over: false,
+            violations: 0,
+            banned_until: Some(now + Duration::from_secs(600)),
+            last_seen: now,
+            reported: false,
+        };
+        cc.inner.insert("a.test|203.0.113.1|dynamic".into(), idle);
+        cc.inner.insert("a.test|203.0.113.2|dynamic".into(), live);
+        cc.inner.insert("a.test|203.0.113.3|dynamic".into(), banned);
+
+        let removed = cc.maintain(now);
+        assert_eq!(removed, 1, "exactly the idle entry should go");
+        assert!(!cc.inner.contains_key("a.test|203.0.113.1|dynamic"));
+        assert!(cc.inner.contains_key("a.test|203.0.113.2|dynamic"));
+        assert!(cc.inner.contains_key("a.test|203.0.113.3|dynamic"));
+    }
+
+    /// The sweep must be able to enforce a hard cap even when many entries are
+    /// still "live". Without this the table is bounded only by traffic, which is
+    /// what the finding describes.
+    #[tokio::test]
+    async fn the_sweep_enforces_a_hard_capacity_cap() {
+        let cc = CcProtector::new();
+        let now = Instant::now();
+        cc.inner.clear();
+        // More entries than the cap, every one of them live.
+        for i in 0..(CC_STATE_HARD_CAP + 500) {
+            let state = ClientState {
+                window_start: now,
+                count: 1,
+                window_over: false,
+                violations: 0,
+                banned_until: None,
+                last_seen: now,
+                reported: false,
+            };
+            cc.inner.insert(
+                format!("a.test|10.0.{}.{}|dynamic", i / 256, i % 256),
+                state,
+            );
+        }
+        let before = cc.inner.len();
+        cc.maintain(now);
+        let after = cc.inner.len();
+        assert!(before > CC_STATE_HARD_CAP, "test must start above the cap");
+        assert!(
+            after <= CC_STATE_HARD_CAP,
+            "capacity cap not enforced: {after} entries remain (cap {CC_STATE_HARD_CAP})"
+        );
+    }
+
+    /// The finding's scenario end to end: a fleet of distinct client IPs, each
+    /// touching the edge just often enough to stay under the old 10-minute rule.
+    ///
+    /// Under the original predicate none of these entries was ever removable, so
+    /// the table grew without bound. With the corrected rule an idle client is
+    /// reclaimed after two windows, so the same population stabilises.
+    #[tokio::test]
+    async fn a_rotating_address_flood_does_not_grow_without_bound() {
+        let cc = CcProtector::new();
+        let cfg = CcConfig {
+            enabled: true,
+            rps: 10_000,
+            burst: 10_000,
+            ban_after: 0,
+            ban_seconds: 0,
+            mode: CcMode::Monitor,
+            allow_ips: Vec::new(),
+            global_rps: 0,
+            global_burst: 0,
+        };
+
+        // 2_000 distinct client groups, one request each, well under the limit so
+        // nobody is ever banned (exactly the "never triggers the threshold" case).
+        let base = Instant::now();
+        for i in 0..2_000u32 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, (i / 256) as u8, (i % 256) as u8, 1));
+            cc.check("flood.test", "/", ip, &cfg, false).await;
+        }
+        let after_traffic = cc.inner.len();
+        assert!(
+            after_traffic >= 1_000,
+            "the flood should have populated the table, got {after_traffic}"
+        );
+
+        // The old predicate required STATE_TTL (600s) of silence. Advance only
+        // past the new idle margin and sweep: nearly everything must go.
+        let later = base + EVICT_IDLE_AFTER + Duration::from_secs(1);
+        let removed = cc.maintain(later);
+        let remaining = cc.inner.len();
+        assert!(
+            remaining < after_traffic / 10,
+            "an idle flood must be reclaimed: {remaining} of {after_traffic} remain \
+             (removed {removed})"
+        );
+    }
+
+    /// The background task must actually run and shrink the table on its own,
+    /// without any request driving it.
+    #[tokio::test(start_paused = true)]
+    async fn the_background_task_reclaims_idle_entries_without_traffic() {
+        let cc = CcProtector::new();
+        let now = Instant::now();
+        for i in 0..500u32 {
+            let state = ClientState {
+                // Already idle relative to a two-second-old `last_seen`.
+                window_start: now - Duration::from_secs(60),
+                count: 1,
+                window_over: false,
+                violations: 0,
+                banned_until: None,
+                last_seen: now - Duration::from_secs(60),
+                reported: false,
+            };
+            cc.inner.insert(
+                format!("t.test|10.1.{}.{}|dynamic", i / 256, i % 256),
+                state,
+            );
+        }
+        assert_eq!(cc.inner.len(), 500);
+
+        cc.spawn_maintenance();
+        // Let the interval fire a few times; no request is made in between.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // The sweep uses real `Instant::now()`, not tokio's paused clock, so the
+        // inserted entries are already idle and must be reclaimed.
+        assert!(
+            cc.inner.len() < 500,
+            "the background sweep did not run: {} entries remain",
+            cc.inner.len()
+        );
+    }
+
+    /// Maintenance must not run on every request: `DashMap::retain` takes a write
+    /// lock on every shard in turn, so doing it inline is what caused the latency
+    /// spikes the finding describes.
+    #[test]
+    fn maintenance_is_not_attempted_on_every_request() {
+        let cc = CcProtector::new();
+        // Requests 1..=INTERVAL-1 must not sweep; request INTERVAL must.
+        for n in 1..MAINTENANCE_INTERVAL_REQUESTS {
+            assert!(
+                !cc.maintenance_due(),
+                "request {n} must not trigger a sweep"
+            );
+        }
+        assert!(
+            cc.maintenance_due(),
+            "request {MAINTENANCE_INTERVAL_REQUESTS} must trigger exactly one sweep"
+        );
+        // And not again immediately after.
+        assert!(
+            !cc.maintenance_due(),
+            "the next request must not sweep again"
         );
     }
 }

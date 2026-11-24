@@ -1,13 +1,20 @@
 //! Alert notification transports: webhook, Telegram and SMTP email.
+//!
+//! Every transport here talks to a tenant-supplied destination, so every
+//! transport resolves through [`crate::service::net_guard`] and dials only
+//! addresses that passed the policy. See that module for the DNS-rebinding
+//! reasoning.
 
-use crate::service::agent_http;
+use crate::service::agent_http::{self, PublicDestination};
+use crate::service::net_guard;
 use lettre::message::{header::ContentType, Mailbox};
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::transport::smtp::client::Tls;
+use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use ring::hmac;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Deserialize)]
@@ -77,7 +84,8 @@ async fn send_webhook(
     if cfg.url.trim().is_empty() {
         return Err("webhook url is required".into());
     }
-    crate::service::net_guard::validate_http_url(cfg.url.trim())
+    let url = cfg.url.trim();
+    crate::service::net_guard::validate_http_url(url)
         .await
         .map_err(|e| format!("webhook url rejected: {e}"))?;
     let ts = SystemTime::now()
@@ -100,7 +108,10 @@ async fn send_webhook(
         signature = format!("sha256={}", hex(tag.as_ref()));
         headers.push(("x-lagran-signature-256", signature.as_str()));
     }
-    let (status, _body) = agent_http::post_json_with_headers(&cfg.url, &body, &headers)
+    // `post_json_with_headers` re-checks the destination at connect time: it
+    // resolves through `GuardedResolver`, so a name that rebinds to an internal
+    // address after the pre-flight check above is refused rather than dialled.
+    let (status, _body) = agent_http::post_json_with_headers(url, &body, &headers)
         .await
         .map_err(|_| "webhook request failed".to_string())?;
     if (200..300).contains(&status) {
@@ -145,7 +156,21 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
 
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("lagran-control/0.1");
+        .user_agent("lagran-control/0.1")
+        // reqwest resolves on its own, so give it the same guarded resolver the
+        // hyper client uses. Without this, `api_base` could be rebound between
+        // `validate_http_url` and the actual request.
+        .dns_resolver(net_guard::GuardedDns::new(
+            net_guard::is_public_ip,
+            PublicDestination::Internet.label(),
+        ))
+        // reqwest also picks up `HTTPS_PROXY`/`ALL_PROXY` on its own, and those
+        // implicit proxies bypass `validate_proxy_url` below: a request would be
+        // handed to whatever endpoint the environment names, unchecked. The
+        // explicit block after this handles environment proxies too, so disabling
+        // auto-detection loses no feature and makes every proxy go through the
+        // guard.
+        .no_proxy();
     let proxy = if cfg.proxy.trim().is_empty() {
         ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
             .iter()
@@ -159,13 +184,19 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
         crate::service::net_guard::validate_proxy_url(&proxy)
             .await
             .map_err(|e| format!("telegram proxy rejected: {e}"))?;
-        let proxy = reqwest::Proxy::all(&proxy)
-            .map_err(|e| format!("invalid telegram proxy: {e}"))?;
+        let proxy =
+            reqwest::Proxy::all(&proxy).map_err(|e| format!("invalid telegram proxy: {e}"))?;
         builder = builder.proxy(proxy);
     }
     let client = builder
         .build()
         .map_err(|e| format!("telegram client error: {e}"))?;
+    // reqwest skips its resolver for IP-literal hosts, so check the literal too.
+    net_guard::check_target(
+        &url,
+        net_guard::is_public_ip,
+        PublicDestination::Internet.label(),
+    )?;
     let response = client
         .post(&url)
         .json(&body)
@@ -191,9 +222,20 @@ async fn send_email(config: &Value, subject: &str, message: &str) -> Result<(), 
     if cfg.smtp_host.trim().is_empty() || cfg.from.trim().is_empty() || cfg.to.is_empty() {
         return Err("email smtp_host, from and to are required".into());
     }
-    crate::service::net_guard::validate_smtp_host(cfg.smtp_host.trim(), cfg.smtp_port)
+    let smtp_host = cfg.smtp_host.trim();
+    // Resolve once, then hand lettre the *validated IP*. lettre resolves the
+    // hostname itself when it opens the socket, which would reopen the rebinding
+    // window this module exists to close; an IP literal is used as-is.
+    let addrs = crate::service::net_guard::resolve_smtp_host(smtp_host, cfg.smtp_port)
         .await
         .map_err(|e| format!("smtp host rejected: {e}"))?;
+    // Pick an address that actually accepts a connection. Handing lettre the
+    // hostname let it try every answer; now that it only gets one literal, probe
+    // them in order so a dead first record does not take alerting down.
+    let chosen = net_guard::connect_any(&addrs, std::time::Duration::from_secs(6))
+        .await
+        .map_err(|e| format!("smtp transport unreachable: {e}"))?;
+    let dial = dial_host(chosen);
     let from: Mailbox = cfg
         .from
         .parse()
@@ -217,16 +259,30 @@ async fn send_email(config: &Value, subject: &str, message: &str) -> Result<(), 
         .body(html)
         .map_err(|e| format!("build email: {e}"))?;
 
+    // TLS still needs the configured hostname for SNI and certificate
+    // verification, so `TlsParameters` is built from it and the socket is dialled
+    // to the checked IP. `builder_dangerous` is misnamed here: it only skips
+    // lettre's own relay presets, and an explicit `Tls` is supplied below.
+    let tls_name = smtp_host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
     let mut transport_builder = match cfg.tls.as_str() {
-        "none" => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.smtp_host)
+        "none" => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(dial.as_str())
             .port(cfg.smtp_port)
             .tls(Tls::None),
-        "implicit" => AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.smtp_host)
-            .map_err(|e| format!("smtp relay: {e}"))?
-            .port(cfg.smtp_port),
-        _ => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.smtp_host)
-            .map_err(|e| format!("smtp starttls: {e}"))?
-            .port(cfg.smtp_port),
+        "implicit" => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(dial.as_str())
+            .port(cfg.smtp_port)
+            .tls(Tls::Wrapper(
+                TlsParameters::new_rustls(tls_name.clone())
+                    .map_err(|e| format!("smtp tls parameters: {e}"))?,
+            )),
+        _ => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(dial.as_str())
+            .port(cfg.smtp_port)
+            .tls(Tls::Required(
+                TlsParameters::new_rustls(tls_name.clone())
+                    .map_err(|e| format!("smtp tls parameters: {e}"))?,
+            )),
     };
     if !cfg.username.is_empty() {
         transport_builder =
@@ -238,6 +294,15 @@ async fn send_email(config: &Value, subject: &str, message: &str) -> Result<(), 
         .await
         .map(|_| ())
         .map_err(|e| format!("smtp send: {e}"))
+}
+
+/// The literal lettre should dial.
+///
+/// Bare, not bracketed: lettre resolves `(host, port)` through tokio, whose
+/// `(&str, u16)` impl parses a plain IPv4/IPv6 literal but not an authority-form
+/// bracketed one. The brackets belong in URLs, not in this argument.
+fn dial_host(addr: SocketAddr) -> String {
+    addr.ip().to_string()
 }
 
 pub fn test_message() -> (&'static str, &'static str, &'static str) {
@@ -267,6 +332,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -294,5 +360,49 @@ mod tests {
         send_telegram(&config, "subject", "message").await.unwrap();
         server.await.unwrap();
     }
-}
 
+    #[tokio::test]
+    async fn webhook_to_metadata_is_refused() {
+        let config = json!({ "url": "http://169.254.169.254/latest/meta-data" });
+        let err = send_webhook(&config, "s", "m", "info").await.unwrap_err();
+        assert!(err.contains("rejected"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn telegram_api_base_pointing_at_metadata_is_refused() {
+        let config = json!({
+            "bot_token": "123:test",
+            "chat_id": "456",
+            "api_base": "http://169.254.169.254",
+        });
+        let err = send_telegram(&config, "s", "m").await.unwrap_err();
+        assert!(err.contains("rejected"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn smtp_host_pointing_at_metadata_is_refused() {
+        let config = json!({
+            "smtp_host": "169.254.169.254",
+            "from": "a@example.com",
+            "to": ["b@example.com"],
+        });
+        let err = send_email(&config, "s", "m").await.unwrap_err();
+        assert!(err.contains("rejected"), "{err}");
+    }
+
+    #[test]
+    fn smtp_dials_the_validated_ip_not_the_name() {
+        // Bare literals: tokio parses these directly, so lettre never consults
+        // DNS and the guard's answer is what gets connected to.
+        assert_eq!(
+            dial_host("203.0.113.10:587".parse().unwrap()),
+            "203.0.113.10"
+        );
+        let v6: SocketAddr = "[2001:db8::1]:587".parse().unwrap();
+        assert_eq!(dial_host(v6), "2001:db8::1");
+        assert!(
+            "2001:db8::1".parse::<IpAddr>().is_ok(),
+            "lettre's resolver must accept the literal as-is"
+        );
+    }
+}

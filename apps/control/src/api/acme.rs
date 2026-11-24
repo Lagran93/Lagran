@@ -81,26 +81,19 @@ pub async fn issue(
             let key_auth = format!("{token}.lagran-acme-dev");
             let _ = repository::put_acme_challenge(&state.pool, &token, &key_auth, &domain).await;
 
-            for node in &nodes {
-                let url = format!(
-                    "{}/__lagran/acme/challenge",
-                    node.agent_url.trim_end_matches('/')
-                );
-                let body = serde_json::json!({
-                    "token": token,
-                    "key_authorization": key_auth,
-                });
-                let _ = agent_http::put_json_ok(
-                    &url,
-                    &body,
-                    if node.auth_token.is_empty() {
-                        &state.config.agent_token
-                    } else {
-                        &node.auth_token
-                    },
-                )
-                .await;
-            }
+            // Bounded fan-out. The dev provider ignores per-node errors (the
+            // certificate is self-signed below), but it must still not serialise.
+            let targets = agent_http::owned_nodes(&nodes, &state.config.agent_token);
+            let body = serde_json::json!({
+                "token": token,
+                "key_authorization": key_auth,
+            });
+            let _ = agent_http::fan_out_edge(&targets, move |node| {
+                let url = node.endpoint("/__lagran/acme/challenge");
+                let body = body.clone();
+                async move { agent_http::put_json_ok(&url, &body, &node.token).await }
+            })
+            .await;
 
             let (cert_pem, key_pem) = issue_dev_cert(&domain).map_err(|e| {
                 (
@@ -186,28 +179,25 @@ pub async fn issue(
 
     let mut edges_pushed = 0u32;
     if req.push_to_edges.unwrap_or(true) {
-        for node in &nodes {
-            let url = format!(
-                "{}/__lagran/certs/load",
-                node.agent_url.trim_end_matches('/')
-            );
-            let body = serde_json::json!({
-                "names": [domain],
-                "cert_pem": cert_pem,
-                "key_pem": key_pem,
-            });
-            let token = if node.auth_token.is_empty() {
-                &state.config.agent_token
-            } else {
-                &node.auth_token
-            };
-            if agent_http::post_json_ok(&url, &body, token)
-                .await
-                .is_ok()
-            {
-                edges_pushed += 1;
-            }
+        // This is the admin-facing endpoint the finding measured: serial pushes
+        // to 20 nodes with a few slow ones blocked the request past the reverse
+        // proxy's timeout. Fan out with a bound instead.
+        let targets = agent_http::owned_nodes(&nodes, &state.config.agent_token);
+        let body = serde_json::json!({
+            "names": [domain],
+            "cert_pem": cert_pem,
+            "key_pem": key_pem,
+        });
+        let (pushed, failures) = agent_http::fan_out_edge(&targets, move |node| {
+            let url = node.endpoint("/__lagran/certs/load");
+            let body = body.clone();
+            async move { agent_http::post_json_ok(&url, &body, &node.token).await }
+        })
+        .await;
+        for (node, error) in failures {
+            tracing::warn!(node = %node, error = %error, "cert push failed");
         }
+        edges_pushed = pushed;
     }
 
     Ok(Json(IssueResponse {

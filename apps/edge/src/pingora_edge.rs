@@ -613,9 +613,17 @@ impl ProxyHttp for DataPlaneProxy {
         // and the in-process fallback) forwards the same chain. The in-process
         // fallback receives the FromPingora marker and therefore does not stamp
         // again.
-        if let Some(reason) =
-            crate::security::loop_guard::detect(&session.req_header().headers, &self.state.node_id)
-        {
+        // Strip loop headers from any peer outside `TRUSTED_EDGES` before taking
+        // the verdict, so a public client cannot inject a 508 (SEC-NEW-04).
+        let trusted_peer = session
+            .client_addr()
+            .and_then(|addr| addr.as_inet())
+            .is_some_and(|addr| self.state.trusted_edges.contains(addr.ip()));
+        if let Some(reason) = crate::security::loop_guard::guard_pingora(
+            session.req_header_mut(),
+            &self.state.node_id,
+            trusted_peer,
+        ) {
             ctx.cache_label = "BYPASS";
             ctx.cache_reason = Some(reason.as_str());
             ctx.status = 508;
@@ -635,10 +643,7 @@ impl ProxyHttp for DataPlaneProxy {
             .await;
             return Ok(true);
         }
-        crate::security::loop_guard::stamp_pingora(
-            session.req_header_mut(),
-            &self.state.node_id,
-        );
+        crate::security::loop_guard::stamp_pingora(session.req_header_mut(), &self.state.node_id);
 
         // The hotlink marker is internal; never trust a client-supplied value.
         session
@@ -1333,10 +1338,7 @@ impl ProxyHttp for DataPlaneProxy {
         upstream_request: &mut pingora::http::RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        crate::security::loop_guard::ensure_stamped_pingora(
-            upstream_request,
-            &self.state.node_id,
-        );
+        crate::security::loop_guard::ensure_stamped_pingora(upstream_request, &self.state.node_id);
         upstream_request.remove_header(signed_url::HOTLINK_OK_HEADER);
         if let Some(plan) = ctx.plan.as_ref() {
             // Keep HTTP Host aligned with the peer actually selected.

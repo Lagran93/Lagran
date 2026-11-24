@@ -8,9 +8,19 @@ use crate::service::redis::RedisService;
 
 const WINDOW: Duration = Duration::from_secs(60);
 const MAX_ATTEMPTS: u32 = 20;
-/// Per-client-IP budget. Higher than the per-email one so a shared NAT is not
-/// locked out by one user, but low enough to make spraying expensive.
+/// Per-client-IP budget for logins. Higher than the per-email one so a shared
+/// NAT is not locked out by one user, but low enough to make spraying expensive.
 pub const LOGIN_IP_LIMIT: u32 = 60;
+/// Per-client-IP budget for registrations.
+///
+/// Registration is a once-per-user event, so the budget is far tighter than the
+/// login one. It exists because the per-email bucket alone cannot bound account
+/// creation: an attacker who invents a fresh address per request (`bot_1@…`,
+/// `bot_2@…`) lands in a new bucket every time and is never limited, while every
+/// request still costs a hash and an INSERT. A shared NAT or office that registers
+/// more than this many accounts in a minute is rare enough to accept the
+/// trade-off, and the limit only delays the next attempt by up to a minute.
+pub const REGISTER_IP_LIMIT: u32 = 10;
 
 #[derive(Default)]
 struct Bucket {
@@ -32,24 +42,33 @@ impl LoginLimiter {
     /// Shared Redis counter when configured, local bucket otherwise.
     #[allow(dead_code)]
     pub async fn check_shared(&self, redis: Option<&RedisService>, key: &str) -> bool {
-        if let Some(redis) = redis {
-            if let Some(count) = redis
-                .incr_with_ttl(&format!("lagran:rl:{key}"), WINDOW.as_secs())
-                .await
-            {
-                return count <= i64::from(MAX_ATTEMPTS);
-            }
-        }
-        self.check(key)
+        self.check_shared_with_limit(redis, key, MAX_ATTEMPTS).await
     }
 
-    /// Whether the key is currently below `limit`, without consuming a slot.
-    pub async fn peek_shared(
+    /// Same as [`Self::check_shared`], but with an explicit per-window budget.
+    ///
+    /// The counter is incremented *before* the comparison, so concurrent requests
+    /// each consume a slot and the limiter holds under a burst rather than only in
+    /// sequential use.
+    pub async fn check_shared_with_limit(
         &self,
         redis: Option<&RedisService>,
         key: &str,
         limit: u32,
     ) -> bool {
+        if let Some(redis) = redis {
+            if let Some(count) = redis
+                .incr_with_ttl(&format!("lagran:rl:{key}"), WINDOW.as_secs())
+                .await
+            {
+                return count <= i64::from(limit);
+            }
+        }
+        self.check_with_limit(key, limit)
+    }
+
+    /// Whether the key is currently below `limit`, without consuming a slot.
+    pub async fn peek_shared(&self, redis: Option<&RedisService>, key: &str, limit: u32) -> bool {
         if let Some(redis) = redis {
             if let Some(raw) = redis.get(&format!("lagran:rl:{key}")).await {
                 if let Ok(count) = raw.parse::<i64>() {
@@ -126,8 +145,13 @@ impl LoginLimiter {
         }
     }
 
-    /// Returns false when the key is over the limit.
+    /// Returns false when the key is over the default login budget.
     pub fn check(&self, key: &str) -> bool {
+        self.check_with_limit(key, MAX_ATTEMPTS)
+    }
+
+    /// Returns false when the key is over `limit`. Consumes a slot either way.
+    pub fn check_with_limit(&self, key: &str, limit: u32) -> bool {
         let mut map = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => return true,
@@ -144,7 +168,7 @@ impl LoginLimiter {
         let b = map.entry(key.to_string()).or_default();
         match b.window_start {
             Some(start) if now.duration_since(start) < WINDOW => {
-                if b.count >= MAX_ATTEMPTS {
+                if b.count >= limit {
                     return false;
                 }
                 b.count += 1;
@@ -196,5 +220,66 @@ mod tests {
         assert!(!limiter.peek(key, MAX_ATTEMPTS));
         limiter.clear_shared(None, key).await;
         assert!(limiter.peek(key, MAX_ATTEMPTS));
+    }
+
+    /// A budget other than `MAX_ATTEMPTS` must be honoured exactly: the first
+    /// `limit` calls pass and the next one is refused. This is what makes the
+    /// per-IP registration bucket independent of the per-email one.
+    #[tokio::test]
+    async fn an_explicit_limit_is_enforced_exactly() {
+        let limiter = LoginLimiter::new();
+        let key = "register-ip:203.0.113.9";
+        for n in 1..=REGISTER_IP_LIMIT {
+            assert!(
+                limiter
+                    .check_shared_with_limit(None, key, REGISTER_IP_LIMIT)
+                    .await,
+                "call {n} should be within budget"
+            );
+        }
+        assert!(
+            !limiter
+                .check_shared_with_limit(None, key, REGISTER_IP_LIMIT)
+                .await,
+            "call {} should be refused",
+            REGISTER_IP_LIMIT + 1
+        );
+    }
+
+    /// The two buckets are keyed separately, so burning the registration budget
+    /// must not lock the same client out of logging in.
+    #[tokio::test]
+    async fn register_and_login_budgets_are_independent() {
+        let limiter = LoginLimiter::new();
+        let ip = "203.0.113.9";
+        for _ in 0..=REGISTER_IP_LIMIT {
+            let _ = limiter
+                .check_shared_with_limit(None, &format!("register-ip:{ip}"), REGISTER_IP_LIMIT)
+                .await;
+        }
+        assert!(
+            !limiter
+                .check_shared_with_limit(None, &format!("register-ip:{ip}"), REGISTER_IP_LIMIT)
+                .await
+        );
+        assert!(
+            limiter
+                .peek_shared(None, &format!("login-ip:{ip}"), LOGIN_IP_LIMIT)
+                .await,
+            "a blocked registration must not consume the login budget"
+        );
+    }
+
+    /// Each distinct key gets its own budget, which is precisely why a per-email
+    /// limit cannot stop an attacker who varies the address.
+    #[tokio::test]
+    async fn distinct_emails_do_not_share_a_bucket() {
+        let limiter = LoginLimiter::new();
+        for n in 0..50 {
+            assert!(
+                limiter.check(&format!("register:bot{n}@example.test")),
+                "a fresh address always passes, which is the gap the IP bucket closes"
+            );
+        }
     }
 }

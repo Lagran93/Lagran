@@ -14,12 +14,13 @@
 use crate::state::AppState;
 use axum::{
     async_trait,
-    extract::FromRequestParts,
+    extract::{ConnectInfo, FromRequestParts},
     http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
+use std::net::SocketAddr;
 
 /// Authenticated edge node, derived from its per-node token.
 pub struct AgentAuth {
@@ -55,6 +56,20 @@ fn allow_unauthenticated_schedule() -> bool {
     )
 }
 
+/// The caller's network address, when the router supplied one.
+///
+/// The agent routes are reachable without a session, so an unknown token is an
+/// untrusted input rather than a misconfiguration. The cache uses this to bound
+/// how many database lookups one source may trigger (see
+/// [`crate::middleware::agent_token_cache`]); it is not an authentication
+/// credential and never influences *which* node a token maps to.
+fn caller_ip(parts: &Parts) -> Option<std::net::IpAddr> {
+    parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+}
+
 fn agent_token(parts: &Parts) -> &str {
     parts
         .headers
@@ -78,7 +93,7 @@ impl FromRequestParts<AppState> for AgentAuth {
         }
         match state
             .agent_tokens
-            .resolve(&state.pool, state.redis.as_deref(), got)
+            .resolve(&state.pool, state.redis.as_deref(), got, caller_ip(parts))
             .await
         {
             Ok(Some(node_name)) => Ok(Self { node_name }),
@@ -124,7 +139,7 @@ impl FromRequestParts<AppState> for ScheduleAuth {
         }
         if state
             .agent_tokens
-            .resolve(&state.pool, state.redis.as_deref(), got)
+            .resolve(&state.pool, state.redis.as_deref(), got, caller_ip(parts))
             .await
             .ok()
             .flatten()

@@ -3,13 +3,26 @@
 //! Every data-plane request is stamped with the node that forwarded it:
 //!
 //! ```text
-//! CDN-Loop: lagran; id=edge-hk-01
+//! CDN-Loop: lagran; id=edge-hk-01-3f9a1c22b71d4e50
 //! X-Lagran-Shield-Hops: 1
 //! ```
+//!
+//! The id carries a per-machine instance token (see
+//! [`crate::config::identity`]) so two edges that share one `NODE_ID` can never
+//! mistake each other for themselves.
 //!
 //! An edge rejects the request with 508 when it sees its own id, or when the
 //! hop counter has already reached the limit. This catches misconfigured
 //! Shield-to-Shield paths before they can spin between nodes.
+//!
+//! These headers are only meaningful between Lagran edges. A public client
+//! could otherwise send `X-Lagran-Shield-Hops: 3` (or `CDN-Loop` naming a
+//! guessable default node id) and have the edge, and then the Shield behind it,
+//! answer 508 to the client's own traffic — a one-way denial of service, and
+//! for cacheable URLs a way to keep the Shield from ever filling its cache.
+//! [`guard`] therefore strips both headers from any peer that is not in
+//! `TRUSTED_EDGES` before the guard runs; the counter a peer can influence is
+//! then only the one this edge stamped itself.
 
 use axum::http::{HeaderMap, HeaderValue};
 
@@ -48,6 +61,50 @@ pub fn detect(headers: &HeaderMap, node_id: &str) -> Option<LoopReason> {
         return Some(LoopReason::TooManyHops);
     }
     None
+}
+
+/// Strip the internal loop headers from a request.
+///
+/// Both headers are removed, including repeated `CDN-Loop` lines: forwarding
+/// only the first line was a previous bug in the origin path, and leaving a
+/// second spoofed line here would re-open the same hole.
+pub fn strip_internal(headers: &mut HeaderMap) {
+    while headers.remove(CDN_LOOP_HEADER).is_some() {}
+    while headers.remove(SHIELD_HOPS_HEADER).is_some() {}
+}
+
+/// Ingress guard for one request.
+///
+/// `trusted_peer` must be true only when the socket peer is a known
+/// Edge/Shield interconnect (configured through `TRUSTED_EDGES`). For anything
+/// else — a public client, a plain reverse proxy in front of the edge — the
+/// loop headers are attacker-controlled input and are stripped before they can
+/// influence either the 508 decision or the counter forwarded upstream.
+pub fn guard(headers: &mut HeaderMap, node_id: &str, trusted_peer: bool) -> Option<LoopReason> {
+    if !trusted_peer {
+        strip_internal(headers);
+    }
+    detect(headers, node_id)
+}
+
+/// Pingora variant of [`strip_internal`].
+pub fn strip_internal_pingora(request: &mut pingora::http::RequestHeader) {
+    // `remove_header` drops every value under the name; the return value is
+    // ignored because only the absence matters.
+    let _ = request.remove_header(CDN_LOOP_HEADER);
+    let _ = request.remove_header(SHIELD_HOPS_HEADER);
+}
+
+/// Pingora variant of [`guard`].
+pub fn guard_pingora(
+    request: &mut pingora::http::RequestHeader,
+    node_id: &str,
+    trusted_peer: bool,
+) -> Option<LoopReason> {
+    if !trusted_peer {
+        strip_internal_pingora(request);
+    }
+    detect(&request.headers, node_id)
 }
 
 /// Add this node to the loop chain and advance the hop counter.
@@ -271,6 +328,139 @@ mod tests {
         assert_eq!(
             fresh.get(SHIELD_HOPS_HEADER).and_then(|v| v.to_str().ok()),
             Some("1")
+        );
+    }
+
+    /// The reported defect: a public client could send the hop limit (or a
+    /// `CDN-Loop` naming a guessable default node id) and make the edge — and
+    /// the Shield behind it — answer 508 to valid traffic. An untrusted peer's
+    /// headers must be gone before the guard runs.
+    #[test]
+    fn untrusted_peer_cannot_trigger_a_loop_verdict() {
+        let mut headers = HeaderMap::new();
+        headers.insert(SHIELD_HOPS_HEADER, header("3"));
+        headers.append(CDN_LOOP_HEADER, header("lagran; id=edge-001"));
+        headers.append(CDN_LOOP_HEADER, header("lagran; id=edge-001"));
+        headers.insert("user-agent", header("curl"));
+
+        assert_eq!(guard(&mut headers, "edge-001", false), None);
+        assert!(
+            headers.get(SHIELD_HOPS_HEADER).is_none(),
+            "spoofed hop counter must be stripped, not just ignored"
+        );
+        assert_eq!(headers.get_all(CDN_LOOP_HEADER).iter().count(), 0);
+        // Unrelated headers survive.
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("curl")
+        );
+    }
+
+    /// A trusted Edge/Shield hop still gets the full chain: self-reference and
+    /// the hop budget both keep working.
+    #[test]
+    fn trusted_peer_chain_is_still_enforced() {
+        let mut headers = HeaderMap::new();
+        headers.append(CDN_LOOP_HEADER, header("lagran; id=edge-a"));
+        assert_eq!(
+            guard(&mut headers, "edge-a", true),
+            Some(LoopReason::SelfReference)
+        );
+        assert_eq!(
+            headers.get_all(CDN_LOOP_HEADER).iter().count(),
+            1,
+            "a trusted chain is preserved for forwarding"
+        );
+
+        let mut hops = HeaderMap::new();
+        hops.insert(SHIELD_HOPS_HEADER, header("3"));
+        assert_eq!(
+            guard(&mut hops, "edge-b", true),
+            Some(LoopReason::TooManyHops)
+        );
+    }
+
+    /// Stripping happens before `stamp`, so an external client can neither
+    /// raise nor reset the counter that reaches the next hop: the chain starts
+    /// at one edge hop again.
+    #[test]
+    fn untrusted_client_cannot_influence_the_forwarded_counter() {
+        let mut headers = HeaderMap::new();
+        headers.insert(SHIELD_HOPS_HEADER, header("99"));
+        headers.append(CDN_LOOP_HEADER, header("lagran; id=edge-001"));
+
+        assert_eq!(guard(&mut headers, "edge-001", false), None);
+        stamp(&mut headers, "edge-001-abc123");
+        let chain = headers
+            .get_all(CDN_LOOP_HEADER)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(chain, "lagran; id=edge-001-abc123");
+        assert_eq!(
+            headers
+                .get(SHIELD_HOPS_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// A public client that is NOT in `TRUSTED_EDGES` cannot force a 508.
+    ///
+    /// This is the end-to-end shape of the reported defect: the old code called
+    /// `detect()` directly on the inbound headers, so the hop counter and the
+    /// `CDN-Loop` line reached the verdict untrimmed. `guard` must strip first,
+    /// then find nothing to reject.
+    #[test]
+    fn public_client_injecting_hop_limit_gets_no_508() {
+        let mut headers = HeaderMap::new();
+        headers.insert(SHIELD_HOPS_HEADER, header("3"));
+        headers.append(CDN_LOOP_HEADER, header("lagran; id=edge-hk-01-deadbeef"));
+        headers.insert("accept", header("*/*"));
+
+        assert_eq!(guard(&mut headers, "edge-hk-01-deadbeef", false), None);
+        assert_eq!(guard(&mut headers, "edge-hk-01", false), None);
+        assert!(headers.get(SHIELD_HOPS_HEADER).is_none());
+        assert_eq!(headers.get_all(CDN_LOOP_HEADER).iter().count(), 0);
+        // The request itself survives: this is a proxy, not a filter.
+        assert_eq!(
+            headers.get("accept").and_then(|v| v.to_str().ok()),
+            Some("*/*")
+        );
+    }
+
+    /// The default node id must not be a fixed literal.
+    ///
+    /// Two hosts configured identically (no `NODE_ID`, or a copied env file) used
+    /// to share `"edge-001"`, so the second tier saw "its own" id in the chain and
+    /// answered 508. The loop identity now carries a per-machine instance token.
+    #[test]
+    fn shared_node_ids_do_not_self_reference_across_hosts() {
+        let a = crate::config::identity::resolve(Some("edge-001"), "/tmp/lg-id-a");
+        let b = crate::config::identity::resolve(Some("edge-001"), "/tmp/lg-id-b");
+
+        // Host A stamps its chain; host B must not recognise it as its own.
+        let mut headers = HeaderMap::new();
+        stamp(&mut headers, &a.loop_id);
+        assert_eq!(
+            detect(&headers, &a.loop_id),
+            Some(LoopReason::SelfReference)
+        );
+        assert_eq!(detect(&headers, &b.loop_id), None);
+
+        let _ = std::fs::remove_dir_all("/tmp/lg-id-a");
+        let _ = std::fs::remove_dir_all("/tmp/lg-id-b");
+    }
+
+    /// Malformed headers from a trusted hop still fail closed.
+    #[test]
+    fn trusted_peer_malformed_header_still_fails_closed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(SHIELD_HOPS_HEADER, header("not-a-number"));
+        assert_eq!(
+            guard(&mut headers, "edge-1", true),
+            Some(LoopReason::TooManyHops)
         );
     }
 }

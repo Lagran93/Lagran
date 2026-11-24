@@ -77,7 +77,16 @@ fn fetch_wait(origin_timeout_ms: u64) -> Duration {
 #[derive(Clone)]
 pub struct AppState {
     /// This edge's node id, used in the CDN-Loop chain.
+    ///
+    /// This is the *loop* identity (node id + per-machine instance token), not
+    /// the control-plane name. Two hosts that share a `NODE_ID` still get distinct
+    /// values here, so neither mistakes the other's stamp for its own.
     pub node_id: String,
+    /// Peers whose loop headers are trusted (`TRUSTED_EDGES`).
+    ///
+    /// Empty by default. An unlisted peer's `CDN-Loop` / `X-Lagran-Shield-Hops`
+    /// are client input and are stripped before the loop guard runs.
+    pub trusted_edges: crate::security::trusted_proxy::TrustedProxies,
     /// Random token attached to internal prefetch requests. The loopback peer
     /// check is necessary but not sufficient when a local reverse proxy accepts
     /// public traffic; this token prevents a client from claiming the internal
@@ -295,9 +304,20 @@ async fn proxy_handler_inner(
     // The native Pingora filter already checked and stamped this request. A
     // direct caller (cache diagnostics) has not, so it needs the same guard.
     // Stamping twice would make every fallback request look like a loop.
+    // Read before the guard so the trust decision can use it; the value is also
+    // needed further down for client-IP resolution.
+    let peer_addr = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
     if req.extensions().get::<host_util::FromPingora>().is_none() {
+        // `guard` (not `detect`): headers from a peer outside `TRUSTED_EDGES` are
+        // stripped first. Without that, any client could send
+        // `X-Lagran-Shield-Hops: 3` or a `CDN-Loop` naming a guessable node id and
+        // force this edge to answer 508 to its own traffic.
+        let trusted_peer = peer_addr.is_some_and(|peer| state.trusted_edges.contains(peer.ip()));
         if let Some(reason) =
-            crate::security::loop_guard::detect(req.headers(), &state.node_id)
+            crate::security::loop_guard::guard(req.headers_mut(), &state.node_id, trusted_peer)
         {
             tracing::debug!(
                 node_id = %state.node_id,
@@ -318,10 +338,6 @@ async fn proxy_handler_inner(
         .unwrap_or_else(|| "/".to_string());
     let path_only = req.uri().path().to_string();
     let host = host_util::resolve_request_host(&req);
-    let peer_addr = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|info| info.0);
     let mut headers = req.headers().clone();
     // The hotlink marker is set by this edge after it verifies a signed URL, so a
     // client-supplied value must never be trusted. Requests forwarded from the

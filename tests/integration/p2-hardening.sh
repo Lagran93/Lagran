@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # P2 control-plane hardening regression:
 #   * alert channels cannot reach loopback/metadata addresses (SSRF);
+#   * registration is limited per client IP, so one source cannot create
+#     unlimited accounts by varying the email address (SEC-NEW-02);
+#   * repeated invalid agent tokens are answered from a negative cache instead of
+#     hitting PostgreSQL on every request (SEC-NEW-03);
 #   * login limiting is failure-based and has a per-IP dimension;
 #   * access-log ingest drops a bad timestamp instead of poisoning the batch,
 #     and attributes rows to the token's node, not the payload;
@@ -33,7 +37,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CONTROL_BIND="127.0.0.1:$CONTROL_PORT" CAPTCHA_ENABLED=false ./target/debug/lagran-control \
+CONTROL_BIND="127.0.0.1:$CONTROL_PORT" CAPTCHA_ENABLED=false ALLOW_REGISTER=true ./target/debug/lagran-control \
   >"$LOG_DIR/control.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 80); do curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null && break; sleep 0.5; done
@@ -133,6 +137,52 @@ if printf '%s' "$DIAG" | grep -q 'Connection refused'; then
 else
   pass "diagnostic does not leak OS errors"
 fi
+
+echo "== registration IP rate limit (SEC-NEW-02) =="
+# The per-email bucket cannot bound account creation: every fresh address is a
+# fresh bucket. Burn the per-IP budget with distinct addresses and require the
+# next attempt from the same source to be refused.
+REG_LIMITED=0
+for n in $(seq 1 15); do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/auth/register" \
+    -H 'content-type: application/json' \
+    -d "{\"email\":\"p2-bot-$n-$$@example.test\",\"password\":\"Str0ng-Passw0rd!$n\"}")
+  if [[ "$CODE" == "429" ]]; then REG_LIMITED=$((REG_LIMITED + 1)); fi
+done
+if [[ "$REG_LIMITED" -gt 0 ]]; then
+  pass "distinct emails from one IP are rate limited"
+else
+  fail "15 distinct registrations from one IP were never rate limited"
+fi
+
+# A different client IP (via the default trusted loopback proxy) is unaffected.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/auth/register" \
+  -H 'content-type: application/json' -H 'x-forwarded-for: 203.0.113.88' \
+  -d "{\"email\":\"p2-other-$$@example.test\",\"password\":\"Str0ng-Passw0rd!x\"}")
+check "another client IP can still register" "$CODE" "201"
+
+echo "== agent token negative cache (SEC-NEW-03) =="
+# The agent routes accept a per-node token without a session, so a random token is
+# attacker input. Replays of one bad token must not turn into one query each.
+BOGUS="not-a-node-token-$$"
+for _ in $(seq 1 20); do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/nodes/heartbeat" \
+    -H 'content-type: application/json' -H "x-lagran-agent-token: $BOGUS" \
+    -d '{"node_id":"x"}')
+done
+check "invalid agent token is rejected" "$CODE" "401"
+
+# A real node token must still authenticate, including immediately after
+# creation (the window the negative cache could have broken).
+NEWNODE=$(curl -s -X POST "$BASE/api/v1/nodes" -H "$AUTH" -H 'content-type: application/json' \
+  -d "{\"name\":\"sec03-node-$$\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:9\"}")
+NEWTOKEN=$(printf '%s' "$NEWNODE" | jq -r '.token // empty')
+NEWNAME=$(printf '%s' "$NEWNODE" | jq -r '.node.name // empty')
+[[ -n "$NEWTOKEN" ]] || { echo "node create failed: $NEWNODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/nodes/heartbeat" \
+  -H 'content-type: application/json' -H "x-lagran-agent-token: $NEWTOKEN" \
+  -d "{\"node_id\":\"$NEWNAME\"}")
+check "freshly created token authenticates immediately" "$CODE" "200"
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then

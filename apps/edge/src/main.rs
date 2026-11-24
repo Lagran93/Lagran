@@ -1,7 +1,7 @@
 use edge::agent::{self, access_report, cert_sync, config_sync, metrics_report, origin_health};
 use edge::cache::{self, policy::RuleSet};
-use edge::config::EdgeConfig;
 use edge::config::registry::DomainRegistry;
+use edge::config::EdgeConfig;
 use edge::metrics::EdgeMetrics;
 use edge::origin::OriginClient;
 use edge::server::access_log::AccessLog;
@@ -273,7 +273,11 @@ async fn main() -> anyhow::Result<()> {
     let local_http_addr = edge::config::local_http_listen_addr(listen_addr);
     let prefetch_token = generate_prefetch_token();
     let state = Arc::new(AppState {
-        node_id: config.node_id.clone(),
+        // The loop identity, not the control-plane name: it carries the
+        // per-machine instance token, so two hosts configured with the same
+        // NODE_ID cannot mistake each other's CDN-Loop stamp for their own.
+        node_id: config.loop_id.clone(),
+        trusted_edges: config.trusted_edges.clone(),
         prefetch_token,
         cache,
         flight,
@@ -332,6 +336,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     agent::cc_sync::spawn_cc_sync(config.clone(), control.clone(), state.cc.clone());
+    // Evicting idle CC entries takes a write lock on every DashMap shard in turn.
+    // Doing that from a request made latency track the table size, and under a
+    // rotating-address flood it stalled the proxy threads entirely; the sweep now
+    // runs once a second on its own task (PERF-NEW-01).
+    state.cc.spawn_maintenance();
 
     let admin_listen = config.admin_listen_addr.clone();
     if let Some(ref admin) = admin_listen {

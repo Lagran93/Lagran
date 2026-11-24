@@ -792,6 +792,11 @@ pub async fn create(
     .await;
     // A new node must be schedulable immediately, not after the snapshot TTL.
     state.nodes.invalidate().await;
+    // The install command this response returns uses `token` seconds from now. A
+    // negative cache entry recorded for that same string before the row existed
+    // (a guessed token that happened to collide, or a deleted node recreated with
+    // its old token) would otherwise reject the node's very first heartbeat.
+    state.agent_tokens.forget_miss(&token);
 
     let commands = install_commands(&base, name, &region, &row.public_ip, &agent_url, &token);
     Ok((
