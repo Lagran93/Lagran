@@ -51,12 +51,37 @@ fn forbidden() -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+/// Domain names the actor may see, in the form the prefetch queries filter on.
+///
+/// `None` means "all domains" (admin). `Some(empty)` means a non-admin that owns
+/// no domain: passing the empty slice to `domain = ANY($n)` matches nothing, so
+/// the isolation is enforced by the database instead of by filtering rows after
+/// they were read. If the name lookup fails the actor gets nothing (fail
+/// closed) rather than every tenant's rows.
+async fn visible_domain_names(state: &AppState, actor: &Actor) -> Option<Vec<String>> {
+    match actor.visible_domain_ids(state).await {
+        None => None,
+        Some(ids) => Some(
+            repository::domain_names_by_ids(&state.pool, &ids)
+                .await
+                .unwrap_or_default()
+                .into_values()
+                .collect(),
+        ),
+    }
+}
+
 pub async fn create(
     State(state): State<AppState>,
     actor: Actor,
     Json(req): Json<PrefetchRequest>,
 ) -> Result<Json<PrefetchResponse>, (StatusCode, Json<ErrorBody>)> {
-    if req.domain.is_empty() || req.paths.is_empty() {
+    // Normalize exactly like `create_schedule`: the console list filters on
+    // `domain = ANY(visible names)` in SQL, so the stored text has to be the
+    // same form the domain registry uses (lowercase). Otherwise an admin could
+    // enqueue `CDN.Example.COM` and no tenant filter would ever match the row.
+    let domain = req.domain.trim().to_ascii_lowercase();
+    if domain.is_empty() || req.paths.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
@@ -64,7 +89,7 @@ pub async fn create(
             }),
         ));
     }
-    if !actor.can_write_domain_name(&state, &req.domain).await {
+    if !actor.can_write_domain_name(&state, &domain).await {
         return Err(forbidden());
     }
     // Each path used to become its own INSERT in a serial loop; an unbounded
@@ -88,7 +113,7 @@ pub async fn create(
         } else {
             format!("/{path}")
         };
-        match repository::create_prefetch(&state.pool, &req.domain, &p, &headers).await {
+        match repository::create_prefetch(&state.pool, &domain, &p, &headers).await {
             Ok(id) => ids.push(id.to_string()),
             Err(e) => tracing::error!(error = %e, "prefetch insert"),
         }
@@ -97,7 +122,7 @@ pub async fn create(
         &state.pool,
         &actor.email,
         "prefetch",
-        &req.domain,
+        &domain,
         &format!("{} paths", ids.len()),
     )
     .await;
@@ -109,27 +134,16 @@ pub async fn create(
 }
 
 pub async fn list(State(state): State<AppState>, actor: Actor) -> Json<Vec<PrefetchTaskDto>> {
-    let rows = repository::list_prefetch(&state.pool, 50)
+    // The tenant filter is part of the query. Reading the newest rows for all
+    // tenants and dropping the others in memory let one tenant's burst hide
+    // everyone else's tasks (SEC-NEW-05).
+    let visible = visible_domain_names(&state, &actor).await;
+    let rows = repository::list_prefetch(&state.pool, 50, visible.as_deref())
         .await
         .unwrap_or_default();
-    let visible = actor.visible_domain_ids(&state).await;
-    let visible_names: Option<std::collections::HashSet<String>> = match visible {
-        None => None,
-        Some(ids) => Some(
-            repository::domain_names_by_ids(&state.pool, &ids)
-                .await
-                .unwrap_or_default()
-                .into_values()
-                .collect(),
-        ),
-    };
 
     Json(
         rows.into_iter()
-            .filter(|(_, domain, _, _, _)| match &visible_names {
-                None => true,
-                Some(names) => names.contains(domain),
-            })
             .map(|(id, domain, url_path, status, message)| PrefetchTaskDto {
                 id: id.to_string(),
                 domain,
@@ -228,29 +242,11 @@ pub async fn list_schedules(
     State(state): State<AppState>,
     actor: Actor,
 ) -> Json<Vec<PrefetchScheduleDto>> {
-    let rows = repository::list_prefetch_schedules(&state.pool)
+    let visible = visible_domain_names(&state, &actor).await;
+    let rows = repository::list_prefetch_schedules(&state.pool, visible.as_deref())
         .await
         .unwrap_or_default();
-    let visible = actor.visible_domain_ids(&state).await;
-    let visible_names: Option<std::collections::HashSet<String>> = match visible {
-        None => None,
-        Some(ids) => Some(
-            repository::domain_names_by_ids(&state.pool, &ids)
-                .await
-                .unwrap_or_default()
-                .into_values()
-                .collect(),
-        ),
-    };
-    Json(
-        rows.into_iter()
-            .filter(|r| match &visible_names {
-                None => true,
-                Some(names) => names.contains(&r.domain),
-            })
-            .map(schedule_dto)
-            .collect(),
-    )
+    Json(rows.into_iter().map(schedule_dto).collect())
 }
 
 pub async fn create_schedule(
@@ -429,26 +425,13 @@ pub struct PrefetchTaskV2 {
 }
 
 pub async fn list_tasks(State(state): State<AppState>, actor: Actor) -> Json<Vec<PrefetchTaskV2>> {
-    let rows = repository::list_prefetch_tasks(&state.pool, 100)
+    // Tenant ownership is pushed into SQL: see `visible_domain_names`.
+    let visible = visible_domain_names(&state, &actor).await;
+    let rows = repository::list_prefetch_tasks(&state.pool, 100, visible.as_deref())
         .await
         .unwrap_or_default();
-    let visible = actor.visible_domain_ids(&state).await;
-    let visible_names: Option<std::collections::HashSet<String>> = match visible {
-        None => None,
-        Some(ids) => Some(
-            repository::domain_names_by_ids(&state.pool, &ids)
-                .await
-                .unwrap_or_default()
-                .into_values()
-                .collect(),
-        ),
-    };
     Json(
         rows.into_iter()
-            .filter(|r| match &visible_names {
-                None => true,
-                Some(names) => names.contains(&r.domain),
-            })
             .map(|r| PrefetchTaskV2 {
                 id: r.id.to_string(),
                 domain: r.domain,

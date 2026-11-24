@@ -8,7 +8,8 @@
 #   * login limiting is failure-based and has a per-IP dimension;
 #   * access-log ingest drops a bad timestamp instead of poisoning the batch,
 #     and attributes rows to the token's node, not the payload;
-#   * prefetch requests are capped and deduplicated;
+#   * prefetch requests are capped and deduplicated, and prefetch listings are
+#     tenant-filtered in SQL (SEC-NEW-05);
 #   * origin diagnostics refuse metadata/loopback targets;
 #   * issued JWTs carry and require iss/aud.
 #
@@ -183,6 +184,61 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/nodes/heartb
   -H 'content-type: application/json' -H "x-lagran-agent-token: $NEWTOKEN" \
   -d "{\"node_id\":\"$NEWNAME\"}")
 check "freshly created token authenticates immediately" "$CODE" "200"
+
+echo "== prefetch tenant isolation (SEC-NEW-05) =="
+# A tenant that queues more paths than the console window must not blank other
+# tenants' progress view. The old listing read the newest rows for *every* tenant
+# and dropped the unauthorized ones in memory, so the flood pushed the other
+# tenants out of the window even though their tasks were still queued/running.
+SEC05_EMAIL="p2-sec05-$$@example.test"
+SEC05_PASSWORD="p2-pass-123"
+curl -s -X POST "$BASE/api/v1/users" -H "$AUTH" -H 'content-type: application/json' \
+  -d "{\"email\":\"$SEC05_EMAIL\",\"password\":\"$SEC05_PASSWORD\",\"role\":\"user\"}" >/dev/null
+SEC05_TOKEN=$(curl -s -X POST "$BASE/api/v1/auth/login" -H 'content-type: application/json' \
+  -d "{\"email\":\"$SEC05_EMAIL\",\"password\":\"$SEC05_PASSWORD\"}" | jq -r '.token // empty')
+[[ -n "$SEC05_TOKEN" ]] || { echo "SEC-NEW-05: tenant login failed"; exit 1; }
+SEC05_AUTH="authorization: Bearer $SEC05_TOKEN"
+SEC05_PROJECT=$(curl -s -X POST "$BASE/api/v1/projects" -H "$SEC05_AUTH" \
+  -H 'content-type: application/json' -d "{\"name\":\"p2-sec05-$$\"}" | jq -r '.id // empty')
+[[ -n "$SEC05_PROJECT" ]] || { echo "SEC-NEW-05: tenant project create failed"; exit 1; }
+
+# The tenant's domain lives in its own project; the admin creates it on the
+# tenant's behalf, exactly like the console's project picker does.
+SEC05_DOMAIN="p2-sec05-tenant-$$.test"
+curl -s -X POST "$BASE/api/v1/domains" -H "$AUTH" -H 'content-type: application/json' \
+  -d "{\"name\":\"$SEC05_DOMAIN\",\"origin_host\":\"127.0.0.1\",\"origin_port\":19090,\"origin_proto\":\"http\",\"project_id\":\"$SEC05_PROJECT\"}" >/dev/null
+
+# Tenant task first (oldest row), then an admin flood of >100 newer rows.
+curl -s -X POST "$BASE/api/v1/prefetch" -H "$SEC05_AUTH" -H 'content-type: application/json' \
+  -d "{\"domain\":\"$SEC05_DOMAIN\",\"paths\":[\"/tenant\"]}" >/dev/null
+SEC05_FLOOD="p2-sec05-admin-$$.test"
+curl -s -X POST "$BASE/api/v1/domains" -H "$AUTH" -H 'content-type: application/json' \
+  -d "{\"name\":\"$SEC05_FLOOD\",\"origin_host\":\"127.0.0.1\",\"origin_port\":19090,\"origin_proto\":\"http\"}" >/dev/null
+FLOOD_PATHS=$(python3 -c 'import json; print(json.dumps([f"/flood{i}" for i in range(120)]))')
+curl -s -X POST "$BASE/api/v1/prefetch" -H "$AUTH" -H 'content-type: application/json' \
+  -d "{\"domain\":\"$SEC05_FLOOD\",\"paths\":$FLOOD_PATHS}" >/dev/null
+
+TASKS=$(curl -s -H "$SEC05_AUTH" "$BASE/api/v1/prefetch/tasks")
+check "tenant still sees its own prefetch task" "$(printf '%s' "$TASKS" | jq 'length')" "1"
+check "tenant task is attributed to its domain" \
+  "$(printf '%s' "$TASKS" | jq -r '.[0].domain')" "$SEC05_DOMAIN"
+V1=$(curl -s -H "$SEC05_AUTH" "$BASE/api/v1/prefetch")
+check "v1 listing returns only the tenant's domain" \
+  "$(printf '%s' "$V1" | jq -r '[.[].domain] | unique | join(",")')" "$SEC05_DOMAIN"
+
+# Schedules follow the same rule: other tenants' scheduling data must not be
+# returned at all.
+curl -s -X POST "$BASE/api/v1/prefetch/schedules" -H "$AUTH" -H 'content-type: application/json' \
+  -d "{\"domain\":\"$SEC05_FLOOD\",\"paths\":[\"/sched\"],\"interval_minutes\":60}" >/dev/null
+SCHEDULES=$(curl -s -H "$SEC05_AUTH" "$BASE/api/v1/prefetch/schedules")
+check "tenant sees no foreign prefetch schedules" "$(printf '%s' "$SCHEDULES" | jq 'length')" "0"
+
+# The admin view is unchanged (unfiltered). The tenant's row is outside the
+# admin's own newest-100 window here — the flood is newer by construction — so
+# assert the flood itself is visible instead.
+ADMIN_TASKS=$(curl -s -H "$AUTH" "$BASE/api/v1/prefetch/tasks")
+check "admin listing is still unfiltered" \
+  "$(printf '%s' "$ADMIN_TASKS" | jq --arg d "$SEC05_FLOOD" '[.[] | select(.domain == $d)] | length > 0')" "true"
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then

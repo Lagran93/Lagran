@@ -2342,19 +2342,31 @@ pub async fn create_prefetch(
     Ok(id)
 }
 
+/// Recent prefetch tasks, optionally restricted to a set of domain names.
+///
+/// `domains` is the tenant filter and it is applied **before** `LIMIT`: `None`
+/// means "no filter" (admin), a slice restricts the scan (an empty slice
+/// matches nothing, so a user without domains sees nothing).
+///
+/// Filtering after the limit was the defect (SEC-NEW-05): the query read the
+/// newest N rows across every tenant, so one tenant queuing N paths blanked the
+/// console of all the others while their tasks were still running.
 pub async fn list_prefetch(
     pool: &PgPool,
     limit: i64,
+    domains: Option<&[String]>,
 ) -> sqlx::Result<Vec<(Uuid, String, String, String, String)>> {
     sqlx::query_as(
         r#"
         SELECT id, domain, url_path, status, message
         FROM prefetch_tasks
+        WHERE ($2::text[] IS NULL OR domain = ANY($2))
         ORDER BY created_at DESC
         LIMIT $1
         "#,
     )
-    .bind(limit)
+    .bind(limit.clamp(1, 500))
+    .bind(domains)
     .fetch_all(pool)
     .await
 }

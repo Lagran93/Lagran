@@ -32,15 +32,26 @@ pub struct PrefetchTaskRow {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
-pub async fn list_prefetch_schedules(pool: &PgPool) -> sqlx::Result<Vec<PrefetchScheduleRow>> {
+/// Every prefetch schedule, optionally restricted to a set of domain names.
+///
+/// The console previously fetched every tenant's schedules and discarded the
+/// rows the actor may not see. Passing the visible names here keeps other
+/// tenants' scheduling data (paths, headers, intervals) from leaving the
+/// database in the first place.
+pub async fn list_prefetch_schedules(
+    pool: &PgPool,
+    domains: Option<&[String]>,
+) -> sqlx::Result<Vec<PrefetchScheduleRow>> {
     sqlx::query_as::<_, PrefetchScheduleRow>(
         r#"
         SELECT id, domain, paths, headers, interval_minutes, enabled,
                last_run_at, next_run_at, created_at
         FROM prefetch_schedules
+        WHERE ($1::text[] IS NULL OR domain = ANY($1))
         ORDER BY created_at DESC
         "#,
     )
+    .bind(domains)
     .fetch_all(pool)
     .await
 }
@@ -282,16 +293,27 @@ pub async fn reclaim_stale_prefetch_tasks(
     Ok((requeued, failed))
 }
 
-pub async fn list_prefetch_tasks(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<PrefetchTaskRow>> {
+/// Recent prefetch tasks for the v2 console view, optionally restricted to a
+/// set of domain names.
+///
+/// See [`crate::repository::list_prefetch`] for why the filter is part of the
+/// query instead of a post-`LIMIT` pass over the rows.
+pub async fn list_prefetch_tasks(
+    pool: &PgPool,
+    limit: i64,
+    domains: Option<&[String]>,
+) -> sqlx::Result<Vec<PrefetchTaskRow>> {
     sqlx::query_as::<_, PrefetchTaskRow>(
         r#"
         SELECT id, domain, url_path, headers, status, message, source, created_at, finished_at
         FROM prefetch_tasks
+        WHERE ($2::text[] IS NULL OR domain = ANY($2))
         ORDER BY created_at DESC
         LIMIT $1
         "#,
     )
     .bind(limit.clamp(1, 500))
+    .bind(domains)
     .fetch_all(pool)
     .await
 }

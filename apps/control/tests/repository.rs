@@ -391,3 +391,136 @@ async fn stale_prefetch_tasks_fail_after_the_retry_limit() {
     assert!(message.contains("abandoned"), "message: {message}");
     db.close().await;
 }
+
+/// SEC-NEW-05: prefetch listings must filter by tenant **inside** the query.
+///
+/// The old `list_prefetch_tasks(pool, 100)` read the newest 100 rows across all
+/// tenants and the API dropped the rest in memory, so one tenant queueing more
+/// than the limit blanked every other tenant's progress view even though those
+/// tasks existed and were running. The regression check is the unfiltered
+/// query: it must still show the flood filling the whole window, while the
+/// filtered queries must return the other tenant's rows.
+#[tokio::test]
+async fn prefetch_task_listing_filters_by_tenant_before_the_limit() {
+    let db = TestDb::new().await;
+    db_or_skip!(db);
+
+    // Tenant B's two tasks are inserted first and are therefore the oldest
+    // rows in the table.
+    for path in ["/b/old-1", "/b/old-2"] {
+        sqlx::query(
+            "INSERT INTO prefetch_tasks (domain, url_path, status) VALUES ('b.test', $1, 'done')",
+        )
+        .bind(path)
+        .execute(&db.pool)
+        .await
+        .expect("insert tenant b task");
+    }
+    // Tenant A then floods the queue with newer rows, more than the limit.
+    sqlx::query(
+        r#"
+        INSERT INTO prefetch_tasks (domain, url_path, status)
+        SELECT 'a.test', '/a/' || g, 'pending' FROM generate_series(1, 120) AS g
+        "#,
+    )
+    .execute(&db.pool)
+    .await
+    .expect("insert tenant a tasks");
+
+    // Premise of the defect: the newest-100 window contains only tenant A.
+    let unfiltered = repository::list_prefetch_tasks(&db.pool, 100, None)
+        .await
+        .expect("unfiltered");
+    assert_eq!(unfiltered.len(), 100);
+    assert!(
+        unfiltered.iter().all(|row| row.domain == "a.test"),
+        "tenant A's burst must fill the unfiltered window, otherwise this test \
+         would not reproduce the starvation"
+    );
+
+    // The fix: tenant B still sees both of its tasks.
+    let b_rows = repository::list_prefetch_tasks(&db.pool, 100, Some(&["b.test".to_string()]))
+        .await
+        .expect("tenant b rows");
+    assert_eq!(b_rows.len(), 2, "tenant B must not be starved by tenant A");
+    assert!(b_rows.iter().all(|row| row.domain == "b.test"));
+
+    // Tenant A's own view stays capped by the limit.
+    let a_rows = repository::list_prefetch_tasks(&db.pool, 100, Some(&["a.test".to_string()]))
+        .await
+        .expect("tenant a rows");
+    assert_eq!(a_rows.len(), 100);
+    assert!(a_rows.iter().all(|row| row.domain == "a.test"));
+
+    // A non-admin who owns no domain gets nothing rather than everything. An
+    // empty slice must match no row; falling through to "no filter" here would
+    // hand the whole table to any actor whose projects have no domains.
+    assert!(
+        repository::list_prefetch_tasks(&db.pool, 100, Some(&[]))
+            .await
+            .expect("empty filter")
+            .is_empty(),
+        "an empty visible-domain set must not behave like \"all domains\""
+    );
+
+    // The v1 view shares the same semantics.
+    let v1_b = repository::list_prefetch(&db.pool, 50, Some(&["b.test".to_string()]))
+        .await
+        .expect("v1 tenant b");
+    assert_eq!(v1_b.len(), 2);
+    assert!(v1_b.iter().all(|row| row.1 == "b.test"));
+    assert!(repository::list_prefetch(&db.pool, 50, None)
+        .await
+        .expect("v1 unfiltered")
+        .iter()
+        .all(|row| row.1 == "a.test"));
+    assert!(repository::list_prefetch(&db.pool, 50, Some(&[]))
+        .await
+        .expect("v1 empty filter")
+        .is_empty());
+
+    db.close().await;
+}
+
+/// SEC-NEW-05, schedules: the console list must not read other tenants'
+/// scheduling data at all, and the filter must not behave like "everything"
+/// when the visible set is empty.
+#[tokio::test]
+async fn prefetch_schedules_are_filtered_by_tenant_in_sql() {
+    let db = TestDb::new().await;
+    db_or_skip!(db);
+
+    for (domain, path) in [("a.test", "/a"), ("b.test", "/b")] {
+        repository::create_prefetch_schedule(
+            &db.pool,
+            domain,
+            &[path.to_string()],
+            &std::collections::HashMap::new(),
+            60,
+        )
+        .await
+        .expect("insert schedule");
+    }
+
+    let all = repository::list_prefetch_schedules(&db.pool, None)
+        .await
+        .expect("all schedules");
+    assert_eq!(all.len(), 2);
+
+    let only_b = repository::list_prefetch_schedules(&db.pool, Some(&["b.test".to_string()]))
+        .await
+        .expect("tenant b schedules");
+    assert_eq!(only_b.len(), 1);
+    assert_eq!(only_b[0].domain, "b.test");
+    assert_eq!(only_b[0].paths.0, vec!["/b".to_string()]);
+
+    assert!(
+        repository::list_prefetch_schedules(&db.pool, Some(&[]))
+            .await
+            .expect("empty filter")
+            .is_empty(),
+        "an empty visible-domain set must not behave like \"all domains\""
+    );
+
+    db.close().await;
+}
