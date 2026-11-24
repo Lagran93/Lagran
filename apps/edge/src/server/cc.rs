@@ -629,8 +629,10 @@ pub struct CcProtector {
     /// Optional shared sliding-window counters.
     redis: Option<RedisCc>,
     /// When set, eviction reproduces the pre-fix rule: the legacy predicate and no
-    /// capacity cap. Measurement seam only. Never set in production; [`Self::new`]
-    /// leaves it off, and no data-plane caller can reach the setter.
+    /// capacity cap. Compiled only for the measurement build (`--features bench`);
+    /// a release build cannot reach the legacy rule at all, so the shipped cap and
+    /// predicate are the only code that exists there.
+    #[cfg(feature = "bench")]
     legacy_eviction: bool,
 }
 
@@ -740,6 +742,7 @@ impl CcProtector {
     /// not in a request.
     pub(crate) fn maintain(&self, now: Instant) -> usize {
         let before = self.inner.len();
+        #[cfg(feature = "bench")]
         if self.legacy_eviction {
             // Measurement only: the pre-fix predicate, which keeps an unbanned
             // entry for `STATE_TTL` however idle it actually is.
@@ -761,7 +764,7 @@ impl CcProtector {
         // least recently seen entries until it fits, skipping active bans so a
         // ban is never lifted early.
         let mut len = self.inner.len();
-        if !self.legacy_eviction && len > CC_STATE_HARD_CAP {
+        if self.capacity_cap_enabled() && len > CC_STATE_HARD_CAP {
             let mut seen: Vec<(Instant, String)> = self
                 .inner
                 .iter()
@@ -784,6 +787,23 @@ impl CcProtector {
         before.saturating_sub(len)
     }
 
+    /// Whether the shipped capacity cap applies.
+    ///
+    /// The measurement build can switch it off to reproduce the pre-fix world;
+    /// a release build always enforces it, and the method folds to a constant
+    /// there.
+    #[inline]
+    fn capacity_cap_enabled(&self) -> bool {
+        #[cfg(feature = "bench")]
+        {
+            !self.legacy_eviction
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            true
+        }
+    }
+
     /// Number of tracked client entries. Measurement/debug only.
     pub fn tracked_clients(&self) -> usize {
         self.inner.len()
@@ -793,18 +813,20 @@ impl CcProtector {
     ///
     /// The scheduled sweep is private, because nothing outside this module should
     /// drive it; a benchmark needs to observe what a single pass removes, so this
-    /// exposes exactly that and nothing more.
+    /// exposes exactly that and nothing more. Compiled only with
+    /// `--features bench`.
+    #[cfg(feature = "bench")]
     pub fn run_maintenance_now_for_measurement(&self) -> usize {
         self.maintain(Instant::now())
     }
 
-    /// Reproduce the pre-fix eviction rule. Measurement/debug only.
+    /// Reproduce the pre-fix eviction rule. Compiled only with
+    /// `--features bench`.
     ///
     /// Used exclusively by `examples/cc_rss_probe.rs`. It disables both halves of
     /// the fix (the predicate and the capacity cap) so a benchmark can measure
     /// what the old code actually did, instead of the comparison being asserted.
-    /// Not reachable from request handling: the only callers are tests and the
-    /// measurement example.
+    #[cfg(feature = "bench")]
     pub fn set_legacy_eviction_for_measurement(&mut self, legacy: bool) {
         self.legacy_eviction = legacy;
     }

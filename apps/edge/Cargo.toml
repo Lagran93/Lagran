@@ -14,6 +14,20 @@ path = "src/main.rs"
 name = "edge"
 path = "src/lib.rs"
 
+[features]
+# Measurement-only seams (`*_for_measurement`) used by `examples/cc_rss_probe`.
+#
+# Off by default on purpose: the probe reproduces the pre-fix CC eviction rule,
+# and a release build must not be *able* to do that — the seam used to exist in
+# shipped code and was held back only by a doc comment saying "no data-plane
+# caller". Compiling it out makes that a property of the build instead of a
+# convention. `cargo run -p edge --example cc_rss_probe --features bench`.
+bench = []
+
+[[example]]
+name = "cc_rss_probe"
+required-features = ["bench"]
+
 [dependencies]
 lagran-cache = { workspace = true }
 redis = { version = "0.27", features = [
