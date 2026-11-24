@@ -266,10 +266,24 @@ SHIELD_LOG="$LOG_DIR/shield-host.log"
 : >"$SHIELD_LOG"
 MOCK_SHIELD=1 MOCK_SHIELD_LOG="$SHIELD_LOG" "$MOCK_BIN" "$SHIELD_PORT" >"$LOG_DIR/shield.log" 2>&1 & PIDS+=($!)
 sleep 0.5
-api -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/settings" \
-  -d "{\"shield_url\":\"http://127.0.0.1:$SHIELD_PORT\"}" >/dev/null
-sleep 4
-SHIELD_BODY=$(curl -s -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/shield-check")
+# `shield_url` is an administrator-managed allowlist: a value that is not a
+# registered, enabled Shield node is rejected with 400 (SSRF hardening), so the
+# node has to be registered before the domain may point at it.
+api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/shield-nodes" \
+  -d "{\"name\":\"diag-shield-$$\",\"url\":\"http://127.0.0.1:$SHIELD_PORT\"}" >/dev/null
+SHIELD_PUT=$(api -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/settings" \
+  -d "{\"shield_url\":\"http://127.0.0.1:$SHIELD_PORT\"}")
+check "shield node accepted" \
+  "$(printf '%s' "$SHIELD_PUT" | jq -r '.shield_url')" "http://127.0.0.1:$SHIELD_PORT"
+# The settings PUT pushes a config reload, but the fetch itself races that
+# notification: poll until the edge has the new config instead of sleeping a
+# fixed amount.
+SHIELD_BODY=""
+for _ in $(seq 1 40); do
+  SHIELD_BODY=$(curl -s -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/shield-check")
+  [[ "$SHIELD_BODY" == "shield-hit" ]] && break
+  sleep 0.5
+done
 check "shield serves request" "$SHIELD_BODY" "shield-hit"
 contains "shield receives public Host" "$(tail -1 "$SHIELD_LOG")" "$DOMAIN"
 

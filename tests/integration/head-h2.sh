@@ -138,13 +138,13 @@ check "H1 cold HEAD length" "$(hdr content-length)" "17"
 
 echo "== HEAD above MAX_CACHEABLE_BODY (16 MiB) =="
 CODE=$(curl -sk -I --http1.1 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
-  -D "$LOG_DIR/h" -o /dev/null -w '%{http_code}' "https://$DOMAIN:$HTTPS_PORT/big")
-check "big HEAD status" "$CODE" "200"
-check "big HEAD length" "$(hdr content-length)" "16777216"
+  -D "$LOG_DIR/h" -o /dev/null -w '%{http_code}' "https://$DOMAIN:$HTTPS_PORT/huge")
+check "huge HEAD status" "$CODE" "200"
+check "huge HEAD length" "$(hdr content-length)" "16777216"
 if grep -q 'origin failed' "$LOG_DIR/edge.log"; then
-  fail "big HEAD was reported as an origin failure"
+  fail "huge HEAD was reported as an origin failure"
 else
-  pass "big HEAD did not mark the origin unhealthy"
+  pass "huge HEAD did not mark the origin unhealthy"
 fi
 
 BODY=$(curl -sk --http2 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" "https://$DOMAIN:$HTTPS_PORT/head")

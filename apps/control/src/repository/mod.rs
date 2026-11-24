@@ -4006,19 +4006,6 @@ pub struct PurgeRetryRow {
     pub auth_token: String,
 }
 
-pub async fn list_nodes_with_agent(pool: &PgPool) -> sqlx::Result<Vec<(String, String, String)>> {
-    sqlx::query_as(
-        r#"
-        SELECT name, COALESCE(agent_url, ''), COALESCE(auth_token, '')
-        FROM edge_nodes
-        WHERE COALESCE(agent_url, '') <> ''
-        ORDER BY name
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-}
-
 pub async fn enqueue_purge_retry(
     pool: &PgPool,
     node_id: &str,

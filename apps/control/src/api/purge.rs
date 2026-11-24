@@ -90,7 +90,13 @@ pub async fn purge(
         "purge requested"
     );
 
-    let nodes = match repository::list_nodes_with_agent(&state.pool).await {
+    // Only nodes that are currently online receive the fan-out. Contacting every
+    // row that ever had an agent_url meant hundreds of dead addresses, each with a
+    // connect timeout plus a retry, and the endpoint reported `success: false` even
+    // though every live edge applied the purge. An offline node serves no traffic,
+    // so it has nothing to purge; a node that dies mid-dispatch is still covered by
+    // the per-node retry queue below.
+    let nodes = match repository::list_online_nodes_with_agent(&state.pool).await {
         Ok(n) => n,
         Err(e) => {
             tracing::error!(error = %e, "list nodes for purge");
@@ -137,7 +143,10 @@ pub async fn purge(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut set = JoinSet::new();
 
-    for (index, (name, agent_url, auth_token)) in nodes.into_iter().enumerate() {
+    for (index, node) in nodes.into_iter().enumerate() {
+        let name = node.name;
+        let agent_url = node.agent_url;
+        let auth_token = node.auth_token;
         let url = format!("{}/__lagran/purge", agent_url.trim_end_matches('/'));
         let token = if auth_token.is_empty() {
             state.config.agent_token.clone()

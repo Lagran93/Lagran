@@ -187,10 +187,11 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ("Cache-Control", "public, max-age=60".into()),
                 ],
             ),
-            // Larger than MAX_CACHEABLE_BODY: a HEAD request must not buffer
-            // the body, must report the real length and must not mark the
-            // origin unhealthy.
-            "/big" => (
+            // Larger than MAX_CACHEABLE_BODY: a HEAD request must not buffer the
+            // body, must report the real length and must not mark the origin
+            // unhealthy. Kept on its own path because `cache-diagnostics.sh`
+            // needs `/big` to be small enough to be cached in L1.
+            "/huge" => (
                 200,
                 vec![b'x'; 16 * 1024 * 1024],
                 vec![
@@ -317,7 +318,14 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ),
                 }
             }
-            "/big" => (200, vec![b'x'; 512 * 1024], vec![]),
+            "/big" => (
+                200,
+                vec![b'x'; 512 * 1024],
+                vec![
+                    ("Content-Type", "application/octet-stream".into()),
+                    ("Cache-Control", "public, max-age=60".into()),
+                ],
+            ),
             "/vary-ua" => (
                 200,
                 b"vary user agent".to_vec(),
