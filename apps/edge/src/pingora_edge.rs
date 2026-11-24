@@ -5173,12 +5173,45 @@ async fn write_axum_response(
     compression: Option<&CompressionConfig>,
 ) {
     let is_h2 = session.downstream_session.is_http2();
-    let (mut parts, body) = resp.into_parts();
+    let (mut parts, mut body) = resp.into_parts();
     if !parts.headers.contains_key("x-lagran-datapath") {
         parts.headers.insert(
             HeaderName::from_static("x-lagran-datapath"),
             HeaderValue::from_static("pingora"),
         );
+    }
+    let no_content =
+        parts.status == StatusCode::NOT_MODIFIED || parts.status == StatusCode::NO_CONTENT;
+    // Decide *before* touching the body. gzip needs the whole payload (the
+    // encoder is one-shot) and HEAD must keep the advertised length, so those
+    // stay buffered. Everything else is relayed frame by frame: collecting a
+    // large media object here meant a downstream abort could not stop the copy,
+    // the whole object was pinned in memory, and the access log billed bytes the
+    // client never received (PERF-NEW-04).
+    let request_version = session.req_header().version;
+    let request_method = session.req_header().method.clone();
+    let request_headers = session.req_header().headers.clone();
+    let would_compress = compression.is_some_and(|cfg| {
+        should_compress(
+            cfg,
+            request_version,
+            &request_method,
+            parts.status.as_u16(),
+            &parts.headers,
+            &request_headers,
+        )
+    });
+    let body_is_empty = {
+        use hyper::body::Body as _;
+        body.size_hint().exact() == Some(0)
+    };
+    // HTTP/1.0 has no chunked framing, so an unknown-length body would have to be
+    // delimited by closing the connection. Keep the previous buffered behaviour
+    // for those clients instead of silently changing keep-alive semantics.
+    let http10 = request_version == Version::HTTP_10;
+    if !is_head && !no_content && !would_compress && !body_is_empty && !http10 {
+        write_engine_response_streamed(session, &parts, &mut body).await;
+        return;
     }
     let mut bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -5194,9 +5227,6 @@ async fn write_axum_response(
     // Pingora path uses (status, content type, size floor, Accept-Encoding), so the
     // two data planes agree on what gets compressed.
     if let Some(cfg) = compression {
-        let request_version = session.req_header().version;
-        let request_method = session.req_header().method.clone();
-        let request_headers = session.req_header().headers.clone();
         if let Some(compressed) = gzip_engine_body(
             cfg,
             is_head,
@@ -5233,8 +5263,6 @@ async fn write_axum_response(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(body_len);
-    let no_content =
-        parts.status == StatusCode::NOT_MODIFIED || parts.status == StatusCode::NO_CONTENT;
     let head_content_length = if is_head {
         head_content_length_for_protocol(is_h2, representation_len)
     } else {
@@ -5284,6 +5312,69 @@ async fn write_axum_response(
     if !end_of_stream {
         let _ = session.write_response_body(Some(bytes), true).await;
     }
+}
+
+/// Relay an engine response to the downstream without buffering it.
+///
+/// Used when the body cannot be compressed and its size is unknown: the large
+/// media / event-stream case. No `Content-Length` is sent because the length is
+/// only known after consuming the body, so HTTP/1.1 gets chunked framing and
+/// HTTP/2 gets one DATA frame per chunk.
+///
+/// A downstream write error stops the copy immediately. That is what makes an
+/// aborted download cheap: the origin body is dropped, and the access record
+/// written by `StreamedAccess` reports only the bytes actually handed to the
+/// client.
+async fn write_engine_response_streamed(
+    session: &mut Session,
+    parts: &axum::http::response::Parts,
+    body: &mut Body,
+) {
+    let Ok(mut response) = ResponseHeader::build(parts.status.as_u16(), None) else {
+        return;
+    };
+    for (name, value) in parts.headers.iter() {
+        if is_hop_by_hop(name.as_str()) || name == axum::http::header::CONTENT_LENGTH {
+            continue;
+        }
+        if response.append_header(name.clone(), value.clone()).is_err() {
+            return;
+        }
+    }
+    if session
+        .write_response_header(Box::new(response), false)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        let frame = match body.frame().await {
+            Some(Ok(frame)) => frame,
+            Some(Err(e)) => {
+                tracing::debug!(error = %e, "engine response body failed mid-stream");
+                break;
+            }
+            None => break,
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        if session
+            .write_response_body(Some(data), false)
+            .await
+            .is_err()
+        {
+            // The downstream is gone (client aborted). Do not drain the origin:
+            // dropping the body lets the stream guard finalise the record with
+            // the bytes delivered so far.
+            return;
+        }
+    }
+    let _ = session.write_response_body(None, true).await;
 }
 
 fn parse_content_range(raw: &str) -> Option<(u64, u64, u64)> {

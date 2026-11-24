@@ -1287,6 +1287,136 @@ async fn bypass_to_origin(
     }
 }
 
+/// Everything the access log needs about one streamed response.
+///
+/// Owned rather than borrowed because the body stream outlives
+/// `bypass_to_origin_streaming`'s stack frame.
+struct StreamedRequest {
+    method: Method,
+    host: String,
+    path: String,
+    status: u16,
+    start: Instant,
+    client_ip: String,
+    user_agent: String,
+    referer: String,
+    label: &'static str,
+    request_id: String,
+}
+
+/// Finalises the byte counters and the access log for one streamed response
+/// **when the transfer ends** (PERF-NEW-04).
+///
+/// The body is produced lazily, so anything recorded before the first poll
+/// describes the response headers rather than the transfer:
+///
+/// * `Content-Length` was billed as if the whole object had been delivered, so a
+///   client that took 1 MiB of a 2 GiB video and closed the page was logged (and
+///   counted for the per-domain traffic totals) as 2 GiB;
+/// * a chunked response has no `Content-Length`, so it was logged as 0 bytes no
+///   matter how much was sent;
+/// * the latency was the time to first byte, not the lifetime of the transfer.
+///
+/// This guard accumulates what was actually handed to the client and writes one
+/// record at the end. A guard (instead of code after the generator loop) is
+/// required because a client can disappear mid-stream: `async_stream` then drops
+/// the generator and the tail never runs. `Drop` also fires after a normal
+/// finish, so [`Self::finish`] is idempotent.
+struct StreamedAccess {
+    metrics: Arc<EdgeMetrics>,
+    log: AccessLog,
+    request: StreamedRequest,
+    bytes: u64,
+    finished: bool,
+}
+
+impl StreamedAccess {
+    /// Count bytes that were actually yielded towards the client.
+    fn record(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Write the per-domain counters and the access record exactly once.
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.metrics.record_bypass(&self.request.host, self.bytes);
+        let record = self.log.record(
+            &self.request.client_ip,
+            self.request.method.as_str(),
+            &self.request.host,
+            &self.request.path,
+            self.request.status,
+            self.bytes,
+            self.request.start.elapsed().as_millis() as u64,
+            self.request.label,
+            &self.request.user_agent,
+            &self.request.referer,
+            &self.request.request_id,
+        );
+        self.log.enqueue(record);
+    }
+}
+
+impl Drop for StreamedAccess {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Wrap an origin body so the transfer is measured and logged when it ends.
+///
+/// `metrics.record_stream_bytes` stays in the loop (it feeds the edge-wide
+/// "streamed bytes" counter), while `completion` receives the same bytes for the
+/// per-domain counters and the access log.
+fn streaming_origin_body(
+    body: Body,
+    idle_timeout: Duration,
+    metrics: Arc<EdgeMetrics>,
+    completion: StreamedAccess,
+) -> Body {
+    let mut source = body;
+    let stream = async_stream::stream! {
+        let mut completion = completion;
+        loop {
+            let frame = match tokio::time::timeout(idle_timeout, source.frame()).await {
+                Ok(frame) => frame,
+                Err(_) => {
+                    metrics.record_stream_error();
+                    yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "origin body idle timeout",
+                    ));
+                    break;
+                }
+            };
+            match frame {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        if !data.is_empty() {
+                            metrics.record_stream_bytes(data.len() as u64);
+                            completion.record(data.len() as u64);
+                            yield Ok::<Bytes, std::io::Error>(data);
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    metrics.record_stream_error();
+                    yield Err::<Bytes, std::io::Error>(std::io::Error::other(format!(
+                        "origin body error: {e}"
+                    )));
+                    break;
+                }
+                None => break,
+            }
+        }
+        completion.finish();
+    };
+    Body::from_stream(stream)
+}
+
 /// Streaming bypass path for legacy traffic (Range, cookie/auth, rules).
 /// Status/headers are bounded by the domain origin timeout; the body uses an
 /// idle timeout per chunk so a long media response is never aborted just for
@@ -1420,60 +1550,38 @@ async fn bypass_to_origin_streaming(
             apply_security_headers(&mut out_headers);
             apply_cors_and_custom(&mut out_headers, &eff.response_headers);
 
-            let mut body = resp.body;
-            let stream_metrics = state.metrics.clone();
-            let stream = async_stream::stream! {
-                loop {
-                    let frame = match tokio::time::timeout(idle_timeout, body.frame()).await {
-                        Ok(frame) => frame,
-                        Err(_) => {
-                            stream_metrics.record_stream_error();
-                            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "origin body idle timeout",
-                            ));
-                            break;
-                        }
-                    };
-                    match frame {
-                        Some(Ok(frame)) => {
-                            if let Ok(data) = frame.into_data() {
-                                if !data.is_empty() {
-                                    stream_metrics.record_stream_bytes(data.len() as u64);
-                                    yield Ok::<Bytes, std::io::Error>(data);
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            stream_metrics.record_stream_error();
-                            yield Err::<Bytes, std::io::Error>(std::io::Error::other(
-                                format!("origin body error: {e}"),
-                            ));
-                            break;
-                        }
-                        None => break,
-                    }
-                }
+            let body = resp.body;
+            // Billing/logging must describe the transfer that actually happens.
+            // Recording here, before the first byte is written, billed the full
+            // `Content-Length` to a client that disconnected after the first
+            // chunk, logged chunked responses as 0 bytes, and reported TTFB as
+            // the latency (PERF-NEW-04).
+            let completion = StreamedAccess {
+                metrics: state.metrics.clone(),
+                log: state.access_log.clone(),
+                request: StreamedRequest {
+                    method: method.clone(),
+                    host: host.to_string(),
+                    path: path_only.to_string(),
+                    status: status.as_u16(),
+                    start,
+                    client_ip: client_ip.to_string(),
+                    user_agent: user_agent.to_string(),
+                    referer: referer.to_string(),
+                    label: label.as_str(),
+                    request_id: request_id.to_string(),
+                },
+                bytes: 0,
+                finished: false,
             };
+            let stream = streaming_origin_body(
+                Body::new(body),
+                idle_timeout,
+                state.metrics.clone(),
+                completion,
+            );
 
-            state.metrics.record_bypass(host, content_length);
-            log_access(
-                &state.access_log,
-                method,
-                host,
-                path_only,
-                status.as_u16(),
-                start,
-                client_ip,
-                user_agent,
-                referer,
-                content_length,
-                label.as_str(),
-                request_id,
-            )
-            .await;
-
-            let mut response = Response::new(Body::from_stream(stream));
+            let mut response = Response::new(stream);
             *response.status_mut() = status;
             *response.headers_mut() = out_headers;
             response
@@ -3471,6 +3579,169 @@ pub(crate) fn https_redirect_response(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    /// Fixture for the streamed-response accounting tests (PERF-NEW-04).
+    fn streamed_request(status: u16, start: Instant) -> StreamedRequest {
+        StreamedRequest {
+            method: Method::GET,
+            host: "a.test".into(),
+            path: "/video.mp4".into(),
+            status,
+            start,
+            client_ip: "203.0.113.9".into(),
+            user_agent: "curl/8".into(),
+            referer: String::new(),
+            label: "BYPASS",
+            request_id: "lr-test".into(),
+        }
+    }
+
+    fn completion(metrics: Arc<EdgeMetrics>, log: AccessLog) -> StreamedAccess {
+        StreamedAccess {
+            metrics,
+            log,
+            request: streamed_request(200, Instant::now()),
+            bytes: 0,
+            finished: false,
+        }
+    }
+
+    /// A body that yields the given chunks and then ends.
+    fn chunked_body(chunks: Vec<&'static [u8]>) -> Body {
+        Body::from_stream(async_stream::stream! {
+            for chunk in chunks {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from_static(chunk));
+            }
+        })
+    }
+
+    /// A response that finishes must be billed with the bytes it actually
+    /// delivered — not with an announced `Content-Length`, and not with 0 for a
+    /// chunked response.
+    #[tokio::test]
+    async fn streamed_response_is_billed_for_the_bytes_actually_sent() {
+        let metrics = EdgeMetrics::new();
+        let log = AccessLog::open(None, "edge-001", 100, false).await;
+        let chunks: Vec<&'static [u8]> = vec![b"12345", b"6789012", b"3456789"];
+        let expected: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        let body = chunked_body(chunks);
+        let wrapped = streaming_origin_body(
+            body,
+            Duration::from_secs(5),
+            metrics.clone(),
+            completion(metrics.clone(), log.clone()),
+        );
+
+        let delivered = wrapped.collect().await.expect("collect").to_bytes();
+        assert_eq!(delivered.len(), expected);
+
+        log.flush(Duration::from_secs(1)).await;
+        let records = log.snapshot(10).await;
+        assert_eq!(records.len(), 1, "exactly one record per streamed response");
+        assert_eq!(
+            records[0].bytes, expected as u64,
+            "the access log must carry delivered bytes, not Content-Length"
+        );
+
+        let snapshot = metrics.global_snapshot();
+        assert_eq!(snapshot.bytes_sent, expected as u64);
+        assert_eq!(
+            snapshot.requests, 1,
+            "the response must be counted exactly once (finish + Drop)"
+        );
+    }
+
+    /// A client that disappears mid-transfer must be billed for what it got, not
+    /// for the origin's `Content-Length`.
+    ///
+    /// This is the reported billing distortion: a 2 GiB video abandoned after
+    /// 1 MiB used to be logged as 2 GiB because the record was written before the
+    /// body was polled.
+    #[tokio::test]
+    async fn an_aborted_stream_is_billed_only_for_the_delivered_prefix() {
+        let metrics = EdgeMetrics::new();
+        let log = AccessLog::open(None, "edge-001", 100, false).await;
+        // Yields one chunk, then stalls forever: the client goes away here.
+        let body = Body::from_stream(async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"first-chunk"));
+            tokio::time::sleep(Duration::from_secs(3_600)).await;
+        });
+        let mut wrapped = streaming_origin_body(
+            body,
+            Duration::from_secs(30),
+            metrics.clone(),
+            completion(metrics.clone(), log.clone()),
+        );
+
+        let first = wrapped
+            .frame()
+            .await
+            .expect("one frame")
+            .expect("ok frame")
+            .into_data()
+            .expect("data frame");
+        assert_eq!(first, Bytes::from_static(b"first-chunk"));
+        // The downstream disconnects: the body stream is dropped, the generator
+        // tail never runs, and only `Drop` can finalise the record.
+        drop(wrapped);
+
+        log.flush(Duration::from_secs(1)).await;
+        let records = log.snapshot(10).await;
+        assert_eq!(records.len(), 1, "an aborted stream must still be logged");
+        assert_eq!(
+            records[0].bytes, 11,
+            "only the bytes handed to the client may be billed"
+        );
+        assert_eq!(metrics.global_snapshot().bytes_sent, 11);
+    }
+
+    /// Latency must cover the whole transfer, not just the time to first byte.
+    #[tokio::test]
+    async fn streamed_latency_covers_the_whole_transfer() {
+        let metrics = EdgeMetrics::new();
+        let log = AccessLog::open(None, "edge-001", 100, false).await;
+        let body = Body::from_stream(async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"abc"));
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"def"));
+        });
+        let wrapped = streaming_origin_body(
+            body,
+            Duration::from_secs(5),
+            metrics.clone(),
+            completion(metrics.clone(), log.clone()),
+        );
+
+        wrapped.collect().await.expect("collect");
+        log.flush(Duration::from_secs(1)).await;
+        let records = log.snapshot(10).await;
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].latency_ms >= 100,
+            "latency must include the body transfer, got {}ms",
+            records[0].latency_ms
+        );
+        assert_eq!(records[0].bytes, 6);
+    }
+
+    /// The guard runs from both the generator tail and `Drop`; only the first
+    /// may write a record.
+    #[tokio::test]
+    async fn finishing_a_stream_twice_records_one_request() {
+        let metrics = EdgeMetrics::new();
+        let log = AccessLog::open(None, "edge-001", 100, false).await;
+        let mut guard = completion(metrics.clone(), log.clone());
+        guard.record(4);
+        guard.finish();
+        guard.finish();
+        drop(guard);
+
+        log.flush(Duration::from_secs(1)).await;
+        assert_eq!(log.snapshot(10).await.len(), 1);
+        let snapshot = metrics.global_snapshot();
+        assert_eq!(snapshot.requests, 1);
+        assert_eq!(snapshot.bytes_sent, 4);
+    }
 
     fn range_entry() -> CacheEntry {
         CacheEntry::new(

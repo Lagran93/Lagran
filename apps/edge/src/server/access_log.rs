@@ -263,12 +263,14 @@ impl AccessLog {
     /// All formatting (and the `tracing` event) happens in the writer task. The
     /// request path used to format the line here and the writer formatted it
     /// again, doubling the cost on the hottest path in the process.
-    /// Total records dropped by either the channel or the ring buffer.
-    pub fn dropped(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub async fn write(&self, rec: AccessRecord) {
+    ///
+    /// This is synchronous on purpose: the body of a streamed response records
+    /// its access line from `Drop` (the client may vanish mid-transfer and the
+    /// generator tail then never runs), and a `Drop` impl cannot `.await`. The
+    /// writer is reached with `try_send`, so nothing ever suspends here; the
+    /// async wrapper [`Self::write`] exists for the request paths that happen to
+    /// be async.
+    pub fn enqueue(&self, rec: AccessRecord) {
         // Never block the request path on the log writer.
         //
         // This used to `send().await`, so a slow disk made every request await a
@@ -295,6 +297,15 @@ impl AccessLog {
                 tracing::warn!("access log writer stopped; record dropped");
             }
         }
+    }
+
+    pub async fn write(&self, rec: AccessRecord) {
+        self.enqueue(rec);
+    }
+
+    /// Total records dropped by either the channel or the ring buffer.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wait until the writer has processed everything queued, or `timeout` elapses.
