@@ -124,6 +124,88 @@ async fn send_webhook(
     }
 }
 
+/// The proxy to use for one alert destination, or `None` to connect directly.
+///
+/// Rules, in order:
+///
+/// 1. An explicit per-channel `proxy` wins: the tenant asked for that egress
+///    specifically, so it is used verbatim (and still passes
+///    [`net_guard::validate_proxy_url`], because the value is tenant input and
+///    the SSRF guard must keep holding for it).
+/// 2. A loopback/private/link-local target is **never** routed through an
+///    external proxy (PERF-NEW-05). Self-hosted Bot API gateways and local
+///    listeners sit inside the network the egress proxy cannot reach; silently
+///    handing them to `HTTPS_PROXY` turned every alert into a connection
+///    failure. DNS names are not classified here — the guarded resolver already
+///    refuses private answers for the alert path.
+/// 3. `NO_PROXY`/`no_proxy` from the environment is honoured for env-sourced
+///    proxies (exact hosts, domain suffixes, `*`, IP/CIDR — reqwest's matcher).
+/// 4. Otherwise the scheme-appropriate environment proxy is used:
+///    `HTTPS_PROXY` only for `https`, `HTTP_PROXY` only for `http`, and
+///    `ALL_PROXY` as the fallback for both. The previous code fed whichever
+///    variable it found into `Proxy::all`, so an `https://` egress proxy also
+///    captured plain-`http` destinations.
+fn proxy_for_target(base: &str, explicit: Option<&str>) -> Option<String> {
+    let parsed = reqwest::Url::parse(base).ok()?;
+    if let Some(proxy) = explicit.map(str::trim).filter(|p| !p.is_empty()) {
+        return Some(proxy.to_string());
+    }
+    if target_is_internal(&parsed) {
+        return None;
+    }
+    env_proxy_url_for(parsed.scheme())
+}
+
+/// Whether a destination is loopback/private/link-local by literal or name.
+fn target_is_internal(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        // The alert path only allows public destinations, so "not public" and
+        // "internal" are the same set here.
+        Ok(ip) => !net_guard::is_public_ip(ip),
+        Err(_) => false,
+    }
+}
+
+/// The environment proxy for one target scheme, or `None` to connect directly.
+///
+/// `Proxy::all` applies one proxy to every scheme, which is why the variable
+/// that names the proxy has to match the destination scheme first: an operator
+/// who exports only `HTTPS_PROXY` did not ask their plain-`http` traffic to be
+/// captured.
+fn env_proxy_url_for(scheme: &str) -> Option<String> {
+    let vars: &[&str] = match scheme {
+        "https" => &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"],
+        "http" => &["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"],
+        _ => &[],
+    };
+    vars.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Env-sourced proxies are operator configuration, so a loopback egress proxy —
+/// the usual `clash`/`v2ray` setup on the same box — must be accepted. Only the
+/// scheme is checked; the destination policy does not apply to them.
+fn validate_env_proxy_scheme(proxy: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(proxy)
+        .map_err(|e| format!("invalid telegram proxy {proxy:?}: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
+        return Err(format!(
+            "telegram proxy scheme must be http, https, socks5 or socks5h (got {:?})",
+            parsed.scheme()
+        ));
+    }
+    Ok(())
+}
+
 async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(), String> {
     let cfg: TelegramConfig = serde_json::from_value(config.clone())
         .map_err(|e| format!("invalid telegram config: {e}"))?;
@@ -154,7 +236,7 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
         "disable_web_page_preview": true,
     });
 
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .user_agent("lagran-control/0.1")
         // reqwest resolves on its own, so give it the same guarded resolver the
@@ -165,29 +247,41 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
             PublicDestination::Internet.label(),
         ))
         // reqwest also picks up `HTTPS_PROXY`/`ALL_PROXY` on its own, and those
-        // implicit proxies bypass `validate_proxy_url` below: a request would be
-        // handed to whatever endpoint the environment names, unchecked. The
-        // explicit block after this handles environment proxies too, so disabling
-        // auto-detection loses no feature and makes every proxy go through the
-        // guard.
+        // implicit proxies bypass the decision below: a request would be handed
+        // to whatever endpoint the environment names, unchecked. Disabling the
+        // auto-detection makes `proxy_for_target` the single authority for
+        // whether a proxy applies.
         .no_proxy();
-    let proxy = if cfg.proxy.trim().is_empty() {
-        ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
-            .iter()
-            .find_map(|key| std::env::var(key).ok())
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    } else {
-        Some(cfg.proxy.trim().to_string())
+    // The channel-level `proxy` is tenant input and keeps the public-only
+    // destination policy. The environment proxies below are operator
+    // configuration, so they skip that policy (a loopback egress proxy is the
+    // normal local setup) and instead honour `NO_PROXY` per request.
+    let explicit = (!cfg.proxy.trim().is_empty()).then(|| cfg.proxy.trim().to_string());
+    let builder = match proxy_for_target(&base, explicit.as_deref()) {
+        Some(proxy) => {
+            if explicit.is_some() {
+                crate::service::net_guard::validate_proxy_url(&proxy)
+                    .await
+                    .map_err(|e| format!("telegram proxy rejected: {e}"))?;
+            } else {
+                validate_env_proxy_scheme(&proxy)?;
+            }
+            let proxy = reqwest::Proxy::all(&proxy)
+                .map_err(|e| format!("invalid telegram proxy: {e}"))?;
+            // `NO_PROXY` is operator configuration, so it only bends env-sourced
+            // proxies. A channel that explicitly names a proxy is that channel's
+            // egress decision and is honoured verbatim.
+            let proxy = if explicit.is_some() {
+                proxy
+            } else {
+                proxy.no_proxy(reqwest::NoProxy::from_env())
+            };
+            builder.proxy(proxy)
+        }
+        // Loopback/private destinations connect directly: routing them through
+        // an egress proxy is what broke local Bot API gateways (PERF-NEW-05).
+        None => builder,
     };
-    if let Some(proxy) = proxy {
-        crate::service::net_guard::validate_proxy_url(&proxy)
-            .await
-            .map_err(|e| format!("telegram proxy rejected: {e}"))?;
-        let proxy =
-            reqwest::Proxy::all(&proxy).map_err(|e| format!("invalid telegram proxy: {e}"))?;
-        builder = builder.proxy(proxy);
-    }
     let client = builder
         .build()
         .map_err(|e| format!("telegram client error: {e}"))?;
@@ -335,6 +429,193 @@ mod tests {
     use std::net::IpAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Proxy environment variables are process-wide; tests that set them must
+    /// not overlap with each other or with the direct-connection test.
+    static PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const PROXY_VARS: &[&str] = &[
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+
+    fn clear_proxy_env() {
+        for key in PROXY_VARS {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        PROXY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A loopback `api_base` must never be handed to the environment proxy.
+    ///
+    /// This is the reported failure: with `HTTPS_PROXY` pointing at a local
+    /// egress proxy (clash/v2ray), `Proxy::all` hijacked the request to a
+    /// self-hosted Bot API on `127.0.0.1` and the alert failed. The mock proxy
+    /// below would accept the connection, so "zero connections" proves the
+    /// request went direct.
+    #[tokio::test]
+    async fn local_api_base_is_never_routed_through_the_env_proxy() {
+        let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_addr = api.local_addr().unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let proxy_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let api_server = tokio::spawn(async move {
+            let (mut socket, _) = api.accept().await.unwrap();
+            let mut buf = [0_u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let proxy_hits_task = {
+            let proxy_hits = proxy_hits.clone();
+            tokio::spawn(async move {
+                // Accept (and count) anything the client wrongly sends here.
+                if let Ok(Ok((mut socket, _))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), proxy.accept()).await
+                {
+                    proxy_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                }
+            })
+        };
+
+        // The lock is released before the request runs: a decision for an internal
+        // destination does not read the environment at all, so a concurrently
+        // running test cannot change the outcome of this one.
+        {
+            let _guard = env_lock();
+            clear_proxy_env();
+            std::env::set_var("HTTPS_PROXY", format!("http://{proxy_addr}"));
+            std::env::set_var("ALL_PROXY", format!("http://{proxy_addr}"));
+        }
+
+        let config = json!({
+            "bot_token": "123:test",
+            "chat_id": "456",
+            "api_base": format!("http://{api_addr}"),
+        });
+        let result = send_telegram(&config, "subject", "message").await;
+        {
+            let _guard = env_lock();
+            clear_proxy_env();
+        }
+
+        result.expect("a local api_base must be reachable with an env proxy set");
+        api_server.await.unwrap();
+        proxy_hits_task.await.unwrap();
+        assert_eq!(
+            proxy_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the env proxy must not see a loopback destination"
+        );
+    }
+
+    /// The env proxy variable has to match the destination scheme.
+    #[test]
+    fn env_proxy_matches_the_target_scheme() {
+        let _guard = env_lock();
+        clear_proxy_env();
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:7890");
+        assert_eq!(
+            env_proxy_url_for("https").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            env_proxy_url_for("http"),
+            None,
+            "an https-only egress proxy must not capture plain http"
+        );
+
+        std::env::set_var("HTTP_PROXY", "http://127.0.0.1:7891");
+        assert_eq!(
+            env_proxy_url_for("http").as_deref(),
+            Some("http://127.0.0.1:7891")
+        );
+        assert_eq!(
+            env_proxy_url_for("https").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+
+        // ALL_PROXY is the fallback for both schemes.
+        clear_proxy_env();
+        std::env::set_var("ALL_PROXY", "socks5h://127.0.0.1:1080");
+        assert_eq!(
+            env_proxy_url_for("https").as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+        assert_eq!(
+            env_proxy_url_for("http").as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+
+        clear_proxy_env();
+        assert_eq!(env_proxy_url_for("https"), None);
+    }
+
+    /// An explicit channel proxy wins over the environment, and internal
+    /// destinations bypass proxies even when one is configured.
+    #[test]
+    fn explicit_proxy_wins_and_internal_targets_bypass_everything() {
+        let _guard = env_lock();
+        clear_proxy_env();
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:7890");
+
+        assert_eq!(
+            proxy_for_target("https://api.telegram.org", Some("http://egress.example:3128"))
+                .as_deref(),
+            Some("http://egress.example:3128"),
+            "the channel configuration is the operator's explicit choice"
+        );
+        assert_eq!(
+            proxy_for_target("https://api.telegram.org", None).as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(proxy_for_target("http://127.0.0.1:8081", None), None, "loopback");
+        assert_eq!(
+            proxy_for_target("http://10.1.2.3:8081", None),
+            None,
+            "private range"
+        );
+        assert_eq!(
+            proxy_for_target("http://169.254.169.254", None),
+            None,
+            "link-local"
+        );
+        assert_eq!(
+            proxy_for_target("http://bot-gateway.localhost:8081", None),
+            None,
+            "the .localhost suffix is reserved for loopback"
+        );
+        clear_proxy_env();
+    }
+
+    /// Only the documented proxy schemes are accepted for env proxies; a
+    /// loopback egress proxy is the normal local setup and must be allowed.
+    #[test]
+    fn env_proxy_scheme_is_validated_without_the_public_ip_policy() {
+        assert!(validate_env_proxy_scheme("http://127.0.0.1:7890").is_ok());
+        assert!(validate_env_proxy_scheme("socks5h://127.0.0.1:1080").is_ok());
+        assert!(validate_env_proxy_scheme("ftp://127.0.0.1:21").is_err());
+        assert!(validate_env_proxy_scheme("not-a-url").is_err());
+    }
 
     #[tokio::test]
     async fn telegram_honors_custom_api_base() {
