@@ -5,6 +5,11 @@
 set -uo pipefail
 source "$HOME/.cargo/env" 2>/dev/null || true
 
+# See head-h2.sh: a shell-level http_proxy turns curl's HTTPS calls into CONNECT
+# tunnels that ignore `--resolve`, so the loopback TLS checks fail with 000.
+# These tests only talk to loopback and must not use a proxy.
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT" || exit 1
 
@@ -22,6 +27,8 @@ FAILED=0
 TOKEN=""
 DOMAIN_ID=""
 PRIMARY_PID=""
+NODE_ROW_ID=""
+NODE_TOKEN=""
 
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=$((FAILED + 1)); }
@@ -31,6 +38,13 @@ contains() { if [[ "$2" == *"$3"* ]]; then pass "$1"; else fail "$1 (missing '$3
 cleanup() {
   if [[ -n "$TOKEN" && -n "$DOMAIN_ID" ]]; then
     curl -s -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID" \
+      -H "authorization: Bearer $TOKEN" >/dev/null 2>&1
+  fi
+  # Leaving the node row behind would keep it "online" until the heartbeat
+  # timeout expires, and a later run's purge fan-out would then hit a dead
+  # address with a stale token (and report success:false).
+  if [[ -n "$TOKEN" && -n "$NODE_ROW_ID" ]]; then
+    curl -s -X DELETE "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/$NODE_ROW_ID" \
       -H "authorization: Bearer $TOKEN" >/dev/null 2>&1
   fi
   [[ -n "$PRIMARY_PID" ]] && kill "$PRIMARY_PID" 2>/dev/null
@@ -77,9 +91,21 @@ DOMAIN_ID=$(printf '%s' "$CREATE" | jq -r '.id // empty')
 [[ -n "$DOMAIN_ID" ]] || { echo "create failed: $CREATE"; exit 1; }
 
 echo "== edge =="
+# The edge pulls /api/v1/config with its per-node token. Without a registered
+# node the request is rejected, the registry stays empty, and every request falls
+# into the legacy single-origin mode -- which points at ORIGIN_URL (default
+# https://example.com) and answers 404 for the origin paths this test asserts on.
+NODE=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
+  -d "{\"name\":\"failover-edge-$$\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
+NODE_ROW_ID=$(printf '%s' "$NODE" | jq -r '.node.id // empty')
+NODE_TOKEN=$(printf '%s' "$NODE" | jq -r '.token // empty')
+[[ -n "$NODE_ROW_ID" && -n "$NODE_TOKEN" ]] || { echo "node failed: $NODE"; exit 1; }
+
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 NODE_ID="failover-edge-$$" \
+AGENT_TOKEN="$NODE_TOKEN" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
+EDGE_ADMIN_LISTEN= \
 EDGE_HTTPS_REDIRECT_PORT="$HTTPS_REDIRECT_PORT" \
 CACHE_BACKEND=memory \
 CACHE_TTL=60 \

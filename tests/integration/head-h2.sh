@@ -5,6 +5,14 @@
 set -uo pipefail
 source "$HOME/.cargo/env" 2>/dev/null || true
 
+# Developer shells often export http_proxy/https_proxy. curl then turns every
+# HTTPS request into a CONNECT tunnel, where `--resolve` is ignored: the proxy
+# dials the real DNS name instead of 127.0.0.1 and the handshake dies with
+# "unexpected eof while reading" (curl reports 000). openssl s_client ignores
+# proxies, which is why the chain check passed while every request failed.
+# These tests only talk to loopback, so no proxy is ever wanted.
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT" || exit 1
 
@@ -94,6 +102,7 @@ NODE_ID="head-h2-$$" \
 AGENT_TOKEN="$NODE_TOKEN" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
 EDGE_HTTPS_LISTEN="127.0.0.1:$HTTPS_PORT" \
+EDGE_ADMIN_LISTEN= \
 CERT_DIR="$CERT_DIR" \
 CACHE_BACKEND=memory CACHE_TTL=60 \
 ./target/debug/lagran-edge >"$LOG_DIR/edge.log" 2>&1 &
