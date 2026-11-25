@@ -10,6 +10,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static ETAG_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Stage-4 revalidation fixtures: the first request is a cacheable 200 so the
+/// edge stores it; later requests misbehave (500 / stall) to exercise the strict
+/// revalidation error paths without a mutable origin.
+static FLAKY_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SLOW_FLAKY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let port: u16 = std::env::args()
@@ -465,6 +470,44 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ("Cache-Control", "public, max-age=60".into()),
                 ],
             ),
+            // Stage-4 fixtures: cacheable first, broken afterwards.
+            "/flaky" => {
+                if FLAKY_COUNTER.fetch_add(1, Ordering::Relaxed) == 0 {
+                    (
+                        200,
+                        b"flaky-before".to_vec(),
+                        vec![
+                            ("ETag", "\"flaky-v1\"".into()),
+                            ("Cache-Control", "public, max-age=60".into()),
+                        ],
+                    )
+                } else {
+                    (
+                        500,
+                        b"flaky-boom".to_vec(),
+                        vec![("Cache-Control", "no-store".into())],
+                    )
+                }
+            }
+            "/slow-flaky" => {
+                if SLOW_FLAKY_COUNTER.fetch_add(1, Ordering::Relaxed) == 0 {
+                    (
+                        200,
+                        b"slow-before".to_vec(),
+                        vec![
+                            ("ETag", "\"slow-v1\"".into()),
+                            ("Cache-Control", "public, max-age=60".into()),
+                        ],
+                    )
+                } else {
+                    thread::sleep(Duration::from_secs(3));
+                    (
+                        200,
+                        b"slow-late".to_vec(),
+                        vec![("Cache-Control", "public, max-age=60".into())],
+                    )
+                }
+            }
             _ => (
                 200,
                 b"hello from origin".to_vec(),

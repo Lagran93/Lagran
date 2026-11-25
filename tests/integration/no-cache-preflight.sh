@@ -33,6 +33,7 @@ pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=$((FAILED + 1)); }
 check() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
 contains() { if [[ "$2" == *"$3"* ]]; then pass "$1"; else fail "$1 (missing '$3')"; fi; }
+contains_h() { local hay="${2,,}" needle="${3,,}"; if [[ "$hay" == *"$needle"* ]]; then pass "$1"; else fail "$1 (missing '$3' in: ${2:0:200})"; fi; }
 
 cleanup() {
   if [[ -n "$TOKEN" && -n "$DOMAIN_ID" ]]; then
@@ -45,10 +46,12 @@ cleanup() {
 trap cleanup EXIT
 
 # request <path> [curl args...] -> status code, body in $LOG_DIR/body
+# `--max-time` keeps a response without Content-Length (the WAF block page is
+# written while the connection stays keep-alive) from blocking the whole suite.
 request() {
   local path=$1
   shift
-  curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' --max-time 20 \
     -H "Host: $DOMAIN" "$@" "http://127.0.0.1:$EDGE_PORT$path"
 }
 
@@ -125,7 +128,7 @@ check "edge synced domain" "$CODE" "200"
 echo "== warm cache =="
 request "/assets/app.css" >/dev/null
 request "/assets/app.css" >/dev/null
-contains "second request is a cache hit" "$(cat "$LOG_DIR/headers")" "x-cache: HIT"
+contains_h "second request is a cache hit" "$(cat "$LOG_DIR/headers")" "x-cache: HIT"
 
 echo "== WAF must inspect no-cache requests too =="
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H "$AUTH" \
@@ -143,7 +146,7 @@ RULE_ID=$(printf '%s' "$RULE" | jq -r '.id // empty')
 # bypass under test needs an entry to be served from.
 request "/assets/app.css" >/dev/null
 request "/assets/app.css" >/dev/null
-contains "cache warmed while the rule is active" "$(cat "$LOG_DIR/headers")" "x-cache: HIT"
+contains_h "cache warmed while the rule is active" "$(cat "$LOG_DIR/headers")" "x-cache: HIT"
 
 CODE=""
 for _ in $(seq 1 60); do
@@ -177,7 +180,7 @@ echo "== 10 parallel no-cache requests must also be limited =="
 TMP=$(mktemp)
 CURL_PIDS=()
 for _ in $(seq 1 10); do
-  (curl -s -o /dev/null -w '%{http_code}\n' -H "Host: $DOMAIN" \
+  (curl -s -o /dev/null -w '%{http_code}\n' --max-time 20 -H "Host: $DOMAIN" \
      -H 'Cache-Control: no-cache' "http://127.0.0.1:$EDGE_PORT/assets/app.css" >>"$TMP") &
   CURL_PIDS+=($!)
 done
