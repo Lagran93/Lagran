@@ -220,6 +220,38 @@ fn normalize_backup(host: &str, port: u16, proto: &str) -> Result<(String, i32, 
     Ok((host.to_string(), port as i32, proto))
 }
 
+/// Validate a primary origin expressed through the legacy single-source fields.
+///
+/// `normalize_origins` only runs when the request carries an explicit pool, so a
+/// client that posts `origin_host`/`origin_port`/`origin_proto` alone used to be
+/// accepted verbatim. An unsupported protocol or an empty host then produced a
+/// domain whose `origin_url` the edge cannot parse (it answers
+/// `UNSUPPORTED_ORIGIN_URL` now). Validate the same shape here so the bad value
+/// never reaches the data plane.
+fn validate_primary_origin(host: &str, port: u16, proto: &str) -> Result<(), String> {
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("origin host cannot be empty".into());
+    }
+    // `host:port` in the legacy field is a common input; split it rather than
+    // rejecting a value the console happily accepts.
+    if let Some((name, tail)) = host.rsplit_once(':') {
+        if !name.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) && port == 0 {
+            let parsed: u16 = tail.parse().unwrap_or(0);
+            return validate_primary_origin(name, parsed, proto);
+        }
+    }
+    let proto = if proto.trim().is_empty() {
+        "http".to_string()
+    } else {
+        proto.trim().to_ascii_lowercase()
+    };
+    if proto != "http" && proto != "https" {
+        return Err("origin protocol must be http or https".into());
+    }
+    Ok(())
+}
+
 fn parse_uuid(id: &str) -> Result<Uuid, (StatusCode, Json<ErrorBody>)> {
     Uuid::parse_str(id.trim()).map_err(|_| {
         (
@@ -321,6 +353,13 @@ pub async fn create(
             })
         });
     let ssl = req.ssl_enabled.unwrap_or(proto == "https");
+
+    // The legacy single-source fields bypass `normalize_origins`; validate them so
+    // the edge never receives an unparseable `origin_url`.
+    if normalized_origins.is_none() {
+        validate_primary_origin(&origin_host, port as u16, &proto)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+    }
 
     if normalized_origins.is_none() {
         let sni = normalize_origin_meta(req.origin_sni.clone(), "origin SNI")
@@ -586,6 +625,20 @@ pub async fn update(
     let ssl_arg = req
         .ssl_enabled
         .or_else(|| primary_origin.as_ref().map(|o| o.proto == "https"));
+
+    // Same guard as `create`: a legacy edit that only touches the primary fields
+    // must not be able to install an unparseable origin.
+    if normalized_origins.is_none() {
+        let effective_host = host_arg
+            .clone()
+            .unwrap_or_else(|| before.origin_host.clone());
+        let effective_port = port_arg.unwrap_or(before.origin_port.max(0) as u16);
+        let effective_proto = proto_arg
+            .clone()
+            .unwrap_or_else(|| before.origin_proto.clone());
+        validate_primary_origin(&effective_host, effective_port, &effective_proto)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+    }
 
     let row = repository::update_domain(
         &state.pool,
