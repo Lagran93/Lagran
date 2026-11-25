@@ -154,7 +154,7 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 - 验收已落到 `tests/integration/cache-diagnostics.sh`：7 项 reason 计数断言（含
   `head`）、管理接口不计入 legacy、`delta` 辅助函数用于"前后增量"断言。
 
-### 阶段 1：preflight 实现搬进 pipeline（1-2 天，纯机械）
+### 阶段 1：preflight 实现搬进 pipeline（1-2 天，纯机械）—— ✅ 已完成
 
 改动：
 
@@ -168,6 +168,22 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 
 验收：`cargo test -p edge`；`waf.sh`、`cc.sh`、`cache-rules.sh`、`p2-hardening.sh`、
 `cache-diagnostics.sh` 全绿。这 415 行是所有安全策略的入口，**必须跑脚本，不能只看编译**。
+
+落地说明（实际实现）：
+
+- 仓库里 `server/pipeline.rs` 是单文件、也没有 `server/shared/` 目录，所以落位调整为：
+  `apps/edge/src/server/preflight.rs`（`preflight_cacheable` + `url_query` + `cc_too_many` +
+  `host_without_port` + `https_redirect_response`）与 `apps/edge/src/server/shared.rs`
+  （`log_access`、`uuid_like_request_id`、`policy_browser_ttl`、`apply_browser_ttl`、
+  `apply_security_headers`、`apply_cors_and_custom`、`hotlink_allowed` 及其
+  `referer_host`/`host_matches`、`challenge_accepts_html`），并连带动了 8 个 hotlink 单测；
+- `pipeline.rs` 现在 `use crate::server::preflight::preflight_cacheable;`，不再从
+  `server::handler` 取 preflight；`pingora_edge.rs` 改为 `use crate::server::shared::{…}`；
+- 搬迁用脚本按行区间**原样抽取、原样删除**（`git diff` 中 `handler.rs` 只有删除 + 导入行，
+  795 行删除 / 7 行新增），并用逐字比对脚本确认三个代码块与 HEAD 完全一致；
+- 剩余耦合：`AppState` 仍定义在 `server::handler`，`preflight.rs`/`pipeline.rs` 仍从那里
+  `use` 它。彻底解耦（把 `AppState` 移到 `server/state.rs`）放到阶段 6 的共享工具落位，
+  否则本阶段会变成跨十几个文件的类型搬迁，失去"可单独回滚"的性质。
 
 ### 阶段 2：HEAD 原生化（3-5 天）
 
@@ -284,10 +300,10 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 
 | 脚本 | 覆盖 | 要求 |
 |---|---|---|
-| `head-h2.sh` | HEAD 的 H1/H2 Content-Length、cold HEAD、huge HEAD | 全绿 + 断言 `pingora` |
-| `cache-diagnostics.sh` | GET / Range / no-cache / diagnose | 全绿 + diagnose 断言 `pingora` |
+| `head-h2.sh` | HEAD 的 H1/H2 Content-Length、cold HEAD、huge HEAD | ✅ 全绿 + 断言 `pingora` |
+| `cache-diagnostics.sh` | GET / Range / no-cache / diagnose | ✅ 全绿 + diagnose 断言 `pingora` |
 | `ws-echo.sh` | WebSocket 隧道 | 全绿（已是 native） |
-| `waf.sh` / `cc.sh` / `cache-rules.sh` | preflight 策略 | 阶段 1 后必须全绿 |
+| `waf.sh` / `cc.sh` / `cache-rules.sh` | preflight 策略 | ✅ 全绿（阶段 1） |
 | `p2-hardening.sh` | SSRF / 限流 / 日志摄入 | 全绿 |
 | `smoke.sh` / `dead-origin.sh` / `multi-origin.sh` | 回源与故障切换 | 阶段 3/4 后全绿 |
 
@@ -302,8 +318,8 @@ sum(rate(lagran_edge_datapath_legacy_total[5m]))
 
 ## 复核期间顺带修复与发现
 
-迁移复核时为了跑通验收脚本，修掉了三处**与迁移无关的环境/脚本问题**，并发现一处
-**真实的产品缺陷**（归入阶段 3/4，不作为阶段 0 的阻塞）。
+迁移复核时为了跑通验收脚本，修掉了一批**与迁移逻辑无关的环境/脚本问题**，并发现两处
+**真实的产品缺陷**（一处已在阶段 1 内修掉，另一处归入阶段 3/4）。
 
 ### 顺带修复（测试脚本）
 
@@ -318,6 +334,52 @@ sum(rate(lagran_edge_datapath_legacy_total[5m]))
    注册表为空 → 走 single-origin → `ORIGIN_URL` 默认 `https://example.com` → 全站
    404（`reason="status"`）。补 `POST /api/v1/nodes` 取 per-node token、传入
    `AGENT_TOKEN`、并在 cleanup 里删节点行（残留的 online 行会让下次 purge 扇出失败）。
+4. **同一主机上的第二个 edge 也会撞 8082**：`cc.sh` 的跨节点用例起第二个 edge 时没有置空
+   `EDGE_ADMIN_LISTEN`，第一个 edge 已占 `127.0.0.1:8082`，第二个进程启动即
+   `Error: cannot bind EDGE_ADMIN_LISTEN … (os error 98)` 退出；随后 `get2` 全得到 502，
+   "second edge receives shared ban" 与 header 断言双双失败，`bans/all` 也因 60 秒 TTL
+   过期读出 `null`。修法：两个 edge 都显式 `EDGE_ADMIN_LISTEN=`，并把
+   `cc_ban_seconds` 从 60 提到 300（否则最长 60 秒的跨节点等待会跑赢 TTL）。
+5. **curl `-X HEAD` 会等 body**：`cache-rules.sh` 用 `-X HEAD` 发 HEAD，curl 不会进入
+   "HEAD 无 body"模式，于是等待 `Content-Length` 声明的字节（HEAD 报真实长度是本项目的
+   既定契约），直接挂死。改用 `-I`（3 处）。
+6. **请求一律带 `--max-time`**：`waf.sh` / `cc.sh` / `cache-rules.sh` 此前都有不带超时的
+   curl，一个停滞响应就把整个脚本挂死（最长 20 分钟）。现在统一 `--max-time 20`，停滞会
+   变成 `000` 快速失败，而不是静默卡住。
+7. **HEAD / `Vary: Cookie` 的断言与契约对齐**：`cache-rules.sh` 曾断言"第二次 HEAD 命中
+   缓存"与"`ignore_cookie` 规则让 `Vary: Cookie` 命中"。实际契约是 HEAD 只返回元数据、
+   **不填充缓存**；且 `cache/policy.rs::vary_cookie_is_rejected` 明确"key 不含 Cookie，
+   即使 `ignore_cookie` 也不得存储"。断言改为 `MISS`，并纠正 `tools/mock-origin` 中
+   与实现矛盾的注释。
+8. **中断的压测会毒化预取队列**：某次 p2 压测被 `kill` 后留下 62 条
+   `prefetch_tasks(status='pending')`（`p2-sec05-admin-*` 域名）与 4 条
+   `prefetch_schedules(enabled=true)`。worker 每 15 秒只领 20 条且按 `created_at` 排序，
+   新任务被陈旧任务饿死在脚本轮询窗口之外 → `cache-diagnostics.sh` 的
+   `control worker completes task` / `prefetched path is HIT` 等 5 项失败。清理：
+   ```sql
+   UPDATE prefetch_tasks SET status='failed', finished_at=now(),
+     message='stale backlog cleanup (dead test domain)'
+   WHERE status='pending' AND domain LIKE 'p2-%';
+   DELETE FROM prefetch_schedules WHERE domain LIKE 'p2-%';
+   ```
+9. **控制面 worker 日志默认不可见**：`.env` 的
+   `RUST_LOG=lagran_control=info,lagran_edge=info,edge::…=debug,…` 不含 `control::*`，
+   所以 `prefetch worker started`、`prefetch worker failed` 都不会出现，容易误判"worker
+   没启动"。排障需显式 `RUST_LOG=control=debug,…`（实测该配置下可见
+   `prefetch worker started interval=15s` 与 `claim … rows_returned=20`）。
+
+### 发现：`write_axum_response` 的流式分支不定界（阶段 1 内已修）
+
+`write_axum_response` 对"非 HEAD / 非 304-204 / 未压缩 / body 非空 / 非 HTTP-1.0"的响应走
+`write_engine_response_streamed`，而该函数用 `ResponseHeader::build(status, None)` 构造响应
+头 —— 既没有 `Content-Length` 也没有 `Transfer-Encoding`，只能靠**关闭连接**定界。落在
+keep-alive 连接上时，客户端会一直等一个永远不来的 EOF：`waf.sh` 的 403 拦截页与 `cc.sh`
+的 429 页都曾因此挂死（表现为脚本"卡住不动"，抓包显示 body 停在 4096 字节）。
+
+修复：把 `body.size_hint().exact()` 作为 `exact_len` 传给
+`write_engine_response_streamed`，让 `ResponseHeader::build` 带上真实 `Content-Length`
+（内存 body 的 hint 是精确值）；同时在写入字节数与声明长度不一致时 `warn!`，避免把
+错误的长度静默写给客户端。未知长度的流式响应行为不变（仍由关闭连接定界）。
 
 ### 发现：kill 主源后不切备份（阶段 3/4 前置）
 
