@@ -112,6 +112,50 @@ check "no-cache without large cache revalidates" "$(hdr x-cache)" "REVALIDATED"
 check "no-cache without large cache uses origin-304" "$(hdr x-lagran-cache-reason)" "origin-304"
 check "no-cache GET uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
 
+# The per-reason fallback counters are the gate for the remaining migration work:
+# they must show HEAD (still in-process), and must NOT show a no-cache GET that
+# completed on Pingora. After the HEAD migration this section flips to
+# `head: 0` with `x-lagran-datapath: pingora` on HEAD as well.
+#
+# With EDGE_ADMIN_LISTEN unset the management API lives on the data listener and
+# requires the node token, so every scrape has to carry it.
+metrics_body() {
+  curl -s -H "x-lagran-agent-token: $NODE_TOKEN" \
+    "http://127.0.0.1:$EDGE_PORT/__lagran/metrics"
+}
+fb() { # <reason> -> current counter value, or "missing"
+  metrics_body \
+    | awk -v key="lagran_edge_legacy_fallback_total{reason=\"$1\"}" \
+        '$1 == key { print $2; found = 1 } END { if (!found) print "missing" }'
+}
+delta() { # <before> <after> -> difference, or "not-a-number"
+  if [[ "$1" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+$ ]]; then
+    echo $(( $2 - $1 ))
+  else
+    echo "not-a-number"
+  fi
+}
+
+echo "== legacy fallback reasons =="
+metrics_body >"$LOG_DIR/metrics.txt" 2>/dev/null
+check "metrics expose every fallback reason" \
+  "$(grep -c 'lagran_edge_legacy_fallback_total{reason=' "$LOG_DIR/metrics.txt")" "7"
+check "an untouched reason starts at zero" "$(fb single_origin)" "0"
+
+HEAD_BEFORE=$(fb head)
+STRICT_BEFORE=$(fb strict_revalidation)
+NODE_BEFORE=$(fb node_disabled)
+OTHER_BEFORE=$(fb other)
+curl -s -I -H "Host: $DOMAIN" -o /dev/null "http://127.0.0.1:$EDGE_PORT/cached"
+check "HEAD counts as a legacy fallback" "$(delta "$HEAD_BEFORE" "$(fb head)")" "1"
+check "node-disabled reason stays untouched" "$(fb node_disabled)" "$NODE_BEFORE"
+check "unclassified reason stays untouched" "$(fb other)" "$OTHER_BEFORE"
+
+# This GET revalidated on Pingora above; it must not be counted as a fallback.
+get "/assets/app.css" -H 'Cache-Control: max-age=0' >/dev/null
+check "a no-cache GET that Pingora served is not a fallback" \
+  "$(fb strict_revalidation)" "$STRICT_BEFORE"
+
 echo "== control cache diagnose =="
 NODE_ONLINE=0
 for _ in $(seq 1 20); do

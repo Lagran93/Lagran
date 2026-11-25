@@ -16,6 +16,7 @@ use crate::cache::policy::{
 use crate::cache::{CacheBackend, CacheSource};
 use crate::config::EdgeConfig;
 use crate::config::registry::{DomainEntry, OriginTarget};
+use crate::metrics::LegacyFallback;
 use crate::origin_dns::OriginDnsCache;
 use crate::security::header_guard;
 use crate::security::origin_auth;
@@ -795,7 +796,9 @@ impl ProxyHttp for DataPlaneProxy {
                 return Ok(true);
             }
             ctx.skip_logging = true;
-            return self.handle_in_process(session, false).await;
+            return self
+                .handle_in_process(session, false, LegacyFallback::SingleOrigin)
+                .await;
         };
         // Run the shared preflight (HTTPS redirect, bot challenge, CC, rate
         // limit, WAF, hotlink) before ANY cache revalidation. This used to live
@@ -1071,12 +1074,15 @@ impl ProxyHttp for DataPlaneProxy {
             return Ok(false);
         }
         // A GET/HEAD that reached this point had a valid domain but could not
-        // use the native cache path (HEAD, strict revalidation, or a method
-        // that the in-process engine must handle). This is expected routing,
-        // not an error; leave diagnostics to the access log so a high-QPS
-        // workload cannot flood the process log.
+        // use the native cache path (HEAD, strict revalidation, a missing origin
+        // or a method the in-process engine must handle). This is expected
+        // routing, not an error; leave diagnostics to the access log so a
+        // high-QPS workload cannot flood the process log. The reason is counted
+        // so the remaining legacy surface stays visible.
         ctx.skip_logging = true;
-        self.handle_in_process(session, ctx.preflight_done).await
+        let reason = self.legacy_reason(session, &domain);
+        self.handle_in_process(session, ctx.preflight_done, reason)
+            .await
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
@@ -2043,24 +2049,7 @@ impl DataPlaneProxy {
         {
             return Ok(false);
         }
-        let strict = session
-            .req_header()
-            .headers
-            .get("cache-control")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                v.split(',')
-                    .any(|p| p.trim().eq_ignore_ascii_case("no-cache"))
-                    || v.split(',')
-                        .any(|p| p.trim().eq_ignore_ascii_case("max-age=0"))
-            })
-            .unwrap_or(false)
-            || session
-                .req_header()
-                .headers
-                .get("pragma")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.eq_ignore_ascii_case("no-cache"));
+        let strict = is_strict_revalidation(&session.req_header().headers);
         if !strict {
             return Ok(false);
         }
@@ -2763,32 +2752,63 @@ impl DataPlaneProxy {
         }
     }
 
-    async fn native_plan(
-        &self,
-        session: &Session,
-        host: &str,
-        domain: &Arc<DomainEntry>,
-    ) -> Option<NativePlan> {
+    /// Why no native plan can be built for this session, if that is the case.
+    ///
+    /// One definition for two callers: `native_plan` decides routing with it and
+    /// `legacy_reason` labels the fallback with it. Keeping them separate would let
+    /// the metric drift away from the actual routing decision.
+    fn plan_blocker(&self, session: &Session) -> Option<LegacyFallback> {
         if !self.native_cache || self.storage.is_none() {
-            return None;
+            return Some(LegacyFallback::NativeCacheDisabled);
         }
         let req = session.req_header();
         // HEAD stays on the in-process engine: it fetches GET, returns the real
         // Content-Length, and shares the GET cache entry. Pingora's H1 encoder
         // cannot carry an upstream GET body under a HEAD response.
         if req.method == Method::HEAD {
-            return None;
+            return Some(LegacyFallback::Head);
         }
-        let has_range = req.headers.contains_key("range");
-        // Small bounded ranges are served from SharedCache when possible; the
-        // remaining ranges use native streaming.
-        // Small bounded ranges normally use the in-process slice cache. When
-        // the complete object is already in the large-object cache, keep the
-        // request on the Pingora path so it can be served directly from disk.
-        // Open-ended ranges (`bytes=0-`) stay streaming as before.
         if !self.state.node_control.is_serving() {
+            return Some(LegacyFallback::NodeDisabled);
+        }
+        // Strict client revalidation has a dedicated conditional-origin path in
+        // the in-process engine (304 refresh). Keep it off the native cache
+        // fast path so a stale body is never served on max-age=0/no-cache.
+        if is_strict_revalidation(&req.headers) {
+            return Some(LegacyFallback::StrictRevalidation);
+        }
+        None
+    }
+
+    /// Label a request that is about to be handed to the in-process engine.
+    ///
+    /// Only called on the fallback path, so it never runs on the native fast path.
+    fn legacy_reason(&self, session: &Session, domain: &DomainEntry) -> LegacyFallback {
+        if let Some(blocker) = self.plan_blocker(session) {
+            return blocker;
+        }
+        // A blocker-free request that still produced no plan has no usable
+        // origin target: `native_plan` fails exactly there.
+        if parse_origin(&domain.origin_url).is_none() {
+            return LegacyFallback::ParseOrigin;
+        }
+        LegacyFallback::Other
+    }
+
+    async fn native_plan(
+        &self,
+        session: &Session,
+        host: &str,
+        domain: &Arc<DomainEntry>,
+    ) -> Option<NativePlan> {
+        if self.plan_blocker(session).is_some() {
             return None;
         }
+        let req = session.req_header();
+        // Small bounded ranges are served from SharedCache when possible; the
+        // remaining ranges use native streaming. Open-ended ranges (`bytes=0-`)
+        // stay streaming as before.
+        let has_range = req.headers.contains_key("range");
         let path = req.uri.path().to_string();
         let path_and_query = req
             .uri
@@ -4659,6 +4679,9 @@ impl DataPlaneProxy {
                         b = s.bytes_sent,
                     ));
                 }
+                // Same exposition as the admin listener: the per-reason fallback
+                // counters are what the migration is measured with.
+                body.push_str(&self.state.metrics.legacy_fallbacks().prometheus_lines());
                 write_plain(
                     session,
                     200,
@@ -4927,7 +4950,16 @@ impl DataPlaneProxy {
         Ok(Box::new(peer))
     }
 
-    async fn handle_in_process(&self, session: &mut Session, preflight_done: bool) -> Result<bool> {
+    async fn handle_in_process(
+        &self,
+        session: &mut Session,
+        preflight_done: bool,
+        reason: LegacyFallback,
+    ) -> Result<bool> {
+        // Counted here, at the hand-off, so the reason is known. The engine itself
+        // also counts `datapath_legacy_total`, which additionally covers direct
+        // callers (cache diagnostics) that have no reason to report.
+        self.state.metrics.record_legacy_fallback(reason);
         let req_header = session.req_header();
         let method: Method = req_header.method.clone();
         let is_head = method == Method::HEAD;
@@ -5751,6 +5783,27 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     upgrade || connection_upgrade
 }
 
+/// Whether the client asked for a revalidation instead of a cached copy.
+///
+/// `no-cache`, `max-age=0` and `Pragma: no-cache` all mean "check with the origin
+/// before answering". Both the large-object revalidation path and the fallback
+/// accounting use this one definition, so the two cannot disagree about which
+/// requests are strict.
+fn is_strict_revalidation(headers: &HeaderMap) -> bool {
+    let cache_control = headers.get("cache-control").and_then(|v| v.to_str().ok());
+    let strict_cc = cache_control.is_some_and(|value| {
+        value.split(',').any(|part| {
+            let part = part.trim();
+            part.eq_ignore_ascii_case("no-cache") || part.eq_ignore_ascii_case("max-age=0")
+        })
+    });
+    let strict_pragma = headers
+        .get("pragma")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("no-cache"));
+    strict_cc || strict_pragma
+}
+
 fn is_hop_by_hop(name: &str) -> bool {
     // `alt-svc` is not hop-by-hop by RFC, but this edge has no QUIC listener.
     // Passing the origin's `h3=":443"` through sends browsers to UDP/443, which
@@ -6018,8 +6071,8 @@ mod tests {
     use super::{
         DataPlaneProxy, ResponsePolicySlot, cached_response_policy, compressed_variant_key,
         effective_connect_timeout_ms, fill_window, gzip_engine_body,
-        head_content_length_for_protocol, merge_multipart_spans, needs_loopback_listener,
-        parse_multi_ranges, parse_single_range,
+        head_content_length_for_protocol, is_strict_revalidation, merge_multipart_spans,
+        needs_loopback_listener, parse_multi_ranges, parse_single_range,
         range_fill_is_candidate, valid_release_tag, vary_on_accept_encoding, weaken_etag,
     };
     use crate::cache::policy::ResolvedPolicy;
@@ -6035,6 +6088,35 @@ mod tests {
             .filter_map(|value| value.to_str().ok())
             .map(str::to_string)
             .collect()
+    }
+
+    /// The revalidation path and the fallback accounting share this predicate, so
+    /// a request the edge treats as "check with the origin" is also the one counted
+    /// as a strict-revalidation fallback when it cannot finish on Pingora.
+    #[test]
+    fn strict_revalidation_covers_the_three_client_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(!is_strict_revalidation(&headers), "no header is not strict");
+
+        headers.insert("cache-control", "public, max-age=60".parse().unwrap());
+        assert!(!is_strict_revalidation(&headers), "a positive TTL is not strict");
+
+        headers.insert("cache-control", "no-cache".parse().unwrap());
+        assert!(is_strict_revalidation(&headers));
+
+        headers.insert("cache-control", "public, max-age=0".parse().unwrap());
+        assert!(is_strict_revalidation(&headers));
+
+        // A list may carry the directive anywhere, with any spacing or case.
+        headers.insert("cache-control", "public, Max-Age=0, must-revalidate".parse().unwrap());
+        assert!(is_strict_revalidation(&headers));
+
+        headers.insert("cache-control", "no-store".parse().unwrap());
+        headers.insert("pragma", "no-cache".parse().unwrap());
+        assert!(is_strict_revalidation(&headers), "pragma counts on its own");
+
+        headers.remove("pragma");
+        assert!(!is_strict_revalidation(&headers), "no-store alone is not a revalidation");
     }
 
     #[test]

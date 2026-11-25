@@ -305,6 +305,10 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         global.chunk_origin_attempts,
         global.chunk_origin_failures
     ));
+    // Why requests still leave the Pingora data plane. `datapath_legacy_total`
+    // above gives the total; this breaks it down so the remaining migration work
+    // is measurable (`docs/request-pipeline-migration.md`).
+    out.push_str(&global.legacy_fallback.prometheus_lines());
     out.push_str(&format!("lagran_edge_domains {}\n", snaps.len()));
     let (large_used, large_available, large_capacity) = state
         .large_cache

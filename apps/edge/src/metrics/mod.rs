@@ -12,6 +12,146 @@ struct Counters {
     bytes_sent: AtomicU64,
 }
 
+/// Why a request left the Pingora data plane for the in-process engine.
+///
+/// `lagran_edge_datapath_legacy_total` answers *how many*; this answers *which*.
+/// Every variant is either a path still to migrate or one deliberately kept, so a
+/// non-zero [`LegacyFallback::Other`] means an unclassified path appeared and the
+/// migration inventory needs updating. Without this dimension the remaining legacy
+/// surface can only be guessed at, and deleting code becomes blind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyFallback {
+    /// HEAD requests are still served by the in-process engine.
+    Head,
+    /// The node is disabled; the 503 page comes from the in-process engine.
+    NodeDisabled,
+    /// Client-requested revalidation (`no-cache` / `max-age=0`) did not complete.
+    StrictRevalidation,
+    /// No domain registry yet: legacy single-origin mode.
+    SingleOrigin,
+    /// `origin_url` could not be parsed, so no origin target exists.
+    ParseOrigin,
+    /// Pingora cache storage was not initialised (should be unreachable).
+    NativeCacheDisabled,
+    /// A fallback path that is not classified yet.
+    Other,
+}
+
+impl LegacyFallback {
+    /// Stable iteration order: metrics output must not move between scrapes.
+    pub const ALL: [Self; 7] = [
+        Self::Head,
+        Self::NodeDisabled,
+        Self::StrictRevalidation,
+        Self::SingleOrigin,
+        Self::ParseOrigin,
+        Self::NativeCacheDisabled,
+        Self::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::NodeDisabled => "node_disabled",
+            Self::StrictRevalidation => "strict_revalidation",
+            Self::SingleOrigin => "single_origin",
+            Self::ParseOrigin => "parse_origin",
+            Self::NativeCacheDisabled => "native_cache_disabled",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One counter per reason: the set is fixed, so this is a plain struct rather
+/// than a labelled map that would allocate on the request path.
+#[derive(Default)]
+struct LegacyFallbackCounters {
+    head: AtomicU64,
+    node_disabled: AtomicU64,
+    strict_revalidation: AtomicU64,
+    single_origin: AtomicU64,
+    parse_origin: AtomicU64,
+    native_cache_disabled: AtomicU64,
+    other: AtomicU64,
+}
+
+impl LegacyFallbackCounters {
+    fn counter(&self, reason: LegacyFallback) -> &AtomicU64 {
+        match reason {
+            LegacyFallback::Head => &self.head,
+            LegacyFallback::NodeDisabled => &self.node_disabled,
+            LegacyFallback::StrictRevalidation => &self.strict_revalidation,
+            LegacyFallback::SingleOrigin => &self.single_origin,
+            LegacyFallback::ParseOrigin => &self.parse_origin,
+            LegacyFallback::NativeCacheDisabled => &self.native_cache_disabled,
+            LegacyFallback::Other => &self.other,
+        }
+    }
+
+    fn snapshot(&self) -> LegacyFallbackSnapshot {
+        LegacyFallbackSnapshot {
+            head: self.head.load(Ordering::Relaxed),
+            node_disabled: self.node_disabled.load(Ordering::Relaxed),
+            strict_revalidation: self.strict_revalidation.load(Ordering::Relaxed),
+            single_origin: self.single_origin.load(Ordering::Relaxed),
+            parse_origin: self.parse_origin.load(Ordering::Relaxed),
+            native_cache_disabled: self.native_cache_disabled.load(Ordering::Relaxed),
+            other: self.other.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Per-reason view of the legacy fallbacks (see [`LegacyFallback`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LegacyFallbackSnapshot {
+    pub head: u64,
+    pub node_disabled: u64,
+    pub strict_revalidation: u64,
+    pub single_origin: u64,
+    pub parse_origin: u64,
+    pub native_cache_disabled: u64,
+    pub other: u64,
+}
+
+impl LegacyFallbackSnapshot {
+    pub fn get(&self, reason: LegacyFallback) -> u64 {
+        match reason {
+            LegacyFallback::Head => self.head,
+            LegacyFallback::NodeDisabled => self.node_disabled,
+            LegacyFallback::StrictRevalidation => self.strict_revalidation,
+            LegacyFallback::SingleOrigin => self.single_origin,
+            LegacyFallback::ParseOrigin => self.parse_origin,
+            LegacyFallback::NativeCacheDisabled => self.native_cache_disabled,
+            LegacyFallback::Other => self.other,
+        }
+    }
+
+    /// `(reason, count)` in stable order, for the Prometheus text endpoint.
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        LegacyFallback::ALL
+            .iter()
+            .map(move |reason| (reason.as_str(), self.get(*reason)))
+    }
+
+    /// Prometheus exposition for `lagran_edge_legacy_fallback_total`.
+    ///
+    /// Two listeners render metrics text (the admin Axum app and the Pingora
+    /// data-plane management path); the exposition lives here so the two can never
+    /// disagree about names or label values.
+    pub fn prometheus_lines(&self) -> String {
+        let mut out = String::from(
+            "# HELP lagran_edge_legacy_fallback_total Requests that left the Pingora data plane, by reason\n\
+             # TYPE lagran_edge_legacy_fallback_total counter\n",
+        );
+        for (reason, count) in self.iter() {
+            out.push_str(&format!(
+                "lagran_edge_legacy_fallback_total{{reason=\"{reason}\"}} {count}\n"
+            ));
+        }
+        out
+    }
+}
+
 #[derive(Default)]
 pub struct EdgeMetrics {
     /// Sharded: every request updates a counter, so a single process-wide lock
@@ -29,6 +169,8 @@ pub struct EdgeMetrics {
     downstream_cancels: AtomicU64,
     datapath_pingora: AtomicU64,
     datapath_legacy: AtomicU64,
+    /// Why each legacy fallback happened (see [`LegacyFallback`]).
+    legacy_fallback: LegacyFallbackCounters,
     chunk_requests: AtomicU64,
     chunk_origin_runs: AtomicU64,
     chunk_fallbacks: AtomicU64,
@@ -57,6 +199,8 @@ pub struct GlobalSnapshot {
     pub downstream_cancels: u64,
     pub datapath_pingora: u64,
     pub datapath_legacy: u64,
+    /// Per-reason breakdown of `datapath_legacy`.
+    pub legacy_fallback: LegacyFallbackSnapshot,
     pub chunk_requests: u64,
     pub chunk_origin_runs: u64,
     pub chunk_fallbacks: u64,
@@ -181,6 +325,22 @@ impl EdgeMetrics {
         self.datapath_legacy.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record *why* a request fell back to the in-process engine.
+    ///
+    /// Called at the Pingora hand-off points, not from the engine itself: the
+    /// engine cannot tell a HEAD request from a revalidation that gave up, and a
+    /// direct engine caller (cache diagnostics) has no reason to report.
+    pub fn record_legacy_fallback(&self, reason: LegacyFallback) {
+        self.legacy_fallback
+            .counter(reason)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the per-reason fallback counters without resetting them.
+    pub fn legacy_fallbacks(&self) -> LegacyFallbackSnapshot {
+        self.legacy_fallback.snapshot()
+    }
+
     pub fn record_chunk_request(&self) {
         self.chunk_requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -245,6 +405,7 @@ impl EdgeMetrics {
             downstream_cancels: self.downstream_cancels.load(Ordering::Relaxed),
             datapath_pingora: self.datapath_pingora.load(Ordering::Relaxed),
             datapath_legacy: self.datapath_legacy.load(Ordering::Relaxed),
+            legacy_fallback: self.legacy_fallback.snapshot(),
             chunk_requests: self.chunk_requests.load(Ordering::Relaxed),
             chunk_origin_runs: self.chunk_origin_runs.load(Ordering::Relaxed),
             chunk_fallbacks: self.chunk_fallbacks.load(Ordering::Relaxed),
@@ -474,6 +635,52 @@ mod tests {
         assert_eq!(snapshot.chunk_fill_drop_send, 1);
         assert_eq!(snapshot.chunk_fill_rejects, 1);
         assert_eq!(snapshot.chunk_fill_rejected_bytes, 400);
+    }
+
+    /// The fallback breakdown must stay one counter per reason, and every reason
+    /// must be reachable by name: the Prometheus label values are a contract with
+    /// the migration plan (`docs/request-pipeline-migration.md`).
+    #[test]
+    fn legacy_fallback_counters_are_per_reason() {
+        let m = EdgeMetrics::default();
+        m.record_legacy_fallback(LegacyFallback::Head);
+        m.record_legacy_fallback(LegacyFallback::Head);
+        m.record_legacy_fallback(LegacyFallback::SingleOrigin);
+
+        let snapshot = m.legacy_fallbacks();
+        assert_eq!(snapshot.head, 2);
+        assert_eq!(snapshot.single_origin, 1);
+        assert_eq!(snapshot.strict_revalidation, 0);
+        assert_eq!(snapshot.get(LegacyFallback::Head), 2);
+        assert_eq!(snapshot.get(LegacyFallback::Other), 0);
+
+        // A reason recorded through the snapshot accessor must match the enum name.
+        let rendered: Vec<(&str, u64)> = snapshot.iter().collect();
+        assert_eq!(rendered.len(), LegacyFallback::ALL.len());
+        assert_eq!(rendered[0], ("head", 2));
+        assert_eq!(rendered[3], ("single_origin", 1));
+    }
+
+    /// `datapath_legacy_total` and the per-reason counters are separate: the total
+    /// also counts direct engine callers (cache diagnostics) that have no reason.
+    #[test]
+    fn legacy_fallback_does_not_touch_the_datapath_total() {
+        let m = EdgeMetrics::default();
+        m.record_legacy_fallback(LegacyFallback::NodeDisabled);
+        let snapshot = m.global_snapshot();
+        assert_eq!(snapshot.datapath_legacy, 0);
+        assert_eq!(snapshot.legacy_fallback.node_disabled, 1);
+    }
+
+    /// Every label value must be unique, otherwise two reasons would collapse into
+    /// one series and the breakdown would silently lose a path.
+    #[test]
+    fn legacy_fallback_labels_are_unique() {
+        let mut names: Vec<&'static str> = LegacyFallback::ALL.iter().map(|r| r.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before);
     }
 
     #[test]
