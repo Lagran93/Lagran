@@ -360,8 +360,9 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ("Cache-Control", "public, max-age=3600".into()),
                 ],
             ),
-            // Static asset that varies on Cookie. An ignore_cookie cache rule
-            // must be able to store it; no-cache is covered by /nocache.
+            // Static asset that varies on Cookie. Even an ignore_cookie rule cannot
+            // store it: Cookie is not in the cache key, so variants would be mixed.
+            // `cache-rules.sh` asserts the second request stays a MISS.
             "/assets/vary.js" => (
                 200,
                 b"console.log('vary');".to_vec(),

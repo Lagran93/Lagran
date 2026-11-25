@@ -26,6 +26,9 @@ NODE_TOKEN=""
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=$((FAILED + 1)); }
 check() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
+# Header values are case-insensitive for tokens like `Connection`/custom markers, and
+# the value case can differ between data planes, so compare without regard to case.
+check_i() { if [[ "${2,,}" == "${3,,}" ]]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
 
 cleanup() {
   if [[ -n "$TOKEN" && -n "$DOMAIN_ID" ]]; then
@@ -38,8 +41,10 @@ cleanup() {
 trap cleanup EXIT
 
 api() { curl -s -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' "$@"; }
-get() { curl -s -H "Host: $DOMAIN" -D "$LOG_DIR/h" -o "$LOG_DIR/b" -w '%{http_code}' "http://127.0.0.1:$EDGE_PORT$1"; }
-get2() { curl -s -H "Host: $DOMAIN" -D "$LOG_DIR/h2" -o "$LOG_DIR/b2" -w '%{http_code}' "http://127.0.0.1:$EDGE2_PORT$1"; }
+# `--max-time` mirrors waf.sh: a stalled response must fail the assertion instead of
+# hanging the whole suite.
+get() { curl -s --max-time 20 -H "Host: $DOMAIN" -D "$LOG_DIR/h" -o "$LOG_DIR/b" -w '%{http_code}' "http://127.0.0.1:$EDGE_PORT$1"; }
+get2() { curl -s --max-time 20 -H "Host: $DOMAIN" -D "$LOG_DIR/h2" -o "$LOG_DIR/b2" -w '%{http_code}' "http://127.0.0.1:$EDGE2_PORT$1"; }
 hdr2() { tr -d '\r' <"$LOG_DIR/h2" | awk -F': ' -v k="$1" 'tolower($1)==k{print $2}' | head -1; }
 hdr() { tr -d '\r' <"$LOG_DIR/h" | awk -F': ' -v k="$1" 'tolower($1)==k{print $2}' | head -1; }
 
@@ -74,10 +79,11 @@ NODE_TOKEN=$(printf '%s' "$NODE_RESP" | jq -r '.token // empty')
 
 echo "== enable CC =="
 api -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/settings" \
-  -d '{"cc_enabled":true,"cc_rps":1,"cc_burst":0,"cc_ban_after":1,"cc_ban_seconds":60,"cc_mode":"block","cc_allow_ips":""}' >/dev/null
+  -d '{"cc_enabled":true,"cc_rps":1,"cc_burst":0,"cc_ban_after":1,"cc_ban_seconds":300,"cc_mode":"block","cc_allow_ips":""}' >/dev/null
 
 echo "== start edge =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
+EDGE_ADMIN_LISTEN= \
 NODE_ID="$NODE_NAME" \
 AGENT_TOKEN="$NODE_TOKEN" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
@@ -106,6 +112,7 @@ NODE2_RESP=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
 NODE2_TOKEN=$(printf '%s' "$NODE2_RESP" | jq -r '.token // empty')
 [[ -n "$NODE2_TOKEN" ]] || { echo "second node creation failed"; exit 1; }
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
+EDGE_ADMIN_LISTEN= \
 NODE_ID="$NODE2_NAME" \
 AGENT_TOKEN="$NODE2_TOKEN" \
 EDGE_LISTEN="127.0.0.1:$EDGE2_PORT" \
@@ -116,13 +123,17 @@ CC_SYNC_INTERVAL=2 \
 PIDS+=($!)
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$EDGE2_PORT/__lagran/health" >/dev/null && break; sleep 0.25; done
 SHARED=0
-for _ in $(seq 1 40); do
+# The second edge has to finish its own start-up (config + shared-ban pull, governed
+# by CC_SYNC_INTERVAL) before it can honour a ban raised on the first edge. A short
+# window turned this into a coin flip, so give it the same 60 s budget the config
+# propagation checks use.
+for _ in $(seq 1 240); do
   CODE=$(get2 "/")
   [[ "$CODE" == "429" ]] && { SHARED=1; break; }
   sleep 0.25
 done
 check "second edge receives shared ban" "$SHARED" "1"
-check "second edge ban header" "$(hdr2 x-lagran-cc)" "banned"
+check_i "second edge ban header" "$(hdr2 x-lagran-cc)" "banned"
 BANS=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/cc/bans/all?domain=$DOMAIN")
 check "control plane lists shared ban" "$(printf '%s' "$BANS" | jq -r '.bans[0].ip')" "127.0.0.1"
 

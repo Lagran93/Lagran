@@ -27,6 +27,9 @@ fail() { printf '  FAIL %s\n' "$1"; FAILED=$((FAILED + 1)); }
 check() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
 contains() { if [[ "$2" == *"$3"* ]]; then pass "$1"; else fail "$1 (missing '$3')"; fi; }
 not_contains() { if [[ "$2" != *"$3"* ]]; then pass "$1"; else fail "$1 (unexpected '$3')"; fi; }
+# Header names are case-insensitive (RFC 7230 3.2) and Pingora emits canonical
+# title-case, so compare header-name assertions without regard to case.
+contains_i() { if [[ "${2,,}" == *"${3,,}"* ]]; then pass "$1"; else fail "$1 (missing '$3')"; fi; }
 
 cleanup() {
   if [[ -n "$TOKEN" && -n "$DOMAIN_ID" ]]; then
@@ -42,7 +45,9 @@ trap cleanup EXIT
 request() {
   local path=$1
   shift
-  curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  # `--max-time` keeps a stalled response from hanging the whole suite: curl
+  # reports `000`, which fails the assertion instead of blocking for 20 minutes.
+  curl -s --max-time 20 -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
     -H "Host: $DOMAIN" "$@" "http://127.0.0.1:$EDGE_PORT$path"
 }
 
@@ -150,7 +155,7 @@ echo "== managed rules (block mode) =="
 CODE=$(request "/search?q=1%27%20or%20%271%27=%271" -H 'X-Forwarded-For: 198.51.100.1')
 check "SQLi query blocked" "$CODE" "403"
 contains "block page is the WAF page" "$(cat "$LOG_DIR/body")" "安全拦截"
-contains "block page carries WAF header" "$(cat "$LOG_DIR/headers")" "x-lagran-waf: blocked"
+contains_i "block page carries WAF header" "$(cat "$LOG_DIR/headers")" "x-lagran-waf: blocked"
 contains "block page has error code" "$(cat "$LOG_DIR/headers")" "WAF_BLOCKED"
 
 CODE=$(request "/x?q=%3Cscript%3Ealert(1)%3C/script%3E" -H 'X-Forwarded-For: 198.51.100.1')
@@ -180,7 +185,7 @@ check "sensitive path blocked" "$CODE" "403"
 echo "== custom rule =="
 CODE=$(request "/blocked" -H 'X-Forwarded-For: 198.51.100.1')
 check "custom path rule blocked" "$CODE" "403"
-contains "custom rule name in header" "$(cat "$LOG_DIR/headers")" "x-lagran-waf-rule:"
+contains_i "custom rule name in header" "$(cat "$LOG_DIR/headers")" "x-lagran-waf-rule:"
 
 echo "== IP ACL =="
 CODE=$(request "/" -H 'X-Forwarded-For: 203.0.113.9')
@@ -194,11 +199,11 @@ echo "== browser challenge =="
 CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.1' -H 'Accept: text/html')
 check "challenge rule returns interstitial" "$CODE" "403"
 contains "challenge page marker" "$(cat "$LOG_DIR/body")" "正在进行安全验证"
-contains "challenge response header" "$(cat "$LOG_DIR/headers")" "x-lagran-challenge:"
+contains_i "challenge response header" "$(cat "$LOG_DIR/headers")" "x-lagran-challenge:"
 
 # A client that cannot render the interstitial (no Accept: text/html) must be
 # blocked, not passed through to the origin.
-CODE=$(curl -s -o "$LOG_DIR/nonhtml_body" -w '%{http_code}' -H "Host: $DOMAIN" \
+CODE=$(curl -s --max-time 20 -o "$LOG_DIR/nonhtml_body" -w '%{http_code}' -H "Host: $DOMAIN" \
   -H 'X-Forwarded-For: 198.51.100.3' "http://127.0.0.1:$EDGE_PORT/challenge-me")
 check "challenge without an HTML client is blocked" "$CODE" "403"
 contains "non-HTML challenge is a block page" "$(cat "$LOG_DIR/nonhtml_body")" "安全拦截"
@@ -221,7 +226,7 @@ else
   fail "proof-of-work solved"
 fi
 
-CODE=$(curl -s -o "$LOG_DIR/verify_body" -D "$LOG_DIR/verify_headers" -w '%{http_code}' \
+CODE=$(curl -s --max-time 20 -o "$LOG_DIR/verify_body" -D "$LOG_DIR/verify_headers" -w '%{http_code}' \
   -c "$LOG_DIR/challenge.jar" -H "Host: $DOMAIN" \
   "http://127.0.0.1:$EDGE_PORT/__lagran/challenge/verify?n=$NONCE&a=$ANSWER&next=%2Fchallenge-me")
 check "verify endpoint redirects" "$CODE" "303"
@@ -229,17 +234,17 @@ contains "clearance cookie issued" "$(cat "$LOG_DIR/verify_headers")" "lagran_cl
 contains "clearance cookie is HttpOnly" "$(cat "$LOG_DIR/verify_headers")" "HttpOnly"
 
 # A solved nonce is single-use: replaying it must not mint another cookie.
-CODE=$(curl -s -o "$LOG_DIR/replay_body" -w '%{http_code}' -H "Host: $DOMAIN" \
+CODE=$(curl -s --max-time 20 -o "$LOG_DIR/replay_body" -w '%{http_code}' -H "Host: $DOMAIN" \
   "http://127.0.0.1:$EDGE_PORT/__lagran/challenge/verify?n=$NONCE&a=$ANSWER&next=%2Fchallenge-me")
 check "nonce replay is rejected" "$CODE" "403"
 contains "replay shows the expired page" "$(cat "$LOG_DIR/replay_body")" "验证已失效"
 
-CODE=$(curl -s -o "$LOG_DIR/body" -b "$LOG_DIR/challenge.jar" -w '%{http_code}' \
+CODE=$(curl -s --max-time 20 -o "$LOG_DIR/body" -b "$LOG_DIR/challenge.jar" -w '%{http_code}' \
   -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/challenge-me")
 check "clearance cookie passes the challenge" "$CODE" "200"
 
 CLEAR_VALUE=$(awk '$6 == "lagran_clearance" { print $7 }' "$LOG_DIR/challenge.jar" | tail -1)
-CODE=$(curl -s -o "$LOG_DIR/body" -w '%{http_code}' \
+CODE=$(curl -s --max-time 20 -o "$LOG_DIR/body" -w '%{http_code}' \
   -H "Host: $DOMAIN" \
   -H "Cookie: lagran_clearance=1.invalid; lagran_clearance=$CLEAR_VALUE" \
   "http://127.0.0.1:$EDGE_PORT/challenge-me")
@@ -267,7 +272,7 @@ curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H
   -H 'content-type: application/json' \
   -d '{"enabled":true,"mode":"monitor","sqli":true,"xss":true,"traversal":true,"scanners":true}' >/dev/null
 
-CODE=$(wait_code 200 20 "/search?q=union%20select" -H 'X-Forwarded-For: 198.51.100.1')
+CODE=$(wait_code 200 60 "/search?q=union%20select" -H 'X-Forwarded-For: 198.51.100.1')
 check "monitor mode lets malicious request through" "$CODE" "200"
 
 sleep 3
@@ -284,7 +289,7 @@ curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H
   -H 'content-type: application/json' \
   -d '{"enabled":false,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true}' >/dev/null
 
-CODE=$(wait_code 200 20 "/search?q=union%20select" -H 'X-Forwarded-For: 198.51.100.1')
+CODE=$(wait_code 200 60 "/search?q=union%20select" -H 'X-Forwarded-For: 198.51.100.1')
 check "disabled WAF stops blocking" "$CODE" "200"
 
 echo

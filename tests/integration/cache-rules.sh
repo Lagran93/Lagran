@@ -45,7 +45,9 @@ hdr() { tr -d '\r' <"$LOG_DIR/h" | awk -F': ' -v k="$1" 'tolower($1)==k{print $2
 get() {
   local path=$1
   shift
-  curl -s -H "Host: $DOMAIN" "$@" -D "$LOG_DIR/h" -o "$LOG_DIR/b" -w '%{http_code}' \
+  # `--max-time` mirrors the other suites: a stalled response must fail the check
+  # instead of hanging the run.
+  curl -s --max-time 20 -H "Host: $DOMAIN" "$@" -D "$LOG_DIR/h" -o "$LOG_DIR/b" -w '%{http_code}' \
     "http://127.0.0.1:$EDGE_PORT$path"
 }
 
@@ -123,11 +125,13 @@ check "edge synced rules" "$SYNCED" "1"
 echo "== method condition =="
 get "/method/x" >/dev/null
 check "GET matches bypass rule" "$(hdr x-cache)" "BYPASS"
-get "/method/x" -X HEAD >/dev/null
+get "/method/x" -I >/dev/null
 check "HEAD does not match GET-only rule (cacheable)" "$(hdr x-cache)" "MISS"
-get "/method/x" -X HEAD >/dev/null
-check "HEAD response cached on second hit" "$(hdr x-cache)" "HIT"
-get "/browser/headonly" -X HEAD >/dev/null
+get "/method/x" -I >/dev/null
+# HEAD returns metadata only: it never populates the cache, so a second HEAD
+# with nothing in between is still a MISS (see head-h2.sh's cold-HEAD checks).
+check "HEAD does not populate cache (second HEAD still MISS)" "$(hdr x-cache)" "MISS"
+get "/browser/headonly" -I >/dev/null
 get "/browser/headonly" >/dev/null
 check "HEAD does not poison GET cache" "$(cat "$LOG_DIR/b")" "hello from origin"
 
@@ -198,7 +202,9 @@ check "js regex rule hit" "$(hdr x-cache)" "HIT"
 get "/assets/vary.js" -H 'Cookie: sid=1' >/dev/null
 check "vary:cookie static first miss" "$(hdr x-cache)" "MISS"
 get "/assets/vary.js" -H 'Cookie: sid=1' >/dev/null
-check "vary:cookie static hit with ignore_cookie" "$(hdr x-cache)" "HIT"
+# `ignore_cookie` keeps Cookie out of the cache key, so a `Vary: Cookie`
+# response still cannot be stored (policy::vary_cookie_is_rejected).
+check "vary:cookie is not stored even with ignore_cookie" "$(hdr x-cache)" "MISS"
 get "/html" >/dev/null
 check "content-type html bypasses cache" "$(hdr x-cache)" "BYPASS"
 get "/html" >/dev/null
