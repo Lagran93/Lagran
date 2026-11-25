@@ -293,6 +293,31 @@ pub async fn reclaim_stale_prefetch_tasks(
     Ok((requeued, failed))
 }
 
+/// Fail tasks that were queued but never claimed for `age_secs`.
+///
+/// [`reclaim_stale_prefetch_tasks`] only rescues rows a worker had already
+/// claimed; a row that was never claimed is invisible to it and stays `pending`
+/// forever. Claims are FIFO and bounded per round, so one such row blocks every
+/// later task behind it: an interrupted test run left 121 of them behind and
+/// starved the next suite's warm-up until its poll window expired.
+pub async fn expire_unclaimed_prefetch_tasks(pool: &PgPool, age_secs: i64) -> sqlx::Result<u64> {
+    let failed = sqlx::query(
+        r#"
+        UPDATE prefetch_tasks
+        SET status = 'failed', finished_at = NOW(),
+            message = 'expired: never claimed by a worker'
+        WHERE status = 'pending'
+          AND created_at < NOW() - make_interval(secs => $1)
+        "#,
+    )
+    .bind(age_secs)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(failed)
+}
+
 /// Recent prefetch tasks for the v2 console view, optionally restricted to a
 /// set of domain names.
 ///

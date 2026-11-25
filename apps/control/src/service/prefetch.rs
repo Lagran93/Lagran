@@ -15,6 +15,11 @@ const STALE_TASK_SECS: i64 = 900;
 /// Attempts allowed before an abandoned task is failed instead of retried.
 const MAX_ATTEMPTS: i32 = 3;
 
+/// How long a task may sit unclaimed before it is failed. Normal warm-ups are
+/// claimed within one or two 15 s rounds; a longer wait means the worker was down
+/// or the queue was jammed, and the task has lost its value.
+const UNCLAIMED_TASK_SECS: i64 = 300;
+
 #[derive(Deserialize)]
 struct EdgePrefetchReply {
     success: bool,
@@ -98,6 +103,15 @@ async fn run_once(state: &AppState) -> Result<(), sqlx::Error> {
             // healthy tasks from running.
             tracing::warn!(error = %e, "reclaim prefetch tasks failed");
         }
+    }
+    // A worker that was killed mid-round leaves `pending` rows nobody owns; they
+    // are claimed FIFO, so they would delay every later task indefinitely.
+    match repository::expire_unclaimed_prefetch_tasks(&state.pool, UNCLAIMED_TASK_SECS).await {
+        Ok(expired) if expired > 0 => {
+            tracing::warn!(expired, "expired unclaimed prefetch tasks");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "expire unclaimed prefetch tasks failed"),
     }
     enqueue_due_schedules(state).await?;
     let tasks = repository::claim_prefetch_tasks(&state.pool, 20).await?;
