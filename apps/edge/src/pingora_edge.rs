@@ -839,6 +839,24 @@ impl ProxyHttp for DataPlaneProxy {
             // a second time for this client request.
             ctx.preflight_done = true;
         }
+        // A node disabled from the console keeps serving nothing but its management
+        // endpoints (health, heartbeat, purge). Answer here rather than falling back
+        // to the in-process engine: the page goes out through `write_axum_response`,
+        // so it carries the pingora datapath marker and the access log records the
+        // refusal instead of an anonymous legacy hand-off.
+        if !self.state.node_control.is_serving() {
+            ctx.cache_label = "NODE_DISABLED";
+            ctx.status = StatusCode::SERVICE_UNAVAILABLE.as_u16();
+            let is_head = ctx.method == Method::HEAD;
+            write_axum_response(
+                session,
+                default_page::node_disabled_page(&ctx.host),
+                is_head,
+                Some(&self.compression),
+            )
+            .await;
+            return Ok(true);
+        }
         if self.try_large_revalidation(session, ctx, &domain).await? {
             return Ok(true);
         }
@@ -2698,9 +2716,6 @@ impl DataPlaneProxy {
         // (real representation length, no body), a miss proxies the HEAD request
         // itself so the origin supplies the length and nothing is written to the
         // cache. Both stay inside Pingora.
-        if !self.state.node_control.is_serving() {
-            return Some(LegacyFallback::NodeDisabled);
-        }
         // Strict client revalidation has a dedicated conditional-origin path in
         // the in-process engine (304 refresh). Keep it off the native cache
         // fast path so a stale body is never served on max-age=0/no-cache.
