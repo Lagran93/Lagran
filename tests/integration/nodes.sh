@@ -44,7 +44,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-api() { curl -s -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' "$@"; }
+# `--max-time` keeps a stalled control plane from hanging the suite: curl then
+# reports `000` and the assertion fails instead of blocking forever.
+api() { curl -s --max-time 15 -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' "$@"; }
 
 echo "== build mock origin =="
 MOCK_BIN="$ROOT/target/mock-origin"
@@ -97,17 +99,19 @@ else
   fail "node token looks random"
 fi
 contains "binary command carries control url" "$(printf '%s' "$CREATE" | jq -r '.commands.binary')" \
-  "CONTROL_URL=http://127.0.0.1:$CONTROL_PORT"
+  "export CONTROL_URL='http://127.0.0.1:$CONTROL_PORT'"
 contains "binary command carries node id" "$(printf '%s' "$CREATE" | jq -r '.commands.binary')" \
-  "NODE_ID=$NODE_NAME"
+  "export NODE_ID='$NODE_NAME'"
+# The management bind follows AGENT_URL, which this fixture sets to the edge port.
 contains "binary command carries admin listener" "$(printf '%s' "$CREATE" | jq -r '.commands.binary')" \
-  "EDGE_ADMIN_LISTEN=0.0.0.0:8081"
+  "export EDGE_ADMIN_LISTEN='127.0.0.1:$EDGE_PORT'"
 contains "binary command uses data port 80" "$(printf '%s' "$CREATE" | jq -r '.commands.binary')" \
   "EDGE_LISTEN=0.0.0.0:80"
 contains "docker command publishes data port" "$(printf '%s' "$CREATE" | jq -r '.commands.docker')" \
   "-p 80:80"
-contains "docker command publishes admin port" "$(printf '%s' "$CREATE" | jq -r '.commands.docker')" \
-  "-p 8081:8081"
+# The container binds the management port internally; the published port is 80 only.
+contains "docker command carries admin listener" "$(printf '%s' "$CREATE" | jq -r '.commands.docker')" \
+  "-e EDGE_ADMIN_LISTEN=127.0.0.1:8081"
 contains "docker command carries token" "$(printf '%s' "$CREATE" | jq -r '.commands.docker')" "$NODE_TOKEN"
 
 LIST=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes")
@@ -193,7 +197,7 @@ if [[ "$CPU" != "null" ]]; then pass "heartbeat reports cpu ($CPU)"; else fail "
 
 CODE=""
 for _ in $(seq 1 40); do
-  CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
+  CODE=$(curl -s --max-time 15 -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
   [[ "$CODE" == "200" ]] && break
   sleep 0.5
 done
@@ -203,19 +207,23 @@ echo "== disable / enable =="
 api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/$NODE_ID/status" -d '{"enabled":false}' >/dev/null
 DISABLED=""
 for _ in $(seq 1 20); do
-  CODE=$(curl -s -o "$LOG_DIR/body" -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
+  CODE=$(curl -s --max-time 15 -D "$LOG_DIR/h" -o "$LOG_DIR/body" -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
   [[ "$CODE" == "503" ]] && break
   sleep 0.5
 done
 check "disabled node returns 503" "$CODE" "503"
 contains "disabled page copy" "$(cat "$LOG_DIR/body")" "节点已停用"
+# 阶段 3: the disabled page is answered inside Pingora instead of falling back
+# to the in-process engine, so it must carry the datapath marker.
+check "disabled page is served by Pingora" \
+  "$(tr -d '\r' <"$LOG_DIR/h" | awk -F': ' 'tolower($1)=="x-lagran-datapath"{print $2}' | head -1)" "pingora"
 STILL=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" | jq -r --arg id "$NODE_ID" \
   '.[] | select(.id == $id) | .status')
 check "heartbeat keeps disabled status" "$STILL" "disabled"
 
 api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/$NODE_ID/status" -d '{"enabled":true}' >/dev/null
 for _ in $(seq 1 20); do
-  CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
+  CODE=$(curl -s --max-time 15 -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
   [[ "$CODE" == "200" ]] && break
   sleep 0.5
 done

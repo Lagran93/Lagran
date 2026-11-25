@@ -27,6 +27,9 @@ pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=$((FAILED + 1)); }
 check() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
 contains() { if [[ "$2" == *"$3"* ]]; then pass "$1"; else fail "$1 (missing '$3' in: ${2:0:200})"; fi; }
+# Header names and token values are case-insensitive on the wire (HTTP/1.1 3.2) and
+# Pingora emits canonical title-case, so header assertions compare without case.
+contains_h() { local hay="${2,,}" needle="${3,,}"; if [[ "$hay" == *"$needle"* ]]; then pass "$1"; else fail "$1 (missing '$3' in: ${2:0:200})"; fi; }
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null; done
   wait 2>/dev/null
@@ -157,9 +160,9 @@ done
 
 echo "== cache behaviour =="
 H1=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
-contains "first /cached is MISS" "$H1" "x-cache: MISS"
+contains_h "first /cached is MISS" "$H1" "x-cache: MISS"
 H2=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
-contains "second /cached is HIT" "$H2" "x-cache: HIT"
+contains_h "second /cached is HIT" "$H2" "x-cache: HIT"
 contains "hit carries Age" "$(printf '%s' "$H2" | tr '[:upper:]' '[:lower:]')" "age:"
 
 ETAG=$(printf '%s' "$H2" | awk 'tolower($1)=="etag:" {print $2}' | tr -d '\r')
@@ -171,45 +174,47 @@ contains "range request is served 206/partial" "$RANGE_HDR" "206 Partial Content
 contains "range request carries content-range" "$(printf '%s' "$RANGE_HDR" | tr '[:upper:]' '[:lower:]')" "content-range:"
 
 SWR1=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/swr")
-contains "swr first request is MISS" "$SWR1" "x-cache: MISS"
+contains_h "swr first request is MISS" "$SWR1" "x-cache: MISS"
 sleep 2
 SWR2=$(curl -s -D "$LOG_DIR/swr2.h" -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/swr" && cat "$LOG_DIR/swr2.h")
-contains "swr stale window serves STALE" "$(printf '%s' "$SWR2" | tr '[:upper:]' '[:lower:]')" "x-cache: stale"
+contains_h "swr stale window serves STALE" "$(printf '%s' "$SWR2" | tr '[:upper:]' '[:lower:]')" "x-cache: stale"
 
 H3=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/nostore")
 H4=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/nostore")
-contains "no-store first MISS" "$H3" "x-cache: MISS"
-contains "no-store second MISS" "$H4" "x-cache: MISS"
+contains_h "no-store first MISS" "$H3" "x-cache: MISS"
+contains_h "no-store second MISS" "$H4" "x-cache: MISS"
 
 H5A=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/private")
 H5B=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/private")
-contains "private first MISS" "$H5A" "x-cache: MISS"
-contains "private is never stored" "$H5B" "x-cache: MISS"
+contains_h "private first MISS" "$H5A" "x-cache: MISS"
+contains_h "private is never stored" "$H5B" "x-cache: MISS"
 
 H5C=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/expires")
 H5D=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/expires")
-contains "expires first MISS" "$H5C" "x-cache: MISS"
-contains "expires TTL honoured (HIT)" "$H5D" "x-cache: HIT"
+contains_h "expires first MISS" "$H5C" "x-cache: MISS"
+contains_h "expires TTL honoured (HIT)" "$H5D" "x-cache: HIT"
 
 echo "== vary: accept-language =="
 curl -s -D "$LOG_DIR/vary_en.h" -o "$LOG_DIR/vary_en.b" -H "Host: $DOMAIN" -H 'Accept-Language: en-US,en;q=0.9' "http://127.0.0.1:$EDGE_PORT/vary" >/dev/null
 curl -s -D "$LOG_DIR/vary_zh.h" -o "$LOG_DIR/vary_zh.b" -H "Host: $DOMAIN" -H 'Accept-Language: zh-CN,zh;q=0.9' "http://127.0.0.1:$EDGE_PORT/vary" >/dev/null
 curl -s -D "$LOG_DIR/vary_en2.h" -o "$LOG_DIR/vary_en2.b" -H "Host: $DOMAIN" -H 'Accept-Language: en-US,en;q=0.9' "http://127.0.0.1:$EDGE_PORT/vary" >/dev/null
-contains "accept-language en is separate MISS" "$(tr '[:upper:]' '[:lower:]' < "$LOG_DIR/vary_en.h")" "x-cache: miss"
-contains "accept-language zh does not reuse en" "$(tr '[:upper:]' '[:lower:]' < "$LOG_DIR/vary_zh.h")" "x-cache: miss"
-contains "accept-language en caches independently" "$(tr '[:upper:]' '[:lower:]' < "$LOG_DIR/vary_en2.h")" "x-cache: hit"
+contains_h "accept-language en is separate MISS" "$(tr '[:upper:]' '[:lower:]' < "$LOG_DIR/vary_en.h")" "x-cache: miss"
+contains_h "accept-language zh does not reuse en" "$(tr '[:upper:]' '[:lower:]' < "$LOG_DIR/vary_zh.h")" "x-cache: miss"
+contains_h "accept-language en caches independently" "$(tr '[:upper:]' '[:lower:]' < "$LOG_DIR/vary_en2.h")" "x-cache: hit"
 contains "en body preserved" "$(cat "$LOG_DIR/vary_en2.b")" "lang=en-US,en;q=0.9"
 contains "zh body is not en" "$(cat "$LOG_DIR/vary_zh.b")" "lang=zh-CN,zh;q=0.9"
 
 echo "== per-domain rule isolation =="
 H7=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN2" "http://127.0.0.1:$EDGE_PORT/cached")
-contains "second domain bypass rule applies there" "$H7" "x-cache: BYPASS"
+contains_h "second domain bypass rule applies there" "$H7" "x-cache: BYPASS"
 H8=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
-contains "first domain still HIT (no cross-domain pollution)" "$H8" "x-cache: HIT"
+contains_h "first domain still HIT (no cross-domain pollution)" "$H8" "x-cache: HIT"
 
 echo "== head shares GET cache =="
-HEAD_CACHED=$(curl -s -D - -o /dev/null -X HEAD -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached" | tr '[:upper:]' '[:lower:]')
-contains "HEAD hits the GET cache entry" "$HEAD_CACHED" "x-cache: hit"
+# `-I` is curl's real HEAD mode; `-X HEAD` makes curl wait for the body a HEAD
+# response advertises through Content-Length (real length since 阶段 2).
+HEAD_CACHED=$(curl -s -D - -o /dev/null -I -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached" | tr '[:upper:]' '[:lower:]')
+contains_h "HEAD hits the GET cache entry" "$HEAD_CACHED" "x-cache: hit"
 
 echo "== etag is content-based =="
 curl -s -D "$LOG_DIR/etag1_miss.h" -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/etag" >/dev/null
@@ -230,13 +235,13 @@ fi
 
 echo "== bypass rule + POST forwarding =="
 H5=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/api/data")
-contains "rule bypass is labelled BYPASS" "$H5" "x-cache: BYPASS"
+contains_h "rule bypass is labelled BYPASS" "$H5" "x-cache: BYPASS"
 POST_BODY=$(curl -s -X POST -H "Host: $DOMAIN" -H 'content-type: text/plain' -H 'x-custom: yes' \
   --data 'ping' "http://127.0.0.1:$EDGE_PORT/echo")
 contains "POST method forwarded" "$POST_BODY" '"method":"POST"'
 contains "POST body forwarded" "$POST_BODY" '"echo":"ping"'
 contains "custom header forwarded" "$POST_BODY" '"x_custom":"yes"'
-contains "POST labelled DYNAMIC" "$(curl -s -D - -o /dev/null -X POST -H "Host: $DOMAIN" --data x "http://127.0.0.1:$EDGE_PORT/echo")" "x-cache: DYNAMIC"
+contains_h "POST labelled DYNAMIC" "$(curl -s -D - -o /dev/null -X POST -H "Host: $DOMAIN" --data x "http://127.0.0.1:$EDGE_PORT/echo")" "x-cache: DYNAMIC"
 POST_CC=$(curl -s -X POST -H "Host: $DOMAIN" -H 'content-type: text/plain' -H 'Cache-Control: no-store' \
   --data 'cc' "http://127.0.0.1:$EDGE_PORT/echo")
 contains "dynamic request keeps Cache-Control" "$POST_CC" '"cache_control":"no-store"'
@@ -263,14 +268,18 @@ PURGE=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/purge" -H "$AUTH"
   -d "{\"domain\":\"$DOMAIN\",\"prefixes\":[\"/cached\"]}")
 contains "purge dispatched" "$PURGE" '"success":true'
 H6=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/cached")
-contains "after purge it is MISS again" "$H6" "x-cache: MISS"
+contains_h "after purge it is MISS again" "$H6" "x-cache: MISS"
 
 echo "== origin failure page =="
 curl -s -D "$LOG_DIR/down.hdr" -o "$LOG_DIR/down.html" -H "Host: $DOWN" \
   "http://127.0.0.1:$EDGE_PORT/some-missing-asset.js" -w '%{http_code}' >"$LOG_DIR/down.code" || true
 DOWN_CODE=$(cat "$LOG_DIR/down.code")
-if [[ "$DOWN_CODE" == "502" || "$DOWN_CODE" == "503" ]]; then
-  pass "origin-down returns 502/503 (got $DOWN_CODE)"
+# Pingora classifies the failure and `default_page::OriginFailure` owns the status
+# table: Unreachable → 502, Unhealthy → 503, Timeout → 504. The categories are
+# asserted through `x-lagran-error: ORIGIN_*` below, so accept any of the three
+# instead of pinning the one this fixture happens to trigger.
+if [[ "$DOWN_CODE" == "502" || "$DOWN_CODE" == "503" || "$DOWN_CODE" == "504" ]]; then
+  pass "origin-down returns a 5xx origin-failure status (got $DOWN_CODE)"
 else
   fail "origin-down status (got $DOWN_CODE)"
 fi
