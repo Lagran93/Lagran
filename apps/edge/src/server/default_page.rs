@@ -324,6 +324,32 @@ pub fn node_disabled_page(host: &str) -> Response {
     response
 }
 
+/// Page returned when a domain's origin configuration cannot be parsed.
+///
+/// This is a control-plane input error rather than an origin outage: the domain
+/// exists and passed preflight, but its `origin_url` does not name a usable
+/// origin. Answering here (instead of falling back to the in-process engine)
+/// makes the misconfiguration visible and stops it from costing legacy resources.
+pub fn config_error_page(host: &str) -> Response {
+    let host_esc = html_escape(host);
+    let body = format!(
+        r#"<h1>源站配置无效</h1>
+    <p>该域名在控制面中的回源地址无法解析，边缘节点已拒绝代理请求。</p>
+    <p>请求信息：域名 <code>{host_esc}</code></p>
+    <p>如果你是访客：请联系站点管理员修正回源配置。</p>
+    <p>如果你是管理员：请在控制台「域名」中检查主源站的协议、主机与端口（以及 JSON 源站池中的 URL）。</p>"#
+    );
+
+    render_page(
+        StatusCode::BAD_GATEWAY,
+        "配置错误",
+        "源站配置无效",
+        &body,
+        "UNSUPPORTED_ORIGIN_URL",
+        true,
+    )
+}
+
 /// Page for a Host that has not been onboarded to this edge.
 pub fn unknown_domain_page(host: &str) -> Response {
     let host_esc = html_escape(host);

@@ -857,6 +857,26 @@ impl ProxyHttp for DataPlaneProxy {
             .await;
             return Ok(true);
         }
+        // A domain whose origin configuration cannot be parsed is a control-plane
+        // input error. Answer 502 here instead of handing the request to the
+        // in-process engine: the legacy path would only fail the same way after a
+        // wasted round trip, and `UNSUPPORTED_ORIGIN_URL` names the real problem.
+        // `config_sync` derives `origin_url` from the (sorted) origin pool, so a
+        // parse failure means the pool itself is unusable.
+        if parse_origin(&domain.origin_url).is_none() {
+            self.state.metrics.record_config_error();
+            ctx.cache_label = "CONFIG_ERROR";
+            ctx.status = StatusCode::BAD_GATEWAY.as_u16();
+            let is_head = ctx.method == Method::HEAD;
+            write_axum_response(
+                session,
+                default_page::config_error_page(&ctx.host),
+                is_head,
+                Some(&self.compression),
+            )
+            .await;
+            return Ok(true);
+        }
         if self.try_large_revalidation(session, ctx, &domain).await? {
             return Ok(true);
         }
@@ -2732,11 +2752,11 @@ impl DataPlaneProxy {
         if let Some(blocker) = self.plan_blocker(session) {
             return blocker;
         }
-        // A blocker-free request that still produced no plan has no usable
-        // origin target: `native_plan` fails exactly there.
-        if parse_origin(&domain.origin_url).is_none() {
-            return LegacyFallback::ParseOrigin;
-        }
+        // `request_filter` answers an unparseable `origin_url` with a 502 before it
+        // reaches this point, so this is not an origin-configuration fallback any
+        // more; labelling it `parse_origin` would make the metric disagree with the
+        // actual routing decision.
+        let _ = domain;
         LegacyFallback::Other
     }
 
@@ -4627,6 +4647,15 @@ impl DataPlaneProxy {
                 // Same exposition as the admin listener: the per-reason fallback
                 // counters are what the migration is measured with.
                 body.push_str(&self.state.metrics.legacy_fallbacks().prometheus_lines());
+                // Origin configuration refusals are counted globally, not per domain:
+                // they point at a control-plane input error, not at traffic shape.
+                body.push_str(&format!(
+                    "# HELP lagran_edge_config_errors_total Requests refused because the domain origin config is unusable\n\
+                     # TYPE lagran_edge_config_errors_total counter\n\
+                     lagran_edge_config_errors_total {}
+",
+                    self.state.metrics.config_errors(),
+                ));
                 write_plain(
                     session,
                     200,

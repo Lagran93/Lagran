@@ -230,6 +230,9 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
          # HELP lagran_edge_origin_errors_total Origin failures\n\
          # TYPE lagran_edge_origin_errors_total counter\n\
          lagran_edge_origin_errors_total {}\n\
+         # HELP lagran_edge_config_errors_total Requests refused because the domain origin config is unusable\n\
+         # TYPE lagran_edge_config_errors_total counter\n\
+         lagran_edge_config_errors_total {}\n\
          # HELP lagran_edge_origin_stream_requests_total Streaming origin responses\n\
          # TYPE lagran_edge_origin_stream_requests_total counter\n\
          lagran_edge_origin_stream_requests_total {}\n\
@@ -286,6 +289,7 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
          lagran_edge_chunk_origin_failures_total {}\n",
         global.origin_timeouts,
         global.origin_errors,
+        global.config_errors,
         global.stream_requests,
         global.stream_bytes,
         global.stream_errors,

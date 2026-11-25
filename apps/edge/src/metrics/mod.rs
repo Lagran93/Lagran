@@ -171,6 +171,10 @@ pub struct EdgeMetrics {
     datapath_legacy: AtomicU64,
     /// Why each legacy fallback happened (see [`LegacyFallback`]).
     legacy_fallback: LegacyFallbackCounters,
+    /// Requests refused with a 502 because the domain's origin configuration could
+    /// not be parsed. A non-zero value means the control plane accepted a domain
+    /// whose `origin_url`/`origin` fields do not form a usable origin.
+    config_errors: AtomicU64,
     chunk_requests: AtomicU64,
     chunk_origin_runs: AtomicU64,
     chunk_fallbacks: AtomicU64,
@@ -193,6 +197,7 @@ pub struct EdgeMetrics {
 pub struct GlobalSnapshot {
     pub origin_timeouts: u64,
     pub origin_errors: u64,
+    pub config_errors: u64,
     pub stream_requests: u64,
     pub stream_bytes: u64,
     pub stream_errors: u64,
@@ -298,6 +303,19 @@ impl EdgeMetrics {
         self.origin_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a request refused because the domain's origin configuration is unusable.
+    ///
+    /// This is the runtime half of the control-plane `origin_url` validation: if it
+    /// ever fires, a bad configuration reached an edge and should be fixed there
+    /// rather than silently falling back to the in-process engine.
+    pub fn record_config_error(&self) {
+        self.config_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn config_errors(&self) -> u64 {
+        self.config_errors.load(Ordering::Relaxed)
+    }
+
     pub fn record_stream_start(&self) {
         self.stream_requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -399,6 +417,7 @@ impl EdgeMetrics {
         GlobalSnapshot {
             origin_timeouts: self.origin_timeouts.load(Ordering::Relaxed),
             origin_errors: self.origin_errors.load(Ordering::Relaxed),
+            config_errors: self.config_errors.load(Ordering::Relaxed),
             stream_requests: self.stream_requests.load(Ordering::Relaxed),
             stream_bytes: self.stream_bytes.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),
