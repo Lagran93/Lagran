@@ -84,7 +84,7 @@ legacy 数据面今天仍会被进入的路径只有下面 6 条。唯一出口�
 | 3 | 严格重校验失败（6 种，见下） | `pingora_edge.rs:2110-2456` | 删缓存 → legacy 全量回源 | 阶段 4：Pingora 内闭环（已实现） |
 | 4 | 未知 host 且注册表为空 | `pingora_edge.rs:786-799` | single-origin（`handler.rs:537-562`） | 阶段 3：改原生静态默认域名（已实现） |
 | 5 | `parse_origin` 失败 | `pingora_edge.rs:2832` | 回落 legacy | 阶段 3：直出 502 + 配置校验 |
-| 6 | 缓存诊断直调 legacy | `server/cache_diag.rs:115` | 诊断测的是 legacy 行为 | 阶段 5：改走 loopback 真实路径 |
+| 6 | 缓存诊断直调 legacy | `server/cache_diag.rs:115` | 诊断测的是 legacy 行为 | 阶段 5：改走 loopback 真实路径（已实现） |
 
 ### 第 3 类的 6 种情形
 
@@ -360,10 +360,10 @@ computed validator、origin 500、origin 超时三种情形均由 `x-lagran-data
 - `tests/integration/strict-revalidation.sh`：独立起控制面 + 边缘，`ORIGIN_READ_TIMEOUT_MS=1500`
   让超时用例快速失败；断言三种情形与 `strict_revalidation` 计数不变。
 
-### 阶段 5：缓存诊断改走真实路径（1 天）
+### 阶段 5：缓存诊断改走真实路径（1 天）—— ✅ 已完成
 
-`server/cache_diag.rs:115` 现在直接调 `proxy_handler`，也就是说控制台的
-"缓存诊断"测的是 legacy 行为，不是生产 Pingora 行为。改为与 prefetch 相同：
+`server/cache_diag.rs:115` 原来直接调 `proxy_handler`，也就是说控制台的
+"缓存诊断"测的是 legacy 行为，不是生产 Pingora 行为。现已改为与 prefetch 相同：
 向 `state.local_http_addr` 的 loopback 公共监听发 HTTP（`server/prefetch.rs:57`
 已有先例），走真实 Pingora 路径。
 
@@ -371,6 +371,24 @@ computed validator、origin 500、origin 超时三种情形均由 `x-lagran-data
 
 验收：`cache-diagnostics.sh` 的 diagnose 段全绿，并断言诊断返回的 headers 里可见
 `x-lagran-datapath: pingora`。
+
+落地说明（阶段 5，已实现）：
+
+- `diag_handler` 不再调用 `proxy_handler`，而是用 `OriginClient::request_stream_with_sni`
+  把请求发给 `http://{local_http_addr}`（Pingora 公共监听），构造 `Host`、
+  `X-Forwarded-Proto`（按 `scheme`，默认 https）、可选 cookie/authorization/cache-control/range，
+  并只读取前 300 字节做预览；状态码与 `x-cache`/`x-cache-status`/`x-lagran-cache-reason`/
+  `x-lagran-datapath` 等响应头原样回传。
+- **关键坑**：`prepare_proxy_headers` 在 `TRUST_PROXY_HEADERS=false`（默认）时会丢弃客户端
+  的 `X-Forwarded-Proto` 并按真实连接 scheme 重写为 `http`，于是 https 诊断会被 HTTPS 强制
+  跳转成 301。为此新增一个仅作用于 **scheme 解析** 的内部标记：loopback 对端 + 固定头
+  `x-lagran-internal-request: 1` + 证明进程内身份的 `x-lagran-internal-token`（即
+  `state.prefetch_token`）。命中时 `prepare_proxy_headers` 只采纳 `X-Forwarded-Proto`，
+  **不**像 prefetch 标记那样跳过 preflight——WAF/CC/限流仍照常执行。两个内部头在
+  `prepare_proxy_headers` 内即被移除，不会到达源站。
+- `selected_header_names()`（控制面直连兜底路径）和边缘 `selected` 列表都加入
+  `x-lagran-datapath`；`cache-diagnostics.sh` 新增断言"diagnose ran on the Pingora data plane"。
+- 这解除了 `handle_in_process` 的最后一个非路由性调用者（缓存诊断），阶段 6 可删除 legacy。
 
 ### 阶段 6：删除 legacy 数据面（2-3 天）
 
