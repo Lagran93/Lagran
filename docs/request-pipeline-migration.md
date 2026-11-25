@@ -185,7 +185,7 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
   `use` 它。彻底解耦（把 `AppState` 移到 `server/state.rs`）放到阶段 6 的共享工具落位，
   否则本阶段会变成跨十几个文件的类型搬迁，失去"可单独回滚"的性质。
 
-### 阶段 2：HEAD 原生化（3-5 天）
+### 阶段 2：HEAD 原生化（3-5 天）—— ✅ 已完成
 
 设计：**HEAD 不进入 Pingora 代理，而是在 `request_filter` 内自应答**，与
 `try_normal_revalidation` 的做法一致，最后用 `write_axum_response(session, resp, true, …)`
@@ -220,6 +220,22 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 - `head-h2.sh` 全绿，且 warm/cold 四条断言都带 `x-lagran-datapath: pingora`；
 - 新增：同一 keepalive 连接连续两次 `curl -I`，验证不因 HEAD 挂住连接；
 - 新增：16 MiB 的 `/huge` HEAD 不产生 `origin failed`。
+
+落地说明（实际实现）：
+
+- 真正的闸门是阶段 0 加进 `plan_blocker` 的 HEAD 分支（`LegacyFallback::Head`）；
+  `native_plan` 本身早就可以产出 `is_head` 计划。删掉该分支后，HEAD 在 `request_filter`
+  内自应答（缓存命中 → `serve_head_cache`），未命中则以 HEAD 转发上游，不再进 legacy；
+- `serve_head_cache` 的 `is_h2 ? len : 0` 改为**始终** `entry.body.len()`，H1 也报真实
+  表示长度；并补上 `x-lagran-datapath: pingora`（它是唯一漏加该头的原生响应路径，其余
+  路径在 `upstream_response_filter` / `write_axum_response` 里加）；
+- 删掉 HEAD 死代码：`response_filter` 的 `content-length: 0` 覆盖与 `head_headers` /
+  `head_status` 暂存、`body_filter` 的 `ctx.head_body` 累积、`logging` 的 HEAD 落盘
+  （原先会拿 HEAD 正文回填缓存，违背"不预热"原则），以及 `ReqCtx` 的三个字段。
+  `NativePlan::is_head` 由死代码转为**活跃**代码，保留；
+- `head_content_length_for_protocol` 未改动：它早已对 H1/H2 都返回真实长度；
+- `cache-diagnostics.sh` 的 HEAD 断言从「计 1 次 legacy」翻转为「`head` 增量 0 且响应带
+  `pingora`」。
 
 ### 阶段 3：确定性兜底改为直出（1-2 天）
 
@@ -367,6 +383,12 @@ sum(rate(lagran_edge_datapath_legacy_total[5m]))
    所以 `prefetch worker started`、`prefetch worker failed` 都不会出现，容易误判"worker
    没启动"。排障需显式 `RUST_LOG=control=debug,…`（实测该配置下可见
    `prefetch worker started interval=15s` 与 `claim … rows_returned=20`）。
+10. **`p2-hardening.sh` 会毒化后续预取队列**：它的 SEC-NEW-05 用例排队 120 条预热路径并
+    创建一条 60 分钟的周期任务，脚本结束即 kill 控制面，于是留下 121 条 `pending` 与一条
+    `enabled` 调度。修法（已落地）：脚本退出前删除自己创建的调度
+    （`DELETE /api/v1/prefetch/schedules/:id`）、并把队列排空后再退出；产品侧同时新增
+    `repository::expire_unclaimed_prefetch_tasks`，把 5 分钟仍未被领取的 `pending` 标记
+    为 `failed`（`reclaim_stale_prefetch_tasks` 只管 `running`，未领取的行此前永不过期）。
 
 ### 发现：`write_axum_response` 的流式分支不定界（阶段 1 内已修）
 
