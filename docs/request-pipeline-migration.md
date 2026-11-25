@@ -425,7 +425,8 @@ computed validator、origin 500、origin 超时三种情形均由 `x-lagran-data
 | `ws-echo.sh` | WebSocket 隧道 | 全绿（已是 native） |
 | `waf.sh` / `cc.sh` / `cache-rules.sh` | preflight 策略 | ✅ 全绿（阶段 1） |
 | `p2-hardening.sh` | SSRF / 限流 / 日志摄入 | 全绿 |
-| `smoke.sh` / `dead-origin.sh` / `multi-origin.sh` | 回源与故障切换 | 阶段 3/4 后全绿 |
+| `smoke.sh` / `dead-origin.sh` / `multi-origin.sh` | 回源与故障切换 | ✅ 全绿（阶段 4 修复后） |
+| `failover-https.sh` | 备份回源切换 + HTTPS 跳转 | ✅ 全绿（阶段 4 修复后） |
 | `single-origin.sh` | 无控制面时任意 Host 走原生单源 | ✅ 全绿 + 断言 `pingora` + 6 个 reason |
 | `strict-revalidation.sh` | no-cache 重校验的 computed / origin 500 / 超时 | ✅ 全绿 + 断言 `pingora` + `strict_revalidation` 不增长 |
 
@@ -536,27 +537,35 @@ keep-alive 连接上时，客户端会一直等一个永远不来的 EOF：`waf.
 （内存 body 的 hint 是精确值）；同时在写入字节数与声明长度不一致时 `warn!`，避免把
 错误的长度静默写给客户端。未知长度的流式响应行为不变（仍由关闭连接定界）。
 
-### 发现：kill 主源后不切备份（阶段 3/4 前置）
+### 已修复：kill 主源后不切备份
 
-`failover-https.sh` 仍有 4 项失败，且是**同一根因**：
+`failover-https.sh` 曾有 4 项失败，同一根因：**一次请求内不会从失败的最优先层降到
+下一优先级层**。三处缺陷，已全部修掉：
 
-- legacy 侧：`origin_sequence`（`handler.rs:180-235`）先按健康过滤，再
-  `retain(|o| o.priority == min_priority)`，备份是 `priority: 1`；而
-  `is_origin_healthy` 在无记录时默认 `true`（`agent/origin_health.rs:63-73`），
-  主源刚被 kill 时仍算健康 → **备份在发请求前就被剪掉**；
-- native 侧：`record_origin_failure` 已经会在硬失败时立即置不健康
-  （`pingora_edge.rs:1299-1312`），但若是 `ConnectRefused` 且首选地址不可达，
-  一次请求内不会换地址/换层；
-- 环境放大器：测试机 `localhost` 优先解析 `::1`，而 `tools/mock-origin` 只绑
-  `127.0.0.1`，即使选中备份也会连不上；
-- 连带失败：脚本末尾 `disabling HTTPS redirect takes effect` 依赖 `/page` 返回 200，
-  主源被杀后未恢复 → 恒为 502。
+- `origin_sequence`（`handler.rs`）与 `origin_order`（`pingora_edge.rs`）原先先按健康
+  过滤、再 `retain(priority == min_priority)`，备份是 `priority: 1`，于是在发请求前就被
+  剪掉；当整层都不健康时又会 `candidates = pool` 但随后仍被剪回最优先层 → 备份永远不选中。
+  **修法**：改为 `layered_order` / `layered_origin_order`——健康源站按 `priority` 升序分层、
+  同层内加权轮转，**不再 pre-prune** 备份；不健康的源站整体追加在所有健康层之后作为最后
+  兜底。`upstream_peer` 的 `ctx.attempt` / `advance_peer` 因此能在一次请求内跨层推进。
+- `fail_to_connect` 原先只 `advance_peer`、不写健康表（只有 `error_while_proxy` 才
+  `record_origin_failure`），`ConnectRefused` 学不到 → 主源死后每个请求都重新选它。
+  **修法**：连接失败也在 `fail_to_connect` 里 `record_origin_failure`，首个失败请求即让
+  健康表记住，后续请求直接走备份。
+- 测试侧：`failover-https.sh` 的 `get()` 与 `multi-origin.sh` 的故障切换/动态请求补
+  `--max-time`（否则 502/504 错误页会挂住 curl）；`multi-origin.sh` 的边缘补
+  `ORIGIN_READ_TIMEOUT_MS=1500`，让 `/slow`（3s）真正触发读超时（`origin_timeout_ms` 只是
+  连接超时，读超时是全局项）。
 
-结论：`failover-https.sh` 不在阶段 0 的验收矩阵内（矩阵里回源/故障切换由
-`smoke.sh`/`dead-origin.sh`/`multi-origin.sh` 承担），因此**不阻塞阶段 0**；但上述
-"一次请求内不降级到下一优先级层"是真实语义缺口，须在阶段 3/4 的
-`dead-origin.sh`/`multi-origin.sh` 验收前修掉（修法：`origin_order` 返回按优先级
-分层的有序列表，最低层全部失败即试下一层；native 路径可复用 `ctx.attempt`）。
+验收（已跑绿）：`failover-https.sh` 的「首个请求即由备份服务（200 + 备份 `X-Origin-Port`）」
+「备份收到自己的 Host」「bypass/API 也故障切换」「HTTPS 跳转开关」全过；`multi-origin.sh`
+的「priority-1 接管」「读超时切下一个源站」「权重分布」「priority-1 平时不接流量」全过。
+单测 `pingora_edge::tests::layered_order_keeps_backup_after_primary_layer` 锁定分层顺序。
+
+遗留（既有、非本次引入）：`default_page` 的源站错误页（502/504）按"关闭连接"定界、不带
+`Content-Length`，所以任何**不带 `--max-time`** 的客户端会在读完全文后继续等 EOF。已在
+`smoke.sh` 的 down 请求上加 `--max-time` 遵从项目"请求一律带超时"的约定；页面正文本身完整
+（实测 7203 字节）。这是一处独立的响应分帧改进项。
 
 ## 工作量
 
