@@ -1338,6 +1338,21 @@ impl ProxyHttp for DataPlaneProxy {
         e: Box<pingora::Error>,
     ) -> Box<pingora::Error> {
         let mut e = e;
+        // A connection-level failure (refused / no route / TLS) must be learned by
+        // the health map immediately, not only after the periodic prober runs:
+        // otherwise a dead primary keeps being chosen for up to a full probe cycle
+        // and the backup is never reached.
+        if !ctx.current_origin.is_empty() {
+            let health = self.state.origin_health.clone();
+            let host = ctx.host.clone();
+            let origin = ctx.current_origin.clone();
+            let reason = e.to_string();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    health.record_origin_failure(&host, &origin, &reason).await;
+                });
+            }
+        }
         if Self::advance_peer(ctx) {
             e.set_retry(true);
         }
@@ -4909,6 +4924,13 @@ impl DataPlaneProxy {
         Self::advance_origin(ctx)
     }
 
+    /// Origin URLs in failover order.
+    ///
+    /// Origins are grouped into priority layers (ascending) and each layer is
+    /// weighted-ordered. A whole layer going down therefore falls through to the
+    /// next layer within the same request instead of pruning the backup before
+    /// dispatch. Unhealthy origins are appended after every healthy layer as a
+    /// last resort, so capacity is never lost while the prober catches up.
     async fn origin_order(&self, domain: &str, entry: &DomainEntry) -> Vec<String> {
         let mut fallback = Vec::new();
         if entry.origins.is_empty() {
@@ -4945,6 +4967,7 @@ impl DataPlaneProxy {
         }
 
         let mut healthy = Vec::with_capacity(pool.len());
+        let mut unhealthy = Vec::new();
         for origin in &pool {
             if self
                 .state
@@ -4952,48 +4975,44 @@ impl DataPlaneProxy {
                 .is_origin_healthy(domain, &origin.url)
                 .await
             {
-                healthy.push(*origin);
+                healthy.push((*origin).clone());
+            } else {
+                unhealthy.push((*origin).clone());
             }
         }
-        let mut candidates = if healthy.is_empty() {
-            tracing::warn!(
-                domain,
-                "all origins unhealthy; trying best available origin"
-            );
-            pool
-        } else {
-            healthy
-        };
-        let min_priority = candidates
-            .iter()
-            .map(|origin| origin.priority)
-            .min()
-            .unwrap_or_default();
-        candidates.retain(|origin| origin.priority == min_priority);
-        if candidates.is_empty() {
-            return Vec::new();
+        if healthy.is_empty() {
+            tracing::warn!(domain, "all origins unhealthy; trying best available origin");
         }
-
-        let total: u64 = candidates
-            .iter()
-            .map(|origin| u64::from(origin.weight.max(1)))
-            .sum();
         let seed = self
             .origin_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut slot = seed % total.max(1);
-        let mut start = 0usize;
-        for (index, origin) in candidates.iter().enumerate() {
-            let weight = u64::from(origin.weight.max(1));
-            if slot < weight {
-                start = index;
-                break;
-            }
-            slot -= weight;
+        let mut order = Self::layered_order(healthy, seed);
+        order.extend(Self::layered_order(unhealthy, seed));
+        order
+    }
+
+    /// Split `candidates` into ascending priority layers, weighted-ordering each
+    /// layer. A fully dead layer is skipped only after it has actually been tried
+    /// (`ctx.attempt` walks this list), so a backup is never pruned up front.
+    fn layered_order(candidates: Vec<OriginTarget>, seed: u64) -> Vec<String> {
+        if candidates.is_empty() {
+            return Vec::new();
         }
-        (0..candidates.len())
-            .map(|offset| candidates[(start + offset) % candidates.len()].url.clone())
-            .collect()
+        let mut priorities: Vec<i32> = candidates.iter().map(|origin| origin.priority).collect();
+        priorities.sort_unstable();
+        priorities.dedup();
+        let mut out = Vec::with_capacity(candidates.len());
+        for priority in priorities {
+            let layer: Vec<OriginTarget> = candidates
+                .iter()
+                .filter(|origin| origin.priority == priority)
+                .cloned()
+                .collect();
+            for target in OriginTarget::weighted_order(layer, seed) {
+                out.push(target.url);
+            }
+        }
+        out
     }
 
     async fn peer_for(
@@ -6312,6 +6331,39 @@ mod tests {
         assert_eq!(ctx.current_address_index, 0);
 
         assert!(!super::DataPlaneProxy::advance_peer(&mut ctx));
+    }
+
+    #[test]
+    fn layered_order_keeps_backup_after_primary_layer() {
+        let target = |url: &str, priority: i32, weight: u32| super::OriginTarget {
+            url: url.into(),
+            weight,
+            priority,
+            enabled: true,
+            host_header: None,
+            sni: None,
+        };
+        // A backup (priority 1) must never sort before a live priority-0 target;
+        // it may only follow them so `ctx.attempt` can fall through when the whole
+        // primary layer fails.
+        let order = super::DataPlaneProxy::layered_order(
+            vec![
+                target("https://backup", 1, 100),
+                target("https://p0-b", 0, 3),
+                target("https://p0-a", 0, 1),
+            ],
+            0,
+        );
+        assert_eq!(order.len(), 3);
+        assert!(
+            order[..2].iter().all(|url| url.starts_with("https://p0-")),
+            "priority-0 targets must come first: {order:?}"
+        );
+        assert_eq!(order[2], "https://backup");
+        // An unhealthy-only pool is still ordered by layer, never dropped.
+        let only_backup =
+            super::DataPlaneProxy::layered_order(vec![target("https://backup", 1, 100)], 0);
+        assert_eq!(only_backup, vec!["https://backup".to_string()]);
     }
 
     #[test]

@@ -208,6 +208,7 @@ async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<O
     }
 
     let mut healthy = Vec::new();
+    let mut unhealthy = Vec::new();
     for origin in &pool {
         if state
             .origin_health
@@ -215,21 +216,36 @@ async fn origin_sequence(state: &AppState, host: &str, eff: &Effective) -> Vec<O
             .await
         {
             healthy.push(origin.clone());
+        } else {
+            unhealthy.push(origin.clone());
         }
     }
-    let mut candidates = if healthy.is_empty() { pool } else { healthy };
-    let min_priority = candidates
-        .iter()
-        .map(|o| o.priority)
-        .min()
-        .unwrap_or_default();
-    candidates.retain(|o| o.priority == min_priority);
+    let seed = HANDLER_ORIGIN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut ordered = layered_origin_order(healthy, seed);
+    ordered.extend(layered_origin_order(unhealthy, seed));
+    ordered
+}
+
+/// Ascending priority layers, weighted-ordered within each layer, so a dead
+/// priority-0 layer falls through to the priority-1 backup instead of being
+/// pruned before dispatch (same fix as `DataPlaneProxy::layered_order`).
+fn layered_origin_order(candidates: Vec<OriginTarget>, seed: u64) -> Vec<OriginTarget> {
     if candidates.is_empty() {
         return Vec::new();
     }
-
-    let seed = HANDLER_ORIGIN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    OriginTarget::weighted_order(candidates, seed)
+    let mut priorities: Vec<i32> = candidates.iter().map(|origin| origin.priority).collect();
+    priorities.sort_unstable();
+    priorities.dedup();
+    let mut out = Vec::with_capacity(candidates.len());
+    for priority in priorities {
+        let layer: Vec<OriginTarget> = candidates
+            .iter()
+            .filter(|origin| origin.priority == priority)
+            .cloned()
+            .collect();
+        out.extend(OriginTarget::weighted_order(layer, seed));
+    }
+    out
 }
 
 enum Fetched {
