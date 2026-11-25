@@ -38,7 +38,9 @@ NODE_ID="$NODE_NAME" PUBLIC_IP=127.0.0.1 ORIGIN_URL="https://a.lagran.test:443" 
 CACHE_BACKEND=memory CERT_DIR="$LOG_DIR/certs" ./target/debug/lagran-edge >"$LOG_DIR/edge.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 80); do curl -sf "http://127.0.0.1:$EDGE_PORT/__lagran/health" >/dev/null && break; sleep .25; done
 sleep 2
-CODE=$(curl -s -o "$LOG_DIR/body" -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/")
+# `--max-time` keeps a stalled origin fetch from hanging the suite: curl then
+# reports `000` and the assertion fails instead of blocking forever.
+CODE=$(curl -s --max-time 15 -o "$LOG_DIR/body" -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/")
 sleep 1
 if [[ "$CODE" == "502" && -s "$LOG_DIR/body" ]] && kill -0 "${PIDS[1]}" 2>/dev/null; then
   echo "ALL DEAD ORIGIN CHECKS PASSED"
