@@ -30,6 +30,16 @@
     </div>
 
     <div class="card">
+      <div v-if="activeJobs.length" class="issue-strip">
+        <div v-for="job in activeJobs" :key="job.id" class="issue-row">
+          <AppIcon name="zap" :size="14" class="icon" />
+          <span class="issue-domain">{{ job.domain_name }}</span>
+          <StatusTag status="warning">{{ jobStatusText(job.status) }}</StatusTag>
+          <span class="issue-message text-muted">{{ job.message }}</span>
+          <span class="issue-elapsed text-muted">{{ Math.round((job.elapsed_ms || 0) / 1000) }}s</span>
+        </div>
+      </div>
+
       <div class="filter-bar">
         <input v-model="keyword" class="input" placeholder="搜索域名" style="min-width: 220px" />
         <select v-model="statusFilter" class="select">
@@ -162,7 +172,7 @@
       <div class="form-col">
         <div class="alert alert-info">
           <AppIcon name="info" :size="16" class="icon" />
-          <span>通过 HTTP-01 校验域名：控制面把 challenge 下发到在线边缘节点，Let's Encrypt 从公网访问该域名完成验证。生产证书约 90 天有效，控制面会定期检查并自动续期。</span>
+          <span>提交后由控制面后台签发（ACME 订单、HTTP-01 校验与 CA 轮询可能耗时数十秒），进度显示在列表上方，无需停留在此页面。生产证书约 90 天有效，控制面会定期检查并自动续期。</span>
         </div>
         <div class="field">
           <label class="field-label">签发方式 <span class="req">*</span></label>
@@ -267,6 +277,86 @@ async function load() {
   }
 }
 
+// ------------------------------------------------------------ 异步签发任务
+// Issuance runs in the control plane: the POST only queues a job. Polling the
+// job keeps the progress strip live and reports the final outcome once, even if
+// the operator reloaded the page in between (the active list is server-side).
+const jobs = ref<any[]>([])
+const pollingIds = new Set<string>()
+let disposed = false
+
+const activeJobs = computed(() =>
+  jobs.value.filter((j) => j.status === 'pending' || j.status === 'running')
+)
+
+function jobStatusText(status: string) {
+  if (status === 'pending') return '排队中'
+  if (status === 'running') return '签发中'
+  if (status === 'succeeded') return '已完成'
+  return '失败'
+}
+
+function upsertJob(job: any) {
+  const idx = jobs.value.findIndex((j) => j.id === job.id)
+  if (idx >= 0) jobs.value[idx] = { ...jobs.value[idx], ...job }
+  else jobs.value = [job, ...jobs.value]
+}
+
+async function loadJobs() {
+  try {
+    const res = await api.get<any>('/api/v1/certs/jobs')
+    const active = res?.jobs || []
+    // Keep finished jobs we already know about (their result toast already fired);
+    // only reconcile the active set with what the control plane reports.
+    const known = new Map(jobs.value.map((j) => [j.id, j]))
+    for (const job of active) known.set(job.id, job)
+    jobs.value = [...known.values()]
+  } catch {
+    // The active list is a nicety; the certificate table still works without it.
+  }
+}
+
+/** Poll one job until it reaches a terminal state. */
+async function pollJob(id: string) {
+  if (pollingIds.has(id)) return
+  pollingIds.add(id)
+  const deadline = Date.now() + 5 * 60 * 1000
+  try {
+    while (!disposed && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+      if (disposed) return
+      let job: any
+      try {
+        job = await api.get<any>(`/api/v1/certs/jobs/${id}`)
+      } catch (e: any) {
+        // 404 means the control plane restarted and the in-process job is gone.
+        // The renewal worker still retries the certificate, so stop polling.
+        if ((e?.status ?? e?.response?.status) === 404) {
+          jobs.value = jobs.value.filter((j) => j.id !== id)
+          toast.error('签发任务已丢失（控制面可能重启），可稍后重试')
+          return
+        }
+        continue // a transient network error just means try again
+      }
+      upsertJob(job)
+      if (job.status === 'succeeded') {
+        toast.success(
+          `已签发 ${job.domain_name}（${job.issuer || '未知签发者'}），推送到 ${job.edges_pushed ?? 0} 个边缘节点`
+        )
+        await load()
+        return
+      }
+      if (job.status === 'failed') {
+        toast.error(`签发失败：${job.message || '请稍后重试'}`)
+        return
+      }
+    }
+    if (!disposed) toast.error('签发耗时较长，请稍后刷新查看结果')
+  } finally {
+    pollingIds.delete(id)
+  }
+}
+
 function openUpload() {
   error.value = ''
   uploadForm.value = {
@@ -318,21 +408,37 @@ function openIssue() {
 
 async function issueCert() {
   error.value = ''
-  if (!issueForm.value.domain_name.trim()) {
+  const domain = issueForm.value.domain_name.trim()
+  if (!domain) {
     error.value = '请填写域名'
+    return
+  }
+  if (activeJobs.value.some((j) => String(j.domain_name).toLowerCase() === domain.toLowerCase())) {
+    error.value = '该域名已有签发任务正在进行，请稍候'
     return
   }
   submitting.value = true
   try {
+    // The endpoint answers 202 with a job id: the ACME exchange (order,
+    // HTTP-01 challenge, polling the CA) runs in the background, so the browser
+    // no longer waits on a request that can take minutes.
     const res = await api.post<any>('/api/v1/certs/issue', {
-      domain_name: issueForm.value.domain_name.trim(),
+      domain_name: domain,
       provider: issueForm.value.provider,
       push_to_edges: issueForm.value.push_to_edges,
       auto_renew: issueForm.value.auto_renew,
     })
     issueOpen.value = false
-    toast.success(`已签发 ${res.domain_name}（${res.issuer}），推送到 ${res.edges_pushed} 个边缘节点`)
-    await load()
+    upsertJob({
+      id: res.job_id,
+      domain_name: res.domain_name,
+      provider: res.provider,
+      status: 'pending',
+      message: res.message || '排队中',
+      elapsed_ms: 0,
+    })
+    toast.success(res.reused ? '该域名已在签发中，正在跟踪进度' : '已提交签发任务，正在后台签发…')
+    void pollJob(res.job_id)
   } catch (e: any) {
     error.value = e?.data?.error || '签发失败，请确认域名已接入'
   } finally {
@@ -357,10 +463,55 @@ async function remove(cert: any) {
   }
 }
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+  // Re-attach to issuances that are still running, so a reload does not lose
+  // the progress strip (the jobs live in the control plane, not the page).
+  await loadJobs()
+  for (const job of activeJobs.value) void pollJob(job.id)
+})
+
+onUnmounted(() => {
+  disposed = true
+})
 </script>
 
 <style scoped>
+/* Progress strip for in-flight issuances; the control plane owns the job, so
+   this survives a page reload (see /api/v1/certs/jobs). */
+.issue-strip {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-subtle, rgba(250, 173, 20, 0.06));
+}
+
+.issue-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  font-size: 13px;
+}
+
+.issue-row + .issue-row {
+  border-top: 1px solid var(--border);
+}
+
+.issue-domain {
+  font-weight: 600;
+}
+
+.issue-message {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.issue-elapsed {
+  font-variant-numeric: tabular-nums;
+}
+
 .material {
   display: inline-flex;
   align-items: center;

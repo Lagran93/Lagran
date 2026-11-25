@@ -186,6 +186,11 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/metrics/report/batch", post(metrics::report_batch))
                 .route("/certs", get(cert::list).post(cert::create))
                 .route("/certs/issue", post(acme::issue))
+                // Issuance jobs: the POST above answers 202 with a job id and the
+                // console polls these. `/certs/jobs` is a static path, so it wins
+                // over `/certs/:id` (same precedence as `/certs/edge-sync`).
+                .route("/certs/jobs", get(acme::list_jobs))
+                .route("/certs/jobs/:id", get(acme::job_status))
                 .route("/certs/:id", get(cert::get).delete(cert::delete))
                 .route("/certs/by-domain/:domain", get(cert::edge_get))
                 .route("/certs/edge-sync", get(cert::edge_list_active))

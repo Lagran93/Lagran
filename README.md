@@ -335,6 +335,7 @@ cargo clippy --workspace --all-targets
 bash tests/integration/smoke.sh
 bash tests/integration/cache-diagnostics.sh
 bash tests/integration/multi-origin.sh
+bash tests/integration/cert-jobs.sh
 bash tests/integration/p2-hardening.sh
 bash tests/integration/waf.sh
 bash tests/integration/ttl.sh

@@ -195,10 +195,17 @@ curl -k https://127.0.0.1:8443/
 
 ### 自动签发（Let's Encrypt）
 ```bash
+# 提交任务：返回 202 + job_id（签发在控制面后台执行，HTTP 请求不再阻塞）
 curl -X POST http://127.0.0.1:8080/api/v1/certs/issue \
   -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"domain_name":"cdn.example.com","provider":"letsencrypt","push_to_edges":true}'
+
+# 轮询结果：status = pending | running | succeeded | failed
+curl http://127.0.0.1:8080/api/v1/certs/jobs/<job_id> -H "Authorization: Bearer $TOKEN"
+
+# 进行中的任务列表（控制台刷新后据此恢复进度条）
+curl http://127.0.0.1:8080/api/v1/certs/jobs -H "Authorization: Bearer $TOKEN"
 ```
 
 - `provider`：`letsencrypt`（默认，生产）、`letsencrypt-staging`、`dev`
@@ -207,6 +214,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/certs/issue \
 - 控制面每 6 小时检查 `auto_renew` 且在 30 天内到期的 Let's Encrypt 证书并自动续期
 - 泛域名 HTTP-01 不支持；泛域名需 DNS-01（未实现）
 - 开发可用 `provider: "dev"` 生成本地 rcgen 自签证书
+- 任务状态是进程内的：控制面重启后轮询返回 `404`，此时重新提交即可（未落地的证书仍会被续期任务重试）
+- 同域名 + 同 provider 的并发提交复用同一任务；全局最多 8 个并发签发，超出返回 `429`
 
 ## 域名高级设置 / 预热 / 分域统计
 

@@ -27,6 +27,11 @@ pub struct AppState {
     pub login_limiter: Arc<LoginLimiter>,
     pub captcha: Arc<crate::service::captcha::CaptchaStore>,
     pub config_cache: Arc<crate::service::config_cache::ConfigCache>,
+    /// In-flight certificate issuances (see `service::cert_jobs`).
+    ///
+    /// ACME issuance takes tens of seconds, so `POST /certs/issue` queues a job
+    /// here and answers `202`; the caller polls `/certs/jobs/:id`.
+    pub cert_jobs: Arc<crate::service::cert_jobs::CertJobs>,
     pub redis: Option<Arc<crate::service::redis::RedisService>>,
 }
 
@@ -58,6 +63,7 @@ impl AppState {
             config_cache: Arc::new(crate::service::config_cache::ConfigCache::new(
                 config_cache_ttl_secs,
             )),
+            cert_jobs: Arc::new(crate::service::cert_jobs::CertJobs::new()),
             redis,
         }
     }

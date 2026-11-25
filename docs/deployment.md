@@ -682,14 +682,27 @@ psql "$DATABASE_URL" -c "SELECT email, role FROM users;"
 # 成功后再用生产；Let's Encrypt 生产有速率限制
 ```
 
-API 示例：
+API 示例（签发是异步任务：接口返回 `202` 与 `job_id`，再轮询结果）：
 
 ```bash
+# 1) 提交签发任务
 curl -X POST https://console.example.com/api/v1/certs/issue \
   -H "Authorization: Bearer <admin-jwt>" \
   -H "Content-Type: application/json" \
   -d '{"domain_name":"cdn.example.com","provider":"letsencrypt","push_to_edges":true}'
+# => 202 {"job_id":"...","status":"pending","poll_url":"/api/v1/certs/jobs/<id>"}
+
+# 2) 轮询直到 status 为 succeeded / failed
+curl https://console.example.com/api/v1/certs/jobs/<job_id> \
+  -H "Authorization: Bearer <admin-jwt>"
+
+# 3) 查看当前仍在进行的签发任务（控制台刷新后恢复进度用）
+curl https://console.example.com/api/v1/certs/jobs \
+  -H "Authorization: Bearer <admin-jwt>"
 ```
+
+同一域名 + 同一 `provider` 的重复提交会复用进行中的任务（返回相同 `job_id`，`reused: true`），
+不会重复创建 ACME 订单；同时最多 8 个签发任务，超出返回 `429`。
 
 常见失败原因：
 

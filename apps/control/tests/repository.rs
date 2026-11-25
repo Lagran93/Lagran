@@ -201,11 +201,8 @@ async fn delete_domain_is_atomic() {
     let id = insert_domain(&db, "atomic.test").await;
     db.pool
         .execute(
-            format!(
-                "INSERT INTO origin_health (domain_name, origin_url, healthy)
-                 VALUES ('atomic.test', 'http://origin.test', true)"
-            )
-            .as_str(),
+            "INSERT INTO origin_health (domain_name, origin_url, healthy)
+             VALUES ('atomic.test', 'http://origin.test', true)",
         )
         .await
         .expect("seed origin health");
