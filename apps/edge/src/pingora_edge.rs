@@ -139,6 +139,25 @@ struct RangeFill {
     raw_range: String,
 }
 
+/// Result of an attempted strict (client-requested) revalidation.
+///
+/// 阶段 4 splits "the native plan is unavailable" from "revalidation missed".
+/// Only `NotApplicable` keeps a request on its original route; every other
+/// outcome is resolved inside the Pingora data plane, so a `no-cache` /
+/// `max-age=0` GET no longer falls back to the legacy engine.
+enum RevalOutcome {
+    /// Not a strict GET (or a Range/HEAD/other method): continue normally.
+    NotApplicable,
+    /// The response (304 body, refreshed 200, or non-2xx pass-through) was written.
+    Served,
+    /// Cached copy dropped; rebuild a cacheable plan and let the native path
+    /// fetch and stream into the cache.
+    NativeMiss,
+    /// The origin could not serve; answer the origin-error page without touching
+    /// the cached copy.
+    OriginError(OriginFailure),
+}
+
 #[derive(Clone)]
 struct ResponsePolicySlot {
     content_type: Option<HeaderValue>,
@@ -885,10 +904,27 @@ impl ProxyHttp for DataPlaneProxy {
             .await;
             return Ok(true);
         }
-        if self.try_large_revalidation(session, ctx, &domain).await? {
-            return Ok(true);
+        // Strict client revalidation is resolved here so a `no-cache`/`max-age=0`
+        // GET never leaves the Pingora data plane (阶段 4). `NotApplicable` is the
+        // only outcome that keeps the original route; the rest are handled inline.
+        let mut force_native_miss = false;
+        match self.try_large_revalidation(session, ctx, &domain).await? {
+            RevalOutcome::Served => return Ok(true),
+            RevalOutcome::OriginError(failure) => {
+                ctx.cache_label = failure.log_label();
+                ctx.status = failure.status().as_u16();
+                let is_head = ctx.method == Method::HEAD;
+                let response = default_page::origin_error_page(&ctx.host, &ctx.path, failure);
+                write_axum_response(session, response, is_head, Some(&self.compression)).await;
+                return Ok(true);
+            }
+            RevalOutcome::NativeMiss => force_native_miss = true,
+            RevalOutcome::NotApplicable => {}
         }
-        if let Some(plan) = self.native_plan(session, &ctx.host, &domain).await {
+        if let Some(plan) = self
+            .native_plan(session, &ctx.host, &domain, force_native_miss)
+            .await
+        {
             self.state.metrics.record_pingora_datapath();
             let small_range = session.req_header().headers.contains_key("range")
                 && range_is_small_bounded(&session.req_header().headers);
@@ -2021,15 +2057,15 @@ impl DataPlaneProxy {
         session: &mut Session,
         ctx: &mut ReqCtx,
         domain: &Arc<DomainEntry>,
-    ) -> Result<bool> {
+    ) -> Result<RevalOutcome> {
         if session.req_header().method != Method::GET
             || session.req_header().headers.contains_key("range")
         {
-            return Ok(false);
+            return Ok(RevalOutcome::NotApplicable);
         }
         let strict = is_strict_revalidation(&session.req_header().headers);
         if !strict {
-            return Ok(false);
+            return Ok(RevalOutcome::NotApplicable);
         }
 
         let cache_control = session.req_header().headers.get("cache-control").cloned();
@@ -2059,15 +2095,15 @@ impl DataPlaneProxy {
         session: &mut Session,
         ctx: &mut ReqCtx,
         domain: &Arc<DomainEntry>,
-    ) -> Result<bool> {
-        let plan = self.native_plan(session, &ctx.host, domain).await;
+    ) -> Result<RevalOutcome> {
+        let plan = self.native_plan(session, &ctx.host, domain, false).await;
         let Some(plan) = plan else {
-            return Ok(false);
+            return Ok(RevalOutcome::NotApplicable);
         };
         if !plan.cacheable {
             // Authorization / Cookie / rule-bypass requests must not be served
             // from the shared cache, even when they ask for revalidation.
-            return Ok(false);
+            return Ok(RevalOutcome::NotApplicable);
         }
         // Normal-object conditional revalidation. On 304 the cached body is
         // served here; on a changed origin the entry is dropped and the native
@@ -2094,28 +2130,27 @@ impl DataPlaneProxy {
             None
         };
         if let Some(entry) = self.state.cache.get(&plan.key).await {
-            if self
-                .try_normal_revalidation(session, ctx, &plan, entry)
-                .await?
-            {
+            let outcome = self.try_normal_revalidation(session, ctx, &plan, entry).await?;
+            if matches!(outcome, RevalOutcome::Served | RevalOutcome::OriginError(_)) {
+                // The response (cached body, refreshed 200, stale copy or the
+                // origin-error page) is written by the Pingora data plane.
                 self.state.metrics.record_pingora_datapath();
-                return Ok(true);
             }
-            return Ok(false);
+            return Ok(outcome);
         }
         let Some(large) = self.state.large_cache.as_ref() else {
             // No LargeCache: the normal-object path above is sufficient. The
             // native path will stream and fill SharedCache for this cold/large
             // object.
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         };
         let Some(entry) = large.get_any(&plan.key).await else {
             // No large object: leave request cache headers removed so the
             // native path streams and fills the large cache in one pass.
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         };
         if !entry.meta.complete {
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         }
         let etag = entry
             .meta
@@ -2138,16 +2173,16 @@ impl DataPlaneProxy {
             .unwrap_or("");
         if validator_source == "computed" {
             large.delete(&plan.key).await;
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         }
         if etag.is_none() && last_modified.is_none() {
             large.delete(&plan.key).await;
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         }
 
         let target = match plan.domain.origins.iter().find(|origin| origin.enabled) {
             Some(target) => target.clone(),
-            None => return Ok(false),
+            None => return Ok(RevalOutcome::OriginError(OriginFailure::Unreachable)),
         };
         let path_and_query = session
             .req_header()
@@ -2191,13 +2226,14 @@ impl DataPlaneProxy {
         {
             Ok(response) => response,
             Err(_) => {
-                large.delete(&plan.key).await;
-                return Ok(false);
+                // Origin unreachable/timeout on the conditional HEAD: keep the
+                // cached copy and answer the origin-error page (阶段 4: 不删缓存).
+                return Ok(RevalOutcome::OriginError(OriginFailure::Unreachable));
             }
         };
         if conditional.status != StatusCode::NOT_MODIFIED {
             large.delete(&plan.key).await;
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         }
         // Build the merged list in one pass. `header_vec` used to materialise the
         // conditional headers first and this loop copied them again; the vector is
@@ -2228,7 +2264,15 @@ impl DataPlaneProxy {
             self.state.default_ttl_secs,
         ) {
             Ok(decision) => decision,
-            Err(_) => return Ok(false),
+            Err(_) => {
+                // The refreshed copy cannot be re-stored, but the existing 304
+                // representation is still valid: keep it and serve it directly.
+                ctx.cache_label = "REVALIDATED";
+                ctx.cache_reason = Some("origin-304-stale");
+                self.serve_large_full(session, entry, &plan).await;
+                self.state.metrics.record_pingora_datapath();
+                return Ok(RevalOutcome::Served);
+            }
         };
         if !large
             .refresh_meta(
@@ -2239,16 +2283,21 @@ impl DataPlaneProxy {
             )
             .await
         {
-            return Ok(false);
+            // Refresh failed: serve the still-valid cached copy unchanged.
+            ctx.cache_label = "REVALIDATED";
+            ctx.cache_reason = Some("origin-304-stale");
+            self.serve_large_full(session, entry, &plan).await;
+            self.state.metrics.record_pingora_datapath();
+            return Ok(RevalOutcome::Served);
         }
         let Some(entry) = large.get(&plan.key).await else {
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         };
         ctx.cache_label = "REVALIDATED";
         ctx.cache_reason = Some("origin-304");
         self.serve_large_full(session, entry, &plan).await;
         self.state.metrics.record_pingora_datapath();
-        Ok(true)
+        Ok(RevalOutcome::Served)
     }
 
     async fn try_normal_revalidation(
@@ -2257,13 +2306,13 @@ impl DataPlaneProxy {
         ctx: &mut ReqCtx,
         plan: &NativePlan,
         entry: crate::cache::CacheEntry,
-    ) -> Result<bool> {
+    ) -> Result<RevalOutcome> {
         let source = entry.header(VALIDATOR_SOURCE_HEADER).unwrap_or("");
         let etag = entry.header("etag").map(str::to_string);
         let last_modified = entry.header("last-modified").map(str::to_string);
         if source == "computed" {
             self.state.cache.delete(&plan.key).await;
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         }
         let use_etag = match source {
             "etag" => etag.is_some(),
@@ -2273,12 +2322,12 @@ impl DataPlaneProxy {
         let use_last_modified = !use_etag && last_modified.is_some();
         if !use_etag && !use_last_modified {
             self.state.cache.delete(&plan.key).await;
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         }
 
         let target = match plan.domain.origins.iter().find(|origin| origin.enabled) {
             Some(target) => target.clone(),
-            None => return Ok(false),
+            None => return Ok(RevalOutcome::OriginError(OriginFailure::Unreachable)),
         };
         let path_and_query = session
             .req_header()
@@ -2328,10 +2377,16 @@ impl DataPlaneProxy {
         .await
         {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(_)) => {
+                // Origin refused / protocol error: keep the cached copy and let
+                // the caller answer the origin-error page (阶段 4: 不删缓存).
                 self.state.metrics.record_origin_error();
-                self.state.cache.delete(&plan.key).await;
-                return Ok(false);
+                return Ok(RevalOutcome::OriginError(OriginFailure::Unreachable));
+            }
+            Err(_) => {
+                // Timed out waiting for the conditional response.
+                self.state.metrics.record_origin_error();
+                return Ok(RevalOutcome::OriginError(OriginFailure::Timeout));
             }
         };
         if conditional.status != StatusCode::NOT_MODIFIED {
@@ -2346,7 +2401,7 @@ impl DataPlaneProxy {
                 ctx.cache_reason = Some("origin-empty-fallback");
                 self.serve_normal_entry(session, entry, plan, "origin-empty-fallback")
                     .await;
-                return Ok(true);
+                return Ok(RevalOutcome::Served);
             }
             if conditional.status.is_success() {
                 let entry = conditional.into_entry();
@@ -2372,10 +2427,13 @@ impl DataPlaneProxy {
                 ctx.cache_reason = Some("origin-200");
                 self.serve_normal_entry(session, entry, plan, "origin-200")
                     .await;
-                return Ok(true);
+                return Ok(RevalOutcome::Served);
             }
+            // Origin answered with a non-2xx, non-304 status. Drop the stale copy
+            // and let the native path fetch and stream the real response
+            // (阶段 4: no legacy fallback).
             self.state.cache.delete(&plan.key).await;
-            return Ok(false);
+            return Ok(RevalOutcome::NativeMiss);
         }
 
         let mut refreshed = entry;
@@ -2406,8 +2464,13 @@ impl DataPlaneProxy {
         ) {
             Ok(decision) => decision,
             Err(_) => {
-                self.state.cache.delete(&plan.key).await;
-                return Ok(false);
+                // The refreshed headers cannot be re-stored, but the cached 304
+                // representation is still valid: keep and serve the old entry.
+                ctx.cache_label = "REVALIDATED";
+                ctx.cache_reason = Some("origin-304-stale");
+                self.serve_normal_entry(session, refreshed, plan, "origin-304-stale")
+                    .await;
+                return Ok(RevalOutcome::Served);
             }
         };
         let now = SystemTime::now()
@@ -2432,7 +2495,7 @@ impl DataPlaneProxy {
         ctx.cache_reason = Some("origin-304");
         self.serve_normal_entry(session, refreshed, plan, "origin-304")
             .await;
-        Ok(true)
+        Ok(RevalOutcome::Served)
     }
 
     // These are the byte-range coordinates plus the session/cache context;
@@ -2735,7 +2798,7 @@ impl DataPlaneProxy {
     /// One definition for two callers: `native_plan` decides routing with it and
     /// `legacy_reason` labels the fallback with it. Keeping them separate would let
     /// the metric drift away from the actual routing decision.
-    fn plan_blocker(&self, session: &Session) -> Option<LegacyFallback> {
+    fn plan_blocker(&self, session: &Session, ignore_strict_revalidation: bool) -> Option<LegacyFallback> {
         if !self.native_cache || self.storage.is_none() {
             return Some(LegacyFallback::NativeCacheDisabled);
         }
@@ -2744,10 +2807,12 @@ impl DataPlaneProxy {
         // (real representation length, no body), a miss proxies the HEAD request
         // itself so the origin supplies the length and nothing is written to the
         // cache. Both stay inside Pingora.
-        // Strict client revalidation has a dedicated conditional-origin path in
-        // the in-process engine (304 refresh). Keep it off the native cache
-        // fast path so a stale body is never served on max-age=0/no-cache.
-        if is_strict_revalidation(&req.headers) {
+        // Strict client revalidation has a dedicated conditional-origin path
+        // (`try_normal_revalidation`). It is normally kept off the native cache
+        // fast path so a stale body is never served on max-age=0/no-cache; when
+        // revalidation reported a `NativeMiss` the caller sets
+        // `ignore_strict_revalidation` so the rebuilt plan can stream and refill.
+        if !ignore_strict_revalidation && is_strict_revalidation(&req.headers) {
             return Some(LegacyFallback::StrictRevalidation);
         }
         None
@@ -2757,7 +2822,7 @@ impl DataPlaneProxy {
     ///
     /// Only called on the fallback path, so it never runs on the native fast path.
     fn legacy_reason(&self, session: &Session, domain: &DomainEntry) -> LegacyFallback {
-        if let Some(blocker) = self.plan_blocker(session) {
+        if let Some(blocker) = self.plan_blocker(session, false) {
             return blocker;
         }
         // `request_filter` answers an unparseable `origin_url` with a 502 before it
@@ -2773,8 +2838,12 @@ impl DataPlaneProxy {
         session: &Session,
         host: &str,
         domain: &Arc<DomainEntry>,
+        ignore_strict_revalidation: bool,
     ) -> Option<NativePlan> {
-        if self.plan_blocker(session).is_some() {
+        if self
+            .plan_blocker(session, ignore_strict_revalidation)
+            .is_some()
+        {
             return None;
         }
         let req = session.req_header();
@@ -2798,15 +2867,26 @@ impl DataPlaneProxy {
         } else {
             class.reason()
         };
-        // Strict client revalidation has a dedicated conditional-origin path in
-        // the in-process engine (304 refresh). Keep it off the native cache
-        // fast path so a stale body is never served on max-age=0/no-cache.
-        if matches!(
-            request_reason,
-            Some("request-max-age-0" | "request-no-cache" | "request-pragma-no-cache")
-        ) {
+        // Strict client revalidation normally has a dedicated conditional-origin
+        // path (see `plan_blocker`). A `NativeMiss` from that path sets
+        // `ignore_strict_revalidation`, and the request then becomes a plain
+        // cacheable GET so the native path can stream and refill the entry.
+        if !ignore_strict_revalidation
+            && matches!(
+                request_reason,
+                Some("request-max-age-0" | "request-no-cache" | "request-pragma-no-cache")
+            )
+        {
             return None;
         }
+        // A forced native miss behaves like a plain cacheable GET: the strict
+        // request headers were a client hint to revalidate, not a bypass, and the
+        // cached copy was already dropped by `try_normal_revalidation`.
+        let request_reason = if ignore_strict_revalidation {
+            None
+        } else {
+            request_reason
+        };
         let bypasses = request_reason.is_some();
         let is_head = req.method == Method::HEAD && policy.action == RuleAction::Cache && !bypasses;
         let is_websocket = is_websocket_upgrade(&req.headers);
