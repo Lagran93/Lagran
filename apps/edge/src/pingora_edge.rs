@@ -314,9 +314,6 @@ struct ReqCtx {
     /// Response policy computed by the cache filter, reused by the response
     /// filter for the same Content-Type.
     response_policy: Option<ResponsePolicySlot>,
-    head_body: BytesMut,
-    head_headers: Option<ResponseHeader>,
-    head_status: u16,
     range_fill: Option<RangeFill>,
     range_sink: Option<RangeSink>,
     /// Active gzip encoder for this response; set in `response_filter`.
@@ -360,9 +357,6 @@ impl Default for ReqCtx {
             current_host_header: String::new(),
             response_bypass: false,
             response_policy: None,
-            head_body: BytesMut::new(),
-            head_headers: None,
-            head_status: 0,
             range_fill: None,
             range_sink: None,
             gzip: None,
@@ -1642,15 +1636,6 @@ impl ProxyHttp for DataPlaneProxy {
                 }
             }
         }
-        if plan.is_head {
-            // HEAD carries no downstream body. Keeping the origin GET's
-            // Content-Length makes Pingora's H1 encoder wait for bytes that
-            // will never be written; use zero so the header completes.
-            let _ = response.remove_header("transfer-encoding");
-            let _ = response.insert_header("content-length", "0");
-            ctx.head_headers = Some(response.clone());
-            ctx.head_status = response.status.as_u16();
-        }
         if let Some(fill) = ctx.range_fill.take() {
             if response_policy.action == RuleAction::Cache
                 && response.status == StatusCode::PARTIAL_CONTENT.as_u16()
@@ -1862,11 +1847,6 @@ impl ProxyHttp for DataPlaneProxy {
             }
             return Ok(None);
         }
-        if ctx.plan.as_ref().is_some_and(|p| p.is_head) {
-            if let Some(chunk) = body.take() {
-                ctx.head_body.extend_from_slice(&chunk);
-            }
-        }
         Ok(None)
     }
 
@@ -1885,55 +1865,6 @@ impl ProxyHttp for DataPlaneProxy {
             .unwrap_or(ctx.status);
         let bytes = session.body_bytes_sent() as u64;
         let label = ctx.cache_label;
-        if let Some(plan) = ctx.plan.as_ref() {
-            if plan.is_head && ctx.head_status == 200 && !ctx.head_body.is_empty() {
-                if let Some(headers) = ctx.head_headers.as_ref() {
-                    let mut hdrs = header_vec(&headers.headers);
-                    hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
-                    hdrs.push((
-                        "content-length".to_string(),
-                        ctx.head_body.len().to_string(),
-                    ));
-                    if let Ok(decision) = decide_storage_reason(
-                        ctx.head_status,
-                        &hdrs,
-                        plan.policy,
-                        self.state.default_ttl_secs,
-                    ) {
-                        if ctx.head_body.len() <= 8 * 1024 * 1024 {
-                            let now_epoch = SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            let mut entry = crate::cache::CacheEntry {
-                                status: ctx.head_status,
-                                headers: hdrs,
-                                body: ctx.head_body.clone().freeze(),
-                                stored_at_epoch_secs: now_epoch,
-                                fresh_until_epoch_secs: now_epoch
-                                    .saturating_add(decision.ttl_secs.max(1)),
-                                stale_until_epoch_secs: now_epoch
-                                    .saturating_add(decision.ttl_secs.max(1))
-                                    .saturating_add(decision.swr_secs),
-                            };
-                            if entry.header("etag").is_none() {
-                                let etag = compute_etag(&entry);
-                                entry.headers.push(("etag".to_string(), etag));
-                            }
-                            self.state
-                                .cache
-                                .set_with_swr(
-                                    &plan.key,
-                                    entry,
-                                    decision.ttl_secs,
-                                    decision.swr_secs,
-                                )
-                                .await;
-                        }
-                    }
-                }
-            }
-        }
         log_access(
             &self.state.access_log,
             &ctx.method,
@@ -2763,12 +2694,10 @@ impl DataPlaneProxy {
             return Some(LegacyFallback::NativeCacheDisabled);
         }
         let req = session.req_header();
-        // HEAD stays on the in-process engine: it fetches GET, returns the real
-        // Content-Length, and shares the GET cache entry. Pingora's H1 encoder
-        // cannot carry an upstream GET body under a HEAD response.
-        if req.method == Method::HEAD {
-            return Some(LegacyFallback::Head);
-        }
+        // HEAD is served natively: a cache hit answers from `serve_head_cache`
+        // (real representation length, no body), a miss proxies the HEAD request
+        // itself so the origin supplies the length and nothing is written to the
+        // cache. Both stay inside Pingora.
         if !self.state.node_control.is_serving() {
             return Some(LegacyFallback::NodeDisabled);
         }
@@ -4735,14 +4664,11 @@ impl DataPlaneProxy {
                 .any(|candidate| candidate == etag || candidate == "*")
         });
         let status = if not_modified { 304 } else { entry.status };
-        let is_h2 = session.downstream_session.is_http2();
-        let len = if not_modified {
-            0
-        } else if is_h2 {
-            entry.body.len()
-        } else {
-            0
-        };
+        // HEAD always advertises the length of the representation a GET would
+        // return, for HTTP/1.1 as well as HTTP/2; the body itself stays empty.
+        // Reporting 0 on H1 made `head-h2.sh` and browser preflights disagree
+        // with the cached object they were describing.
+        let len = if not_modified { 0 } else { entry.body.len() };
         let mut headers = HeaderMap::new();
         for (name, value) in &entry.headers {
             if name.eq_ignore_ascii_case(META_HEADER)
@@ -4782,6 +4708,10 @@ impl DataPlaneProxy {
         apply_browser_ttl(&mut headers, policy_browser_ttl(&plan.policy));
         apply_security_headers(&mut headers);
         apply_cors_and_custom(&mut headers, &plan.domain.response_headers);
+        headers.insert(
+            HeaderName::from_static("x-lagran-datapath"),
+            HeaderValue::from_static("pingora"),
+        );
         headers.insert(
             HeaderName::from_static("content-length"),
             HeaderValue::from_str(&len.to_string())
