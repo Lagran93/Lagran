@@ -880,9 +880,14 @@ pub async fn node_name_for_token(pool: &PgPool, token: &str) -> sqlx::Result<Opt
     if token.is_empty() {
         return Ok(None);
     }
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT name FROM edge_nodes WHERE auth_token = $1 AND status <> 'disabled' LIMIT 1",
-    )
+    // Disabled nodes must still authenticate. The agent learns that it was
+    // disabled from the heartbeat reply (`enabled: false`); filtering
+    // `status <> 'disabled'` here turned the disable into a 401 lockout, so the
+    // edge never stopped serving and could not see a later re-enable either.
+    // Refusing traffic is the data plane's job (`NodeControl::is_serving`), not
+    // an authentication side effect.
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM edge_nodes WHERE auth_token = $1 LIMIT 1")
             .bind(token)
             .fetch_optional(pool)
             .await?;
