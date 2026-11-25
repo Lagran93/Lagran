@@ -171,6 +171,8 @@ DIAG=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/cache/diagnose" \
   -d "{\"domain\":\"$DOMAIN\",\"path\":\"/cached\"}")
 check "diagnose API status" "$(printf '%s' "$DIAG" | jq -r '.status')" "200"
 check "diagnose API cache reason" "$(printf '%s' "$DIAG" | jq -r '.cache_reason')" "hit"
+check "diagnose ran on the Pingora data plane" \
+  "$(printf '%s' "$DIAG" | jq -r '.headers[] | select(.[0]=="x-lagran-datapath") | .[1]' | head -1)" "pingora"
 
 echo "== https diagnostic does not stop at redirect =="
 TLS_DIAG=""

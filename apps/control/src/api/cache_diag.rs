@@ -218,11 +218,12 @@ struct EdgeDiagReply {
     body_preview: String,
 }
 
-fn selected_header_names() -> [&'static str; 9] {
+fn selected_header_names() -> [&'static str; 10] {
     [
         "x-cache",
         "x-cache-status",
         "x-lagran-cache-reason",
+        "x-lagran-datapath",
         "age",
         "etag",
         "cache-control",
