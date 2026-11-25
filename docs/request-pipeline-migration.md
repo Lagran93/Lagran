@@ -81,14 +81,15 @@ legacy 数据面今天仍会被进入的路径只有下面 6 条。唯一出口�
 |---|---|---|---|---|
 | 1 | HEAD（全部） | `native_plan` 早退 `pingora_edge.rs:2779` | 命中缓存或 HEAD 回源 | 阶段 2：Pingora 内自应答 |
 | 2 | 节点被禁用 `!node_control.is_serving()` | `pingora_edge.rs:2789` | 503 页面（`handler.rs:413-430`） | 阶段 3：filter 内直出 |
-| 3 | 严格重校验失败（6 种，见下） | `pingora_edge.rs:2110-2456` | 删缓存 → legacy 全量回源 | 阶段 4：Pingora 内闭环 |
+| 3 | 严格重校验失败（6 种，见下） | `pingora_edge.rs:2110-2456` | 删缓存 → legacy 全量回源 | 阶段 4：Pingora 内闭环（已实现） |
 | 4 | 未知 host 且注册表为空 | `pingora_edge.rs:786-799` | single-origin（`handler.rs:537-562`） | 阶段 3：改原生静态默认域名（已实现） |
 | 5 | `parse_origin` 失败 | `pingora_edge.rs:2832` | 回落 legacy | 阶段 3：直出 502 + 配置校验 |
 | 6 | 缓存诊断直调 legacy | `server/cache_diag.rs:115` | 诊断测的是 legacy 行为 | 阶段 5：改走 loopback 真实路径 |
 
 ### 第 3 类的 6 种情形
 
-`try_normal_revalidation` 返回 `Ok(false)` 的条件，阶段 4 逐个收敛：
+`try_normal_revalidation` 原返回 `Ok(false)` 的 6 个条件，阶段 4 已逐个收敛为
+`RevalOutcome`（`NativeMiss` / `OriginError` / `Served`），不再回落 legacy：
 
 - validator 来源是 `computed`（`pingora_edge.rs:2297-2300`）
 - 无 etag 也无 last-modified（`2306-2310`）
@@ -311,25 +312,53 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 - 单元测试 `registry::tests::static_default_serves_any_host_until_real_config_arrives`
   锁定「真实配置到达前服务任意 Host、到达后遮蔽」的切换语义。
 
-### 阶段 4：重校验兜底在 Pingora 内闭环（2-3 天）
+### 阶段 4：重校验兜底在 Pingora 内闭环（2-3 天）—— ✅ 已完成
 
 把"剩余兜底清单"第 3 类的 6 种情形从"删缓存 → 回落 legacy"改成"Pingora 内继续"：
 
-| 情形 | 现在 | 目标 |
+| 情形 | 以前 | 现在（已实现） |
 |---|---|---|
-| `computed` validator | 删缓存 → legacy 全量回源 | 删缓存 → `PlanFallback::NativeMiss`，由 native_plan 生成可缓存计划走 native streaming |
+| `computed` validator | 删缓存 → legacy 全量回源 | 删缓存 → `RevalOutcome::NativeMiss` → 原生 MISS 流式回源并回填 |
 | 无 etag / last-modified | 同上 | 同上 |
-| 无 enabled origin | 回落 | 直出 502 origin 页面（复用 `fail_to_proxy` 的 `OriginFailure`） |
-| origin 错误 / 超时 | 删缓存 → 回落 | 502，不删缓存 |
-| origin 非 2xx 非 304 | 删缓存 → 回落 | 直接 native streaming 该响应 |
-| 304 但 `decide_storage_reason` 失败 | 删缓存 → 回落 | 保留旧 entry 直接服务 |
+| 无 enabled origin | 回落 | 直出 502 origin 页面（`OriginFailure::Unreachable`） |
+| origin 错误 / 超时 | 删缓存 → 回落 | 502 / 504 origin 页面，**不删缓存** |
+| origin 非 2xx 非 304 | 删缓存 → 回落 | 删旧 entry → `NativeMiss`，由原生路径流式返回该响应 |
+| 304 但 `decide_storage_reason` 失败 | 删缓存 → 回落 | 保留旧 entry，直接 `REVALIDATED` 服务 |
 
-关键重构：把"native plan 不可用"与"重校验未命中"拆成两个概念，新增
-`enum PlanFallback { InProcess, NativeMiss, OriginError(OriginFailure) }`；
-只有 `InProcess` 才进 legacy，其余都在 Pingora 内闭环。
+实现时用 `enum RevalOutcome { NotApplicable, Served, NativeMiss, OriginError(OriginFailure) }`
+（比草案的 `PlanFallback` 多一个 `NotApplicable`，表示"不是严格重校验，按原路继续"）。
+`try_large_revalidation` / `revalidate_strict` / `try_normal_revalidation` 都改成返回它；
+`request_filter` 收到 `NativeMiss` 后重建一个"忽略严格重校验"的 plan
+（`native_plan(..., ignore_strict_revalidation=true)`，此时 `request_reason` 归零、按普通
+可缓存 GET 处理），`OriginError` 则直出 `default_page::origin_error_page`。`plan_blocker`
+也带上了该开关，只有 `ignore=false` 且请求带 `no-cache`/`max-age=0` 时才标 `StrictRevalidation`。
 
-验收：`cache-diagnostics.sh` 的 no-cache 段，加新增 4 条（computed etag、
-无 validator、origin 500、origin 超时），全部断言 `x-lagran-datapath: pingora`。
+验收：新增 `tests/integration/strict-revalidation.sh`（详见下方落地说明），断言
+computed validator、origin 500、origin 超时三种情形均由 `x-lagran-datapath: pingora` 服务，
+且 `lagran_edge_legacy_fallback_total{reason="strict_revalidation"}` 不增长。
+（原计划的 4 条改为独立脚本：`cache-diagnostics.sh` 已在跑大量 revalidation 断言，
+再往里塞会互相干扰；`/assets/no-validator.css` 已由 `cache-rules.sh` 覆盖 computed 分支。）
+
+落地说明（阶段 4，已实现）：
+
+- `apps/edge/src/pingora_edge.rs`：
+  - 新增 `RevalOutcome`；`try_large_revalidation`/`revalidate_strict`/`try_normal_revalidation`
+    返回它，`request_filter` 在 `native_plan` 之前 `match` 处理 `Served`/`NativeMiss`/`OriginError`；
+  - `native_plan` 增加 `ignore_strict_revalidation` 参数；为 true 时跳过 `plan_blocker` 的严格
+    重校验拦截、把 `request_reason` 置 `None`，于是重建出可缓存 plan；
+  - `try_normal_revalidation` 的 6 个 `Ok(false)` 出口逐一映射：computed/无 validator → 删缓存 +
+    `NativeMiss`；无 origin → `OriginError(Unreachable)`；origin `Ok(Err)` → `OriginError(Unreachable)`、
+    `Err`(超时) → `OriginError(Timeout)`，两者都**不删缓存**；非 2xx → 删缓存 + `NativeMiss`；
+    304 但 `decide_storage_reason` 失败 → 服务旧 entry（`origin-304-stale`）；
+  - 大对象（LargeCache）分支同样改为 `NativeMiss` / `OriginError` / `Served`，其中 304 但无法
+    重存时直接服务既有完整对象（`origin-304-stale`）；
+  - `record_pingora_datapath()` 只在真正由 Pingora 写出响应（`Served`/`OriginError`）时计一次，
+    避免与 `request_filter` 重复计数。
+- `tools/mock-origin/origin.rs`：新增两个有状态 fixture —— `/flaky`（首次 200 带 ETag，
+  之后 500）与 `/slow-flaky`（首次 200 带 ETag，之后 sleep 3s），用于稳定复现
+  "条件请求返回非 2xx / 超时"两条路径。
+- `tests/integration/strict-revalidation.sh`：独立起控制面 + 边缘，`ORIGIN_READ_TIMEOUT_MS=1500`
+  让超时用例快速失败；断言三种情形与 `strict_revalidation` 计数不变。
 
 ### 阶段 5：缓存诊断改走真实路径（1 天）
 
@@ -380,6 +409,7 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 | `p2-hardening.sh` | SSRF / 限流 / 日志摄入 | 全绿 |
 | `smoke.sh` / `dead-origin.sh` / `multi-origin.sh` | 回源与故障切换 | 阶段 3/4 后全绿 |
 | `single-origin.sh` | 无控制面时任意 Host 走原生单源 | ✅ 全绿 + 断言 `pingora` + 6 个 reason |
+| `strict-revalidation.sh` | no-cache 重校验的 computed / origin 500 / 超时 | ✅ 全绿 + 断言 `pingora` + `strict_revalidation` 不增长 |
 
 指标断言（阶段 0 之后每个阶段都要复查）：
 
@@ -468,6 +498,12 @@ sum(rate(lagran_edge_datapath_legacy_total[5m]))
     `success:false`（`cache-diagnostics.sh` 的 `tag purge succeeds` 因此失败）。
     处理：跑套件前把残留行置为 `offline`（`UPDATE edge_nodes SET status='offline'
     WHERE status='online'`），或清理这些节点。
+16. **`no-cache-preflight.sh` 的大小写敏感断言与缺失超时**：它在 warm/HIT 处用大小写敏感的
+    `contains … "x-cache: HIT"`，而 Pingora 输出 `X-Cache`（第 13 条），会永远失败；同时
+    `request()` 与并发段的两处 curl 没有 `--max-time`，而 WAF 拦截页既无 `Content-Length`
+    也无 `Transfer-Encoding`、却保持 keep-alive，curl 会一直等待——整份脚本因此挂死。
+    修法：改用 `contains_h`，并给两处 curl 加 `--max-time 20`。（阶段 4 复核时发现，
+    与重校验逻辑无关。）
 
 ### 发现：`write_axum_response` 的流式分支不定界（阶段 1 内已修）
 
