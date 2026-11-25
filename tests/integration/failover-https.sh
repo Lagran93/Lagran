@@ -59,7 +59,7 @@ hdr() { tr -d '\r' <"$LOG_DIR/h" | awk -F': ' -v k="$1" 'tolower($1)==k{print $2
 get() {
   local path=$1
   shift
-  curl -s -H "Host: $DOMAIN" "$@" -D "$LOG_DIR/h" -o "$LOG_DIR/b" -w '%{http_code}' \
+  curl -s --max-time 15 -H "Host: $DOMAIN" "$@" -D "$LOG_DIR/h" -o "$LOG_DIR/b" -w '%{http_code}' \
     "http://127.0.0.1:$EDGE_PORT$path"
 }
 
@@ -127,16 +127,12 @@ kill "$PRIMARY_PID" 2>/dev/null
 wait "$PRIMARY_PID" 2>/dev/null
 PRIMARY_PID=""
 
-FAILOVER=0
-for _ in $(seq 1 40); do
-  CODE=$(get "/nostore")
-  if [[ "$CODE" == "200" && "$(hdr x-origin-port)" == "$BACKUP_PORT" ]]; then
-    FAILOVER=1
-    break
-  fi
-  sleep 0.5
-done
-check "backup serves after primary stops" "$FAILOVER" "1"
+# The very next request must already be served by the backup: `origin_order` walks
+# priority layers, so a refused primary falls through to the priority-1 origin
+# within the same request (阶段 3/4 fix).
+FIRST_CODE=$(get "/nostore")
+FIRST_PORT=$(hdr x-origin-port)
+check "first request after primary death is served by backup" "$FIRST_CODE:$FIRST_PORT" "200:$BACKUP_PORT"
 check "backup receives its own Host" "$(hdr x-origin-host)" "localhost"
 CODE=$(get "/api/data")
 check "bypass/API path also fails over" "$(hdr x-origin-port)" "$BACKUP_PORT"

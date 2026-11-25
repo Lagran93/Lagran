@@ -80,10 +80,14 @@ NODE_NAME="multi-origin-edge-$$"
 NODE_RESP=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
   -d "{\"name\":\"$NODE_NAME\",\"region\":\"test\",\"agent_url\":\"http://127.0.0.1:$EDGE_PORT\"}")
 NODE_TOKEN=$(printf '%s' "$NODE_RESP" | jq -r '.token // empty')
+# `origin_timeout_ms` is a TCP *connect* override; the read timeout is the
+# cluster-wide ORIGIN_READ_TIMEOUT_MS. Keep it short so the `/slow` fixture (3 s)
+# really triggers a read timeout and the retry-next-origin check is meaningful.
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 NODE_ID="$NODE_NAME" AGENT_TOKEN="$NODE_TOKEN" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" CACHE_TTL=60 CACHE_BACKEND=memory \
 ORIGIN_HEALTH_INTERVAL_SECS=2 ORIGIN_HEALTH_FAIL_THRESHOLD=1 \
+ORIGIN_READ_TIMEOUT_MS=1500 \
 ./target/debug/lagran-edge >"$LOG_DIR/edge.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$EDGE_PORT/__lagran/health" >/dev/null && break; sleep 0.5; done
 
@@ -99,7 +103,7 @@ check "edge synced origin pool" "$SYNCED" "1"
 echo "== weighted dispatch =="
 A=0; B=0; C=0
 for i in $(seq 1 80); do
-  PORT=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" \
+  PORT=$(curl -s --max-time 8 -D - -o /dev/null -H "Host: $DOMAIN" \
     "http://127.0.0.1:$EDGE_PORT/lb/$i?i=$i" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-origin-port"{print $2}' | head -1)
   case "$PORT" in
     "$ORIGIN_A") A=$((A + 1)) ;;
@@ -151,11 +155,11 @@ echo "== priority fallback =="
 # Stop the two priority-0 origins; the priority-1 origin must take over.
 kill "$A_PID" "$B_PID" 2>/dev/null || true
 sleep 5
-PORT=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" \
+PORT=$(curl -s --max-time 8 -D - -o /dev/null -H "Host: $DOMAIN" \
   "http://127.0.0.1:$EDGE_PORT/lb/failover?fail=1" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-origin-port"{print $2}' | head -1)
 check "priority-1 origin takes over" "$PORT" "$ORIGIN_C"
 
-DYNAMIC=$(curl -s -D - -o /dev/null -X POST -H "Host: $DOMAIN" \
+DYNAMIC=$(curl -s --max-time 8 -D - -o /dev/null -X POST -H "Host: $DOMAIN" \
   -H 'content-type: application/json' -d '{"ping":true}' \
   "http://127.0.0.1:$EDGE_PORT/api/echo?fail=1" | tr -d '\r' | \
   awk -F': ' 'tolower($1)=="x-origin-port"{print $2}' | head -1)

@@ -271,7 +271,9 @@ H6=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/c
 contains_h "after purge it is MISS again" "$H6" "x-cache: MISS"
 
 echo "== origin failure page =="
-curl -s -D "$LOG_DIR/down.hdr" -o "$LOG_DIR/down.html" -H "Host: $DOWN" \
+# `--max-time` first: an origin-error page is delimited by closing the connection,
+# so a client that holds the socket open would otherwise wait for an EOF forever.
+curl -s --max-time 20 -D "$LOG_DIR/down.hdr" -o "$LOG_DIR/down.html" -H "Host: $DOWN" \
   "http://127.0.0.1:$EDGE_PORT/some-missing-asset.js" -w '%{http_code}' >"$LOG_DIR/down.code" || true
 DOWN_CODE=$(cat "$LOG_DIR/down.code")
 # Pingora classifies the failure and `default_page::OriginFailure` owns the status
