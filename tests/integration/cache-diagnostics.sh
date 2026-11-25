@@ -139,8 +139,8 @@ delta() { # <before> <after> -> difference, or "not-a-number"
 echo "== legacy fallback reasons =="
 metrics_body >"$LOG_DIR/metrics.txt" 2>/dev/null
 check "metrics expose every fallback reason" \
-  "$(grep -c 'lagran_edge_legacy_fallback_total{reason=' "$LOG_DIR/metrics.txt")" "7"
-check "an untouched reason starts at zero" "$(fb single_origin)" "0"
+  "$(grep -c 'lagran_edge_legacy_fallback_total{reason=' "$LOG_DIR/metrics.txt")" "6"
+check "an untouched reason starts at zero" "$(fb parse_origin)" "0"
 
 HEAD_BEFORE=$(fb head)
 STRICT_BEFORE=$(fb strict_revalidation)
