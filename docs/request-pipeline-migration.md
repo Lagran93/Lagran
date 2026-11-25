@@ -354,7 +354,9 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 
 删除顺序（每步单独可回滚）：
 
-1. handler 的 HEAD 回源/缓存分支（`fetch_head_origin` 已在阶段 2 搬走）；
+1. handler 的 HEAD 回源/缓存分支（`fetch_head_origin` 已在阶段 2 搬走），以及
+   `proxy_handler_inner` 里 `domain_entry == None` 的「单源」分支（阶段 3 后注册表总有
+   静态默认条目，该分支只剩空 Host 才可能进入，而 Pingora 已先返回 400）；
 2. `revalidate_cached_entry`（1864）、`spawn_revalidation`（2195）、`serve_cached`（2443）、
    `bypass_to_origin`（1069）、`bypass_to_origin_streaming`（1425）、
    `store_large_response`（2605）、`serve_range_entry`（2381）、`fetch_origin`（1729）、
