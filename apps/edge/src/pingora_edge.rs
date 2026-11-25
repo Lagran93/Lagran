@@ -25,9 +25,10 @@ use crate::server::cert_store::CertStore;
 use crate::server::challenge;
 use crate::server::compression::{CompressionConfig, GzipEncoder, replay_chunk, should_compress};
 use crate::server::default_page::{self, OriginFailure};
-use crate::server::handler::{
-    AppState, apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed,
-    log_access, policy_browser_ttl, proxy_handler,
+use crate::server::handler::{AppState, proxy_handler};
+use crate::server::shared::{
+    apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed, log_access,
+    policy_browser_ttl,
 };
 use crate::server::host_util::normalized_authority_host;
 use crate::server::native_cache::{META_HEADER, NativeStorage, leak_storage_with_large};
@@ -5233,16 +5234,21 @@ async fn write_axum_response(
             &request_headers,
         )
     });
-    let body_is_empty = {
+    let exact_len = {
         use hyper::body::Body as _;
-        body.size_hint().exact() == Some(0)
+        body.size_hint().exact()
     };
+    let body_is_empty = exact_len == Some(0);
     // HTTP/1.0 has no chunked framing, so an unknown-length body would have to be
     // delimited by closing the connection. Keep the previous buffered behaviour
     // for those clients instead of silently changing keep-alive semantics.
     let http10 = request_version == Version::HTTP_10;
     if !is_head && !no_content && !would_compress && !body_is_empty && !http10 {
-        write_engine_response_streamed(session, &parts, &mut body).await;
+        // Pass the known length down: a streamed response that advertises no
+        // `Content-Length` can only be delimited by closing the connection, and on
+        // a keep-alive session that leaves the client waiting for an EOF that never
+        // arrives (this is what hung `waf.sh` on a 403 block page).
+        write_engine_response_streamed(session, &parts, &mut body, exact_len).await;
         return;
     }
     let mut bytes = match body.collect().await {
@@ -5361,8 +5367,13 @@ async fn write_engine_response_streamed(
     session: &mut Session,
     parts: &axum::http::response::Parts,
     body: &mut Body,
+    exact_len: Option<u64>,
 ) {
-    let Ok(mut response) = ResponseHeader::build(parts.status.as_u16(), None) else {
+    // `ResponseHeader::build` sizes the header from a `usize`; the body hint is a
+    // `u64`. A body that does not fit in `usize` cannot be framed here anyway.
+    let Ok(mut response) =
+        ResponseHeader::build(parts.status.as_u16(), exact_len.map(|len| len as usize))
+    else {
         return;
     };
     for (name, value) in parts.headers.iter() {
@@ -5380,6 +5391,7 @@ async fn write_engine_response_streamed(
     {
         return;
     }
+    let mut written = 0usize;
     loop {
         let frame = match body.frame().await {
             Some(Ok(frame)) => frame,
@@ -5395,6 +5407,7 @@ async fn write_engine_response_streamed(
         if data.is_empty() {
             continue;
         }
+        written += data.len();
         if session
             .write_response_body(Some(data), false)
             .await
@@ -5404,6 +5417,17 @@ async fn write_engine_response_streamed(
             // dropping the body lets the stream guard finalise the record with
             // the bytes delivered so far.
             return;
+        }
+    }
+    // A `Content-Length` that does not match what the body produced would leave
+    // the client waiting for the missing bytes, so make the mismatch loud.
+    if let Some(expected) = exact_len {
+        if written as u64 != expected {
+            tracing::warn!(
+                expected,
+                written,
+                "engine response body length does not match its size hint"
+            );
         }
     }
     let _ = session.write_response_body(None, true).await;

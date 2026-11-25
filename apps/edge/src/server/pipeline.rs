@@ -10,7 +10,8 @@ use crate::cache::policy::{
     resolve_rule_policy, ResolvedPolicy, RuleAction,
 };
 use crate::config::registry::DomainEntry;
-use crate::server::handler::{preflight_cacheable, AppState};
+use crate::server::handler::AppState;
+use crate::server::preflight::preflight_cacheable;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, Response};
 use std::sync::Arc;
