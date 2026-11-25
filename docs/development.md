@@ -21,6 +21,10 @@ cargo run -p control
 # 3. 边缘端（支持 HTTPS 回源）
 ORIGIN_URL=https://example.com cargo run -p edge
 
+#    这一步不设 CONTROL_URL，边缘进入「单源模式」：任意 Host 都由 ORIGIN_URL 服务。
+#    自阶段 3 起该模式走 Pingora 原生路径（不再是 legacy 进程内引擎），响应带
+#    x-lagran-datapath: pingora；一旦控制面下发真实域名，单源默认条目即被遮蔽。
+
 # 4. 前端
 cd apps/frontend
 npm install

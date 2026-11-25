@@ -24,7 +24,7 @@ RequestPipeline
 
 Legacy
   迁移目标：不承载数据面（阶段 6 删除）
-  仅 single-origin 兜底，是否保留见阶段 3 决策
+  目标：不承载数据面（阶段 6 删除）；阶段 3 后只剩「严格重校验」与「缓存诊断」两类兜底
   管理接口是独立监听器（EDGE_ADMIN_LISTEN），不属于 legacy
 ```
 
@@ -82,7 +82,7 @@ legacy 数据面今天仍会被进入的路径只有下面 6 条。唯一出口�
 | 1 | HEAD（全部） | `native_plan` 早退 `pingora_edge.rs:2779` | 命中缓存或 HEAD 回源 | 阶段 2：Pingora 内自应答 |
 | 2 | 节点被禁用 `!node_control.is_serving()` | `pingora_edge.rs:2789` | 503 页面（`handler.rs:413-430`） | 阶段 3：filter 内直出 |
 | 3 | 严格重校验失败（6 种，见下） | `pingora_edge.rs:2110-2456` | 删缓存 → legacy 全量回源 | 阶段 4：Pingora 内闭环 |
-| 4 | 未知 host 且注册表为空 | `pingora_edge.rs:786-799` | single-origin（`handler.rs:537-562`） | 阶段 3：决策保留或废弃 |
+| 4 | 未知 host 且注册表为空 | `pingora_edge.rs:786-799` | single-origin（`handler.rs:537-562`） | 阶段 3：改原生静态默认域名（已实现） |
 | 5 | `parse_origin` 失败 | `pingora_edge.rs:2832` | 回落 legacy | 阶段 3：直出 502 + 配置校验 |
 | 6 | 缓存诊断直调 legacy | `server/cache_diag.rs:115` | 诊断测的是 legacy 行为 | 阶段 5：改走 loopback 真实路径 |
 
@@ -143,7 +143,8 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 
 - reason 收敛为 7 个固定变体 `LegacyFallback`：`head` / `node_disabled` /
   `strict_revalidation` / `single_origin` / `parse_origin` / `native_cache_disabled` /
-  `other`。推导集中在 `plan_blocker`，`native_plan` 与 `legacy_reason` **共用同一份
+  `other`（阶段 3 第 3 项后 `single_origin` 已删除，剩 6 个）。推导集中在 `plan_blocker`，
+  `native_plan` 与 `legacy_reason` **共用同一份
   判断**，避免"指标里的原因"与"实际路由决策"漂移；
 - 指标暴露 `legacy_fallbacks()` → `LegacyFallbackSnapshot`，Prometheus 文本由
   `prometheus_lines()` 统一生成，数据面 `pingora_edge.rs` 的 `/__lagran/metrics`
@@ -237,23 +238,22 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 - `cache-diagnostics.sh` 的 HEAD 断言从「计 1 次 legacy」翻转为「`head` 增量 0 且响应带
   `pingora`」。
 
-### 阶段 3：确定性兜底改为直出（1-2 天）—— 第 1、2 项已完成
+### 阶段 3：确定性兜底改为直出（1-2 天）—— ✅ 全部完成
 
 - **节点禁用**：在 `request_filter` 中（preflight 之后、`native_plan` 之前）直接
   `default_page::node_disabled_page` + `log_access(503, "NODE_DISABLED")`，与
   `handler.rs:413-430` 完全对齐，不再进 legacy。
 - **`parse_origin` 失败**：归为配置错误，直出 502 并记录 `unsupported_origin_url`；
   同时在控制面保存域名时校验 `origin_url`，让运行时不再出现该分支。
-- **未知 host + 空注册表（single-origin 模式）**：唯一可能"真需要 legacy"的点，
-  需产品决策：
-  - (A) 保留能力：在 Pingora 里实现 `NativePlan::default_origin`（origin 取
-    `state.origin.base_url()`，policy 用全局 `state.rules.resolve`，无 key-ignore 表）；
-    工作量不小，因为要补齐全局规则与"无域名"语义；
-  - (B) 明确废弃：只在 `ORIGIN_URL` + 无控制面的开发场景使用，加启动告警并在
-    `docs/deployment.md` 标注 deprecated，允许这一条继续走 legacy。
-  - 建议先用阶段 0 的 `reason=single_origin` 量化真实用量，再决定做 (A) 还是 (B)。
+- **未知 host + 空注册表（single-origin 模式）**：已改为原生（选项 A）。启动时把
+  `ORIGIN_URL` 装成注册表的**静态默认条目**，注册表为空时任意 Host 都解析到它、走
+  Pingora 计划；一旦控制面同步到真实域名，该条目被整体覆盖遮蔽，已纳管的边缘对未知
+  Host 仍返回 404。之所以能直接选 A：生产部署 `CONTROL_URL` 为必需（`docs/deployment.md`），
+  注册表必然非空，该路径生产不可达；实测也确认 `reason=single_origin` 只在「无控制面」
+  的裸启动下增长（3 次请求 → 3），而所有集成脚本都注册节点、该计数恒为 0。
+  legacy 的单源分支（`LegacyFallback::SingleOrigin` 及其指标变体）随之删除。
 
-验收：`dead-origin.sh`、`smoke.sh` 全绿；新增断言"节点禁用响应带
+验收：`dead-origin.sh`、`smoke.sh`、`single-origin.sh` 全绿；新增断言"节点禁用响应带
 `x-lagran-datapath: pingora`"（该页面经 `write_axum_response` 写出，天然带该头）。
 
 落地说明（第 1 项，已实现）：
@@ -293,6 +293,24 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
   `normalize_origins`，`origin_proto: "ftp"` 之类会被原样落库）；显式源站池仍走
   `normalize_origins`，备份源站仍走 `normalize_backup`。
 
+落地说明（第 3 项 / 剩余项 2，已实现，采用选项 A）：
+
+- 注册表新增 `static_default` 槽位（`config/registry.rs`）与 `set_static_default`；
+  `main.rs` 启动时用 `ORIGIN_URL` 构造一条 `version="static"` 的 `DomainEntry`（含同 URL 的
+  单条 `OriginTarget`）装入。它与真实条目**分开存放**，所以控制面首次 `replace_all` 会整体
+  接管、无需清理；`lookup` 仅在 `inner` 为空时才回退到它——已纳管边缘对未知 Host 仍返回
+  404（`cache-diagnostics.sh` 的 `unknown_domain` 语义不变）。
+- `request_filter` 删除了 `handle_in_process(…, LegacyFallback::SingleOrigin)` 交接；该
+  `else` 分支如今只对应空 Host，改为直出 404（`skip_logging`，与旧行为一致），不再进 legacy。
+- `LegacyFallback::SingleOrigin` 变体、计数器与快照字段一并删除，Prometheus 的
+  `lagran_edge_legacy_fallback_total` 由 7 个 reason 收敛为 **6** 个；
+  `cache-diagnostics.sh` 的断言同步改为 6，并把「未触碰 reason 为 0」的探针换到 `parse_origin`。
+- 新增 `tests/integration/single-origin.sh`：不启控制面（`CONTROL_URL` 指关闭端口，避免被
+  其它套件残留的控制面污染），断言任意两个不同 Host 都 200、`x-lagran-datapath: pingora`、
+  MISS→HIT、以及六个 reason 计数之和为 0。
+- 单元测试 `registry::tests::static_default_serves_any_host_until_real_config_arrives`
+  锁定「真实配置到达前服务任意 Host、到达后遮蔽」的切换语义。
+
 ### 阶段 4：重校验兜底在 Pingora 内闭环（2-3 天）
 
 把"剩余兜底清单"第 3 类的 6 种情形从"删缓存 → 回落 legacy"改成"Pingora 内继续"：
@@ -330,7 +348,7 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 前置门槛（必须同时满足）：
 
 - `lagran_edge_datapath_legacy_total` 在一个发布周期内零增长
-  （single-origin 若按 3(B) 保留，则只允许该 reason 增长）；
+  （阶段 3 后 single-origin 已改原生，不再有该 reason 的增长空间）；
 - `lagran_edge_legacy_fallback_total{reason}` 各 reason 归零；
 - 全部集成脚本绿。
 
@@ -359,6 +377,7 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 | `waf.sh` / `cc.sh` / `cache-rules.sh` | preflight 策略 | ✅ 全绿（阶段 1） |
 | `p2-hardening.sh` | SSRF / 限流 / 日志摄入 | 全绿 |
 | `smoke.sh` / `dead-origin.sh` / `multi-origin.sh` | 回源与故障切换 | 阶段 3/4 后全绿 |
+| `single-origin.sh` | 无控制面时任意 Host 走原生单源 | ✅ 全绿 + 断言 `pingora` + 6 个 reason |
 
 指标断言（阶段 0 之后每个阶段都要复查）：
 
