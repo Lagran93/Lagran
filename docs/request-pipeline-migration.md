@@ -237,7 +237,7 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 - `cache-diagnostics.sh` 的 HEAD 断言从「计 1 次 legacy」翻转为「`head` 增量 0 且响应带
   `pingora`」。
 
-### 阶段 3：确定性兜底改为直出（1-2 天）
+### 阶段 3：确定性兜底改为直出（1-2 天）—— 第 1 项已完成
 
 - **节点禁用**：在 `request_filter` 中（preflight 之后、`native_plan` 之前）直接
   `default_page::node_disabled_page` + `log_access(503, "NODE_DISABLED")`，与
@@ -255,6 +255,24 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 
 验收：`dead-origin.sh`、`smoke.sh` 全绿；新增断言"节点禁用响应带
 `x-lagran-datapath: pingora`"（该页面经 `write_axum_response` 写出，天然带该头）。
+
+落地说明（第 1 项，已实现）：
+
+- 直出点在 `request_filter` 里 preflight 之后、`try_large_revalidation`/`native_plan` 之前：
+  `!node_control.is_serving()` → `ctx.cache_label = "NODE_DISABLED"`、
+  `ctx.status = 503`，用 `write_axum_response(…, node_disabled_page, is_head, …)` 写出，
+  因此天然带 `x-lagran-datapath: pingora`，访问日志记为 `NODE_DISABLED`；
+- `plan_blocker` 删掉了 `LegacyFallback::NodeDisabled` 分支，禁用节点不再计入 legacy
+  （`cache-diagnostics.sh` 的 `node_disabled` 计数保持为 0）；
+- 顺带修掉一个**阻塞该验收的产品缺陷**：`repository::node_name_for_token` 原来带
+  `AND status <> 'disabled'`，节点被禁用后它的令牌立刻解析失败 → 所有 agent 接口 401，
+  edge 既收不到 `enabled:false`（于是继续放行，禁用无效），也看不到后续的重新启用。
+  现在禁用节点仍可认证，是否放行完全由数据面的 `NodeControl::is_serving` 决定；
+- `nodes.sh` 新增/对齐的断言：`disabled node returns 503`、页面文案、**`disabled page is
+  served by Pingora`**、`heartbeat keeps disabled status`、重新启用后恢复 200；同时把
+  `commands.binary`/`commands.docker` 的四条断言对齐到加固后的写法（值经 shell 引号包裹、
+  `EDGE_ADMIN_LISTEN` 由 `AGENT_URL` 推导、docker 只 publish 80 端口而在容器内
+  `EDGE_ADMIN_LISTEN=127.0.0.1:8081`）。
 
 ### 阶段 4：重校验兜底在 Pingora 内闭环（2-3 天）
 
@@ -389,6 +407,27 @@ sum(rate(lagran_edge_datapath_legacy_total[5m]))
     （`DELETE /api/v1/prefetch/schedules/:id`）、并把队列排空后再退出；产品侧同时新增
     `repository::expire_unclaimed_prefetch_tasks`，把 5 分钟仍未被领取的 `pending` 标记
     为 `failed`（`reclaim_stale_prefetch_tasks` 只管 `running`，未领取的行此前永不过期）。
+11. **`.env` 里重复的 `AGENT_TOKEN` 让节点令牌一律 401**：本地 `.env` 同时存在
+    `AGENT_TOKEN=<全局令牌>`（靠前）与一条空的 `AGENT_TOKEN=`（靠后），dotenvy 加载后
+    后者生效 → edge 不带 `x-lagran-agent-token` → 心跳与配置同步全部 401 → 节点永远
+    学不到禁用状态（表现为"节点禁用不生效"）。已把空赋值注释掉；`edge.env.example` 也
+    已明确"AGENT_TOKEN 必须是预注册节点的 auth_token"。
+12. **curl `-X HEAD` 会等响应体**：`cache-rules.sh`、`smoke.sh` 里用 `-X HEAD` 发 HEAD，
+    curl 不进入"HEAD 无 body"模式，于是等 `Content-Length` 声明的字节（HEAD 报真实长度
+    是本项目的既定契约），直接挂死。全部改为 `-I`。
+13. **Pingora 输出标题大小写的响应头**：`X-Cache: HIT`、`X-Lagran-Datapath: pingora`
+    等与 hyper/legacy 的小写形式不同，`smoke.sh` 原来 19 条大小写敏感的 `contains`
+    因此全部失败。新增 `contains_h`（两边都转小写）后统一处理。
+14. **`smoke.sh` 的源站故障状态断言过窄**：只接受 502/503，而 Pingora 会按
+    `default_page::OriginFailure` 给出 `Unreachable→502`、`Unhealthy→503`、
+    `Timeout→504`（该表由 `default_page` 单测锁定）。现改为接受三种 5xx，并由
+    `x-lagran-error: ORIGIN_*` 断言锁定具体类别。
+15. **残留 `online` 节点会让 purge 扇出失败**：`purge` 的聚合是
+    `success: !results.iter().any(|r| !r.success)`，而数据库里会留下历次测试的
+    `online` 行（agent_url 指向已关闭的测试端口），任意一个失败就把整体翻成
+    `success:false`（`cache-diagnostics.sh` 的 `tag purge succeeds` 因此失败）。
+    处理：跑套件前把残留行置为 `offline`（`UPDATE edge_nodes SET status='offline'
+    WHERE status='online'`），或清理这些节点。
 
 ### 发现：`write_axum_response` 的流式分支不定界（阶段 1 内已修）
 
