@@ -101,11 +101,35 @@ pub struct DomainEntry {
 pub struct DomainRegistry {
     inner: Arc<RwLock<HashMap<String, Arc<DomainEntry>>>>,
     version: Arc<RwLock<String>>,
+    /// Fallback served for every `Host` while `inner` is empty.
+    ///
+    /// This is the native replacement for the legacy single-origin mode: an edge
+    /// started without any control-plane config still serves one origin
+    /// (`ORIGIN_URL`) for all hosts, but through the Pingora plan instead of the
+    /// in-process engine. It is deliberately a separate slot rather than a
+    /// wildcard key in `inner`, so the first real config sync — which replaces
+    /// `inner` wholesale — takes over with no cleanup and a configured edge keeps
+    /// answering 404 for unknown domains.
+    static_default: Arc<RwLock<Option<Arc<DomainEntry>>>>,
 }
 
 impl DomainRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the single-origin fallback used only while no real domain exists.
+    pub async fn set_static_default(&self, mut entry: DomainEntry) {
+        entry.rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
+        entry.has_content_type_rules = entry
+            .rules
+            .iter()
+            .any(|rule| !rule.match_content_type.trim().is_empty());
+        entry.response_headers = Arc::new(ResponseHeaderOverrides::parse(
+            &entry.cors_origins,
+            &entry.custom_headers,
+        ));
+        *self.static_default.write().await = Some(Arc::new(entry));
     }
 
     pub async fn replace_all(&self, entries: Vec<DomainEntry>, version: String) {
@@ -160,14 +184,26 @@ impl DomainRegistry {
     pub async fn lookup(&self, host: &str) -> (bool, Option<Arc<DomainEntry>>) {
         let host = normalize_host(host);
         let entries = self.inner.read().await;
-        (
-            entries.is_empty(),
-            if host.is_empty() {
-                None
-            } else {
-                entries.get(&host).cloned()
-            },
-        )
+        let real_empty = entries.is_empty();
+        let direct = if host.is_empty() {
+            None
+        } else {
+            entries.get(&host).cloned()
+        };
+        drop(entries);
+        if let Some(entry) = direct {
+            return (false, Some(entry));
+        }
+        if !real_empty {
+            return (false, None);
+        }
+        // No real config at all: serve the single-origin fallback for any Host.
+        // A hostless request stays unattributable so the caller can answer 400.
+        let fallback = self.static_default.read().await.clone();
+        match fallback {
+            Some(entry) if !host.is_empty() => (false, Some(entry)),
+            _ => (true, None),
+        }
     }
 
     /// Domain name -> per-domain config version, for cache invalidation when a
@@ -343,6 +379,45 @@ mod tests {
         let (empty, found) = reg.lookup("unknown.test").await;
         assert!(!empty);
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn static_default_serves_any_host_until_real_config_arrives() {
+        let reg = DomainRegistry::new();
+        let (empty, found) = reg.lookup("anything.test").await;
+        assert!(empty, "no config and no fallback must read as empty");
+        assert!(found.is_none());
+
+        reg.set_static_default(DomainEntry {
+            domain: String::new(),
+            origin_url: "http://origin.test".into(),
+            version: "static".into(),
+            ..Default::default()
+        })
+        .await;
+
+        // Every non-empty Host resolves to the fallback, so requests reach the
+        // native plan instead of the legacy single-origin engine.
+        let (empty, found) = reg.lookup("anything.test").await;
+        assert!(!empty);
+        assert_eq!(found.unwrap().origin_url, "http://origin.test");
+        let (empty, found) = reg.lookup("other.example:8443").await;
+        assert!(!empty);
+        assert!(found.is_some());
+
+        // A hostless request stays unattributable (the caller answers 400).
+        let (empty, found) = reg.lookup("").await;
+        assert!(empty);
+        assert!(found.is_none());
+
+        // The first real sync shadows the fallback: unknown hosts are 404 again,
+        // which is what stops a configured edge from proxying stray Hosts.
+        reg.replace_all(vec![entry("cdn.test", 1)], "v2".into())
+            .await;
+        let (empty, found) = reg.lookup("anything.test").await;
+        assert!(!empty);
+        assert!(found.is_none());
+        assert_eq!(reg.lookup("cdn.test").await.1.unwrap().domain, "cdn.test");
     }
 
     #[tokio::test]

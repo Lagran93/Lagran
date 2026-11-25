@@ -790,10 +790,18 @@ impl ProxyHttp for DataPlaneProxy {
                 write_axum_response(session, response, false, Some(&self.compression)).await;
                 return Ok(true);
             }
+            // No domain entry and no static single-origin fallback. With the
+            // native fallback installed at startup this is only reachable for a
+            // hostless request, and there is no origin to serve it from. Answer
+            // 404 instead of handing the request to the in-process engine: the
+            // unconfigured edge has nothing to attribute the row to, so logging
+            // is skipped exactly as it was on the legacy path.
+            ctx.cache_label = "NONE";
             ctx.skip_logging = true;
-            return self
-                .handle_in_process(session, false, LegacyFallback::SingleOrigin)
-                .await;
+            ctx.status = StatusCode::NOT_FOUND.as_u16();
+            let response = default_page::unknown_domain_page(&ctx.host);
+            write_axum_response(session, response, false, Some(&self.compression)).await;
+            return Ok(true);
         };
         // Run the shared preflight (HTTPS redirect, bot challenge, CC, rate
         // limit, WAF, hotlink) before ANY cache revalidation. This used to live

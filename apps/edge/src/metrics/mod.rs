@@ -27,8 +27,6 @@ pub enum LegacyFallback {
     NodeDisabled,
     /// Client-requested revalidation (`no-cache` / `max-age=0`) did not complete.
     StrictRevalidation,
-    /// No domain registry yet: legacy single-origin mode.
-    SingleOrigin,
     /// `origin_url` could not be parsed, so no origin target exists.
     ParseOrigin,
     /// Pingora cache storage was not initialised (should be unreachable).
@@ -39,11 +37,10 @@ pub enum LegacyFallback {
 
 impl LegacyFallback {
     /// Stable iteration order: metrics output must not move between scrapes.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::Head,
         Self::NodeDisabled,
         Self::StrictRevalidation,
-        Self::SingleOrigin,
         Self::ParseOrigin,
         Self::NativeCacheDisabled,
         Self::Other,
@@ -54,7 +51,6 @@ impl LegacyFallback {
             Self::Head => "head",
             Self::NodeDisabled => "node_disabled",
             Self::StrictRevalidation => "strict_revalidation",
-            Self::SingleOrigin => "single_origin",
             Self::ParseOrigin => "parse_origin",
             Self::NativeCacheDisabled => "native_cache_disabled",
             Self::Other => "other",
@@ -69,7 +65,6 @@ struct LegacyFallbackCounters {
     head: AtomicU64,
     node_disabled: AtomicU64,
     strict_revalidation: AtomicU64,
-    single_origin: AtomicU64,
     parse_origin: AtomicU64,
     native_cache_disabled: AtomicU64,
     other: AtomicU64,
@@ -81,7 +76,6 @@ impl LegacyFallbackCounters {
             LegacyFallback::Head => &self.head,
             LegacyFallback::NodeDisabled => &self.node_disabled,
             LegacyFallback::StrictRevalidation => &self.strict_revalidation,
-            LegacyFallback::SingleOrigin => &self.single_origin,
             LegacyFallback::ParseOrigin => &self.parse_origin,
             LegacyFallback::NativeCacheDisabled => &self.native_cache_disabled,
             LegacyFallback::Other => &self.other,
@@ -93,7 +87,6 @@ impl LegacyFallbackCounters {
             head: self.head.load(Ordering::Relaxed),
             node_disabled: self.node_disabled.load(Ordering::Relaxed),
             strict_revalidation: self.strict_revalidation.load(Ordering::Relaxed),
-            single_origin: self.single_origin.load(Ordering::Relaxed),
             parse_origin: self.parse_origin.load(Ordering::Relaxed),
             native_cache_disabled: self.native_cache_disabled.load(Ordering::Relaxed),
             other: self.other.load(Ordering::Relaxed),
@@ -107,7 +100,6 @@ pub struct LegacyFallbackSnapshot {
     pub head: u64,
     pub node_disabled: u64,
     pub strict_revalidation: u64,
-    pub single_origin: u64,
     pub parse_origin: u64,
     pub native_cache_disabled: u64,
     pub other: u64,
@@ -119,7 +111,6 @@ impl LegacyFallbackSnapshot {
             LegacyFallback::Head => self.head,
             LegacyFallback::NodeDisabled => self.node_disabled,
             LegacyFallback::StrictRevalidation => self.strict_revalidation,
-            LegacyFallback::SingleOrigin => self.single_origin,
             LegacyFallback::ParseOrigin => self.parse_origin,
             LegacyFallback::NativeCacheDisabled => self.native_cache_disabled,
             LegacyFallback::Other => self.other,
@@ -664,12 +655,12 @@ mod tests {
         let m = EdgeMetrics::default();
         m.record_legacy_fallback(LegacyFallback::Head);
         m.record_legacy_fallback(LegacyFallback::Head);
-        m.record_legacy_fallback(LegacyFallback::SingleOrigin);
+        m.record_legacy_fallback(LegacyFallback::StrictRevalidation);
 
         let snapshot = m.legacy_fallbacks();
         assert_eq!(snapshot.head, 2);
-        assert_eq!(snapshot.single_origin, 1);
-        assert_eq!(snapshot.strict_revalidation, 0);
+        assert_eq!(snapshot.strict_revalidation, 1);
+        assert_eq!(snapshot.node_disabled, 0);
         assert_eq!(snapshot.get(LegacyFallback::Head), 2);
         assert_eq!(snapshot.get(LegacyFallback::Other), 0);
 
@@ -677,7 +668,7 @@ mod tests {
         let rendered: Vec<(&str, u64)> = snapshot.iter().collect();
         assert_eq!(rendered.len(), LegacyFallback::ALL.len());
         assert_eq!(rendered[0], ("head", 2));
-        assert_eq!(rendered[3], ("single_origin", 1));
+        assert_eq!(rendered[2], ("strict_revalidation", 1));
     }
 
     /// `datapath_legacy_total` and the per-reason counters are separate: the total

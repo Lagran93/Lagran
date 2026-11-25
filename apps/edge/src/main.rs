@@ -1,6 +1,6 @@
 use edge::agent::{self, access_report, cert_sync, config_sync, metrics_report, origin_health};
 use edge::cache::{self, policy::RuleSet};
-use edge::config::registry::DomainRegistry;
+use edge::config::registry::{DomainEntry, DomainRegistry, OriginTarget};
 use edge::config::EdgeConfig;
 use edge::metrics::EdgeMetrics;
 use edge::origin::OriginClient;
@@ -125,6 +125,27 @@ async fn main() -> anyhow::Result<()> {
     .await;
     let origin_health_map = origin_health::OriginHealthMap::new();
     let domains = DomainRegistry::new();
+    // Native single-origin fallback. An edge with no control-plane config still
+    // serves every `Host` from `ORIGIN_URL`, but through the Pingora plan rather
+    // than the legacy in-process engine. The entry is shadowed automatically as
+    // soon as a real domain is synced, so this never changes the 404 an
+    // onboarded edge returns for an unknown Host.
+    domains
+        .set_static_default(DomainEntry {
+            domain: config.domain.clone(),
+            origin_url: config.origin_url.clone(),
+            origins: vec![OriginTarget {
+                url: config.origin_url.clone(),
+                weight: 100,
+                priority: 0,
+                enabled: true,
+                host_header: None,
+                sni: None,
+            }],
+            version: "static".into(),
+            ..Default::default()
+        })
+        .await;
     let control = agent::ControlClient::new(&config);
     let node_control = agent::NodeControl::new();
     let waf_log = edge::server::waf_log::WafLog::new(&config.node_id, 2000);
