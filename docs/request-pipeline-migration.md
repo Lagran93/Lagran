@@ -237,7 +237,7 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
 - `cache-diagnostics.sh` 的 HEAD 断言从「计 1 次 legacy」翻转为「`head` 增量 0 且响应带
   `pingora`」。
 
-### 阶段 3：确定性兜底改为直出（1-2 天）—— 第 1 项已完成
+### 阶段 3：确定性兜底改为直出（1-2 天）—— 第 1、2 项已完成
 
 - **节点禁用**：在 `request_filter` 中（preflight 之后、`native_plan` 之前）直接
   `default_page::node_disabled_page` + `log_access(503, "NODE_DISABLED")`，与
@@ -273,6 +273,25 @@ Prometheus 文本在 `server/listener.rs:242-247`），无法回答"还剩什么
   `commands.binary`/`commands.docker` 的四条断言对齐到加固后的写法（值经 shell 引号包裹、
   `EDGE_ADMIN_LISTEN` 由 `AGENT_URL` 推导、docker 只 publish 80 端口而在容器内
   `EDGE_ADMIN_LISTEN=127.0.0.1:8081`）。
+
+落地说明（第 2 项，已实现）：
+
+- `request_filter` 在节点禁用检查之后、`try_large_revalidation`/`native_plan` 之前判断
+  `parse_origin(&domain.origin_url).is_none()`：直出 **502**，页面
+  `default_page::config_error_page`，`ctx.cache_label = "CONFIG_ERROR"`，响应带
+  `x-lagran-datapath: pingora` 与 `x-lagran-error: UNSUPPORTED_ORIGIN_URL`；
+- 新增全局计数 `lagran_edge_config_errors_total`（`EdgeMetrics::record_config_error` /
+  `config_errors()`，两个数据面的 metrics 端点都输出同一行），它非 0 即说明控制面放进来了
+  一份边缘无法解析的回源配置；
+- `legacy_reason` 删掉了 `ParseOrigin` 回落：既然 `request_filter` 已经先拦下，这个标签
+  只会让指标与真实路由不一致（`LegacyFallback::ParseOrigin` 变体保留，历史看板不受影响）；
+- 设计风险的消解：`config_sync` 的 `origin_url` 来自**已按优先级/权重排序**的源站池
+  （优先取 enabled 的第一项，否则取第一项，池为空才回退到单源字段），所以 `origin_url`
+  解析失败等价于整个源站池不可用，直接在它上面判断不会误伤合法的多源域名；
+- 控制面同步补齐：`domain::create`/`domain::update` 增加 `validate_primary_origin`，对
+  仅用旧式 `origin_host`/`origin_port`/`origin_proto` 提交的场景校验（这些字段原本绕过了
+  `normalize_origins`，`origin_proto: "ftp"` 之类会被原样落库）；显式源站池仍走
+  `normalize_origins`，备份源站仍走 `normalize_backup`。
 
 ### 阶段 4：重校验兜底在 Pingora 内闭环（2-3 天）
 
