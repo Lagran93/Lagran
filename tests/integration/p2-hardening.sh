@@ -27,12 +27,25 @@ mkdir -p "$LOG_DIR"
 PIDS=()
 FAILED=0
 TOKEN=""
+# Filled in by the SEC-NEW-05 case; `cleanup` needs them under `set -u`.
+SEC05_FLOOD=""
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=$((FAILED + 1)); }
 check() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
 contains() { if [[ "$2" == *"$3"* ]]; then pass "$1"; else fail "$1 (missing '$3')"; fi; }
 
 cleanup() {
+  # The SEC-NEW-05 case queues 120 warm-up paths and leaves a recurring schedule
+  # behind. Prefetch claims are FIFO at 20 tasks per 15 s round, so a leftover
+  # backlog starves the next suite's warm-up until its poll window expires
+  # (`cache-diagnostics.sh` failed exactly that way). Remove what this run created.
+  if [[ -n "${TOKEN:-}" && -n "${SEC05_FLOOD:-}" ]]; then
+    local ids id
+    ids=$(curl -s -H "authorization: Bearer $TOKEN"       "http://127.0.0.1:$CONTROL_PORT/api/v1/prefetch/schedules"       | jq -r --arg d "$SEC05_FLOOD" '.[] | select(.domain == $d) | .id' 2>/dev/null)
+    for id in $ids; do
+      curl -s -X DELETE         "http://127.0.0.1:$CONTROL_PORT/api/v1/prefetch/schedules/$id"         -H "authorization: Bearer $TOKEN" >/dev/null 2>&1
+    done
+  fi
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null; done
   wait 2>/dev/null
 }
@@ -239,6 +252,18 @@ check "tenant sees no foreign prefetch schedules" "$(printf '%s' "$SCHEDULES" | 
 ADMIN_TASKS=$(curl -s -H "$AUTH" "$BASE/api/v1/prefetch/tasks")
 check "admin listing is still unfiltered" \
   "$(printf '%s' "$ADMIN_TASKS" | jq --arg d "$SEC05_FLOOD" '[.[] | select(.domain == $d)] | length > 0')" "true"
+
+echo "== drain queued warm-ups =="
+# The flood above queues 121 tasks. Claims are FIFO at 20 per 15 s round, so
+# exiting with them still pending poisons the next suite's prefetch queue.
+DRAINED=0
+for _ in $(seq 1 90); do
+  LEFT=$(curl -s -H "$AUTH" "$BASE/api/v1/prefetch/tasks" \
+    | jq --arg d "$SEC05_FLOOD" '[.[] | select(.domain == $d and .status == "pending")] | length' 2>/dev/null)
+  [[ "${LEFT:-1}" == "0" ]] && { DRAINED=1; break; }
+  sleep 2.5
+done
+check "queued warm-up tasks drain before the suite exits" "$DRAINED" "1"
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then

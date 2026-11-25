@@ -112,10 +112,10 @@ check "no-cache without large cache revalidates" "$(hdr x-cache)" "REVALIDATED"
 check "no-cache without large cache uses origin-304" "$(hdr x-lagran-cache-reason)" "origin-304"
 check "no-cache GET uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
 
-# The per-reason fallback counters are the gate for the remaining migration work:
-# they must show HEAD (still in-process), and must NOT show a no-cache GET that
-# completed on Pingora. After the HEAD migration this section flips to
-# `head: 0` with `x-lagran-datapath: pingora` on HEAD as well.
+# The per-reason fallback counters are the gate for the remaining migration work.
+# HEAD is served natively since 阶段 2, so a HEAD request must not move the `head`
+# counter any more, and it must carry the pingora datapath marker. A no-cache GET
+# that completed on Pingora must not be counted either.
 #
 # With EDGE_ADMIN_LISTEN unset the management API lives on the data listener and
 # requires the node token, so every scrape has to carry it.
@@ -146,8 +146,9 @@ HEAD_BEFORE=$(fb head)
 STRICT_BEFORE=$(fb strict_revalidation)
 NODE_BEFORE=$(fb node_disabled)
 OTHER_BEFORE=$(fb other)
-curl -s -I -H "Host: $DOMAIN" -o /dev/null "http://127.0.0.1:$EDGE_PORT/cached"
-check "HEAD counts as a legacy fallback" "$(delta "$HEAD_BEFORE" "$(fb head)")" "1"
+curl -s -I -H "Host: $DOMAIN" -D "$LOG_DIR/h" -o /dev/null "http://127.0.0.1:$EDGE_PORT/cached"
+check "HEAD no longer falls back to the legacy engine" "$(delta "$HEAD_BEFORE" "$(fb head)")" "0"
+check "HEAD is served by Pingora" "$(hdr x-lagran-datapath)" "pingora"
 check "node-disabled reason stays untouched" "$(fb node_disabled)" "$NODE_BEFORE"
 check "unclassified reason stays untouched" "$(fb other)" "$OTHER_BEFORE"
 

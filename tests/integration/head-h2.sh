@@ -128,22 +128,26 @@ CODE=$(curl -sk -I --http2 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
   -D "$LOG_DIR/h" -o /dev/null -w '%{http_code}' "https://$DOMAIN:$HTTPS_PORT/head")
 check "H2 HEAD status" "$CODE" "200"
 check "H2 HEAD reported length" "$(hdr content-length)" "17"
+check "H2 HEAD is served by Pingora" "$(hdr x-lagran-datapath)" "pingora"
 
 echo "== HTTP/1.1 HEAD =="
 CODE=$(curl -sk -I --http1.1 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
   -D "$LOG_DIR/h" -o /dev/null -w '%{http_code}' "https://$DOMAIN:$HTTPS_PORT/head")
 check "H1 HEAD status" "$CODE" "200"
 check "H1 HEAD reported length" "$(hdr content-length)" "17"
+check "H1 HEAD is served by Pingora" "$(hdr x-lagran-datapath)" "pingora"
 
 echo "== cold HEAD (handler path) =="
 CODE=$(curl -sk -I --http2 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
   -D "$LOG_DIR/h" -o /dev/null -w '%{http_code}' "https://$DOMAIN:$HTTPS_PORT/head-cold-h2")
 check "H2 cold HEAD status" "$CODE" "200"
 check "H2 cold HEAD length" "$(hdr content-length)" "17"
+check "H2 cold HEAD is served by Pingora" "$(hdr x-lagran-datapath)" "pingora"
 CODE=$(curl -sk -I --http1.1 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
   -D "$LOG_DIR/h" -o /dev/null -w '%{http_code}' "https://$DOMAIN:$HTTPS_PORT/head-cold-h1")
 check "H1 cold HEAD status" "$CODE" "200"
 check "H1 cold HEAD length" "$(hdr content-length)" "17"
+check "H1 cold HEAD is served by Pingora" "$(hdr x-lagran-datapath)" "pingora"
 
 echo "== HEAD above MAX_CACHEABLE_BODY (16 MiB) =="
 CODE=$(curl -sk -I --http1.1 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
@@ -155,6 +159,18 @@ if grep -q 'origin failed' "$LOG_DIR/edge.log"; then
 else
   pass "huge HEAD did not mark the origin unhealthy"
 fi
+
+echo "== keepalive HEAD x2 =="
+# Two HEADs on one connection must not hang: HEAD carries the real length but no
+# body, so a client that waits for those bytes would stall until the timeout.
+# One `-o` per URL keeps `-I` from printing the second response's headers into
+# the `-w` stream; only the code/num_connects pairs are compared.
+KEEP=$(curl -sk -I --http1.1 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
+  -o /dev/null -o /dev/null -w '%{http_code}/%{num_connects} ' \
+  "https://$DOMAIN:$HTTPS_PORT/head" "https://$DOMAIN:$HTTPS_PORT/head" 2>/dev/null)
+KEEP=$(printf '%s' "$KEEP" | grep -oE '[0-9]{3}/[0-9]+' | tr '
+' ' ')
+check "second HEAD reuses the first connection" "$KEEP" "200/1 200/0 "
 
 BODY=$(curl -sk --http2 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" "https://$DOMAIN:$HTTPS_PORT/head")
 check "GET after HEAD has full body" "$BODY" "hello from origin"
