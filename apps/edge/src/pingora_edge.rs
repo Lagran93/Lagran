@@ -5967,6 +5967,23 @@ fn prepare_proxy_headers(
             .get("x-lagran-prefetch-token")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value == prefetch_token);
+    // The cache diagnostic (server/cache_diag.rs) runs in this process and loops
+    // back through the public listener to exercise the real pipeline. It must be
+    // able to state the scheme it is *simulating* (https) even though the
+    // loopback hop is plaintext, while still running the full preflight. It
+    // proves itself with the in-memory token, so only the scheme is honoured —
+    // unlike the prefetch marker, which bypasses preflight entirely.
+    let internal_diag = peer.is_some_and(|addr| addr.ip().is_loopback())
+        && req
+            .headers
+            .get("x-lagran-internal-request")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "1")
+        && req
+            .headers
+            .get("x-lagran-internal-token")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == prefetch_token);
 
     // `trust_proxy_headers` is the legacy switch. When true but no CIDR list is
     // configured, trust the immediate peer: that is only sane for the loopback
@@ -5988,10 +6005,11 @@ fn prepare_proxy_headers(
         &effective_trusted
     };
 
-    let identity = if internal_prefetch {
-        // A loopback peer carrying the internal prefetch marker is this Edge's
-        // own worker, not a public client. Preserve the HTTPS intent it came
-        // with even when external proxy-trust is disabled.
+    let identity = if internal_prefetch || internal_diag {
+        // A loopback peer carrying an in-process marker is this Edge's own
+        // worker (prefetch) or its cache diagnostic, not a public client.
+        // Preserve the HTTPS intent it came with even when external
+        // proxy-trust is disabled.
         crate::security::trusted_proxy::ClientIdentity {
             ip: peer.map(|addr| addr.ip()),
             is_https: xfp.is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https")),
@@ -6015,6 +6033,9 @@ fn prepare_proxy_headers(
     if !client_ip.is_empty() {
         req.insert_header("x-real-ip", client_ip.as_str())?;
     }
+    // Internal markers never reach the origin or the rest of the pipeline.
+    req.remove_header("x-lagran-internal-request");
+    req.remove_header("x-lagran-internal-token");
     // Same for the scheme: only a trusted hop may override what we observed.
     req.remove_header("x-forwarded-proto");
     req.insert_header(

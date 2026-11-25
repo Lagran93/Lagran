@@ -3,12 +3,18 @@
 //! The control plane asks an online edge to execute this request locally. That
 //! avoids depending on public DNS / hairpin NAT / TLS for a control-plane
 //! diagnostics call while still exercising the real edge cache path.
+//!
+//! 阶段 5: the diagnostic used to call `proxy_handler` directly, which measured
+//! the *legacy* in-process engine rather than the production Pingora data plane.
+//! It now sends a real HTTP request to the loopback public listener (same trick
+//! as `server/prefetch.rs`), so the reported status/headers reflect exactly what
+//! a client would get: native cache, Range/large-cache, HTTPS redirect and the
+//! preflight (WAF/CC/rate-limit).
 
-use crate::server::handler::{proxy_handler, AppState};
+use crate::server::handler::AppState;
 use axum::{
-    body::Body,
     extract::State,
-    http::{header, HeaderName, HeaderValue, Request, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     Json,
 };
 use http_body_util::BodyExt;
@@ -37,6 +43,14 @@ pub struct EdgeDiagResponse {
     pub body_preview: String,
 }
 
+fn bad_request(message: &str) -> Json<EdgeDiagResponse> {
+    Json(EdgeDiagResponse {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        headers: vec![],
+        body_preview: message.into(),
+    })
+}
+
 pub async fn diag_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EdgeDiagRequest>,
@@ -51,23 +65,53 @@ pub async fn diag_handler(
         || path.contains('\n')
         || path.starts_with("/__lagran/")
     {
-        return Json(EdgeDiagResponse {
-            status: StatusCode::BAD_REQUEST.as_u16(),
-            headers: vec![],
-            body_preview: "invalid diagnostic request".into(),
-        });
+        return bad_request("invalid diagnostic request");
     }
 
-    let mut builder = Request::builder()
-        .method("GET")
-        .uri(&path)
-        .header(header::HOST, &domain)
-        .header(header::USER_AGENT, "lagran-cache-diagnose/1.0");
+    // Scheme decides the `X-Forwarded-Proto` the loopback listener sees: with
+    // `https` an HTTPS-enforcing domain goes through the cache path, with `http`
+    // it shows the 301 redirect a real plaintext client would receive.
+    let is_https = req
+        .scheme
+        .as_deref()
+        .map(|v| v.eq_ignore_ascii_case("https"))
+        .unwrap_or(true);
+    let proto = if is_https { "https" } else { "http" };
+
+    let mut headers = HeaderMap::new();
+    let Ok(host) = HeaderValue::from_str(&domain) else {
+        return bad_request("invalid diagnostic request");
+    };
+    headers.insert(header::HOST, host);
+    headers.insert(
+        HeaderName::from_static("x-forwarded-proto"),
+        HeaderValue::from_static(proto),
+    );
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static("lagran-cache-diagnose/1.0"),
+    );
+    // Prove to `prepare_proxy_headers` that this loopback request is the Edge's
+    // own diagnostic, so the simulated scheme (`x-forwarded-proto`) is honoured
+    // while the full preflight (WAF/CC/rate-limit) still runs.
+    headers.insert(
+        HeaderName::from_static("x-lagran-internal-request"),
+        HeaderValue::from_static("1"),
+    );
+    if let Ok(token) = HeaderValue::from_str(&state.prefetch_token) {
+        headers.insert(HeaderName::from_static("x-lagran-internal-token"), token);
+    }
+    // Ask for identity so the preview and `Content-Length` describe the stored
+    // object, not a gzip variant.
+    headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     if req.simulate_cookie {
-        builder = builder.header(header::COOKIE, "lagran_debug=1");
+        headers.insert(header::COOKIE, HeaderValue::from_static("lagran_debug=1"));
     }
     if req.simulate_authorization {
-        builder = builder.header(header::AUTHORIZATION, "Bearer lagran-diagnostic");
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer lagran-diagnostic"),
+        );
     }
     if let Some(cc) = req
         .request_cache_control
@@ -75,48 +119,35 @@ pub async fn diag_handler(
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        builder = builder.header(header::CACHE_CONTROL, cc);
+        if let Ok(value) = HeaderValue::from_str(cc) {
+            headers.insert(header::CACHE_CONTROL, value);
+        }
     }
     if req.probe_range {
         // Large video/stream probes must not download the whole object. One
         // byte is enough to exercise the real cache/range path.
-        builder = builder.header(header::RANGE, "bytes=0-0");
-    }
-    let mut request = match builder.body(Body::empty()) {
-        Ok(request) => request,
-        Err(_) => {
-            return Json(EdgeDiagResponse {
-                status: StatusCode::BAD_REQUEST.as_u16(),
-                headers: vec![],
-                body_preview: "invalid diagnostic request".into(),
-            })
-        }
-    };
-    let is_https = req
-        .scheme
-        .as_deref()
-        .map(|v| v.eq_ignore_ascii_case("https"))
-        .unwrap_or(true);
-    if is_https {
-        // The in-process data path normally receives this marker from the TLS
-        // listener; without it a domain with HTTPS enforcement would answer
-        // 301 before WAF/cache and look like an un-cacheable response.
-        request
-            .extensions_mut()
-            .insert(crate::server::host_util::TlsSni(domain.clone()));
-        request.headers_mut().insert(
-            HeaderName::from_static("x-forwarded-proto"),
-            HeaderValue::from_static("https"),
-        );
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-0"));
     }
 
-    let response = match tokio::time::timeout(
+    // Go through the loopback public listener so Pingora's real data plane runs.
+    let base = format!("http://{}", state.local_http_addr);
+    let origin = match tokio::time::timeout(
         Duration::from_secs(10),
-        proxy_handler(State(state), request),
+        state
+            .origin
+            .request_stream_with_sni(&base, &Method::GET, &path, &headers, None, true, None),
     )
     .await
     {
-        Ok(response) => response,
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            tracing::warn!(%domain, %path, error = %e, "cache diagnostic loopback request failed");
+            return Json(EdgeDiagResponse {
+                status: StatusCode::BAD_GATEWAY.as_u16(),
+                headers: vec![],
+                body_preview: "cache diagnostic could not reach the edge data plane".into(),
+            });
+        }
         Err(_) => {
             return Json(EdgeDiagResponse {
                 status: StatusCode::GATEWAY_TIMEOUT.as_u16(),
@@ -126,12 +157,14 @@ pub async fn diag_handler(
             })
         }
     };
-    let status = response.status().as_u16();
+
+    let status = origin.status.as_u16();
     let selected = [
         "x-cache",
         "x-cache-status",
         "x-lagran-cache-reason",
         "x-lagran-cache-ttl",
+        "x-lagran-datapath",
         "age",
         "etag",
         "cache-control",
@@ -139,14 +172,14 @@ pub async fn diag_handler(
         "content-type",
         "server",
     ];
-    let mut headers = Vec::new();
+    let mut out_headers = Vec::new();
     for name in selected {
-        if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok()) {
-            headers.push((name.to_string(), value.to_string()));
+        if let Some(value) = origin.headers.get(name).and_then(|v| v.to_str().ok()) {
+            out_headers.push((name.to_string(), value.to_string()));
         }
     }
 
-    let mut body = response.into_body();
+    let mut body = origin.body;
     let mut preview = Vec::new();
     while preview.len() < 300 {
         match body.frame().await {
@@ -162,7 +195,7 @@ pub async fn diag_handler(
 
     Json(EdgeDiagResponse {
         status,
-        headers,
+        headers: out_headers,
         body_preview: String::from_utf8_lossy(&preview).to_string(),
     })
 }
