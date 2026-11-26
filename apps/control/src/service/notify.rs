@@ -239,6 +239,14 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .user_agent("lagran-control/0.1")
+        // Redirects are off: reqwest's default policy follows up to 10 hops and
+        // every hop is a fresh URL. It skips `check_target` (which only saw the
+        // initial URL) and, for proxied requests, the guarded resolver runs at
+        // the proxy instead. A tenant-controlled `api_base` answering
+        // `302 Location: http://169.254.169.254/...` made the control plane dial
+        // metadata or an internal port (H2). Alert delivery does not need
+        // redirects, so the 3xx is surfaced as an error below.
+        .redirect(reqwest::redirect::Policy::none())
         // reqwest resolves on its own, so give it the same guarded resolver the
         // hyper client uses. Without this, `api_base` could be rebound between
         // `validate_http_url` and the actual request.
@@ -305,6 +313,18 @@ async fn send_telegram(config: &Value, subject: &str, message: &str) -> Result<(
     let _body = response.text().await.unwrap_or_default();
     if status.is_success() {
         Ok(())
+    } else if status.is_redirection() {
+        // `Policy::none()` never dials the target of a redirect; make the
+        // operator fix `api_base` instead of chasing a 3xx.
+        tracing::warn!(
+            status = status.as_u16(),
+            api_base = %base,
+            "telegram api_base returned a redirect; redirects are not followed"
+        );
+        Err(format!(
+            "telegram HTTP {} (redirects are not followed; point api_base at the final URL)",
+            status.as_u16()
+        ))
     } else {
         Err(format!("telegram HTTP {}", status.as_u16()))
     }
@@ -640,6 +660,64 @@ mod tests {
         });
         send_telegram(&config, "subject", "message").await.unwrap();
         server.await.unwrap();
+    }
+
+    /// A redirect from `api_base` must not be followed.
+    ///
+    /// reqwest's default policy follows up to 10 hops, and a redirect to an IP
+    /// literal never reaches the guarded resolver: `check_target` only validated
+    /// the initial URL. The mock Bot API below answers `302` pointing at a
+    /// loopback "metadata" listener, so following it would be visible as a
+    /// connection (loopback is permitted in `cfg(test)` builds on purpose).
+    #[tokio::test]
+    async fn telegram_redirect_to_internal_destination_is_not_followed() {
+        let metadata = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let metadata_addr = metadata.local_addr().unwrap();
+        let metadata_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let metadata_task = {
+            let metadata_hits = metadata_hits.clone();
+            tokio::spawn(async move {
+                if let Ok(Ok((mut socket, _))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), metadata.accept()).await
+                {
+                    metadata_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                }
+            })
+        };
+
+        let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_addr = api.local_addr().unwrap();
+        let api_task = tokio::spawn(async move {
+            let (mut socket, _) = api.accept().await.unwrap();
+            let mut buf = [0_u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://{metadata_addr}/latest/meta-data\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let config = json!({
+            "bot_token": "123:test",
+            "chat_id": "456",
+            "api_base": format!("http://{api_addr}"),
+        });
+        let err = send_telegram(&config, "subject", "message")
+            .await
+            .expect_err("a redirect must not be followed");
+        assert!(err.contains("redirect"), "{err}");
+
+        api_task.await.unwrap();
+        metadata_task.await.unwrap();
+        assert_eq!(
+            metadata_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target must never be dialled"
+        );
     }
 
     #[tokio::test]
