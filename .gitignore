@@ -54,3 +54,6 @@ data/
 docs/todo-bug.md
 docs/security*
 docs/reviews
+
+# bench
+bench/
