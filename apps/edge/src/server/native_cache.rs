@@ -384,47 +384,63 @@ impl Storage for NativeStorage {
         let Some(key) = Self::key_str(key) else {
             return Ok(None);
         };
-        if let Some(large) = self.large.as_ref() {
-            if let Some(entry) = large.get(key).await {
-                let len = entry.content_length() as usize;
-                let mut meta = if let Some(encoded) = entry
-                    .meta
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(META_HEADER))
-                    .map(|(_, v)| v.as_str())
-                {
-                    decode_meta(encoded)
-                        .unwrap_or(derive_meta_parts(entry.meta.status, &entry.meta.headers, len)?)
-                } else {
-                    derive_meta_parts(entry.meta.status, &entry.meta.headers, len)?
-                };
-                if let Some(etag) = entry
-                    .meta
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
-                    .map(|(_, v)| v)
-                {
-                    if !meta.response_header().headers.contains_key("etag") {
-                        meta.response_header_mut().insert_header("etag", etag)?;
+        let (cache_result, source) = self.cache.get_result_with_source(key).await;
+        // Probe the disk-backed large-object cache only when the in-memory cache
+        // is not a fresh hit. Probing it first (the old order) made every small
+        // object HIT pay a `fs::read(meta_path)` round-trip through the blocking
+        // pool + a JSON parse attempt for an object that can never live in the
+        // large cache — measurable per-request CPU on the hot path.
+        //
+        // A small object and a large object for the same key are mutually
+        // exclusive (get_miss_handler routes to exactly one store), so a fresh
+        // small Hit cannot hide a complete large copy. A Stale small entry still
+        // prefers a complete large copy, preserving the old precedence.
+        let (small_entry, probe_large) = match cache_result {
+            CacheGetResult::Hit(entry) => (Some(entry), false),
+            CacheGetResult::Stale(entry) => (Some(entry), true),
+            CacheGetResult::Expired | CacheGetResult::Miss => (None, true),
+        };
+        if probe_large {
+            if let Some(large) = self.large.as_ref() {
+                if let Some(entry) = large.get(key).await {
+                    let len = entry.content_length() as usize;
+                    let mut meta = if let Some(encoded) = entry
+                        .meta
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(META_HEADER))
+                        .map(|(_, v)| v.as_str())
+                    {
+                        decode_meta(encoded)
+                            .unwrap_or(derive_meta_parts(entry.meta.status, &entry.meta.headers, len)?)
+                    } else {
+                        derive_meta_parts(entry.meta.status, &entry.meta.headers, len)?
+                    };
+                    if let Some(etag) = entry
+                        .meta
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+                        .map(|(_, v)| v)
+                    {
+                        if !meta.response_header().headers.contains_key("etag") {
+                            meta.response_header_mut().insert_header("etag", etag)?;
+                        }
                     }
+                    add_cache_headers(&mut meta, CacheSource::L3, lookup_start.elapsed().as_millis());
+                    return Ok(Some((
+                        meta,
+                        Box::new(LargeEntryHit {
+                            entry,
+                            pos: 0,
+                            end: len as u64,
+                        }) as HitHandler,
+                    )));
                 }
-                add_cache_headers(&mut meta, CacheSource::L3, lookup_start.elapsed().as_millis());
-                return Ok(Some((
-                    meta,
-                    Box::new(LargeEntryHit {
-                        entry,
-                        pos: 0,
-                        end: len as u64,
-                    }) as HitHandler,
-                )));
             }
         }
-        let (cache_result, source) = self.cache.get_result_with_source(key).await;
-        let entry = match cache_result {
-            CacheGetResult::Hit(entry) | CacheGetResult::Stale(entry) => entry,
-            CacheGetResult::Expired | CacheGetResult::Miss => return Ok(None),
+        let Some(entry) = small_entry else {
+            return Ok(None);
         };
         let mut meta = if let Some(encoded) = entry
             .headers
