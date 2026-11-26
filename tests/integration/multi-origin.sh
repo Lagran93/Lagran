@@ -152,12 +152,25 @@ check "slow origin does not surface 504" "$OK" "8"
 check "read timeout retries next origin" "$FAST" "8"
 
 echo "== priority fallback =="
+# Warm a validator-bearing object while the priority-0 layer is still alive.
+# The no-cache refresh after the kill below exercises strict revalidation (H3):
+# it must walk the same failover order instead of pinning to the first
+# configured origin.
+curl -s --max-time 8 -o /dev/null -H "Host: $DOMAIN" \
+  "http://127.0.0.1:$EDGE_PORT/assets/app.css"
 # Stop the two priority-0 origins; the priority-1 origin must take over.
 kill "$A_PID" "$B_PID" 2>/dev/null || true
 sleep 5
 PORT=$(curl -s --max-time 8 -D - -o /dev/null -H "Host: $DOMAIN" \
   "http://127.0.0.1:$EDGE_PORT/lb/failover?fail=1" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-origin-port"{print $2}' | head -1)
 check "priority-1 origin takes over" "$PORT" "$ORIGIN_C"
+
+REVAL=$(curl -s --max-time 8 -D "$LOG_DIR/reval.h" -o "$LOG_DIR/reval.b" -w '%{http_code}' \
+  -H "Host: $DOMAIN" -H 'Cache-Control: no-cache' \
+  "http://127.0.0.1:$EDGE_PORT/assets/app.css")
+REVAL_PORT=$(tr -d '\r' <"$LOG_DIR/reval.h" | awk -F': ' 'tolower($1)=="x-origin-port"{print $2}' | head -1)
+check "no-cache revalidation fails over to the backup" "$REVAL" "200"
+check "revalidation used the backup origin" "$REVAL_PORT" "$ORIGIN_C"
 
 DYNAMIC=$(curl -s --max-time 8 -D - -o /dev/null -X POST -H "Host: $DOMAIN" \
   -H 'content-type: application/json' -d '{"ping":true}' \

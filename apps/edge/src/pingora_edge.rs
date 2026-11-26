@@ -2251,10 +2251,6 @@ impl DataPlaneProxy {
             return Ok(RevalOutcome::NativeMiss);
         }
 
-        let target = match plan.domain.origins.iter().find(|origin| origin.enabled) {
-            Some(target) => target.clone(),
-            None => return Ok(RevalOutcome::OriginError(OriginFailure::Unreachable)),
-        };
         let path_and_query = session
             .req_header()
             .uri
@@ -2262,11 +2258,6 @@ impl DataPlaneProxy {
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
         let mut headers = session.req_header().headers.clone();
-        if let Some(host) = target.host_header.as_deref() {
-            if let Ok(value) = HeaderValue::from_str(host) {
-                headers.insert(axum::http::header::HOST, value);
-            }
-        }
         origin_auth::apply(
             &mut headers,
             &plan.domain.origin_auth_header,
@@ -2282,24 +2273,15 @@ impl DataPlaneProxy {
             }
         }
         let conditional = match self
-            .state
-            .origin
-            .request_with_sni(
-                &target.url,
-                &Method::HEAD,
-                &path_and_query,
-                &headers,
-                None,
-                false,
-                target.sni.as_deref(),
-            )
+            .origin_conditional(&plan, &Method::HEAD, &path_and_query, &headers, None)
             .await
         {
             Ok(response) => response,
-            Err(_) => {
-                // Origin unreachable/timeout on the conditional HEAD: keep the
-                // cached copy and answer the origin-error page (阶段 4: 不删缓存).
-                return Ok(RevalOutcome::OriginError(OriginFailure::Unreachable));
+            Err(failure) => {
+                // Every candidate was unreachable/timed out on the conditional
+                // HEAD: keep the cached copy and answer the origin-error page
+                // (阶段 4: 不删缓存).
+                return Ok(RevalOutcome::OriginError(failure));
             }
         };
         if conditional.status != StatusCode::NOT_MODIFIED {
@@ -2371,6 +2353,75 @@ impl DataPlaneProxy {
         Ok(RevalOutcome::Served)
     }
 
+    /// Send one conditional revalidation request to the first origin that answers.
+    ///
+    /// Strict revalidation used to take `origins.iter().find(|o| o.enabled)` —
+    /// configuration order, ignoring health, priority and backup origins (H3).
+    /// It now walks the same failover order as normal fetches: a transport
+    /// failure marks that origin unhealthy immediately and the request moves on,
+    /// so a `Cache-Control: no-cache` refresh still succeeds while the primary is
+    /// down instead of pinning every refresh to a dead origin.
+    async fn origin_conditional(
+        &self,
+        plan: &NativePlan,
+        method: &Method,
+        path_and_query: &str,
+        base_headers: &HeaderMap,
+        timeout: Option<Duration>,
+    ) -> Result<crate::origin::OriginResponse, OriginFailure> {
+        let targets = self.origin_targets_in_failover_order(&plan.domain).await;
+        if targets.is_empty() {
+            return Err(OriginFailure::Unreachable);
+        }
+        let mut failure = OriginFailure::Unreachable;
+        for target in targets {
+            let mut headers = base_headers.clone();
+            if let Some(host) = target.host_header.as_deref() {
+                if let Ok(value) = HeaderValue::from_str(host) {
+                    headers.insert(axum::http::header::HOST, value);
+                }
+            }
+            let request = self.state.origin.request_with_sni(
+                &target.url,
+                method,
+                path_and_query,
+                &headers,
+                None,
+                false,
+                target.sni.as_deref(),
+            );
+            let result = match timeout {
+                Some(limit) => match tokio::time::timeout(limit, request).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        self.state
+                            .origin_health
+                            .record_origin_failure(&plan.domain.domain, &target.url, "timeout")
+                            .await;
+                        failure = OriginFailure::Timeout;
+                        continue;
+                    }
+                },
+                None => request.await,
+            };
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    self.state
+                        .origin_health
+                        .record_origin_failure(&plan.domain.domain, &target.url, &error.to_string())
+                        .await;
+                    // A timeout anywhere in the chain is the more actionable
+                    // cause, so it survives a later `unreachable` answer.
+                    if failure != OriginFailure::Timeout {
+                        failure = OriginFailure::Unreachable;
+                    }
+                }
+            }
+        }
+        Err(failure)
+    }
+
     async fn try_normal_revalidation(
         &self,
         session: &mut Session,
@@ -2396,10 +2447,6 @@ impl DataPlaneProxy {
             return Ok(RevalOutcome::NativeMiss);
         }
 
-        let target = match plan.domain.origins.iter().find(|origin| origin.enabled) {
-            Some(target) => target.clone(),
-            None => return Ok(RevalOutcome::OriginError(OriginFailure::Unreachable)),
-        };
         let path_and_query = session
             .req_header()
             .uri
@@ -2411,11 +2458,6 @@ impl DataPlaneProxy {
         headers.remove("pragma");
         headers.remove("if-none-match");
         headers.remove("if-modified-since");
-        if let Some(host) = target.host_header.as_deref() {
-            if let Ok(value) = HeaderValue::from_str(host) {
-                headers.insert(axum::http::header::HOST, value);
-            }
-        }
         origin_auth::apply(
             &mut headers,
             &plan.domain.origin_auth_header,
@@ -2433,31 +2475,23 @@ impl DataPlaneProxy {
             }
         }
 
-        let conditional = match tokio::time::timeout(
-            Duration::from_millis(plan.read_timeout_ms),
-            self.state.origin.request_with_sni(
-                &target.url,
+        let conditional = match self
+            .origin_conditional(
+                plan,
                 &Method::GET,
                 &path_and_query,
                 &headers,
-                None,
-                false,
-                target.sni.as_deref(),
-            ),
-        )
-        .await
+                Some(Duration::from_millis(plan.read_timeout_ms)),
+            )
+            .await
         {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => {
-                // Origin refused / protocol error: keep the cached copy and let
-                // the caller answer the origin-error page (阶段 4: 不删缓存).
+            Ok(response) => response,
+            Err(failure) => {
+                // Every candidate failed (refused, protocol error or timeout):
+                // keep the cached copy and let the caller answer the origin-error
+                // page (阶段 4: 不删缓存).
                 self.state.metrics.record_origin_error();
-                return Ok(RevalOutcome::OriginError(OriginFailure::Unreachable));
-            }
-            Err(_) => {
-                // Timed out waiting for the conditional response.
-                self.state.metrics.record_origin_error();
-                return Ok(RevalOutcome::OriginError(OriginFailure::Timeout));
+                return Ok(RevalOutcome::OriginError(failure));
             }
         };
         if conditional.status != StatusCode::NOT_MODIFIED {
@@ -3503,17 +3537,14 @@ impl DataPlaneProxy {
         true
     }
 
-    /// Open one origin request for a chunk-aligned run.
-    ///
-    /// `Err(true)` means the cached representation is invalid (200, ETag or
-    /// Content-Range mismatch); the caller should drop the entry. `Err(false)`
-    /// is a transient/unsupported response and leaves the cache alone.
-    #[allow(clippy::too_many_arguments)]
-    /// Origin targets in failover order for manual Range requests.
+    /// Origin targets in failover order for every manual fetch path.
     ///
     /// `origin_order` applies health, priority and weighted ordering. It returns
     /// URLs only, so re-attach the full OriginTarget (Host/SNI) where possible.
-    async fn chunk_origin_targets(&self, domain: &DomainEntry) -> Vec<OriginTarget> {
+    /// Manual Range/Chunk fills and strict revalidation all consume this order,
+    /// so a no-cache refresh fails over exactly like a normal GET instead of
+    /// pinning to the first configured origin (H3).
+    async fn origin_targets_in_failover_order(&self, domain: &DomainEntry) -> Vec<OriginTarget> {
         let order = self.origin_order(&domain.domain, domain).await;
         let mut targets = Vec::with_capacity(order.len().max(1));
         for url in order {
@@ -3567,7 +3598,9 @@ impl DataPlaneProxy {
         run_end: u64,
         total: u64,
     ) -> Result<crate::origin::OriginStreamResponse, bool> {
-        let targets = self.chunk_origin_targets(&native_plan.domain).await;
+        let targets = self
+            .origin_targets_in_failover_order(&native_plan.domain)
+            .await;
         if targets.is_empty() {
             return Err(false);
         }
@@ -3719,7 +3752,9 @@ impl DataPlaneProxy {
         run_start: u64,
         run_end: Option<u64>,
     ) -> Result<(crate::origin::OriginStreamResponse, u64, u64), bool> {
-        let targets = self.chunk_origin_targets(&native_plan.domain).await;
+        let targets = self
+            .origin_targets_in_failover_order(&native_plan.domain)
+            .await;
         if targets.is_empty() {
             return Err(false);
         }
@@ -3837,7 +3872,9 @@ impl DataPlaneProxy {
     /// HEAD is cheapest and does not pull a body. Some origins reject HEAD, so
     /// fall back to a one-byte `bytes=0-0` GET and read Content-Range.
     async fn probe_origin_total(&self, session: &Session, native_plan: &NativePlan) -> Option<u64> {
-        let targets = self.chunk_origin_targets(&native_plan.domain).await;
+        let targets = self
+            .origin_targets_in_failover_order(&native_plan.domain)
+            .await;
         if targets.is_empty() {
             return None;
         }
