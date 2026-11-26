@@ -70,6 +70,23 @@ fn caller_ip(parts: &Parts) -> Option<std::net::IpAddr> {
         .map(|ConnectInfo(addr)| addr.ip())
 }
 
+/// Constant-time byte comparison for the shared agent token.
+///
+/// `==` on `&str` returns on the first differing byte, which leaks the matching
+/// prefix length. A 32-byte random token makes remote timing impractical, but the
+/// rest of the repository already compares credentials this way; consistency
+/// matters once a token is shortened or derived (M4).
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 fn agent_token(parts: &Parts) -> &str {
     parts
         .headers
@@ -109,6 +126,19 @@ impl FromRequestParts<AppState> for AgentAuth {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn shared_agent_token_comparison_is_constant_time() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+}
+
 #[async_trait]
 impl FromRequestParts<AppState> for ScheduleAuth {
     type Rejection = AgentAuthError;
@@ -134,7 +164,7 @@ impl FromRequestParts<AppState> for ScheduleAuth {
             return Err(AgentAuthError);
         }
         let got = agent_token(parts);
-        if got == expected {
+        if constant_time_eq(got.as_bytes(), expected.as_bytes()) {
             return Ok(ScheduleAuth);
         }
         if state

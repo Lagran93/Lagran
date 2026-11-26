@@ -705,7 +705,12 @@ impl ProxyHttp for DataPlaneProxy {
                 .headers
                 .get("x-lagran-prefetch-token")
                 .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value == self.state.prefetch_token)
+                .is_some_and(|value| {
+                    crate::server::agent_auth::constant_time_eq(
+                        value.as_bytes(),
+                        self.state.prefetch_token.as_bytes(),
+                    )
+                })
             && ctx
                 .client_ip
                 .parse::<std::net::IpAddr>()
@@ -6062,7 +6067,9 @@ fn prepare_proxy_headers(
             .headers
             .get("x-lagran-prefetch-token")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == prefetch_token);
+            .is_some_and(|value| {
+                crate::server::agent_auth::constant_time_eq(value.as_bytes(), prefetch_token.as_bytes())
+            });
     // The cache diagnostic (server/cache_diag.rs) runs in this process and loops
     // back through the public listener to exercise the real pipeline. It must be
     // able to state the scheme it is *simulating* (https) even though the
@@ -6079,7 +6086,9 @@ fn prepare_proxy_headers(
             .headers
             .get("x-lagran-internal-token")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == prefetch_token);
+            .is_some_and(|value| {
+                crate::server::agent_auth::constant_time_eq(value.as_bytes(), prefetch_token.as_bytes())
+            });
 
     // `trust_proxy_headers` is the legacy switch. When true but no CIDR list is
     // configured, trust the immediate peer: that is only sane for the loopback
