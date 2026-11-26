@@ -343,6 +343,10 @@ struct ReqCtx {
     /// Remaining lifetime of the identity entry, reused as the variant TTL.
     identity_ttl_secs: Option<u64>,
     flight_guard: Option<crate::cache::flight::FlightGuard>,
+    /// When the first upstream request was handed to Pingora. Used to report
+    /// `origin;dur` in `Server-Timing`, so an access-log latency can be split
+    /// into cache, origin and downstream-transfer time.
+    upstream_start: Option<Instant>,
     /// Set when the in-process handler already wrote its own access log.
     skip_logging: bool,
     /// Set once the shared preflight has run for this request, so the
@@ -382,6 +386,7 @@ impl Default for ReqCtx {
             gzip_store: None,
             identity_ttl_secs: None,
             flight_guard: None,
+            upstream_start: None,
             skip_logging: false,
             preflight_done: false,
         }
@@ -937,6 +942,7 @@ impl ProxyHttp for DataPlaneProxy {
                         &plan.key,
                         plan.read_timeout_ms,
                         self.state.cache.as_ref(),
+                        self.state.cache_flight_wait_ms,
                     )
                     .await;
                     if outcome.is_degraded() {
@@ -1447,6 +1453,12 @@ impl ProxyHttp for DataPlaneProxy {
     ) -> Result<()> {
         crate::security::loop_guard::ensure_stamped_pingora(upstream_request, &self.state.node_id);
         upstream_request.remove_header(signed_url::HOTLINK_OK_HEADER);
+        // Time from handing the request to Pingora until the response headers
+        // arrive. Includes connect/TLS, retries and origin TTFB, but not the
+        // downstream body transfer.
+        if ctx.upstream_start.is_none() {
+            ctx.upstream_start = Some(Instant::now());
+        }
         if let Some(plan) = ctx.plan.as_ref() {
             // Keep HTTP Host aligned with the peer actually selected.
             let host = if !ctx.current_host_header.is_empty() {
@@ -1671,7 +1683,18 @@ impl ProxyHttp for DataPlaneProxy {
             .to_string();
         response.insert_header("x-lagran-cache-source", cache_source)?;
         response.insert_header("x-lagran-cache-lookup-ms", lookup_ms.clone())?;
-        response.insert_header("server-timing", format!("cache;dur={lookup_ms}"))?;
+        // Split the request into its observable stages. Without this a 2 s log
+        // entry cannot be attributed to cache (Redis L2), origin TTFB or the
+        // downstream transfer to a distant client.
+        let mut timing = format!("cache;dur={lookup_ms}");
+        if let Some(upstream_start) = ctx.upstream_start {
+            let origin_ms = upstream_start.elapsed().as_millis();
+            timing.push_str(&format!(", origin;dur={origin_ms}"));
+            if let Ok(value) = HeaderValue::from_str(&origin_ms.to_string()) {
+                response.insert_header("x-lagran-origin-ms", value)?;
+            }
+        }
+        response.insert_header("server-timing", timing)?;
 
         if plan.cacheable || plan.is_head {
             let browser_ttl = (response_policy.action == RuleAction::Cache)
@@ -1838,6 +1861,20 @@ impl ProxyHttp for DataPlaneProxy {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        // The flight lock exists to stop duplicate origin fetches, not to cover
+        // the downstream write. Holding it until the request ends (the guard
+        // lives in `ctx` and is only dropped with it) made every retry of the
+        // same URL wait for a previous client's slow download: a 1.8 KB object
+        // to a lossy client held the lock for tens of seconds while healthy
+        // requests queued behind it. Release as soon as the origin body is
+        // complete; the cache entry is already published at that point.
+        if end_of_stream {
+            if let Some(guard) = ctx.flight_guard.take() {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move { guard.release_now().await });
+                }
+            }
+        }
         if ctx.gzip_replay.is_some() || ctx.gzip.is_some() {
             // Replay path: the compressed copy is already in memory. The
             // identity body is still streamed by the cache layer, so it is
@@ -2145,8 +2182,16 @@ impl DataPlaneProxy {
                     // Another node is validating this key. Wait for its
                     // conditional request to finish, then use the refreshed
                     // shared entry instead of firing a duplicate origin check.
+                    // The wait obeys the same cap as a normal follower: a slow
+                    // leader must not stall every no-cache request.
                     flight
-                        .wait_unlocked(&plan.key, crate::cache::flight::lock_wait(ttl_ms))
+                        .wait_unlocked(
+                            &plan.key,
+                            crate::cache::flight::follower_wait(
+                                ttl_ms,
+                                self.state.cache_flight_wait_ms,
+                            ),
+                        )
                         .await;
                     None
                 }

@@ -302,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
         prefetch_token,
         cache,
         flight,
+        cache_flight_wait_ms: config.cache_flight_wait_ms,
         // 128 concurrent background revalidations: enough to refresh a large
         // deployment quickly, far below the request concurrency that would exhaust
         // the origin pool.

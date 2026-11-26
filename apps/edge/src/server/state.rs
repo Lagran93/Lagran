@@ -43,6 +43,9 @@ pub struct AppState {
     pub cache: SharedCache,
     /// Cross-node cold-miss coalescing; None when Redis L2 is disabled.
     pub flight: Option<Arc<RedisFlight>>,
+    /// Cap on how long a follower waits for the flight leader before fetching
+    /// the object itself (`EdgeConfig::cache_flight_wait_ms`).
+    pub cache_flight_wait_ms: u64,
     /// Caps concurrent background revalidations.
     ///
     /// A stale hit spawns a detached origin fetch. When a whole cache expires at

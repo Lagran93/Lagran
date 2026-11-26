@@ -54,6 +54,16 @@ pub struct EdgeConfig {
     /// the old hardcoded 250 ms a cross-rack link turns ordinary latency into
     /// "flight lock unavailable", which silently disables coalescing.
     pub cache_flight_timeout_ms: u64,
+    /// Maximum time a follower waits for the flight leader to publish the
+    /// object before fetching it itself, in milliseconds.
+    ///
+    /// This used to be derived only from the origin read timeout (4/5 of the
+    /// lock TTL): with the default 30 s origin timeout a follower could sit for
+    /// 25.6 s on a key whose leader was slow — or whose response turned out to
+    /// be uncacheable, so the shared entry never appeared at all. Coalescing is
+    /// only worth it when the leader is nearly done, so the wait is capped
+    /// independently and configurable. 0 disables follower waiting entirely.
+    pub cache_flight_wait_ms: u64,
     pub cache_redis_prefix: String,
     /// Maximum serialized body written to Redis L2.
     pub cache_l2_max_body: usize,
@@ -303,6 +313,16 @@ impl Default for EdgeConfig {
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(250)
                 .clamp(50, 5_000),
+            // A follower must never inherit the leader's whole origin timeout:
+            // 30 s derives a 25.6 s wait that turns one slow fetch into a
+            // fleet-wide latency spike. The cap is deliberately small and
+            // configurable; coalescing only pays off when the leader is close
+            // to finishing.
+            cache_flight_wait_ms: std::env::var("CACHE_FLIGHT_WAIT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(2_000)
+                .clamp(0, 30_000),
             cache_redis_prefix: std::env::var("CACHE_REDIS_PREFIX")
                 .ok()
                 .map(|v| v.trim().to_string())
@@ -710,6 +730,21 @@ mod tests {
         // Garbage falls back to the default rather than disabling the lock path.
         std::env::set_var("CACHE_FLIGHT_TIMEOUT_MS", "not-a-number");
         assert_eq!(EdgeConfig::load().cache_flight_timeout_ms, 250);
+
+        // The follower wait is capped independently of the origin timeout. The
+        // default origin timeout (30 s) previously derived a 25.6 s wait, which
+        // is the latency spike this cap exists to prevent.
+        std::env::remove_var("CACHE_FLIGHT_WAIT_MS");
+        assert_eq!(EdgeConfig::load().cache_flight_wait_ms, 2_000);
+        std::env::set_var("CACHE_FLIGHT_WAIT_MS", "750");
+        assert_eq!(EdgeConfig::load().cache_flight_wait_ms, 750);
+        std::env::set_var("CACHE_FLIGHT_WAIT_MS", "999999");
+        assert_eq!(EdgeConfig::load().cache_flight_wait_ms, 30_000);
+        std::env::set_var("CACHE_FLIGHT_WAIT_MS", "1");
+        assert_eq!(EdgeConfig::load().cache_flight_wait_ms, 1);
+        std::env::set_var("CACHE_FLIGHT_WAIT_MS", "garbage");
+        assert_eq!(EdgeConfig::load().cache_flight_wait_ms, 2_000);
+        std::env::remove_var("CACHE_FLIGHT_WAIT_MS");
 
         std::env::remove_var("CACHE_FLIGHT_TIMEOUT_MS");
     }

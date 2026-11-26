@@ -503,7 +503,21 @@ impl CacheBackend for RedisL2Cache {
                 .saturating_add(fresh_secs.max(1))
                 .saturating_add(swr_secs),
         };
+        let write_start = std::time::Instant::now();
         self.redis_write(key, &l2, &tags).await;
+        // `HandleMiss::finish` awaits this call, so a slow cross-region Redis
+        // shows up as response latency rather than as a cache-write metric.
+        // Surface it explicitly instead of leaving operators to guess why a
+        // 30 KB MISS took two seconds.
+        let write_ms = write_start.elapsed().as_millis() as u64;
+        if write_ms >= 500 {
+            tracing::warn!(
+                key = %key,
+                body_len,
+                write_ms,
+                "Redis L2 write is slow and sits on the response path; consider a shorter write timeout or a closer Redis"
+            );
+        }
     }
 
     async fn delete(&self, key: &str) {

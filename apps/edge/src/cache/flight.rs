@@ -46,6 +46,17 @@ pub(crate) fn lock_wait(ttl_ms: u64) -> Duration {
         .max(Duration::from_millis(100))
 }
 
+/// Follower wait actually used for one acquire attempt.
+///
+/// The lock-derived window (4/5 of the TTL) is an upper bound, not a target:
+/// with the default 30 s origin timeout it is 25.6 s, and a follower that
+/// inherits all of it turns one slow leader into a fleet-wide stall. The
+/// configured cap wins whenever it is smaller.
+pub(crate) fn follower_wait(ttl_ms: u64, cap_ms: u64) -> Duration {
+    let derived = lock_wait(ttl_ms).as_millis() as u64;
+    Duration::from_millis(derived.min(cap_ms))
+}
+
 /// Per-process random-ish nonce, stable for the process lifetime.
 fn process_nonce() -> u64 {
     use std::hash::{BuildHasher, Hasher};
@@ -208,6 +219,28 @@ impl RedisFlight {
         }
     }
 
+    /// Whether the flight lock for `key` still exists. `None` when the round
+    /// trip fails; callers treat that as "stop waiting".
+    ///
+    /// A leader that finishes without publishing an entry (response not
+    /// cacheable, L2 write failed, client aborted) releases the lock without
+    /// ever populating L2. Without this probe a follower would keep polling the
+    /// cache for the rest of its window even though nobody is fetching anymore.
+    pub(crate) async fn is_locked(&self, key: &str) -> Option<bool> {
+        let mut conn = self.conn.clone();
+        match tokio::time::timeout(
+            self.timeout,
+            redis::cmd("EXISTS")
+                .arg(self.key(key))
+                .query_async::<i64>(&mut conn),
+        )
+        .await
+        {
+            Ok(Ok(value)) => Some(value > 0),
+            _ => None,
+        }
+    }
+
     async fn release(&self, key: &str, token: &str) {
         let mut conn = self.conn.clone();
         let script = redis::Script::new(
@@ -295,6 +328,7 @@ pub async fn acquire(
     key: &str,
     origin_timeout_ms: u64,
     cache: &dyn lagran_cache::CacheBackend,
+    follower_wait_ms: u64,
 ) -> FlightOutcome {
     let ttl_ms = lock_ttl_ms(origin_timeout_ms);
     match flight.try_lock(key, ttl_ms).await {
@@ -312,16 +346,30 @@ pub async fn acquire(
         }
         Ok(None) => {}
     }
-    // Follower: wait for the leader to populate shared L2. The window is derived
-    // from the same origin timeout as the lock, so it covers a leader that is
-    // simply slow rather than only one that died.
-    let deadline = tokio::time::Instant::now() + lock_wait(ttl_ms);
+    // Follower: wait for the leader to populate shared L2. The lock-derived
+    // window is an upper bound; the configured cap keeps one slow (or
+    // uncacheable) leader from charging its whole fetch time to every follower.
+    // A zero cap means "fetch in parallel immediately".
+    let wait = follower_wait(ttl_ms, follower_wait_ms);
+    if wait.is_zero() {
+        return FlightOutcome::Follower;
+    }
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut polls: u32 = 0;
     while tokio::time::Instant::now() < deadline {
         if !matches!(
             cache.get_result(key).await,
             lagran_cache::CacheGetResult::Miss | lagran_cache::CacheGetResult::Expired
         ) {
             break;
+        }
+        // Sparse lock probe: stop as soon as the lock disappears, instead of
+        // polling the cache for a window that nobody is filling anymore.
+        polls += 1;
+        if polls.is_multiple_of(5) {
+            if matches!(flight.is_locked(key).await, Some(false)) {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -350,9 +398,9 @@ mod tests {
         };
         let cache = MemoryCache::new(10);
         let key = "GET:flight.test:/a";
-        let guard = acquire(&flight, key, 10_000, &cache).await.into_guard();
+        let guard = acquire(&flight, key, 10_000, &cache, 5_000).await.into_guard();
         assert!(guard.is_some());
-        let second = acquire(&flight, key, 10_000, &cache).await;
+        let second = acquire(&flight, key, 10_000, &cache, 5_000).await;
         assert!(
             !matches!(second, FlightOutcome::Leader(_)),
             "a second node must not lead while the lock is held"
@@ -360,7 +408,7 @@ mod tests {
         assert!(!second.is_degraded(), "Redis is up; this is a follower");
         drop(guard);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(acquire(&flight, key, 10_000, &cache)
+        assert!(acquire(&flight, key, 10_000, &cache, 5_000)
             .await
             .into_guard()
             .is_some());
@@ -406,6 +454,25 @@ mod tests {
         }
         // A tiny timeout still yields a usable minimum.
         assert!(lock_wait(lock_ttl_ms(0)) >= Duration::from_millis(100));
+    }
+
+    /// A follower must not inherit the leader's full origin timeout.
+    ///
+    /// With the default 30 s origin timeout the lock-derived window is 25.6 s;
+    /// the production symptom was exactly that: 25.7 s `MISS` entries for a
+    /// 1.8 KB object whose origin answered in milliseconds.
+    #[test]
+    fn follower_wait_is_capped() {
+        let default_ttl = lock_ttl_ms(30_000);
+        assert_eq!(lock_wait(default_ttl), Duration::from_millis(25_600));
+        assert_eq!(
+            follower_wait(default_ttl, 2_000),
+            Duration::from_millis(2_000)
+        );
+        assert_eq!(follower_wait(default_ttl, 0), Duration::from_millis(0));
+        // A generous cap never stretches the lock-derived window.
+        let short = lock_ttl_ms(1_000);
+        assert_eq!(follower_wait(short, 60_000), lock_wait(short));
     }
 
     /// Short origin timeouts are floored so followers still have a window.
