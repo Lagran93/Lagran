@@ -10,7 +10,7 @@
 use crate::cache::large::{ChunkPlan, FillBudget, LargeEntry, RangeWriter};
 use crate::cache::policy::{
     ResolvedPolicy, RuleAction, VALIDATOR_SOURCE_HEADER, apply_key_ignore_default, compute_etag,
-    decide_storage_reason, decide_storage_reason_map, request_bypass_reason_headers,
+    CacheDecision, decide_storage_reason, decide_storage_reason_map, request_bypass_reason_headers,
     resolve_rule_policy_for_response,
 };
 use crate::cache::{CacheBackend, CacheSource};
@@ -439,6 +439,28 @@ fn resolve_response_policy(
         resolve_rule_policy_for_response(&plan.domain.rules, path, method, query, content_type);
     apply_key_ignore_default(&mut policy, &plan.domain.cache_key_ignore_headers);
     policy
+}
+
+/// Rule policy to apply when deciding whether an origin response may be stored.
+///
+/// Content-Type rules are matched against the *response's* Content-Type, which
+/// the request-stage [`NativePlan::policy`] cannot know. `response_cache_filter`
+/// already resolved this per response; the strict-revalidation writers used the
+/// request policy instead, so a domain that bypasses JSON could still store a
+/// JSON 200/304 fetched by a `no-cache` request (H4). Both paths share this
+/// function now.
+fn response_storage_policy(
+    plan: &NativePlan,
+    path: &str,
+    method: &str,
+    query: &str,
+    content_type: &str,
+) -> ResolvedPolicy {
+    if plan.domain.has_content_type_rules {
+        resolve_response_policy(plan, path, method, query, content_type)
+    } else {
+        plan.policy
+    }
 }
 
 #[async_trait]
@@ -1528,11 +1550,8 @@ impl ProxyHttp for DataPlaneProxy {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("");
         let query = session.req_header().uri.query().unwrap_or("");
-        let response_policy = if plan.domain.has_content_type_rules {
-            resolve_response_policy(plan, &ctx.path, ctx.method.as_str(), query, content_type)
-        } else {
-            plan.policy
-        };
+        let response_policy =
+            response_storage_policy(plan, &ctx.path, ctx.method.as_str(), query, content_type);
         if plan.domain.has_content_type_rules {
             ctx.response_policy = Some(ResponsePolicySlot {
                 content_type: content_type_value.cloned(),
@@ -2310,11 +2329,14 @@ impl DataPlaneProxy {
             merged_headers.push((name.to_string(), value.to_string()));
             conditional_headers.push((name.to_string(), value.to_string()));
         }
-        let decision = match decide_storage_reason(
+        let query = session.req_header().uri.query().unwrap_or("").to_string();
+        let decision = match self.decide_response_storage(
+            &plan,
+            &ctx.path,
+            ctx.method.as_str(),
+            &query,
             200,
             &merged_headers,
-            plan.policy,
-            self.state.default_ttl_secs,
         ) {
             Ok(decision) => decision,
             Err(_) => {
@@ -2422,6 +2444,34 @@ impl DataPlaneProxy {
         Err(failure)
     }
 
+    /// Storage decision for an origin response produced by revalidation.
+    ///
+    /// Revalidation used to call `decide_storage_reason(..., plan.policy, ...)`,
+    /// i.e. the request-stage policy, so a domain with a `content-type` bypass
+    /// still wrote the refreshed JSON/HTML 200 or 304 into the shared cache
+    /// (H4). The response's own Content-Type now selects the policy; a non-cache
+    /// rule means "serve it, do not write it".
+    fn decide_response_storage(
+        &self,
+        plan: &NativePlan,
+        path: &str,
+        method: &str,
+        query: &str,
+        status: u16,
+        headers: &[(String, String)],
+    ) -> Result<CacheDecision, &'static str> {
+        let content_type = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("");
+        let policy = response_storage_policy(plan, path, method, query, content_type);
+        if policy.action != RuleAction::Cache {
+            return Err("content-type-bypass");
+        }
+        decide_storage_reason(status, headers, policy, self.state.default_ttl_secs)
+    }
+
     async fn try_normal_revalidation(
         &self,
         session: &mut Session,
@@ -2511,11 +2561,14 @@ impl DataPlaneProxy {
             if conditional.status.is_success() {
                 let entry = conditional.into_entry();
                 if entry.body.len() <= self.state.max_cacheable_body {
-                    if let Ok(decision) = decide_storage_reason(
+                    let query = session.req_header().uri.query().unwrap_or("").to_string();
+                    if let Ok(decision) = self.decide_response_storage(
+                        plan,
+                        &ctx.path,
+                        ctx.method.as_str(),
+                        &query,
                         entry.status,
                         &entry.headers,
-                        plan.policy,
-                        self.state.default_ttl_secs,
                     ) {
                         self.state
                             .cache
@@ -2561,11 +2614,14 @@ impl DataPlaneProxy {
                 value.to_str().unwrap_or("").to_string(),
             ));
         }
-        let decision = match decide_storage_reason(
+        let query = session.req_header().uri.query().unwrap_or("").to_string();
+        let decision = match self.decide_response_storage(
+            plan,
+            &ctx.path,
+            ctx.method.as_str(),
+            &query,
             refreshed.status,
             &refreshed.headers,
-            plan.policy,
-            self.state.default_ttl_secs,
         ) {
             Ok(decision) => decision,
             Err(_) => {

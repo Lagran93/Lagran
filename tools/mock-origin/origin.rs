@@ -15,6 +15,10 @@ static ETAG_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// revalidation error paths without a mutable origin.
 static FLAKY_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SLOW_FLAKY_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// H4 fixture: how many conditional refreshes of the original plain
+/// representation the origin has answered. The first one changes the object to
+/// JSON; later ones report "not modified".
+static REVAL_FLIP_CONDITIONAL: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let port: u16 = std::env::args()
@@ -435,6 +439,84 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ),
                 ],
             ),
+            // H4 fixture: first a plain-text representation, then the conditional
+            // request that a `no-cache` refresh sends gets JSON. The JSON is
+            // bypassed by a content-type rule and must never replace the cached
+            // plain copy.
+            "/api/reval-flip" => {
+                if if_none_match.is_empty() {
+                    (
+                        200,
+                        b"plain-first".to_vec(),
+                        vec![
+                            ("Content-Type", "text/plain".into()),
+                            ("Cache-Control", "public, max-age=60".into()),
+                            ("ETag", "\"flip-v1\"".into()),
+                        ],
+                    )
+                } else if if_none_match.contains("flip-v2") {
+                    // The buggy edge stored the JSON from the first no-cache
+                    // refresh; revalidating that entry keeps the cached JSON body.
+                    (
+                        304,
+                        Vec::new(),
+                        vec![
+                            ("Content-Type", "application/json".into()),
+                            ("Cache-Control", "public, max-age=60".into()),
+                            ("ETag", "\"flip-v2\"".into()),
+                        ],
+                    )
+                } else if REVAL_FLIP_CONDITIONAL.fetch_add(1, Ordering::Relaxed) == 0 {
+                    // First no-cache refresh: the representation changed to JSON.
+                    (
+                        200,
+                        br#"{"data":"private"}"#.to_vec(),
+                        vec![
+                            ("Content-Type", "application/json".into()),
+                            ("Cache-Control", "public, max-age=60".into()),
+                            ("ETag", "\"flip-v2\"".into()),
+                        ],
+                    )
+                } else {
+                    // A correct edge still holds the plain representation, so the
+                    // object is unchanged and the cached plain body is served.
+                    (
+                        304,
+                        Vec::new(),
+                        vec![
+                            ("Content-Type", "text/plain".into()),
+                            ("Cache-Control", "public, max-age=60".into()),
+                            ("ETag", "\"flip-v1\"".into()),
+                        ],
+                    )
+                }
+            }
+            // H4 fixture for the origin-304 refresh branch: the 304 carries a
+            // bypassed Content-Type, which must not be written into the cached
+            // entry's headers.
+            "/api/reval-json304" => {
+                if if_none_match.is_empty() {
+                    (
+                        200,
+                        b"plain-304".to_vec(),
+                        vec![
+                            ("Content-Type", "text/plain".into()),
+                            ("Cache-Control", "public, max-age=60".into()),
+                            ("ETag", "\"json304-v1\"".into()),
+                        ],
+                    )
+                } else {
+                    (
+                        304,
+                        Vec::new(),
+                        vec![
+                            ("Content-Type", "application/json".into()),
+                            ("Cache-Control", "public, max-age=60".into()),
+                            ("ETag", "\"json304-v1\"".into()),
+                        ],
+                    )
+                }
+            }
             "/large" => {
                 if method == "HEAD"
                     && if_none_match

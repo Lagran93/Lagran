@@ -91,6 +91,10 @@ mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/q/*\",\"action\":\"by
 RULE_OFF=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/off/*\",\"action\":\"bypass\",\"enabled\":false,\"priority\":10}" | jq -r '.id')
 RULE_BROWSER=$(mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/browser/*\",\"action\":\"cache\",\"ttl_seconds\":60,\"browser_ttl_seconds\":3600,\"priority\":10}" | jq -r '.id')
 mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/iq/*\",\"action\":\"cache\",\"ttl_seconds\":60,\"ignore_query\":true,\"priority\":10}" >/dev/null
+# H4: cache this path, but bypass JSON responses. The JSON bypass must use a
+# higher priority than the cache rule (policy sorts by descending priority).
+mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/api/*\",\"action\":\"cache\",\"ttl_seconds\":60,\"priority\":5}" >/dev/null
+mk_rule "{\"domain_id\":\"$DOMAIN_ID\",\"path_pattern\":\"/api/*\",\"match_content_type\":\"application/json\",\"action\":\"bypass\",\"priority\":10}" >/dev/null
 
 BAD=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules" \
@@ -216,6 +220,38 @@ if [[ "$(hdr cache-control)" == *"max-age=600"* ]]; then
 else
   pass "html does not match css/js regex"
 fi
+
+echo "== revalidation content-type (H4) =="
+# A `no-cache` refresh revalidates inside the Pingora data plane, which used the
+# request-stage policy. A JSON response from that refresh must still obey the
+# content-type bypass: serve it, never store it.
+get "/api/reval-flip" >/dev/null
+check "flip fixture cold miss" "$(hdr x-cache)" "MISS"
+check "flip fixture cold body" "$(cat "$LOG_DIR/b")" "plain-first"
+get "/api/reval-flip" >/dev/null
+check "flip fixture warm hit" "$(hdr x-cache)" "HIT"
+CODE=$(get "/api/reval-flip" -H 'Cache-Control: no-cache')
+check "no-cache flip returns 200" "$CODE" "200"
+contains "revalidation served the JSON representation" "$(cat "$LOG_DIR/b")" '"data":"private"'
+# The bypassed JSON must not become the cached representation. The next
+# refresh of the same key must still be served the original text/plain body,
+# not the JSON fetched by the previous no-cache request.
+CODE=$(get "/api/reval-flip" -H 'Cache-Control: no-cache')
+check "second no-cache refresh returns 200" "$CODE" "200"
+check "second no-cache refresh serves the cached plain body" "$(cat "$LOG_DIR/b")" "plain-first"
+check "second no-cache refresh keeps text/plain" "$(hdr content-type)" "text/plain"
+
+# Same rule, but the origin answers the conditional request with 304. The 304
+# refresh branch also used to store the request policy; assert the cached
+# Content-Type is untouched.
+get "/api/reval-json304" >/dev/null
+check "304 fixture cold miss" "$(hdr x-cache)" "MISS"
+CODE=$(get "/api/reval-json304" -H 'Cache-Control: no-cache')
+check "no-cache 304 revalidates" "$CODE" "200"
+check "304 revalidation reports origin-304-stale" "$(hdr x-lagran-cache-reason)" "origin-304-stale"
+get "/api/reval-json304" >/dev/null
+check "304 body stayed cached" "$(cat "$LOG_DIR/b")" "plain-304"
+check "bypassed 304 did not rewrite the cached content type" "$(hdr content-type)" "text/plain"
 TEST=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/rules/test" \
   -d "{\"domain_id\":\"$DOMAIN_ID\",\"path\":\"/assets/app.js\"}")
 check "tester matches regex suffix" "$(printf '%s' "$TEST" | jq -r '.matched.note')" "regex suffix"
