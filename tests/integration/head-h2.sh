@@ -150,10 +150,20 @@ check "H1 cold HEAD length" "$(hdr content-length)" "17"
 check "H1 cold HEAD is served by Pingora" "$(hdr x-lagran-datapath)" "pingora"
 
 echo "== HEAD above MAX_CACHEABLE_BODY (16 MiB) =="
+# The origin counts `/huge` HEAD requests and GET body bytes. A cache-miss HEAD
+# must reach it as HEAD, not as a rewritten GET that downloads all 16 MiB (H5).
+BEFORE=$(curl -s "http://127.0.0.1:$ORIGIN_PORT/__stats")
 CODE=$(curl -sk -I --http1.1 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
   -D "$LOG_DIR/h" -o /dev/null -w '%{http_code}' "https://$DOMAIN:$HTTPS_PORT/huge")
+AFTER=$(curl -s "http://127.0.0.1:$ORIGIN_PORT/__stats")
 check "huge HEAD status" "$CODE" "200"
 check "huge HEAD length" "$(hdr content-length)" "16777216"
+check "huge HEAD reached the origin as HEAD" \
+  "$(( $(printf '%s' "$AFTER" | jq -r .huge_head_requests) - $(printf '%s' "$BEFORE" | jq -r .huge_head_requests) ))" "1"
+check "huge HEAD did not fall back to a GET" \
+  "$(( $(printf '%s' "$AFTER" | jq -r .huge_get_requests) - $(printf '%s' "$BEFORE" | jq -r .huge_get_requests) ))" "0"
+check "huge HEAD transferred no origin body bytes" \
+  "$(( $(printf '%s' "$AFTER" | jq -r .huge_get_body_bytes) - $(printf '%s' "$BEFORE" | jq -r .huge_get_body_bytes) ))" "0"
 if grep -q 'origin failed' "$LOG_DIR/edge.log"; then
   fail "huge HEAD was reported as an origin failure"
 else

@@ -1516,9 +1516,11 @@ impl ProxyHttp for DataPlaneProxy {
                 }
                 upstream_request.insert_header("accept-encoding", "identity")?;
             }
-            if plan.is_head {
-                upstream_request.set_method(Method::GET);
-            }
+            // Keep HEAD a HEAD upstream: the cache key already normalises HEAD
+            // to GET, so the origin can answer with the representation's headers
+            // and no body. Rewriting it to GET made every cache-miss HEAD
+            // download the full object just to discard it (H5), which is
+            // unbounded origin bandwidth for large files.
         }
         Ok(())
     }

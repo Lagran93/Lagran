@@ -19,6 +19,11 @@ static SLOW_FLAKY_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// representation the origin has answered. The first one changes the object to
 /// JSON; later ones report "not modified".
 static REVAL_FLIP_CONDITIONAL: AtomicU64 = AtomicU64::new(0);
+/// H5 fixture: `/huge` traffic, so the test can prove a cache-miss HEAD is not
+/// silently turned into a full GET. Served over `GET /__stats`.
+static HUGE_HEAD_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HUGE_GET_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HUGE_GET_BODY_BYTES: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let port: u16 = std::env::args()
@@ -75,6 +80,23 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
     let method = parts.next().unwrap_or("GET").to_uppercase();
     let target = parts.next().unwrap_or("/").to_string();
     let path = target.split('?').next().unwrap_or("/").to_string();
+
+    if path == "/__stats" {
+        let body = format!(
+            "{{\"huge_head_requests\":{},\"huge_get_requests\":{},\"huge_get_body_bytes\":{}}}",
+            HUGE_HEAD_REQUESTS.load(Ordering::Relaxed),
+            HUGE_GET_REQUESTS.load(Ordering::Relaxed),
+            HUGE_GET_BODY_BYTES.load(Ordering::Relaxed),
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes())?;
+        stream.flush()?;
+        return Ok(());
+    }
 
     let mut content_length = 0usize;
     let mut custom_header = String::new();
@@ -597,6 +619,15 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
             ),
         },
     };
+
+    if path == "/huge" {
+        if method == "HEAD" {
+            HUGE_HEAD_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            HUGE_GET_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            HUGE_GET_BODY_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        }
+    }
 
     let mut response = format!(
         "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n",
