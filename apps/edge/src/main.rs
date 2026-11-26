@@ -5,7 +5,7 @@ use edge::config::EdgeConfig;
 use edge::metrics::EdgeMetrics;
 use edge::origin::OriginClient;
 use edge::server::access_log::AccessLog;
-use edge::server::handler::AppState;
+use edge::server::state::AppState;
 use edge::server::inflight::Inflight;
 use edge::server::{listener, tls};
 use std::net::SocketAddr;

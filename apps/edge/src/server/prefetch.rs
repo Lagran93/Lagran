@@ -1,6 +1,6 @@
 //! Internal cache warming endpoint used by the control-plane prefetch worker.
 
-use crate::server::handler::AppState;
+use crate::server::state::AppState;
 use axum::{
     extract::State,
     http::{HeaderMap, HeaderValue, Method},

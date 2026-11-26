@@ -15,7 +15,7 @@
 //! registry additionally makes each nonce single-use; cross-node replay would
 //! require a shared store.
 
-use crate::server::handler::AppState;
+use crate::server::state::AppState;
 use crate::server::host_util::{self, TlsSni};
 use axum::{
     body::Body,

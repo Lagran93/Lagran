@@ -15,7 +15,7 @@ use std::time::Instant;
 use crate::cache::policy::CacheStatus;
 use crate::config::registry::DomainEntry;
 use crate::server::cc::{CcDecision, CcMode};
-use crate::server::handler::AppState;
+use crate::server::state::AppState;
 use crate::server::shared::{
     challenge_accepts_html, hotlink_allowed, log_access, uuid_like_request_id,
 };

@@ -1,6 +1,6 @@
 //! Edge-local purge API (called by control plane)
 
-use crate::server::handler::AppState;
+use crate::server::state::AppState;
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

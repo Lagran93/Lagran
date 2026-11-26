@@ -25,7 +25,7 @@ use crate::server::cert_store::CertStore;
 use crate::server::challenge;
 use crate::server::compression::{CompressionConfig, GzipEncoder, replay_chunk, should_compress};
 use crate::server::default_page::{self, OriginFailure};
-use crate::server::handler::{AppState, proxy_handler};
+use crate::server::state::AppState;
 use crate::server::shared::{
     apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed, log_access,
     policy_browser_ttl,
@@ -37,9 +37,9 @@ use crate::server::purge;
 use async_trait::async_trait;
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::{
-    HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version, header,
+    HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version, header,
 };
 use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
@@ -63,7 +63,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;
 /// Bound the number of sequential origin requests for one client request.
 /// A pathologically fragmented cache would otherwise produce one connection
 /// per chunk; above this the initial range path is used instead.
@@ -1156,10 +1155,20 @@ impl ProxyHttp for DataPlaneProxy {
         // routing, not an error; leave diagnostics to the access log so a
         // high-QPS workload cannot flood the process log. The reason is counted
         // so the remaining legacy surface stays visible.
+        // No native plan and no legacy engine any more (阶段 6). This is only
+        // reachable when the native cache was not initialised, which is a startup
+        // error: answer 503 rather than silently proxying through deleted code.
+        ctx.cache_label = "BYPASS";
         ctx.skip_logging = true;
-        let reason = self.legacy_reason(session, &domain);
-        self.handle_in_process(session, ctx.preflight_done, reason)
-            .await
+        ctx.status = StatusCode::SERVICE_UNAVAILABLE.as_u16();
+        write_plain(
+            session,
+            503,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"data plane unavailable"),
+        )
+        .await;
+        Ok(true)
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
@@ -2117,8 +2126,10 @@ impl DataPlaneProxy {
         };
         if !plan.cacheable {
             // Authorization / Cookie / rule-bypass requests must not be served
-            // from the shared cache, even when they ask for revalidation.
-            return Ok(RevalOutcome::NotApplicable);
+            // from the shared cache, even when they ask for revalidation. Hand
+            // them back to the native path as a streaming bypass instead of the
+            // deleted legacy engine (阶段 6).
+            return Ok(RevalOutcome::NativeMiss);
         }
         // Normal-object conditional revalidation. On 304 the cached body is
         // served here; on a changed origin the entry is dropped and the native
@@ -2810,9 +2821,9 @@ impl DataPlaneProxy {
 
     /// Why no native plan can be built for this session, if that is the case.
     ///
-    /// One definition for two callers: `native_plan` decides routing with it and
-    /// `legacy_reason` labels the fallback with it. Keeping them separate would let
-    /// the metric drift away from the actual routing decision.
+    /// `native_plan` uses it to decide whether a native route exists. After the
+    /// legacy engine was deleted (阶段 6), a `Some(_)` here means the Pingora
+    /// data plane cannot serve the request and `request_filter` answers 503.
     fn plan_blocker(&self, session: &Session, ignore_strict_revalidation: bool) -> Option<LegacyFallback> {
         if !self.native_cache || self.storage.is_none() {
             return Some(LegacyFallback::NativeCacheDisabled);
@@ -2836,18 +2847,6 @@ impl DataPlaneProxy {
     /// Label a request that is about to be handed to the in-process engine.
     ///
     /// Only called on the fallback path, so it never runs on the native fast path.
-    fn legacy_reason(&self, session: &Session, domain: &DomainEntry) -> LegacyFallback {
-        if let Some(blocker) = self.plan_blocker(session, false) {
-            return blocker;
-        }
-        // `request_filter` answers an unparseable `origin_url` with a 502 before it
-        // reaches this point, so this is not an origin-configuration fallback any
-        // more; labelling it `parse_origin` would make the metric disagree with the
-        // actual routing decision.
-        let _ = domain;
-        LegacyFallback::Other
-    }
-
     async fn native_plan(
         &self,
         session: &Session,
@@ -2894,13 +2893,17 @@ impl DataPlaneProxy {
         {
             return None;
         }
-        // A forced native miss behaves like a plain cacheable GET: the strict
-        // request headers were a client hint to revalidate, not a bypass, and the
-        // cached copy was already dropped by `try_normal_revalidation`.
-        let request_reason = if ignore_strict_revalidation {
-            None
-        } else {
-            request_reason
+        // Under `ignore_strict_revalidation` the *strict* hints (no-cache /
+        // max-age=0 / pragma) stop counting as a bypass so the rebuilt plan can
+        // cache; genuine bypass causes (Cookie / Authorization / no-store /
+        // rule-bypass) must stay, otherwise a private response could be stored.
+        let request_reason = match request_reason {
+            Some("request-max-age-0" | "request-no-cache" | "request-pragma-no-cache")
+                if ignore_strict_revalidation =>
+            {
+                None
+            }
+            other => other,
         };
         let bypasses = request_reason.is_some();
         let is_head = req.method == Method::HEAD && policy.action == RuleAction::Cache && !bypasses;
@@ -5032,81 +5035,6 @@ impl DataPlaneProxy {
         Ok(Box::new(peer))
     }
 
-    async fn handle_in_process(
-        &self,
-        session: &mut Session,
-        preflight_done: bool,
-        reason: LegacyFallback,
-    ) -> Result<bool> {
-        // Counted here, at the hand-off, so the reason is known. The engine itself
-        // also counts `datapath_legacy_total`, which additionally covers direct
-        // callers (cache diagnostics) that have no reason to report.
-        self.state.metrics.record_legacy_fallback(reason);
-        let req_header = session.req_header();
-        let method: Method = req_header.method.clone();
-        let is_head = method == Method::HEAD;
-        let uri: Uri = req_header.uri.clone();
-        let version = req_header.version;
-        let headers = req_header.headers.clone();
-
-        let mut body = BytesMut::new();
-        while let Some(chunk) = session.read_request_body().await? {
-            if body.len() + chunk.len() > MAX_PROXY_BODY {
-                session
-                    .respond_error_with_body(
-                        StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
-                        Bytes::from_static(b"request body too large"),
-                    )
-                    .await?;
-                return Ok(true);
-            }
-            body.extend_from_slice(&chunk);
-        }
-
-        let mut builder = Request::builder().method(method).uri(uri).version(version);
-        for (name, value) in headers.iter() {
-            builder = builder.header(name.clone(), value.clone());
-        }
-        let mut axum_req = match builder.body(Body::from(body.freeze())) {
-            Ok(req) => req,
-            Err(e) => {
-                tracing::warn!(error = %e, "build internal request failed");
-                session
-                    .respond_error_with_body(500, Bytes::from_static(b"internal request error"))
-                    .await?;
-                return Ok(true);
-            }
-        };
-        if let Some(peer) = session.client_addr().and_then(|a| a.as_inet()).copied() {
-            axum_req.extensions_mut().insert(ConnectInfo(peer));
-        }
-        // The legacy handler cannot see this session, so forward the fact that
-        // the downstream connection was TLS. Without it the HTTPS redirect
-        // fires for requests that already arrived over HTTPS (HEAD, no-cache
-        // revalidation and other in-process fallbacks).
-        let downstream_tls = session
-            .digest()
-            .is_some_and(|digest| digest.ssl_digest.is_some());
-        if downstream_tls {
-            axum_req
-                .extensions_mut()
-                .insert(crate::server::host_util::TlsTerminated);
-        }
-        // The markers in this request were written by the filters above, so the
-        // in-process handler must not strip them again.
-        axum_req
-            .extensions_mut()
-            .insert(crate::server::host_util::FromPingora);
-        if preflight_done {
-            axum_req
-                .extensions_mut()
-                .insert(crate::server::host_util::PreflightDone);
-        }
-
-        let resp = proxy_handler(State(self.state.clone()), axum_req).await;
-        write_axum_response(session, resp, is_head, Some(&self.compression)).await;
-        Ok(true)
-    }
 }
 
 pub(crate) fn edge_update_helper_installed() -> bool {
@@ -5328,7 +5256,9 @@ async fn write_axum_response(
         // Pass the known length down: a streamed response that advertises no
         // `Content-Length` can only be delimited by closing the connection, and on
         // a keep-alive session that leaves the client waiting for an EOF that never
-        // arrives (this is what hung `waf.sh` on a 403 block page).
+        // arrives (this is what hung `waf.sh` on a 403 block page and `smoke.sh` on
+        // the 502 origin-error page). `write_engine_response_streamed` turns the
+        // hint into a real `content-length` header.
         write_engine_response_streamed(session, &parts, &mut body, exact_len).await;
         return;
     }
@@ -5435,10 +5365,13 @@ async fn write_axum_response(
 
 /// Relay an engine response to the downstream without buffering it.
 ///
-/// Used when the body cannot be compressed and its size is unknown: the large
-/// media / event-stream case. No `Content-Length` is sent because the length is
-/// only known after consuming the body, so HTTP/1.1 gets chunked framing and
-/// HTTP/2 gets one DATA frame per chunk.
+/// Used when the body cannot be compressed: the large media / event-stream case
+/// and the operator-facing `default_page` error pages (403/429/502/504). When the
+/// body exposes an exact size hint (an in-memory `Html<String>` does) that length
+/// is advertised as `Content-Length`, so the response is self-delimiting and a
+/// keep-alive client stops reading at the last byte. Only a body whose length is
+/// unknown is left unframed, and then HTTP/1.1 falls back to chunked framing
+/// while HTTP/2 gets one DATA frame per chunk.
 ///
 /// A downstream write error stops the copy immediately. That is what makes an
 /// aborted download cheap: the origin body is dropped, and the access record
@@ -5450,8 +5383,9 @@ async fn write_engine_response_streamed(
     body: &mut Body,
     exact_len: Option<u64>,
 ) {
-    // `ResponseHeader::build` sizes the header from a `usize`; the body hint is a
-    // `u64`. A body that does not fit in `usize` cannot be framed here anyway.
+    // `ResponseHeader::build`'s `size_hint` only reserves header-map capacity; it
+    // never emits `Content-Length`. The hint is also a `u64` while `build` takes a
+    // `usize`, so a body that does not fit in `usize` cannot be framed here anyway.
     let Ok(mut response) =
         ResponseHeader::build(parts.status.as_u16(), exact_len.map(|len| len as usize))
     else {
@@ -5462,6 +5396,13 @@ async fn write_engine_response_streamed(
             continue;
         }
         if response.append_header(name.clone(), value.clone()).is_err() {
+            return;
+        }
+    }
+    // The authoritative length comes from the body, not from a copied header:
+    // without it the response can only be delimited by closing the connection.
+    if let Some(len) = exact_len {
+        if response.insert_header("content-length", len.to_string()).is_err() {
             return;
         }
     }

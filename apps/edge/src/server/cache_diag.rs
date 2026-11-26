@@ -11,7 +11,7 @@
 //! a client would get: native cache, Range/large-cache, HTTPS redirect and the
 //! preflight (WAF/CC/rate-limit).
 
-use crate::server::handler::AppState;
+use crate::server::state::AppState;
 use axum::{
     extract::State,
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},

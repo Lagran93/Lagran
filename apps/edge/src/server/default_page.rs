@@ -545,6 +545,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn error_pages_expose_an_exact_size_hint_for_content_length() {
+        // `write_axum_response` takes the streamed path for these pages (they are
+        // HTML, uncompressed for a client without `Accept-Encoding`, and non-empty)
+        // and derives `Content-Length` from `body.size_hint().exact()`. A page whose
+        // hint were `None` would go out close-delimited, which hangs keep-alive
+        // clients. Pin the hint to the real body length.
+        use http_body_util::BodyExt;
+        use hyper::body::Body as _;
+
+        let pages = [
+            origin_error_page("cdn.test", "/a", OriginFailure::Unreachable),
+            origin_error_page("cdn.test", "/a", OriginFailure::Timeout),
+            waf_blocked_page("cdn.test", "/search", "SQL 注入", "sqli"),
+            rate_limited_page("cdn.test", "/api", 7, false),
+            node_disabled_page("cdn.test"),
+            config_error_page("cdn.test"),
+            unknown_domain_page("not-onboarded.test"),
+            missing_host_page(),
+        ];
+        for response in pages {
+            let status = response.status();
+            let hint = response.body().size_hint().exact();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                hint,
+                Some(body.len() as u64),
+                "{status} page must advertise its exact length"
+            );
+            assert!(!body.is_empty(), "{status} page must not be empty");
+        }
+    }
+
+    #[tokio::test]
     async fn all_edge_error_pages_include_support_link() {
         use http_body_util::BodyExt;
 

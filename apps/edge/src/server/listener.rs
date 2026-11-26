@@ -1,7 +1,7 @@
 //! HTTP listener setup
 
 use crate::server::agent_auth::RequireAgentToken;
-use crate::server::handler::AppState;
+use crate::server::state::AppState;
 use crate::server::purge::{self, EdgePurgeRequest};
 use axum::{
     Json, Router,
