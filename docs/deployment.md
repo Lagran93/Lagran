@@ -305,7 +305,11 @@ DNS 只调用 `/api/v1/schedule`，使用 `ScheduleAuth`：
 ```
 
 DNS 不是边缘节点，推荐 DNS 使用全局 `AGENT_TOKEN`。  
-如果 `control.AGENT_TOKEN` 为空，调度接口在开发环境下不校验。
+如果 `control.AGENT_TOKEN` 为空，调度接口仅在显式设置
+`ALLOW_UNAUTHENTICATED_SCHEDULE=true` 时放行（仅限本地开发）。  
+Agent 调度接口只按 `ip` / `subnet` 推导地理信息，忽略 `country` / `province` / `city` /
+`isp` 覆盖；这些覆盖只用于管理员预览 `/api/v1/schedule/test`。响应的
+`candidates[].public_ip` 对 agent 为空，避免任一节点令牌枚举全部节点公网 IP。
 
 ### 控制面 → 边缘
 

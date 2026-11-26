@@ -414,6 +414,9 @@ ttl
 
 然后生成 A 记录。
 
+`candidates[].public_ip` 在 agent 响应中被置空：该列表只用于控制台排障，避免任一节点
+令牌枚举全部节点公网 IP（`primary` / `backup` 仍返回 IP，DNS 应答依赖它们）。
+
 ---
 
 ## 5. DNS 返回 A 记录

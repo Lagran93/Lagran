@@ -410,13 +410,16 @@ score = weight
 ```
 
 返回 `primary` / `backup` / `candidates`（前 5）与 `ttl`（`SCHEDULE_TTL`，默认 30s）。
-客户端省份/运营商可通过查询参数覆盖，适合 DNS 插件已经解析好 ECS 的场景。
+客户端地理信息由 `ip` / `subnet`（ECS）推导；`country` / `province` / `city` / `isp`
+覆盖参数只对管理员预览接口 `/api/v1/schedule/test` 生效，agent 接口忽略它们（避免节点
+令牌把调度钉到指定节点）。agent 响应的 `candidates[].public_ip` 被置空，`primary` /
+`backup` 仍返回公网 IP 供 DNS 应答。
 
 ### 接口
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| GET | `/api/v1/schedule?domain=&ip=&subnet=&province=&isp=` | agent token | DNS 插件/SDK 调用 |
+| GET | `/api/v1/schedule?domain=&ip=&subnet=` | agent token | DNS 插件/SDK 调用；忽略 geo 覆盖参数 |
 | POST | `/api/v1/schedule/test` | 登录 admin | 控制台「调度测试」 |
 
 `tools/dns/powerdns-pipe.sh` 是最小 PowerDNS pipe backend 示例，配置见

@@ -848,12 +848,34 @@ pub async fn resolve(
     }
 }
 
+/// Resolve one DNS-agent scheduling query.
+///
+/// The agent credential is either the global token or *any* node token, so this
+/// path must not let the caller replace GeoIP with query parameters:
+/// `province`/`isp` carry +80/+40 scoring weight and would let any edge (or a
+/// stolen node token) pin traffic to a node of its choice (H6). Only the admin
+/// `/schedule/test` preview may override the looked-up geo.
+///
+/// A DNS agent only consumes `primary` / `backup` / `ttl`; the candidate list
+/// still reports names and scores, but its public IPs are blanked so a node
+/// token cannot be turned into a fleet-inventory API.
 pub async fn resolve_agent(
     State(state): State<AppState>,
     _agent: crate::middleware::agent_auth::ScheduleAuth,
     axum::extract::Query(req): axum::extract::Query<ScheduleRequest>,
 ) -> Json<ScheduleResponse> {
-    Json(resolve(&state, req, true).await)
+    let mut response = resolve(&state, req, false).await;
+    hide_candidate_ips(&mut response);
+    Json(response)
+}
+
+/// Remove node public IPs from the candidate list of an agent response.
+///
+/// `primary` and `backup` keep theirs: the DNS answer is built from them.
+fn hide_candidate_ips(response: &mut ScheduleResponse) {
+    for candidate in &mut response.candidates {
+        candidate.public_ip.clear();
+    }
 }
 
 pub async fn test(
@@ -1083,6 +1105,49 @@ mod tests {
         let req = spoofing_request();
         assert_ne!(req.country.as_deref(), Some(geo.country.as_str()));
         assert_ne!(req.province.as_deref(), Some(geo.province.as_str()));
+    }
+
+    /// Agent responses keep the DNS answer but not the node inventory.
+    #[test]
+    fn agent_response_hides_candidate_ips() {
+        let node = |name: &str, ip: &str| NodeRef {
+            name: name.into(),
+            public_ip: ip.into(),
+            region: "test".into(),
+            province: "广东".into(),
+            city: "深圳".into(),
+            isp: "电信".into(),
+            weight: 100,
+        };
+        let candidate = |name: &str, ip: &str| Candidate {
+            name: name.into(),
+            public_ip: ip.into(),
+            region: "test".into(),
+            province: "广东".into(),
+            city: "深圳".into(),
+            isp: "电信".into(),
+            weight: 100,
+            score: 100,
+            reason: "weight=100".into(),
+        };
+        let mut response = ScheduleResponse {
+            domain: "cdn.test".into(),
+            ttl: 30,
+            client: GeoInfo::default(),
+            primary: Some(node("a", "203.0.113.1")),
+            backup: Some(node("b", "203.0.113.2")),
+            candidates: vec![candidate("a", "203.0.113.1"), candidate("c", "203.0.113.3")],
+            note: String::new(),
+        };
+
+        hide_candidate_ips(&mut response);
+
+        assert!(
+            response.candidates.iter().all(|c| c.public_ip.is_empty()),
+            "candidate IPs must not be exposed to agent callers"
+        );
+        assert_eq!(response.primary.unwrap().public_ip, "203.0.113.1");
+        assert_eq!(response.backup.unwrap().public_ip, "203.0.113.2");
     }
 
     /// An empty override must not blank out a real GeoIP value.

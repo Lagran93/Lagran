@@ -46,7 +46,7 @@ cat >"$GEO_FILE" <<'JSON'
 JSON
 
 echo "== control with GeoIP table =="
-CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN= GEOIP_JSON_PATH="$GEO_FILE" \
+CONTROL_BIND="127.0.0.1:$CONTROL_PORT" AGENT_TOKEN=test-global GEOIP_PATH="$GEO_FILE" \
   CAPTCHA_ENABLED=false ./target/debug/lagran-control >"$LOG_DIR/control.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null && break; sleep 0.5; done
@@ -68,7 +68,7 @@ create_node() {
   local name=$1 public_ip=$2 province=$3 city=$4 isp=$5 weight=$6
   local resp id token
   resp=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" \
-    -d "{\"name\":\"$name\",\"region\":\"$province\",\"public_ip\":\"$public_ip\",\"province\":\"$province\",\"city\":\"$city\",\"isp\":\"$isp\",\"weight\":$weight,\"agent_url\":\"http://127.0.0.1:19000\"}")
+    -d "{\"name\":\"$name\",\"region\":\"test\",\"public_ip\":\"$public_ip\",\"province\":\"$province\",\"city\":\"$city\",\"isp\":\"$isp\",\"weight\":$weight,\"agent_url\":\"http://127.0.0.1:19000\"}")
   id=$(printf '%s' "$resp" | jq -r '.node.id')
   token=$(printf '%s' "$resp" | jq -r '.token')
   printf '%s|%s\n' "$id" "$token"
@@ -100,9 +100,12 @@ check "node exposes weight" "$(printf '%s' "$LIST" | jq -r '.[] | select(.name =
 ONLINE=$(printf '%s' "$LIST" | jq '[.[] | select(.name == "gd-telecom" or .name == "gd-unicom" or .name == "bj-telecom" or .name == "gd-telecom-low") | select(.status == "online")] | length')
 check "created nodes online" "$ONLINE" "4"
 
+# DNS calls this endpoint with a node/global agent token. Use a node token here
+# so the H6 regression covers the weaker credential, not just the global one.
 sched() {
   local ip=$1
   curl -s -G "http://127.0.0.1:$CONTROL_PORT/api/v1/schedule" \
+    -H "x-lagran-agent-token: $GD_TELECOM_TOKEN" \
     --data-urlencode "domain=cdn.schedule.test" --data-urlencode "ip=$ip"
 }
 
@@ -119,13 +122,20 @@ check "Beijing picks bj-telecom" "$(printf '%s' "$R" | jq -r '.primary.name')" "
 R=$(sched "192.0.2.7")
 check "Guangdong unicom prefers gd-unicom" "$(printf '%s' "$R" | jq -r '.primary.name')" "gd-unicom"
 
+# H6: the scheduling endpoint accepts node tokens, so query-parameter geo must
+# not replace the GeoIP lookup. `ip`/`subnet` (ECS) remain the trusted inputs.
 R=$(curl -s -G "http://127.0.0.1:$CONTROL_PORT/api/v1/schedule" \
-  --data-urlencode "domain=cdn.schedule.test" --data-urlencode "province=北京" --data-urlencode "isp=电信")
-check "explicit geo override works" "$(printf '%s' "$R" | jq -r '.primary.name')" "bj-telecom"
+  -H "x-lagran-agent-token: $GD_TELECOM_TOKEN" \
+  --data-urlencode "domain=cdn.schedule.test" --data-urlencode "ip=198.51.100.7" \
+  --data-urlencode "province=广东" --data-urlencode "isp=联通")
+check "agent endpoint ignores query geo override" "$(printf '%s' "$R" | jq -r '.client.province')" "北京"
+check "agent endpoint keeps GeoIP scoring" "$(printf '%s' "$R" | jq -r '.primary.name')" "bj-telecom"
+check "agent response hides candidate public_ip" "$(printf '%s' "$R" | jq -r '[.candidates[].public_ip] | all(. == "")')" "true"
 
 echo "== admin test endpoint =="
 T=$(api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/schedule/test" -d '{"province":"广东","isp":"联通"}')
 check "admin test returns gd-unicom" "$(printf '%s' "$T" | jq -r '.primary.name')" "gd-unicom"
+check "admin test keeps candidate public_ip" "$(printf '%s' "$T" | jq -r '[.candidates[].public_ip] | any(. != "")')" "true"
 
 echo "== disabled node excluded =="
 api -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/$BJ_TELECOM/status" -d '{"enabled":false}' >/dev/null
@@ -138,7 +148,7 @@ fi
 
 echo "== PowerDNS pipe sample =="
 PIPE_OUT=$(printf 'HELO\t1\nQ\tcdn.schedule.test\tIN\tA\t-1\t203.0.113.9\n' \
-  | CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" AGENT_TOKEN="" \
+  | CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" AGENT_TOKEN="test-global" \
     bash tools/dns/powerdns-pipe.sh)
 contains_pipe() { if [[ "$PIPE_OUT" == *"$1"* ]]; then pass "$2"; else fail "$2"; fi; }
 contains_pipe "OK" "pipe backend handshake"
