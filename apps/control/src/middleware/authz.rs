@@ -21,7 +21,18 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
+
+/// `/metrics` counters for the actor load path.
+///
+/// `ACTOR_DB_LOADS` is the regression guard: with the permission middleware
+/// publishing the actor into the request extensions, one authenticated request
+/// must produce exactly one DB load — or one Redis hit when the session cache
+/// is enabled — never two.
+pub static ACTOR_DB_LOADS: AtomicU64 = AtomicU64::new(0);
+pub static ACTOR_REDIS_HITS: AtomicU64 = AtomicU64::new(0);
+pub static ACTOR_REUSES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedSession {
@@ -89,6 +100,12 @@ impl FromRequestParts<AppState> for Actor {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // The permission middleware already resolved the actor for this
+        // request; reuse it instead of paying for a second load.
+        if let Some(actor) = parts.extensions.get::<Actor>() {
+            ACTOR_REUSES.fetch_add(1, Ordering::Relaxed);
+            return Ok(actor.clone());
+        }
         let user = <AuthUser as FromRequestParts<AppState>>::from_request_parts(parts, state)
             .await
             .map_err(|_| ActorError::unauthorized("unauthorized"))?;
@@ -101,6 +118,9 @@ impl FromRequestParts<AppState> for Actor {
         } else {
             None
         };
+        if cached.is_some() {
+            ACTOR_REDIS_HITS.fetch_add(1, Ordering::Relaxed);
+        }
         let (role, is_active, token_version, permissions, restricted) = if let Some(cached) = cached
         {
             (
@@ -111,21 +131,20 @@ impl FromRequestParts<AppState> for Actor {
                 cached.restricted,
             )
         } else {
-            let fresh = repository::get_user_session(&state.pool, id)
-                .await
-                .map_err(|_| ActorError::internal())?
-                .ok_or_else(|| ActorError::unauthorized("user no longer exists"))?;
-            let (permissions, restricted) = repository::permissions_and_membership(&state.pool, id)
-                .await
-                .unwrap_or_else(|_| (Vec::new(), true));
+            let (role, is_active, token_version, restricted, permissions) =
+                repository::get_actor_facts(&state.pool, id)
+                    .await
+                    .map_err(|_| ActorError::internal())?
+                    .ok_or_else(|| ActorError::unauthorized("user no longer exists"))?;
+            ACTOR_DB_LOADS.fetch_add(1, Ordering::Relaxed);
             if let Some(redis) = redis {
                 let _ = redis
                     .set_json(
                         &session_key,
                         &CachedSession {
-                            role: fresh.0.clone(),
-                            is_active: fresh.1,
-                            token_version: fresh.2,
+                            role: role.clone(),
+                            is_active,
+                            token_version,
                             permissions: permissions.clone(),
                             restricted,
                         },
@@ -133,7 +152,7 @@ impl FromRequestParts<AppState> for Actor {
                     )
                     .await;
             }
-            (fresh.0, fresh.1, fresh.2, permissions, restricted)
+            (role, is_active, token_version, permissions, restricted)
         };
         if !is_active {
             if let Some(redis) = redis {
@@ -308,5 +327,38 @@ mod tests {
         assert!(!a.allows("domain:write"));
         assert!(a.allows("cache:purge"));
         assert!(actor(Some(vec!["*"])).allows("anything:at:all"));
+    }
+
+    /// The extension path must not touch the database.
+    ///
+    /// The pool points at a closed port, so any accidental query fails the test
+    /// instead of silently hitting a real database.
+    #[tokio::test]
+    async fn actor_is_reused_from_request_extensions() {
+        use axum::body::Body;
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+        use sqlx::postgres::PgPoolOptions;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let state = crate::state::AppState::new(pool, crate::config::AppConfig::load(), None);
+        let actor = super::Actor {
+            id: Uuid::new_v4(),
+            email: "actor@example.test".into(),
+            name: "actor".into(),
+            is_admin: true,
+            permissions: None,
+        };
+        let mut request = Request::builder().body(Body::empty()).unwrap();
+        request.extensions_mut().insert(actor.clone());
+        let (mut parts, _body) = request.into_parts();
+        let resolved = super::Actor::from_request_parts(&mut parts, &state)
+            .await
+            .expect("the actor must come from the extension, not the DB");
+        assert_eq!(resolved.id, actor.id);
+        assert!(resolved.is_admin);
     }
 }

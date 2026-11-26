@@ -5,8 +5,9 @@ use crate::repository;
 use crate::state::AppState;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -290,22 +291,77 @@ fn not_found(id: &str) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+/// Paging for list endpoints. `None` keeps the historical "return everything"
+/// behaviour, so an older console that sends no query string is unaffected.
+#[derive(Deserialize, Default)]
+pub struct ListDomainsQuery {
+    /// Page size; clamped to 1..=500.
+    pub limit: Option<u32>,
+    /// Rows to skip; defaults to 0. Only meaningful together with `limit`.
+    pub offset: Option<u32>,
+    /// `summary` returns a lightweight row without `origins`/backup/shield.
+    pub view: Option<String>,
+}
+
+/// Clamp user-supplied paging into something a database should accept.
+pub(crate) fn page_bounds(limit: Option<u32>, offset: Option<u32>) -> (Option<i64>, i64) {
+    let limit = limit.map(|v| v.clamp(1, 500) as i64);
+    (limit, offset.unwrap_or(0) as i64)
+}
+
+/// Lightweight domain row for list views that only need the headline fields.
+#[derive(Serialize)]
+pub struct DomainSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub origin_host: String,
+    pub origin_port: u16,
+    pub origin_proto: String,
+    pub ssl_enabled: bool,
+    pub status: String,
+    pub project_id: Option<String>,
+    pub rate_limit_rps: u32,
+    pub origin_count: usize,
+}
+
+pub(crate) fn to_summary_dto(r: repository::DomainRow) -> DomainSummaryDto {
+    DomainSummaryDto {
+        id: r.id.to_string(),
+        name: r.name,
+        origin_host: r.origin_host,
+        origin_port: r.origin_port as u16,
+        origin_proto: r.origin_proto,
+        ssl_enabled: r.ssl_enabled,
+        status: r.status,
+        project_id: r.project_id.map(|p| p.to_string()),
+        rate_limit_rps: r.rate_limit_rps.max(0) as u32,
+        origin_count: r.origins.0.len(),
+    }
+}
+
 pub async fn list(
     State(state): State<AppState>,
     actor: Actor,
-) -> Result<Json<Vec<DomainDto>>, (StatusCode, Json<ErrorBody>)> {
+    Query(q): Query<ListDomainsQuery>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let (limit, offset) = page_bounds(q.limit, q.offset);
     // Filter in SQL rather than loading every domain and dropping the invisible
     // ones in Rust.
     let visible = actor.visible_domain_ids(&state).await;
     let rows = match visible {
-        None => repository::list_domains(&state.pool).await,
-        Some(ids) => repository::list_domains_by_ids(&state.pool, &ids).await,
+        None => repository::list_domains_page(&state.pool, limit, offset).await,
+        Some(ids) => {
+            repository::list_domains_by_ids_page(&state.pool, &ids, limit, offset).await
+        }
     }
     .map_err(|e| {
         tracing::error!(error = %e, "list domains");
         db_error()
     })?;
-    Ok(Json(rows.into_iter().map(to_dto).collect()))
+    if q.view.as_deref() == Some("summary") {
+        return Ok(Json(rows.into_iter().map(to_summary_dto).collect::<Vec<_>>()).into_response());
+    }
+    Ok(Json(rows.into_iter().map(to_dto).collect::<Vec<_>>()).into_response())
 }
 
 pub async fn create(
@@ -2051,5 +2107,18 @@ mod tests {
         assert_eq!(pool.len(), 2);
         assert_eq!(pool[0].host, "primary.test");
         assert_eq!(pool[1].priority, 1);
+    }
+}
+
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::page_bounds;
+
+    #[test]
+    fn limit_is_clamped_and_offset_defaults_to_zero() {
+        assert_eq!(page_bounds(None, None), (None, 0));
+        assert_eq!(page_bounds(Some(0), Some(0)), (Some(1), 0));
+        assert_eq!(page_bounds(Some(10_000), Some(42)), (Some(500), 42));
     }
 }

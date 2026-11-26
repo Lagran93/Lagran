@@ -107,6 +107,27 @@ pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Respo
     out.push_str(&format!(
         "# HELP lagran_control_db_up Database reachable\n# TYPE lagran_control_db_up gauge\nlagran_control_db_up {db_up}\n"
     ));
+    let actor_db_loads =
+        crate::middleware::authz::ACTOR_DB_LOADS.load(std::sync::atomic::Ordering::Relaxed);
+    let actor_redis_hits =
+        crate::middleware::authz::ACTOR_REDIS_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    let actor_reuses =
+        crate::middleware::authz::ACTOR_REUSES.load(std::sync::atomic::Ordering::Relaxed);
+    out.push_str("# HELP lagran_control_actor_loads_total Actor loads from PostgreSQL\n");
+    out.push_str("# TYPE lagran_control_actor_loads_total counter\n");
+    out.push_str(&format!(
+        "lagran_control_actor_loads_total {actor_db_loads}\n"
+    ));
+    out.push_str("# HELP lagran_control_actor_redis_hits_total Actor loads served by the Redis session cache\n");
+    out.push_str("# TYPE lagran_control_actor_redis_hits_total counter\n");
+    out.push_str(&format!(
+        "lagran_control_actor_redis_hits_total {actor_redis_hits}\n"
+    ));
+    out.push_str("# HELP lagran_control_actor_extension_reuses_total Actor extractions served from the request extension\n");
+    out.push_str("# TYPE lagran_control_actor_extension_reuses_total counter\n");
+    out.push_str(&format!(
+        "lagran_control_actor_extension_reuses_total {actor_reuses}\n"
+    ));
 
     let domains: Vec<(String, i64)> =
         sqlx::query_as("SELECT status, COUNT(*)::BIGINT FROM domains GROUP BY status")

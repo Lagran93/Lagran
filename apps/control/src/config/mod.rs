@@ -14,7 +14,7 @@ fn normalize_public_url(raw: &str) -> String {
 pub struct AppConfig {
     pub server: ServerConfig,
     pub database_url: String,
-    /// Per-process PostgreSQL pool size (default 20).
+    /// Per-process PostgreSQL pool size (default 32).
     pub database_max_connections: u32,
     /// Kept warm even when idle (default 2).
     pub database_min_connections: u32,
@@ -105,7 +105,7 @@ impl Default for AppConfig {
             database_max_connections: std::env::var("DATABASE_MAX_CONNECTIONS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(20)
+                .unwrap_or(32)
                 .clamp(2, 200),
             database_min_connections: std::env::var("DATABASE_MIN_CONNECTIONS")
                 .ok()

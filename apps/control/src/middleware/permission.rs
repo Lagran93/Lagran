@@ -61,6 +61,7 @@ pub async fn require_permission(
     let (mut parts, body) = request.into_parts();
     match Actor::from_request_parts(&mut parts, &state).await {
         Ok(actor) if actor.allows(permission) => {
+            parts.extensions.insert(actor);
             next.run(Request::from_parts(parts, body)).await
         }
         Ok(_) => (

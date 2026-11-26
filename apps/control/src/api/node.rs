@@ -647,15 +647,27 @@ export CACHE_BACKEND=memory
 }
 
 /// Node inventory (including agent URLs) is infrastructure data: admin only.
+#[derive(Deserialize, Default)]
+pub struct ListNodesQuery {
+    /// Page size; clamped to 1..=500. Absent keeps the historical full list.
+    pub limit: Option<u32>,
+    /// Rows to skip; defaults to 0.
+    pub offset: Option<u32>,
+}
+
 pub async fn list(
     State(state): State<AppState>,
     actor: Actor,
+    Query(q): Query<ListNodesQuery>,
 ) -> Result<Json<Vec<NodeDto>>, (StatusCode, Json<ErrorBody>)> {
     admin(&actor)?;
-    let rows = repository::list_nodes(&state.pool).await.map_err(|e| {
-        tracing::error!(error = %e, "list nodes");
-        db_error()
-    })?;
+    let (limit, offset) = crate::api::domain::page_bounds(q.limit, q.offset);
+    let rows = repository::list_nodes_page(&state.pool, limit, offset)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "list nodes");
+            db_error()
+        })?;
     Ok(Json(rows.into_iter().map(to_dto).collect()))
 }
 

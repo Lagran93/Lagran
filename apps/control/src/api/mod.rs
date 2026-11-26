@@ -41,6 +41,7 @@ use axum::{
 };
 use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::compression::CompressionLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::Instrument;
 
@@ -284,6 +285,10 @@ pub fn create_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(trace_http_request))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
+        // Response compression for the list endpoints (domains/nodes are ~100 KB
+        // at a few hundred rows). tower-http skips bodies that are already
+        // encoded and only kicks in when the client sends Accept-Encoding.
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 

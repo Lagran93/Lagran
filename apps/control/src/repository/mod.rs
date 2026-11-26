@@ -378,6 +378,42 @@ pub async fn get_user_session(
         .await
 }
 
+/// Everything the request path needs to build an `Actor`, in one round trip.
+///
+/// Previously: `get_user_session` (users) + `permissions_for_user` (group
+/// aggregate) + `permissions_restricted` (users again) = three round trips per
+/// actor load, and the actor was loaded twice per request (permission
+/// middleware + handler extractor).
+pub async fn get_actor_facts(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<(String, bool, i64, bool, Vec<String>)>> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            u.role,
+            u.is_active,
+            u.token_version,
+            u.permissions_restricted,
+            COALESCE(
+                (
+                    SELECT array_agg(DISTINCT p)
+                    FROM user_group_members m
+                    JOIN user_groups g ON g.id = m.group_id
+                    CROSS JOIN LATERAL unnest(g.permissions) AS p
+                    WHERE m.user_id = u.id
+                ),
+                '{}'::text[]
+            ) AS permissions
+        FROM users u
+        WHERE u.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn touch_last_login(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
     sqlx::query("UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1")
         .bind(id)
@@ -427,6 +463,39 @@ pub async fn list_domains_by_ids(pool: &PgPool, ids: &[Uuid]) -> sqlx::Result<Ve
         "#,
     )
     .bind(ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Paged variant of [`list_domains_by_ids`] for tenant-scoped lists.
+pub async fn list_domains_by_ids_page(
+    pool: &PgPool,
+    ids: &[Uuid],
+    limit: Option<i64>,
+    offset: i64,
+) -> sqlx::Result<Vec<DomainRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        SELECT id, project_id, name, origin_host, origin_port, origin_proto,
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(origins, '[]'::jsonb) AS origins,
+               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id
+        FROM domains
+        WHERE id = ANY($1)
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(ids)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
 }
@@ -487,6 +556,36 @@ pub async fn list_domains(pool: &PgPool) -> sqlx::Result<Vec<DomainRow>> {
         ORDER BY created_at DESC
         "#,
     )
+    .fetch_all(pool)
+    .await
+}
+
+/// Same row shape as [`list_domains`], with optional paging.
+///
+/// `limit = None` keeps the previous "whole table" behaviour so existing
+/// callers (config snapshots) and console versions are unaffected. PostgreSQL
+/// treats a NULL `LIMIT` as unlimited, so one SQL serves both modes.
+pub async fn list_domains_page(
+    pool: &PgPool,
+    limit: Option<i64>,
+    offset: i64,
+) -> sqlx::Result<Vec<DomainRow>> {
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        SELECT id, project_id, name, origin_host, origin_port, origin_proto,
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id
+        FROM domains
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2
+        "#,
+    )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
 }
@@ -606,6 +705,37 @@ pub async fn list_nodes(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
         ORDER BY name
         "#,
     )
+    .fetch_all(pool)
+    .await
+}
+
+/// Same row shape as [`list_nodes`], with optional paging.
+pub async fn list_nodes_page(
+    pool: &PgPool,
+    limit: Option<i64>,
+    offset: i64,
+) -> sqlx::Result<Vec<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile
+        FROM edge_nodes
+        ORDER BY name
+        LIMIT $1 OFFSET $2
+        "#,
+    )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
 }
