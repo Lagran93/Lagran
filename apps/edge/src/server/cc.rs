@@ -10,7 +10,7 @@ use crate::waf::IpNet;
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -626,6 +626,10 @@ pub struct CcProtector {
     /// Runs table maintenance every N requests; `DashMap::len()` is O(shards)
     /// and must not sit on the hot path.
     maintenance_tick: Arc<AtomicU64>,
+    /// Set by [`Self::spawn_maintenance`]. Once the 1 s background sweep owns
+    /// maintenance, the request path must not scan every shard at all (M1).
+    /// Tests and embeddings that never spawn it keep the bounded inline fallback.
+    background_started: Arc<AtomicBool>,
     /// Optional shared sliding-window counters.
     redis: Option<RedisCc>,
     /// When set, eviction reproduces the pre-fix rule: the legacy predicate and no
@@ -735,6 +739,14 @@ impl CcProtector {
             .is_multiple_of(MAINTENANCE_INTERVAL_REQUESTS)
     }
 
+    /// Whether this request may run the inline sweep.
+    ///
+    /// Short-circuits before touching the tick counter once the background task
+    /// owns maintenance, so neither the counter nor any shard is touched.
+    fn inline_maintenance_due(&self) -> bool {
+        !self.background_started.load(Ordering::Acquire) && self.maintenance_due()
+    }
+
     /// Drop entries that can no longer affect a decision, and enforce the cap.
     ///
     /// Returns how many client entries were removed. This touches every shard in
@@ -836,6 +848,7 @@ impl CcProtector {
     /// Off the request path, a full sweep is affordable, so eviction can be
     /// driven by the state itself rather than by a request counter.
     pub fn spawn_maintenance(&self) {
+        self.background_started.store(true, Ordering::Release);
         let me = self.clone();
         crate::agent::spawn_supervised("cc-maintenance", move || {
             let me = me.clone();
@@ -873,13 +886,9 @@ impl CcProtector {
             }
         }
         let now = Instant::now();
-        // Same rule as the per-client path: a request may run the cheap due-check
-        // but never the full write-locked sweep. `global` is bounded separately
-        // below and carried by the background task.
-        if self.maintenance_due() {
-            self.global
-                .retain(|_, state| now.duration_since(state.window_start) < STATE_TTL);
-        }
+        // No inline sweep here. `maintain` (background, or the bounded fallback
+        // above) bounds this table; doing `retain` from `global_over` put a scan
+        // of every global counter on the request path (M1).
         if let Some(mut state) = self.global.get_mut(host) {
             return bump_global(&mut state, now) > limit;
         }
@@ -986,10 +995,10 @@ impl CcProtector {
             }
         }
 
-        // Cheap inline path only when the background task may not be running
-        // (unit tests, or an embedding that never spawned it). The full sweep is
-        // deliberately not reachable from a request.
-        if self.maintenance_due() {
+        // Off the request path once the background task is running. Only unit
+        // tests / embeddings that never spawned it keep this bounded fallback;
+        // the full sweep is never reachable from a request otherwise (M1).
+        if self.inline_maintenance_due() {
             self.maintain(now);
         }
         let mut entry = self.inner.entry(key).or_insert_with(|| ClientState {
@@ -1072,7 +1081,7 @@ impl CcProtector {
     /// request is over the limit. Local state only tracks ban strikes, not the
     /// request count.
     async fn note_over_limit(&self, key: &str, cfg: &CcConfig, now: Instant) -> CcDecision {
-        if self.maintenance_due() {
+        if self.inline_maintenance_due() {
             self.maintain(now);
         }
         let mut entry = self
@@ -1788,6 +1797,24 @@ mod tests {
             cc.inner.len() < 500,
             "the background sweep did not run: {} entries remain",
             cc.inner.len()
+        );
+    }
+
+    /// Once the background task runs, the request path must not even tick.
+    #[test]
+    fn background_task_suppresses_inline_maintenance() {
+        let cc = CcProtector::new();
+        cc.background_started.store(true, Ordering::Release);
+        for _ in 0..(MAINTENANCE_INTERVAL_REQUESTS * 3) {
+            assert!(
+                !cc.inline_maintenance_due(),
+                "the request path must not run maintenance while the background task is active"
+            );
+        }
+        assert_eq!(
+            cc.maintenance_tick.load(Ordering::Relaxed),
+            0,
+            "the request path must not even advance the maintenance tick"
         );
     }
 
