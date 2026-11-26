@@ -74,7 +74,10 @@ RequestPipeline::new(&state)
 
 ## 剩余兜底清单
 
-legacy 数据面今天仍会被进入的路径只有下面 6 条。唯一出口是 `handle_in_process`
+> **阶段 6 已全部清零**：下列 6 条兜底路径都已改为 Pingora 原生处理，`handle_in_process`
+> 与整个 `server/handler.rs`（legacy 引擎）已删除。本表保留作为历史记录。
+
+legacy 数据面曾会被进入的路径只有下面 6 条。唯一出口是 `handle_in_process`
 （调用点 `pingora_edge.rs:798`、`pingora_edge.rs:1079`，实现 `4930`）。
 
 | # | 触发条件 | 代码位置 | 今天的行为 | 迁移目标 |
@@ -390,7 +393,7 @@ computed validator、origin 500、origin 超时三种情形均由 `x-lagran-data
   `x-lagran-datapath`；`cache-diagnostics.sh` 新增断言"diagnose ran on the Pingora data plane"。
 - 这解除了 `handle_in_process` 的最后一个非路由性调用者（缓存诊断），阶段 6 可删除 legacy。
 
-### 阶段 6：删除 legacy 数据面（2-3 天）
+### 阶段 6：删除 legacy 数据面（2-3 天）—— ✅ 已完成
 
 前置门槛（必须同时满足）：
 
@@ -415,6 +418,30 @@ computed validator、origin 500、origin 超时三种情形均由 `x-lagran-data
 5. handler 的 WebSocket 分支（599-640）与 `server/websocket.rs` 的隧道实现
    （保留 `is_websocket_upgrade`，pipeline 仍在用）；
 6. `datapath_legacy` 指标保留一个版本（便于回滚观测），下个版本再删。
+
+落地说明（阶段 6，已实现）：
+
+- **`AppState` 迁出**：新建 `apps/edge/src/server/state.rs` 承载 `AppState`（原
+  `server/handler.rs:79-158`），`main.rs` 与 `cache_diag`/`prefetch`/`pipeline`/`preflight`/
+  `listener`/`agent_auth`/`purge`/`challenge`/`pingora_edge` 全部改用
+  `crate::server::state::AppState`；`server/mod.rs` 增加 `pub mod state;`。
+- **关闭最后一条兜底**：`revalidate_strict` 在 `!plan.cacheable`（Cookie/Authorization/
+  rule-bypass 的严格重校验）时改为返回 `RevalOutcome::NativeMiss`，由原生路径按 bypass 流式
+  处理；同时 `native_plan` 在 `ignore_strict_revalidation` 时只把 strict 提示（no-cache/
+  max-age=0/pragma）清零，保留 Cookie/Authorization/no-store 等真实 bypass 原因，避免缓存
+  私有响应。
+- **删除 legacy 引擎**：移除 `handle_in_process`、`legacy_reason` 与 `proxy_handler` 调用，
+  删除整个 `apps/edge/src/server/handler.rs`（约 3300 行）并移除 `pub mod handler;`。
+  `request_filter` 的兜底分支改为 503「data plane unavailable」（仅在原生缓存未初始化这种
+  启动错误下可达）。
+- **WebSocket**：`server/websocket.rs` 由 544 行精简为只保留 `is_websocket_upgrade`
+  （pipeline 仍用），删除隧道实现；升级请求本身由 Pingora 原生隧道处理（`ws-echo.sh` 全绿）。
+- **指标**：保留 `LegacyFallback` 枚举与 `lagran_edge_legacy_fallback_total{reason}`
+  （6 个 reason，一个发布周期内观测），计数恒为 0；`lagran_edge_datapath_legacy_total` 同理。
+- **验收（已跑绿）**：`cargo test -p edge --lib` 347 passed（较前少 25 个，均为被删 handler.rs
+  的单测）；clippy `-D warnings` 干净；集成脚本 `smoke`/`dead-origin`/`cache-diagnostics`/
+  `cache-rules`/`head-h2`/`nodes`/`single-origin`/`strict-revalidation`/`failover-https`/
+  `multi-origin`/`waf`/`cc`/`p2-hardening`/`ws-echo`/`no-cache-preflight` 全绿。
 
 ## 验收矩阵
 
@@ -562,10 +589,32 @@ keep-alive 连接上时，客户端会一直等一个永远不来的 EOF：`waf.
 的「priority-1 接管」「读超时切下一个源站」「权重分布」「priority-1 平时不接流量」全过。
 单测 `pingora_edge::tests::layered_order_keeps_backup_after_primary_layer` 锁定分层顺序。
 
-遗留（既有、非本次引入）：`default_page` 的源站错误页（502/504）按"关闭连接"定界、不带
-`Content-Length`，所以任何**不带 `--max-time`** 的客户端会在读完全文后继续等 EOF。已在
-`smoke.sh` 的 down 请求上加 `--max-time` 遵从项目"请求一律带超时"的约定；页面正文本身完整
-（实测 7203 字节）。这是一处独立的响应分帧改进项。
+### 已修复：`default_page` 错误页不定界（无 `Content-Length`）
+
+`default_page` 的运营页（403/429/502/504 等）走 `write_axum_response` 的流式分支：
+非 HEAD、非 304/204、未压缩（客户端没发 `Accept-Encoding`）、body 非空。这条分支原先
+**没有任何分帧头**，于是只能靠关闭连接定界，落到 keep-alive 连接上客户端会一直等一个
+永远不来的 EOF（`smoke.sh` 的 502 页、`waf.sh` 的 403 页都曾因此挂死）。
+
+根因是一处误导：`ResponseHeader::build(status, size_hint)` 的 `size_hint` 只是
+**header map 的容量预分配提示**（`RespBuilder`/`CaseMap::with_capacity`），它**不会**
+写入 `Content-Length`。此前把 `body.size_hint().exact()` 传给它就以为"带上了真实长度"，
+实际上页面的分帧完全没变。
+
+修复：在 `write_engine_response_streamed` 里，当 `exact_len` 为 `Some(len)` 时显式
+`insert_header("content-length", len)`（长度以 body 为准，复制响应头时仍然跳过原
+`Content-Length`，避免信任上游）；未知长度的流式 body 保持原有行为（H1.1 chunked /
+H2 逐 DATA 帧）。`write_axum_response` 的缓冲分支（gzip / HEAD / 空 body）本来就显式
+写 CL，未受影响。
+
+验证：
+
+- 单测 `default_page::tests::error_pages_expose_an_exact_size_hint_for_content_length`
+  锁定所有运营页的 `size_hint().exact()` 等于真实 body 长度（修复的前提）。
+- 实测 502 页响应头：`Content-Length: 7237`（body 7237 字节），且同一 keep-alive
+  连接上连续两个 502 都能正常复用（不再需要 `Connection: close`）。
+- 集成断言：`dead-origin.sh`（CL 与 body 一致、无 `Transfer-Encoding`）、
+  `smoke.sh`（502 页 CL=7203）、`waf.sh`（403 页 CL=7324）。
 
 ## 工作量
 

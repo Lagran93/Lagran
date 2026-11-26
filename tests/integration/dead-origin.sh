@@ -40,12 +40,16 @@ for _ in $(seq 1 80); do curl -sf "http://127.0.0.1:$EDGE_PORT/__lagran/health" 
 sleep 2
 # `--max-time` keeps a stalled origin fetch from hanging the suite: curl then
 # reports `000` and the assertion fails instead of blocking forever.
-CODE=$(curl -s --max-time 15 -o "$LOG_DIR/body" -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/")
+CODE=$(curl -s --max-time 15 -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/")
 sleep 1
-if [[ "$CODE" == "502" && -s "$LOG_DIR/body" ]] && kill -0 "${PIDS[1]}" 2>/dev/null; then
+CONTENT_LENGTH=$(grep -i '^content-length:' "$LOG_DIR/headers" | tr -d '\r' | awk '{print $2}')
+BODY_SIZE=$(wc -c < "$LOG_DIR/body" | tr -d ' ')
+TRANSFER_ENCODING=$(grep -i '^transfer-encoding:' "$LOG_DIR/headers" || true)
+if [[ "$CODE" == "502" && -s "$LOG_DIR/body" ]] && kill -0 "${PIDS[1]}" 2>/dev/null \
+  && [[ -n "$CONTENT_LENGTH" && "$CONTENT_LENGTH" == "$BODY_SIZE" && -z "$TRANSFER_ENCODING" ]]; then
   echo "ALL DEAD ORIGIN CHECKS PASSED"
 else
-  echo "DEAD ORIGIN CHECK FAILED (code=$CODE, process_alive=$(kill -0 "${PIDS[1]}" 2>/dev/null && echo yes || echo no))"
+  echo "DEAD ORIGIN CHECK FAILED (code=$CODE, content_length=${CONTENT_LENGTH:-none}, body_size=$BODY_SIZE, transfer_encoding=${TRANSFER_ENCODING:-none}, process_alive=$(kill -0 "${PIDS[1]}" 2>/dev/null && echo yes || echo no))"
   echo "logs: $LOG_DIR"
   exit 1
 fi

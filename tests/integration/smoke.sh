@@ -271,8 +271,9 @@ H6=$(curl -s -D - -o /dev/null -H "Host: $DOMAIN" "http://127.0.0.1:$EDGE_PORT/c
 contains_h "after purge it is MISS again" "$H6" "x-cache: MISS"
 
 echo "== origin failure page =="
-# `--max-time` first: an origin-error page is delimited by closing the connection,
-# so a client that holds the socket open would otherwise wait for an EOF forever.
+# `--max-time` keeps a stalled origin fetch from hanging the suite, and the page
+# must be self-delimiting: `Content-Length` has to match the body byte count, or a
+# keep-alive client would wait for an EOF that never arrives.
 curl -s --max-time 20 -D "$LOG_DIR/down.hdr" -o "$LOG_DIR/down.html" -H "Host: $DOWN" \
   "http://127.0.0.1:$EDGE_PORT/some-missing-asset.js" -w '%{http_code}' >"$LOG_DIR/down.code" || true
 DOWN_CODE=$(cat "$LOG_DIR/down.code")
@@ -290,6 +291,14 @@ grep -q '源站' "$LOG_DIR/down.html" && pass "error page explains the origin pr
 grep -qi '^x-lagran-error: ORIGIN_' "$LOG_DIR/down.hdr" && pass "error page carries ORIGIN_* code" || fail "x-lagran-error header"
 grep -qi '^cache-control: no-store' "$LOG_DIR/down.hdr" && pass "error page is no-store" || fail "error page cache-control"
 grep -q "$DOWN" "$LOG_DIR/down.html" && pass "error page names the domain" || fail "error page domain"
+DOWN_LEN=$(grep -i '^content-length:' "$LOG_DIR/down.hdr" | tr -d '\r' | awk '{print $2}')
+DOWN_SIZE=$(wc -c < "$LOG_DIR/down.html" | tr -d ' ')
+if [[ -n "$DOWN_LEN" && "$DOWN_LEN" == "$DOWN_SIZE" ]]; then
+  pass "error page carries a matching Content-Length ($DOWN_LEN)"
+else
+  fail "error page Content-Length (header='${DOWN_LEN:-none}', body=$DOWN_SIZE)"
+fi
+grep -qi '^transfer-encoding:' "$LOG_DIR/down.hdr" && fail "error page must not be chunked with a Content-Length" || pass "error page is self-delimiting"
 
 echo "== multi-tenant isolation =="
 REG=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/register" \

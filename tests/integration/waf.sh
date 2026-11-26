@@ -157,6 +157,13 @@ check "SQLi query blocked" "$CODE" "403"
 contains "block page is the WAF page" "$(cat "$LOG_DIR/body")" "安全拦截"
 contains_i "block page carries WAF header" "$(cat "$LOG_DIR/headers")" "x-lagran-waf: blocked"
 contains "block page has error code" "$(cat "$LOG_DIR/headers")" "WAF_BLOCKED"
+BLOCK_LEN=$(grep -i '^content-length:' "$LOG_DIR/headers" | tr -d '\r' | awk '{print $2}')
+BLOCK_SIZE=$(wc -c < "$LOG_DIR/body" | tr -d ' ')
+if [[ -n "$BLOCK_LEN" && "$BLOCK_LEN" == "$BLOCK_SIZE" ]]; then
+  pass "block page carries a matching Content-Length ($BLOCK_LEN)"
+else
+  fail "block page Content-Length (header='${BLOCK_LEN:-none}', body=$BLOCK_SIZE)"
+fi
 
 CODE=$(request "/x?q=%3Cscript%3Ealert(1)%3C/script%3E" -H 'X-Forwarded-For: 198.51.100.1')
 check "XSS query blocked" "$CODE" "403"
