@@ -705,6 +705,7 @@ CC_SYNC_INTERVAL=5   # 共享封禁拉取间隔（秒），最小 2
 | `LOG_RETENTION_DAYS` | `30` | 访问日志/指标保留天数，0=不清理 |
 | `ALLOW_INSECURE_AGENT` | `false` | 边缘 `AGENT_TOKEN` 为空时仍放行管理接口（仅本地） |
 | `AGENT_TOKEN` / 节点令牌 | — | 生产必须配置；空 token 时管理接口返回 401 |
+| `METRICS_TOKEN` | 空（回退 `AGENT_TOKEN`） | 边缘 `/__lagran/metrics` 的专用抓取令牌；两者都为空时该端点返回 401 |
 
 密码策略：注册至少 8 位且含字母与数字。登录/注册按邮箱约 60 秒内最多 20 次。
 

@@ -756,6 +756,8 @@ curl https://console.example.com/api/v1/certs/jobs \
 ```bash
 CONTROL_URL=http://10.0.0.10:8080
 AGENT_TOKEN=该节点的 auth_token
+# Prometheus 抓取 /__lagran/metrics 的专用令牌；留空回退 AGENT_TOKEN
+# METRICS_TOKEN=
 NODE_ID=edge-gz-01
 NODE_REGION=guangdong
 PUBLIC_IP=203.0.113.21
@@ -764,7 +766,8 @@ AGENT_URL=http://203.0.113.21:8081
 # 数据面：CDN 用户流量（80/443）
 EDGE_LISTEN=0.0.0.0:80
 EDGE_HTTPS_LISTEN=0.0.0.0:443
-# 管理面：控制面回调 purge/cert/challenge，不暴露给公网用户
+# 管理面：控制面回调 purge/cert/challenge/metrics，不暴露给公网用户；
+# 所有管理端点（含 /__lagran/metrics）都要求节点 token，禁止匿名访问
 EDGE_ADMIN_LISTEN=0.0.0.0:8081
 # EDGE_HTTPS_REDIRECT_PORT=443
 
@@ -789,12 +792,13 @@ RUST_LOG=edge=info,tower_http=warn
 | `CONTROL_URL` | 是 | `http://127.0.0.1:8080` | 控制面地址。边缘用它拉配置、证书、上报心跳/指标/日志/WAF。生产建议内网 HTTP 或有效 HTTPS。 |
 | `ORIGIN_URL` | 仅单源模式 | `https://example.com` | 仅当边缘**没有**从控制面拿到任何域名时使用的兜底源站（如本地开发直接 `cargo run -p edge`）。此模式下任意 `Host` 都由它服务，且自阶段 3 起走 Pingora 原生路径；正常部署以控制面下发的域名配置为准，此值不生效。 |
 | `AGENT_TOKEN` | 生产必填 | 空 | 必须是该节点在控制台预注册时生成的 `auth_token`。边缘配置/心跳只接受节点 token，**不能用控制面全局 `AGENT_TOKEN`**；节点 token 为空时请重新创建节点。 |
+| `METRICS_TOKEN` | 否 | 空（回退 `AGENT_TOKEN`） | Prometheus 抓取 `/__lagran/metrics` 的专用令牌（`X-Lagran-Metrics-Token` 或 `Authorization: Bearer`）。留空时回退 `AGENT_TOKEN`；两者都为空时该端点返回 401（`ALLOW_INSECURE_AGENT=true` 仅限本地）。 |
 | `NODE_ID` | 是 | `edge-001` | 节点唯一标识，对应控制台预注册名称。改名后需同步修改，否则会注册成新节点。 |
 | `NODE_REGION` | 否 | `local` | 区域标签，首次心跳写入；控制台已填非空区域时不会被心跳覆盖。 |
 | `PUBLIC_IP` | 调度必填 | 空 | 节点公网 IP，随心跳上报，DNS 调度返回这个地址。必须是对用户可访问的 IP。 |
 | `AGENT_URL` | 是 | 根据 `EDGE_ADMIN_LISTEN` / `EDGE_LISTEN` 推导 | 控制面回调边缘的地址（purge、证书、ACME）。应指向 **`EDGE_ADMIN_LISTEN` 管理端口**，例如 `http://IP:8081`；控制面必须能访问。 |
 | `EDGE_LISTEN` | 是 | `0.0.0.0:8081` | Pingora 公共 HTTP 监听：CDN 用户流量、WAF challenge verify、ACME HTTP-01 challenge。生产用 80。绑定具体 IP 时，Edge 会额外监听同端口的 loopback 地址，供内部缓存预热使用。 |
-| `EDGE_ADMIN_LISTEN` | 推荐 | 空 | 管理面监听：purge、证书加载、ACME challenge 下发、access-log。与控制面通信使用此端口；**不要对公网开放**，只允许控制面来源 IP。为空时兼容旧模式，管理接口仍留在数据面。 |
+| `EDGE_ADMIN_LISTEN` | 推荐 | 空 | 管理面监听：purge、证书加载、ACME challenge 下发、access-log、metrics。与控制面通信使用此端口；**不要对公网开放**，只允许控制面来源 IP（见「防火墙」）。为空时兼容旧模式，管理接口仍留在数据面。所有管理端点都要求节点 token；metrics 也可用 `METRICS_TOKEN`。 |
 | `EDGE_HTTPS_LISTEN` | 否 | 空 | Pingora 公共 HTTPS 监听。生产用 `0.0.0.0:443`，需要已同步证书。为空表示不启用 TLS。 |
 | `EDGE_HTTPS_REDIRECT_PORT` | 否 | 从 HTTPS 监听推导 | 域名开启 HTTPS 后，HTTP→HTTPS 跳转使用的端口。`443` 可省略；开发 8443 时写 8443。它只影响跳转 URL，不改变监听。 |
 | `CACHE_BACKEND` | 否 | `memory` | `memory`：内存；`disk`：磁盘；`hybrid`：内存+磁盘。生产大文件建议 `hybrid`。 |
@@ -820,9 +824,9 @@ RUST_LOG=edge=info,tower_http=warn
 `edge.env`，适合不想手算缓存容量和超时参数的运维者：
 
 1. **节点身份**：节点名称、区域、公网 IP 与部署方式。选择「控制面在另一台机器」时，
-   向导自动把 `EDGE_ADMIN_LISTEN` 设为 `0.0.0.0:8081`、`AGENT_URL` 设为
-   `http://<公网IP>:8081`；选择「同机」时两者都使用 `127.0.0.1:8081`。
-   这样控制面回调地址和边缘真正监听的地址不会再各写各的。
+   向导把 `AGENT_URL` 设为 `http://<公网IP>:8081`，并让 `EDGE_ADMIN_LISTEN` 跟随它
+   绑定到该 IP 的 8081（不会生成 `0.0.0.0`）；选择「同机」时两者都使用
+   `127.0.0.1:8081`。管理端口仍需用防火墙限制到控制面来源。
 2. **硬件画像**：CPU / 内存 / 磁盘 / 磁盘类型 / 出口带宽 / 业务类型，以及节点角色
    （普通边缘或 Origin Shield）。Shield 会自动写入 `EDGE_SHIELD_DISABLED=true`。
 3. **容量规划**：展示每个容量参数的推导依据（L1/L2/L3 缓存、分片、回源超时等）。

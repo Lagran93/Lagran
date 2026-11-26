@@ -69,6 +69,9 @@ pub struct AppState {
     pub control: ControlClient,
     pub origin_health: OriginHealthMap,
     pub agent_token: String,
+    /// Dedicated Prometheus scrape credential for `/__lagran/metrics`
+    /// (empty falls back to `agent_token`; see `server::agent_auth`).
+    pub metrics_token: String,
     pub inflight: Inflight,
     pub waf_log: WafLog,
     /// Trust X-Forwarded-For when determining the client IP (WAF ACLs).

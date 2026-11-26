@@ -6,6 +6,21 @@ Edge 暴露 Prometheus 指标：
 /__lagran/metrics
 ```
 
+该端点包含逐域名的请求与字节数，必须鉴权：优先使用 `METRICS_TOKEN`
+（`X-Lagran-Metrics-Token` 或 `Authorization: Bearer`），未配置时回退节点
+`AGENT_TOKEN`；两者都为空时返回 401。Prometheus 抓取配置示例：
+
+```yaml
+scrape_configs:
+  - job_name: lagran-edge
+    metrics_path: /__lagran/metrics
+    authorization:
+      type: Bearer
+      credentials: <METRICS_TOKEN 或节点 AGENT_TOKEN>
+    static_configs:
+      - targets: ['127.0.0.1:8082']
+```
+
 ## 核心规则
 
 ```yaml

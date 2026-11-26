@@ -1,6 +1,6 @@
 //! HTTP listener setup
 
-use crate::server::agent_auth::RequireAgentToken;
+use crate::server::agent_auth::{RequireAgentToken, RequireMetricsToken};
 use crate::server::state::AppState;
 use crate::server::purge::{self, EdgePurgeRequest};
 use axum::{
@@ -24,6 +24,8 @@ fn management_routes() -> Router<Arc<AppState>> {
         .route("/__lagran/access-logs", get(list_access_logs))
         .route("/__lagran/config/reload", post(config_reload_authed))
         .route("/__lagran/update", post(update_authed))
+        // Per-domain counters expose every tenant's domains and traffic. This
+        // is the one management route that used to skip the token check.
         .route("/__lagran/metrics", get(prometheus_metrics))
 }
 
@@ -171,7 +173,10 @@ async fn update_authed(
         .into_response()
 }
 
-async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn prometheus_metrics(
+    _auth: RequireMetricsToken,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let snaps = state.metrics.take_snapshots_peek();
     let global = state.metrics.global_snapshot();
     let mut out = String::from(

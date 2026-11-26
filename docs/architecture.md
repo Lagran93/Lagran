@@ -155,7 +155,8 @@ Internet
 
 - 控制面 `GET /metrics` 输出 Prometheus 文本：进程/数据库状态、域名与节点分组、逐源站健康与连续失败、
   证书到期时间戳、24h 请求/命中率/WAF 事件、当前 firing 告警和启用通知渠道。
-- 边缘 `GET /__lagran/metrics`（管理端口或数据面管理路径）输出逐域名请求、命中、未命中、字节数。
+- 边缘 `GET /__lagran/metrics`（管理端口或数据面管理路径）输出逐域名请求、命中、未命中、字节数；
+  该端点要求 `METRICS_TOKEN` 或节点 `AGENT_TOKEN`（两者都未配置时返回 401），避免匿名枚举租户域名。
 - `OTEL_EXPORTER_OTLP_ENDPOINT` 开启 OTLP/HTTP JSON Trace 导出；HTTP 中间件为每个请求创建
   `http.request` span，字段含 `http.method`、`url.path`、`http.status_code`，采样率由
   `OTEL_TRACES_SAMPLER_ARG` 控制。未配置时完全关闭，不增加导出开销。

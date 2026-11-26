@@ -39,13 +39,36 @@ RUST_LOG=edge=info \
 ./target/debug/lagran-edge >"$LOG_DIR/edge.log" 2>&1 &
 PIDS+=($!)
 
+# Pingora opens the data listener on its own thread after the admin listener, so
+# waiting only for admin health made the first data-port request race startup.
 for _ in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$ADMIN_PORT/__lagran/health" >/dev/null && break
+  ADMIN_READY=$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 \
+    "http://127.0.0.1:$ADMIN_PORT/__lagran/health")
+  DATA_READY=$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 \
+    "http://127.0.0.1:$DATA_PORT/__lagran/health")
+  [[ "$ADMIN_READY" == "200" && "$DATA_READY" == "200" ]] && break
   sleep 0.25
 done
 
 check "admin health" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ADMIN_PORT/__lagran/health")" "200"
 check "data health" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DATA_PORT/__lagran/health")" "200"
+
+# H1 regression: metrics list every tenant's domains and traffic, so the admin
+# listener must not serve them anonymously even though health stays open.
+echo "== metrics authentication =="
+check "admin metrics rejects an anonymous scrape" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ADMIN_PORT/__lagran/metrics")" "401"
+check "admin metrics rejects a wrong token" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'x-lagran-agent-token: wrong' \
+    "http://127.0.0.1:$ADMIN_PORT/__lagran/metrics")" "401"
+check "admin metrics accepts the node token" \
+  "$(curl -s -o "$LOG_DIR/metrics.txt" -w '%{http_code}' \
+    -H 'x-lagran-agent-token: admin-port-token' \
+    "http://127.0.0.1:$ADMIN_PORT/__lagran/metrics")" "200"
+check "admin metrics body is Prometheus text" \
+  "$(grep -c '^lagran_edge_up 1' "$LOG_DIR/metrics.txt")" "1"
+check "data port refuses management metrics" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DATA_PORT/__lagran/metrics")" "405"
 
 PUT=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
   "http://127.0.0.1:$ADMIN_PORT/__lagran/acme/challenge" \

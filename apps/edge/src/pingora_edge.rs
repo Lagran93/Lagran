@@ -4551,26 +4551,22 @@ impl DataPlaneProxy {
 
     async fn handle_management(&self, session: &mut Session, path: &str) -> Result<bool> {
         let method = session.req_header().method.clone();
-        let expected = self.state.agent_token.as_str();
-        let got = session
-            .req_header()
-            .headers
-            .get("x-lagran-agent-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let allow_insecure = matches!(
-            std::env::var("ALLOW_INSECURE_AGENT")
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str(),
-            "1" | "true" | "yes" | "on"
-        );
-        let unauthorized = if expected.is_empty() {
-            !allow_insecure
+        // `/metrics` exposes every tenant's domain names and traffic totals, and
+        // Prometheus deployments have their own credential. Prefer
+        // METRICS_TOKEN for that one path, with the same precedence as the
+        // control plane's `/metrics`; every other management endpoint stays on
+        // the node token.
+        let headers = &session.req_header().headers;
+        let authorized = if method == http::Method::GET && path == "/__lagran/metrics" {
+            crate::server::agent_auth::metrics_authorized(
+                &self.state.metrics_token,
+                &self.state.agent_token,
+                headers,
+            )
         } else {
-            got != expected
+            crate::server::agent_auth::agent_authorized(&self.state.agent_token, headers)
         };
-        if unauthorized {
+        if !authorized {
             write_plain(
                 session,
                 401,

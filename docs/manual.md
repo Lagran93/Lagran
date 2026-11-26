@@ -1018,7 +1018,10 @@ NODE_ID=edge-01
 AGENT_TOKEN=<节点令牌>
 CONTROL_URL=https://control.example.com
 AGENT_URL=http://<内网IP>:8082
+# 管理端口不要对公网开放：防火墙只放行控制面来源
 EDGE_ADMIN_LISTEN=0.0.0.0:8082
+# Prometheus 抓取 /__lagran/metrics 的专用令牌（留空回退 AGENT_TOKEN）
+# METRICS_TOKEN=
 PUBLIC_IP=<公网IP>
 ```
 
@@ -1153,9 +1156,10 @@ Control 的 CONTROL_PUBLIC_URL
 |---|---|
 | `EDGE_LISTEN` | 公共 HTTP，默认 `0.0.0.0:8081` |
 | `EDGE_HTTPS_LISTEN` | 公共 HTTPS，留空关闭 |
-| `EDGE_ADMIN_LISTEN` | 管理/Agent，默认 `127.0.0.1:8082` |
+| `EDGE_ADMIN_LISTEN` | 管理/Agent，默认 `127.0.0.1:8082`；管理端点（含 `/__lagran/metrics`）要求节点 token，metrics 也可用 `METRICS_TOKEN` |
 | `NODE_ID` | 必须与控制台节点一致 |
 | `AGENT_TOKEN` | 节点独立 token，不是全局 token |
+| `METRICS_TOKEN` | Prometheus 抓取 edge metrics 的专用令牌；留空回退 `AGENT_TOKEN` |
 | `CONTROL_URL` | 控制面地址 |
 | `AGENT_URL` | 控制面回调 Edge 的地址，必须是管理端口 |
 | `PUBLIC_IP` | GeoDNS 使用 |
@@ -2974,7 +2978,10 @@ Prometheus 指标包含：
 ```bash
 # 管理口
 curl -fsS http://127.0.0.1:8082/__lagran/health
-curl -fsS http://127.0.0.1:8082/__lagran/metrics
+# /__lagran/metrics 暴露逐域名流量，必须带节点 token 或 METRICS_TOKEN；
+# 两者都未配置时返回 401（本地调试可用 ALLOW_INSECURE_AGENT=true）。
+curl -fsS -H "X-Lagran-Agent-Token: $AGENT_TOKEN" \
+  http://127.0.0.1:8082/__lagran/metrics
 
 # 数据面健康
 curl -fsS -H 'Host: cdn.example.com' http://127.0.0.1:8081/__lagran/health

@@ -128,6 +128,13 @@ pub struct EdgeConfig {
     /// a problem worth fixing. Defaults to true.
     pub access_log_enabled: bool,
     pub agent_token: String,
+    /// Dedicated Prometheus scrape credential for `/__lagran/metrics`.
+    ///
+    /// Empty falls back to `agent_token`; when both are empty the endpoint is
+    /// closed unless `ALLOW_INSECURE_AGENT=true` (see `server::agent_auth`).
+    /// Lets monitoring scrape per-tenant domain/traffic counters without
+    /// handing the more powerful purge/update token to Prometheus.
+    pub metrics_token: String,
     /// HMAC secret for signed WAF rulepacks (empty = AGENT_TOKEN fallback).
     pub waf_rulepack_secret: String,
     pub access_log_json: bool,
@@ -383,6 +390,7 @@ impl Default for EdgeConfig {
             agent_token: env_nonempty("AGENT_TOKEN")
                 .or_else(|| env_nonempty("EDGE_AGENT_TOKEN"))
                 .unwrap_or_default(),
+            metrics_token: env_nonempty("METRICS_TOKEN").unwrap_or_default(),
             waf_rulepack_secret: env_nonempty("WAF_RULEPACK_SECRET").unwrap_or_default(),
             access_log_json: std::env::var("ACCESS_LOG_JSON")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

@@ -380,7 +380,9 @@ curl -fsS http://127.0.0.1:8082/__lagran/health
 ### 指标
 
 ```bash
-curl -fsS http://127.0.0.1:8082/__lagran/metrics
+# 指标包含逐域名流量，必须带节点 token 或 METRICS_TOKEN；否则返回 401
+curl -fsS -H "X-Lagran-Agent-Token: $AGENT_TOKEN" \
+  http://127.0.0.1:8082/__lagran/metrics
 ```
 
 重点指标：

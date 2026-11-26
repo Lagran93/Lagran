@@ -321,6 +321,7 @@ async fn main() -> anyhow::Result<()> {
         control: control.clone(),
         origin_health: origin_health_map,
         agent_token: config.agent_token.clone(),
+        metrics_token: config.metrics_token.clone(),
         inflight: Inflight::default(),
         waf_log,
         // Pingora overwrites X-Forwarded-For/Proto before it forwards to this
