@@ -35,6 +35,41 @@ type PublicClient = Client<GuardedConnector, Full<Bytes>>;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTEMPTS: usize = 2;
 
+/// Trust anchors for `https://` edge agent callbacks.
+///
+/// WebPKI roots cover the normal case; `AGENT_TLS_CA_FILE` lets an operator pin
+/// a private CA for an edge management listener that uses a self-signed or
+/// internally issued certificate (M6).
+fn agent_tls_config() -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Ok(path) = std::env::var("AGENT_TLS_CA_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            match std::fs::read(path) {
+                Ok(data) => {
+                    let mut reader = std::io::BufReader::new(&data[..]);
+                    let mut added = 0;
+                    for cert in rustls_pemfile::certs(&mut reader).flatten() {
+                        if roots.add(cert).is_ok() {
+                            added += 1;
+                        }
+                    }
+                    tracing::info!(ca = %path, certs = added, "trusting private CA for edge agent callbacks");
+                }
+                Err(e) => tracing::error!(
+                    ca = %path,
+                    error = %e,
+                    "cannot read AGENT_TLS_CA_FILE; https edge callbacks may fail"
+                ),
+            }
+        }
+    }
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+}
+
 pub fn client() -> &'static EdgeClient {
     static CLIENT: OnceLock<EdgeClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -46,7 +81,7 @@ pub fn client() -> &'static EdgeClient {
         // selection, so `enforce_http` would reject every `https://` agent URL.
         http.enforce_http(false);
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
+            .with_tls_config(agent_tls_config())
             .https_or_http()
             .enable_http1()
             .enable_http2()

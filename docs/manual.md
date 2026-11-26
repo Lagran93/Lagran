@@ -413,7 +413,10 @@ no_store  当前实现按请求阶段非 cache 处理：回源且不写入缓存
 域名高级设置包括：
 
 - 回源超时
-- 全局限流 RPS / 突发（配置 Edge `REDIS_URL` 后跨节点共享 token bucket）
+- 每客户端限流 RPS / 突发（IPv4 按 /24、IPv6 按 /64 聚合并各自持有 token bucket；
+  配置 Edge `REDIS_URL` 后跨节点共享）。另有 20x 的域名级总闸
+  （`RATE_LIMIT_DOMAIN_GATE_FACTOR`），只用于兜底轮换地址洪泛，避免单个客户端
+  耗尽整域配额；缓存命中同样消耗该客户端的桶。
 - 忽略 Query
 - CORS 允许来源
 - 防盗链 Referer
@@ -517,7 +520,8 @@ lagran_edge_chunk_fill_drop_budget_total
 
 开启 CC 后：
 
-- 域名全局限流 RPS/突发同时作为 CC 全局攻击阈值。
+- CC 的全局阈值来自域名的 CC 配置（`global_rps`/`global_burst`）；普通限流已改为
+  每客户端桶 + 域名总闸，不再用单一域名桶限制所有访客。
 - 超过阈值自动进入 60 秒攻击模式，客户端限额减半。
 - HTML 首次超限进入 PoW 挑战，通过 clearance 后获得临时 2x 预算。
 - 持续超限才封禁。
@@ -1027,6 +1031,9 @@ PUBLIC_IP=<公网IP>
 
 3. 启动后观察心跳、版本、CPU/内存。
 4. 确保控制面能访问 `AGENT_URL`，否则 purge/config/cert/challenge 会失败。
+   心跳中的 `public_ip` 必须是 IP；`ip` 允许 IP 或 `IP:端口`（兼容不同 Agent）；
+   `agent_url` 必须是 http/https URL 且不能带凭据。任一字段不合法，整条心跳返回
+   400 且不会写入节点表。
 5. 在节点列表点击「升级」：控制面解析 GitHub Release，调用节点 `/__lagran/update`；Edge 写入更新请求，由 root 的 `lagran-edge-update.path/service` 下载、校验 SHA256、替换二进制并重启。
    - 需要 `install.sh edge` 安装 `lagran-edge-update` helper 与 systemd path 单元。
    - 首次启用该功能时，旧版 Edge 没有 `/__lagran/update` 端点，需要在节点上重新执行一次新版 `install.sh edge`；之后即可在控制台点击升级。
@@ -1162,12 +1169,16 @@ Control 的 CONTROL_PUBLIC_URL
 | `METRICS_TOKEN` | Prometheus 抓取 edge metrics 的专用令牌；留空回退 `AGENT_TOKEN` |
 | `CONTROL_URL` | 控制面地址 |
 | `AGENT_URL` | 控制面回调 Edge 的地址，必须是管理端口 |
+| `EDGE_ADMIN_TLS_CERT` / `EDGE_ADMIN_TLS_KEY` | 管理端口 TLS 证书链与私钥路径；两者必须同时设置 |
+| `EDGE_ADMIN_REQUIRE_TLS` | 为 true 时拒绝在明文管理端口推送证书私钥（需先配置 TLS） |
 | `PUBLIC_IP` | GeoDNS 使用 |
 | `CC_SYNC_INTERVAL` | 共享封禁同步间隔 |
 | `REDIS_URL` | CC 滑动窗口与普通域名限流共享 |
 | `CC_REDIS_PREFIX` | CC Redis key 前缀 |
 | `CC_REDIS_TIMEOUT_MS` | 单次跨节点 CC Redis 往返预算，默认 50ms；局域网 Redis 通常无需调整，跨地域链路需调大或接受回退到单机预算 |
 | `RATE_LIMIT_REDIS_PREFIX` | 普通限流 Redis key 前缀 |
+| `RATE_LIMIT_DOMAIN_GATE_FACTOR` | 域名级总闸相对单客户端限额的倍数，默认 20，范围 1–1000 |
+| `RATE_LIMIT_MAX_BUCKETS` | 限流桶硬上限，默认 100000；后台任务每分钟清理空闲桶 |
 | `CACHE_TTL` | 默认缓存 TTL |
 | `CACHE_BACKEND` | `memory` / `disk` / `hybrid` / `redis` / `l2`；`redis` 与 `l2` 当前等价，均启用本地 MemoryCache + Redis L2 |
 | `DISK_CACHE_DIR` | 普通磁盘缓存目录 |

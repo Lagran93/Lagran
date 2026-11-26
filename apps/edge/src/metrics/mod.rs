@@ -166,6 +166,10 @@ pub struct EdgeMetrics {
     /// not be parsed. A non-zero value means the control plane accepted a domain
     /// whose `origin_url`/`origin` fields do not form a usable origin.
     config_errors: AtomicU64,
+    /// Enabled managed rulesets absent from the verified rulepack (M5). The
+    /// control plane now falls back to built-in categories, so a non-zero value
+    /// means an edge is running an older pairing and may be under-protected.
+    rulepack_missing_rulesets: AtomicU64,
     chunk_requests: AtomicU64,
     chunk_origin_runs: AtomicU64,
     chunk_fallbacks: AtomicU64,
@@ -189,6 +193,7 @@ pub struct GlobalSnapshot {
     pub origin_timeouts: u64,
     pub origin_errors: u64,
     pub config_errors: u64,
+    pub rulepack_missing_rulesets: u64,
     pub stream_requests: u64,
     pub stream_bytes: u64,
     pub stream_errors: u64,
@@ -307,6 +312,18 @@ impl EdgeMetrics {
         self.config_errors.load(Ordering::Relaxed)
     }
 
+    /// Store the missing-ruleset count observed for the current config.
+    ///
+    /// A gauge, not a counter: the same domain is re-applied on every sync, so
+    /// adding would inflate the number without anything having changed.
+    pub fn set_rulepack_missing_rulesets(&self, count: u64) {
+        self.rulepack_missing_rulesets.store(count, Ordering::Relaxed);
+    }
+
+    pub fn rulepack_missing_rulesets(&self) -> u64 {
+        self.rulepack_missing_rulesets.load(Ordering::Relaxed)
+    }
+
     pub fn record_stream_start(&self) {
         self.stream_requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -409,6 +426,7 @@ impl EdgeMetrics {
             origin_timeouts: self.origin_timeouts.load(Ordering::Relaxed),
             origin_errors: self.origin_errors.load(Ordering::Relaxed),
             config_errors: self.config_errors.load(Ordering::Relaxed),
+            rulepack_missing_rulesets: self.rulepack_missing_rulesets.load(Ordering::Relaxed),
             stream_requests: self.stream_requests.load(Ordering::Relaxed),
             stream_bytes: self.stream_bytes.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),

@@ -69,6 +69,10 @@ pub struct AppState {
     pub control: ControlClient,
     pub origin_health: OriginHealthMap,
     pub agent_token: String,
+    /// True when the management listener terminates TLS.
+    pub admin_tls: bool,
+    /// Whether certificate pushes must be refused on a plaintext listener.
+    pub admin_require_tls: bool,
     /// Dedicated Prometheus scrape credential for `/__lagran/metrics`
     /// (empty falls back to `agent_token`; see `server::agent_auth`).
     pub metrics_token: String,

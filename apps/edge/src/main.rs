@@ -173,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
         domains.clone(),
         cache.clone(),
         large_cache.clone(),
+        metrics.clone(),
     );
     metrics_report::spawn_metrics_report(config.clone(), control.clone(), metrics.clone());
     access_report::spawn_access_report(config.clone(), control.clone(), access_log.clone());
@@ -321,6 +322,8 @@ async fn main() -> anyhow::Result<()> {
         control: control.clone(),
         origin_health: origin_health_map,
         agent_token: config.agent_token.clone(),
+        admin_tls: config.admin_tls_cert.is_some(),
+        admin_require_tls: config.admin_require_tls,
         metrics_token: config.metrics_token.clone(),
         inflight: Inflight::default(),
         waf_log,
@@ -364,6 +367,21 @@ async fn main() -> anyhow::Result<()> {
     // rotating-address flood it stalled the proxy threads entirely; the sweep now
     // runs once a second on its own task (PERF-NEW-01).
     state.cc.spawn_maintenance();
+    // Client-group rate-limit buckets must be pruned and capped now that the
+    // key is no longer a bounded domain name.
+    state.rate_limiter.spawn_maintenance();
+
+    match (&config.admin_tls_cert, &config.admin_tls_key) {
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => anyhow::bail!(
+            "EDGE_ADMIN_TLS_CERT and EDGE_ADMIN_TLS_KEY must be set together"
+        ),
+    }
+    if config.admin_require_tls && config.admin_tls_cert.is_none() {
+        anyhow::bail!(
+            "EDGE_ADMIN_REQUIRE_TLS=true requires EDGE_ADMIN_TLS_CERT and EDGE_ADMIN_TLS_KEY"
+        );
+    }
 
     let admin_listen = config.admin_listen_addr.clone();
     if let Some(ref admin) = admin_listen {
@@ -390,12 +408,31 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         let admin_app = listener::create_admin_router(state.clone());
+        let admin_tls_cert = config.admin_tls_cert.clone();
+        let admin_tls_key = config.admin_tls_key.clone();
         tracing::info!(admin = %admin_addr, "edge management listener started");
         // Not supervised: the listener owns a bound socket, so a restart would
         // fail with "address in use" and loop. Report a panic explicitly instead,
         // and keep the error path for a normal shutdown.
         tokio::spawn(async move {
-            if let Err(e) = tls::serve_http(admin_addr, admin_app).await {
+            let result = match (admin_tls_cert, admin_tls_key) {
+                (Some(cert), Some(key)) => {
+                    tracing::info!(admin = %admin_addr, "management listener uses TLS");
+                    tls::serve_https(admin_addr, admin_app, &cert, &key).await
+                }
+                _ => {
+                    if !admin_addr.ip().is_loopback() {
+                        tracing::warn!(
+                            admin = %admin_addr,
+                            "management listener is plaintext on a non-loopback address; the \
+                             node token and pushed certificate private keys cross the network \
+                             unencrypted. Set EDGE_ADMIN_TLS_CERT/KEY (M6)."
+                        );
+                    }
+                    tls::serve_http(admin_addr, admin_app).await
+                }
+            };
+            if let Err(e) = result {
                 tracing::error!(error = %e, "management listener stopped");
             }
         });

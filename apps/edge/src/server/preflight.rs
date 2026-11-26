@@ -266,12 +266,24 @@ pub(crate) async fn preflight_cacheable(
     let skip_rate_limit =
         domain.cc.enabled && domain.cc.mode == CcMode::Block && domain.cc.global_rps > 0;
     if !skip_rate_limit {
-        let rl_key = if host.is_empty() { "default" } else { host };
-        if !state
+        // Per-client bucket first: a single client must not be able to exhaust
+        // the domain's entire quota. The domain-wide gate below is much wider
+        // and only caps rotating-address floods (M2).
+        let domain_key = if host.is_empty() { "default" } else { host };
+        let client_key = match client_ip_addr {
+            Some(ip) => format!("{domain_key}|{}", crate::server::cc::client_group(ip)),
+            None => domain_key.to_string(),
+        };
+        let client_allowed = state
             .rate_limiter
-            .check(rl_key, domain.rate_limit_rps, domain.rate_limit_burst)
-            .await
-        {
+            .check(&client_key, domain.rate_limit_rps, domain.rate_limit_burst)
+            .await;
+        let allowed = client_allowed
+            && state
+                .rate_limiter
+                .check_domain_gate(domain_key, domain.rate_limit_rps, domain.rate_limit_burst)
+                .await;
+        if !allowed {
             log_access(
                 &state.access_log,
                 method,

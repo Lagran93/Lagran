@@ -33,6 +33,14 @@ pub struct EdgeConfig {
     /// Optional isolated listener for control-plane management endpoints.
     /// When unset, management stays on `listen_addr` for compatibility.
     pub admin_listen_addr: Option<String>,
+    /// Optional certificate chain for terminating TLS on the management
+    /// listener (`EDGE_ADMIN_TLS_CERT`). Set together with [`Self::admin_tls_key`].
+    pub admin_tls_cert: Option<String>,
+    /// Private key for [`Self::admin_tls_cert`] (`EDGE_ADMIN_TLS_KEY`).
+    pub admin_tls_key: Option<String>,
+    /// Reject certificate/private-key pushes unless the management listener is
+    /// TLS (`EDGE_ADMIN_REQUIRE_TLS`). Off by default for rolling upgrades.
+    pub admin_require_tls: bool,
     /// Worker threads for the Pingora data plane.
     ///
     /// Pingora's own default is a single thread, which serialises downstream
@@ -289,6 +297,9 @@ impl Default for EdgeConfig {
         Self {
             listen_addr: listen,
             admin_listen_addr,
+            admin_tls_cert: env_nonempty("EDGE_ADMIN_TLS_CERT"),
+            admin_tls_key: env_nonempty("EDGE_ADMIN_TLS_KEY"),
+            admin_require_tls: bool_env("EDGE_ADMIN_REQUIRE_TLS", false),
             worker_threads: std::env::var("EDGE_WORKER_THREADS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())

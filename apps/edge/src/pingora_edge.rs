@@ -4764,6 +4764,17 @@ impl DataPlaneProxy {
                 }
             }
             ("POST", "/__lagran/certs/load") => {
+                if self.state.admin_require_tls && !self.state.admin_tls {
+                    write_json(
+                        session,
+                        426,
+                        &serde_json::json!({
+                            "error": "certificate pushes require TLS on the management listener"
+                        }),
+                    )
+                    .await;
+                    return Ok(true);
+                }
                 let body = read_body(session, 16 * 1024 * 1024).await?;
                 let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
                     write_plain(
@@ -4899,9 +4910,13 @@ impl DataPlaneProxy {
                 body.push_str(&format!(
                     "# HELP lagran_edge_config_errors_total Requests refused because the domain origin config is unusable\n\
                      # TYPE lagran_edge_config_errors_total counter\n\
-                     lagran_edge_config_errors_total {}
+                     lagran_edge_config_errors_total {}\n\
+                     # HELP lagran_edge_rulepack_missing_rulesets Enabled WAF rulesets missing from the pinned rulepack\n\
+                     # TYPE lagran_edge_rulepack_missing_rulesets gauge\n\
+                     lagran_edge_rulepack_missing_rulesets {}
 ",
                     self.state.metrics.config_errors(),
+                    self.state.metrics.rulepack_missing_rulesets(),
                 ));
                 write_plain(
                     session,

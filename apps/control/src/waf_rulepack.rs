@@ -47,11 +47,32 @@ impl RulepackRow {
             return categories;
         };
         for id in ids {
-            let Some(entry) = package.rulesets.iter().find(|r| r.id == *id) else {
+            if let Some(entry) = package.rulesets.iter().find(|r| r.id == *id) {
+                for category in &entry.categories {
+                    categories = categories.enable(category);
+                }
                 continue;
-            };
-            for category in &entry.categories {
-                categories = categories.enable(category);
+            }
+            // The pinned package can predate a ruleset (or have been restored
+            // from an older version). Silently enabling nothing left the console
+            // showing "enabled" while no category was active (M5). Fall back to
+            // the built-in catalog so the domain keeps the protection the
+            // operator selected.
+            if let Some(builtin) = waf_rulesets::find(id) {
+                tracing::warn!(
+                    ruleset = %id,
+                    package_version = %self.version,
+                    "rulepack is missing an enabled ruleset; applying built-in categories"
+                );
+                for category in builtin.categories {
+                    categories = categories.enable(category);
+                }
+            } else {
+                tracing::warn!(
+                    ruleset = %id,
+                    package_version = %self.version,
+                    "enabled ruleset is unknown to the built-in catalog; no categories applied"
+                );
             }
         }
         categories
@@ -708,6 +729,39 @@ mod tests {
     fn gray_bucket_is_stable() {
         assert_eq!(gray_bucket("a.example.com", "1"), gray_bucket("a.example.com", "1"));
         assert!(gray_bucket("a.example.com", "1") < 100);
+    }
+
+    /// A pinned old package must not silently drop a newer built-in ruleset.
+    #[test]
+    fn missing_ruleset_falls_back_to_builtin_catalog() {
+        let package = Rulepack {
+            id: "lagran-waf-core".into(),
+            version: "2026.01".into(),
+            generated_at: "2026-01-01T00:00:00Z".into(),
+            // Deliberately older than the catalog: it only knows owasp-core.
+            rulesets: vec![RulesetEntry {
+                id: "owasp-core".into(),
+                name: "OWASP core".into(),
+                version: "2026.01".into(),
+                categories: vec!["sqli".into()],
+            }],
+        };
+        let row = RulepackRow {
+            version: "2026.01".into(),
+            payload: serde_json::to_string(&package).unwrap(),
+            signature: String::new(),
+            checksum: String::new(),
+            slot: "active".into(),
+            created_at: chrono::Utc::now(),
+            created_by: "test".into(),
+        };
+
+        let categories = row.categories_for(&["owasp-core".into(), "injection-extended".into()]);
+        assert!(categories.sqli, "package categories still apply");
+        assert!(
+            categories.ssti && categories.nosql,
+            "a ruleset missing from the old package must fall back to the built-in catalog"
+        );
     }
 
     #[test]

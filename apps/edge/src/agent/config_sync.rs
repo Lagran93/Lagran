@@ -22,7 +22,9 @@ use crate::cache::large::LargeCache;
 use crate::cache::policy::{CacheRule, RuleSet};
 use crate::config::EdgeConfig;
 use crate::config::registry::{DomainEntry, DomainRegistry};
+use crate::metrics::EdgeMetrics;
 use crate::origin::OriginClient;
+use std::sync::Arc;
 use crate::waf::{
     IpNet, ManagedRules, SecurityLevel, WafAction, WafConfig, WafField, WafMode, WafOp, WafRule,
 };
@@ -213,7 +215,7 @@ struct DomainCfg {
 }
 
 impl DomainCfg {
-    fn into_entry(self, config: &EdgeConfig) -> DomainEntry {
+    fn into_entry(self, config: &EdgeConfig, metrics: &Arc<EdgeMetrics>) -> DomainEntry {
         let mut origins: Vec<crate::config::registry::OriginTarget> = if self.origins.is_empty() {
             let mut list = vec![origin_target(&self.origin)];
             if let Some(ref backup) = self.backup_origin {
@@ -277,7 +279,7 @@ impl DomainCfg {
             custom_headers: self.custom_headers,
             backup_origin_url,
             ssl_enabled: self.ssl_enabled,
-            waf: into_waf(self.waf, config),
+            waf: into_waf(self.waf, config, metrics),
             cc,
             signed_url_enabled: self.signed_url_enabled,
             signed_url_mode: self.signed_url_mode,
@@ -418,7 +420,49 @@ struct WafRuleCfg {
     expr: String,
 }
 
-fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
+/// Enable the categories of every ruleset that is present in the package.
+///
+/// Returns how many enabled rulesets the package does not contain. A pinned old
+/// package (or a restored backup) can be missing a newer ruleset; the control
+/// plane now supplies built-in fallbacks, but an edge paired with an older
+/// control plane must at least make the gap visible instead of silently keeping
+/// the category off (M5).
+fn apply_package_rulesets(
+    managed: &mut ManagedRules,
+    package: &[crate::waf::rulepack::RulepackEntry],
+    enabled: &[String],
+) -> u64 {
+    let mut missing = 0;
+    for id in enabled {
+        let Some(entry) = package.iter().find(|r| &r.id == id) else {
+            missing += 1;
+            continue;
+        };
+        for category in &entry.categories {
+            match category.as_str() {
+                "sqli" => managed.sqli = true,
+                "xss" => managed.xss = true,
+                "traversal" => managed.traversal = true,
+                "scanners" => managed.scanners = true,
+                "rce" => managed.rce = true,
+                "ssrf" => managed.ssrf = true,
+                "xxe" => managed.xxe = true,
+                "log4shell" => managed.log4shell = true,
+                "crlf" => managed.crlf = true,
+                "ssti" => managed.ssti = true,
+                "nosql" => managed.nosql = true,
+                "ldap" => managed.ldap = true,
+                "java" => managed.java = true,
+                "webshell" => managed.webshell = true,
+                "protocol" => managed.protocol = true,
+                _ => {}
+            }
+        }
+    }
+    missing
+}
+
+fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig, metrics: &Arc<EdgeMetrics>) -> WafConfig {
     let Some(cfg) = cfg else {
         return WafConfig::default();
     };
@@ -447,30 +491,16 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
         protocol: cfg.managed.protocol,
     };
     if let Some(package) = &package {
-        for id in &cfg.managed_rulesets {
-            let Some(entry) = package.rulesets.iter().find(|r| r.id == *id) else {
-                continue;
-            };
-            for category in &entry.categories {
-                match category.as_str() {
-                    "sqli" => managed.sqli = true,
-                    "xss" => managed.xss = true,
-                    "traversal" => managed.traversal = true,
-                    "scanners" => managed.scanners = true,
-                    "rce" => managed.rce = true,
-                    "ssrf" => managed.ssrf = true,
-                    "xxe" => managed.xxe = true,
-                    "log4shell" => managed.log4shell = true,
-                    "crlf" => managed.crlf = true,
-                    "ssti" => managed.ssti = true,
-                    "nosql" => managed.nosql = true,
-                    "ldap" => managed.ldap = true,
-                    "java" => managed.java = true,
-                    "webshell" => managed.webshell = true,
-                    "protocol" => managed.protocol = true,
-                    _ => {}
-                }
-            }
+        let missing =
+            apply_package_rulesets(&mut managed, &package.rulesets, &cfg.managed_rulesets);
+        if missing > 0 {
+            tracing::warn!(
+                version = %package.version,
+                missing,
+                "enabled WAF rulesets are missing from the verified rulepack; their categories \
+                 were not enabled. Update the rulepack or unpin the old version."
+            );
+            metrics.set_rulepack_missing_rulesets(missing);
         }
         tracing::info!(
             version = %package.version,
@@ -597,6 +627,7 @@ pub fn spawn_config_sync(
     registry: DomainRegistry,
     cache: SharedCache,
     large_cache: Option<std::sync::Arc<LargeCache>>,
+    metrics: Arc<EdgeMetrics>,
 ) {
     // Supervised: if this loop panics, the edge would keep serving its startup
     // configuration forever while still reporting healthy.
@@ -608,6 +639,7 @@ pub fn spawn_config_sync(
         let registry = registry.clone();
         let cache = cache.clone();
         let large_cache = large_cache.clone();
+        let metrics = metrics.clone();
         async move {
             tracing::info!(url = %control.endpoint("/api/v1/config"), "domain registry sync started");
             let mut last_version = String::new();
@@ -629,7 +661,7 @@ pub fn spawn_config_sync(
                                 let entries: Vec<DomainEntry> = cfg
                                     .domains
                                     .into_iter()
-                                    .map(|d| d.into_entry(&config))
+                                    .map(|d| d.into_entry(&config, &metrics))
                                     .collect();
                                 let n = entries.len();
 
@@ -760,7 +792,7 @@ pub fn spawn_config_sync(
                     let path = format!("/api/v1/config/{}", config.domain);
                     match control.get_json::<DomainCfg>(&path).await {
                         Ok(d) => {
-                            let entry = d.into_entry(&config);
+                            let entry = d.into_entry(&config, &metrics);
                             origin.set_base_url(entry.origin_url.clone()).await;
                             rules.replace(entry.rules.clone()).await;
                             registry.upsert(entry).await;
@@ -778,6 +810,47 @@ pub fn spawn_config_sync(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod rulepack_merge_tests {
+    use super::*;
+
+    fn entry(id: &str, categories: &[&str]) -> crate::waf::rulepack::RulepackEntry {
+        crate::waf::rulepack::RulepackEntry {
+            id: id.into(),
+            categories: categories.iter().map(|c| (*c).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn missing_ruleset_is_counted_and_present_ones_apply() {
+        let package = vec![entry("owasp-core", &["sqli", "xss"])];
+        let enabled = vec!["owasp-core".to_string(), "injection-extended".to_string()];
+        let mut managed = ManagedRules {
+            sqli: false,
+            xss: false,
+            traversal: false,
+            scanners: false,
+            rce: false,
+            ssrf: false,
+            xxe: false,
+            log4shell: false,
+            crlf: false,
+            ssti: false,
+            nosql: false,
+            ldap: false,
+            java: false,
+            webshell: false,
+            protocol: false,
+        };
+
+        let missing = apply_package_rulesets(&mut managed, &package, &enabled);
+
+        assert_eq!(missing, 1, "the absent ruleset must be reported");
+        assert!(managed.sqli && managed.xss, "present ruleset categories apply");
+        assert!(!managed.ssti, "the absent ruleset enables nothing on the edge");
+    }
 }
 
 #[cfg(test)]

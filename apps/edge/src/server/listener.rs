@@ -102,6 +102,15 @@ async fn load_cert_authed(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LoadCertBody>,
 ) -> impl IntoResponse {
+    if state.admin_require_tls && !state.admin_tls {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(serde_json::json!({
+                "error": "certificate pushes require TLS on the management listener                           (EDGE_ADMIN_TLS_CERT/KEY)"
+            })),
+        )
+            .into_response();
+    }
     match state.certs.upsert(
         &body.names,
         body.cert_pem.as_bytes(),
@@ -238,6 +247,9 @@ async fn prometheus_metrics(
          # HELP lagran_edge_config_errors_total Requests refused because the domain origin config is unusable\n\
          # TYPE lagran_edge_config_errors_total counter\n\
          lagran_edge_config_errors_total {}\n\
+         # HELP lagran_edge_rulepack_missing_rulesets Enabled WAF rulesets missing from the pinned rulepack\n\
+         # TYPE lagran_edge_rulepack_missing_rulesets gauge\n\
+         lagran_edge_rulepack_missing_rulesets {}\n\
          # HELP lagran_edge_origin_stream_requests_total Streaming origin responses\n\
          # TYPE lagran_edge_origin_stream_requests_total counter\n\
          lagran_edge_origin_stream_requests_total {}\n\
@@ -295,6 +307,7 @@ async fn prometheus_metrics(
         global.origin_timeouts,
         global.origin_errors,
         global.config_errors,
+        global.rulepack_missing_rulesets,
         global.stream_requests,
         global.stream_bytes,
         global.stream_errors,

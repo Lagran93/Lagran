@@ -155,6 +155,26 @@ check "unregistered node is rejected" "$UNREG_CODE" "403"
 AFTER_COUNT=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" | jq 'length')
 check "heartbeat does not auto-create nodes" "$AFTER_COUNT" "$BEFORE_COUNT"
 
+echo "== heartbeat identity validation (M7) =="
+bad_heartbeat() { # <json body>
+  curl -s -o /dev/null -w '%{http_code}' -X POST \
+    "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes/heartbeat" \
+    -H 'content-type: application/json' \
+    -H "x-lagran-agent-token: $NODE_TOKEN" \
+    -d "$1"
+}
+check "heartbeat rejects a non-IP public_ip" \
+  "$(bad_heartbeat "{\"node_id\":\"$NODE_NAME\",\"public_ip\":\"metadata.invalid\"}")" "400"
+check "heartbeat rejects a non-IP ip" \
+  "$(bad_heartbeat "{\"node_id\":\"$NODE_NAME\",\"ip\":\"999.1.1.1\"}")" "400"
+check "heartbeat rejects a non-HTTP agent_url" \
+  "$(bad_heartbeat "{\"node_id\":\"$NODE_NAME\",\"agent_url\":\"ftp://edge.test/\"}")" "400"
+check "heartbeat rejects agent_url credentials" \
+  "$(bad_heartbeat "{\"node_id\":\"$NODE_NAME\",\"agent_url\":\"http://user:pass@edge.test/\"}")" "400"
+NODE_PUBLIC=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" | jq -r --arg id "$NODE_ID" \
+  '.[] | select(.id == $id) | .public_ip')
+check "invalid heartbeats did not write public_ip" "$NODE_PUBLIC" ""
+
 echo "== start edge with per-node token (global token differs) =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 NODE_ID="$NODE_NAME" \

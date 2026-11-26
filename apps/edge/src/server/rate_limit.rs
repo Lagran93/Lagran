@@ -1,9 +1,15 @@
-//! Per-host token-bucket rate limiter.
+//! Per-client token-bucket rate limiter with a domain-wide backstop.
 //!
-//! The process-local bucket remains the fallback. When `REDIS_URL` is set and
-//! reachable, the same token bucket is evaluated atomically in Redis so all
-//! edge nodes share one budget per domain. The Redis script uses Redis `TIME`
-//! as the clock, avoiding skew between edge hosts.
+//! A single client cannot exhaust the domain budget: every client group (IPv4
+//! /24, IPv6 /64 — the same grouping CC uses) gets its own bucket at the
+//! configured `rate_limit_rps`/`burst`. A second, much larger domain gate
+//! (`RATE_LIMIT_DOMAIN_GATE_FACTOR`, default 20x) still bounds the aggregate so
+//! a rotating-address flood cannot consume unlimited capacity.
+//!
+//! The process-local buckets remain the fallback. When `REDIS_URL` is set and
+//! reachable, the same token buckets are evaluated atomically in Redis so all
+//! edge nodes share one budget. The Redis script uses Redis `TIME` as the clock,
+//! avoiding skew between edge hosts.
 
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -30,14 +36,18 @@ pub struct RateLimiter {
     /// Sharded: one lock per bucket shard instead of a process-wide lock on
     /// every request.
     ///
-    /// Never pruned — which is safe only because the key is a domain name, and the
-    /// domain set is bounded by the registry. If this ever keys on client IP or path
-    /// it becomes an unbounded map that grows with traffic; add eviction at the same
-    /// time as that change, not after.
+    /// Client-group buckets (`host|group`) plus domain gate buckets (`gate|host`).
+    ///
+    /// This map is bounded by the maintenance task: idle buckets are dropped and
+    /// the hard cap evicts the least recently used entries (M2).
     inner: Arc<DashMap<String, Bucket>>,
     /// Global default RPS (0 = off)
     default_rps: u32,
     default_burst: u32,
+    /// Multiplier applied to the domain-wide gate (`RATE_LIMIT_DOMAIN_GATE_FACTOR`).
+    gate_factor: u32,
+    /// Hard cap on buckets (`RATE_LIMIT_MAX_BUCKETS`).
+    max_buckets: usize,
     redis: Option<RedisRateLimiter>,
 }
 
@@ -181,6 +191,9 @@ impl RateLimiter {
             inner: Arc::new(DashMap::new()),
             default_rps,
             default_burst,
+            gate_factor: env_u32("RATE_LIMIT_DOMAIN_GATE_FACTOR", 20).clamp(1, 1_000),
+            max_buckets: env_u32("RATE_LIMIT_MAX_BUCKETS", 100_000).clamp(1_000, 5_000_000)
+                as usize,
             redis: None,
         }
     }
@@ -201,8 +214,8 @@ impl RateLimiter {
         self
     }
 
-    /// Check and consume one token. Returns true if allowed.
-    pub async fn check(&self, key: &str, rps: u32, burst: u32) -> bool {
+    /// Resolve the effective limits: explicit domain values, else edge defaults.
+    fn limits(&self, rps: u32, burst: u32) -> (u32, u32) {
         let rps = if rps > 0 { rps } else { self.default_rps };
         let burst = if burst > 0 {
             burst
@@ -211,10 +224,36 @@ impl RateLimiter {
         } else {
             rps.max(1) * 2
         };
+        (rps, burst)
+    }
+
+    /// Check and consume one token from one client-group bucket. Returns true if
+    /// allowed.
+    pub async fn check(&self, key: &str, rps: u32, burst: u32) -> bool {
+        let (rps, burst) = self.limits(rps, burst);
         if rps == 0 {
             return true; // unlimited
         }
+        self.check_bucket(key, rps, burst).await
+    }
 
+    /// Consume one token from the domain-wide gate.
+    ///
+    /// The gate is deliberately much wider than a single client's bucket: it
+    /// exists to stop rotating-address floods, not to let one client consume the
+    /// whole domain's budget (M2).
+    pub async fn check_domain_gate(&self, host: &str, rps: u32, burst: u32) -> bool {
+        let (rps, burst) = self.limits(rps, burst);
+        if rps == 0 {
+            return true;
+        }
+        let gate_rps = rps.saturating_mul(self.gate_factor);
+        let gate_burst = burst.saturating_mul(self.gate_factor).max(gate_rps);
+        self.check_bucket(&format!("gate|{host}"), gate_rps, gate_burst)
+            .await
+    }
+
+    async fn check_bucket(&self, key: &str, rps: u32, burst: u32) -> bool {
         if let Some(redis) = self.redis.as_ref() {
             if let Some(allowed) = redis.check(key, rps, burst).await {
                 return allowed;
@@ -236,6 +275,52 @@ impl RateLimiter {
         });
         take_token(&mut bucket, now, rps, burst)
     }
+
+    /// Drop idle buckets and enforce the hard cap on the bucket map.
+    ///
+    /// The map is no longer domain-scoped (client groups), so it must be
+    /// bounded. Runs on its own task, never on the request path.
+    fn prune(&self, now: Instant) -> usize {
+        const IDLE: Duration = Duration::from_secs(600);
+        let before = self.inner.len();
+        self.inner
+            .retain(|_, bucket| now.duration_since(bucket.last) < IDLE);
+        let len = self.inner.len();
+        if len > self.max_buckets {
+            let mut seen: Vec<(Instant, String)> = self
+                .inner
+                .iter()
+                .map(|entry| (entry.value().last, entry.key().clone()))
+                .collect();
+            seen.sort_unstable_by_key(|(last, _)| *last);
+            for (_, key) in seen.into_iter().take(len - self.max_buckets) {
+                self.inner.remove(&key);
+            }
+        }
+        before.saturating_sub(self.inner.len())
+    }
+
+    /// Run the bucket sweep once a minute. Called once from `main`.
+    pub fn spawn_maintenance(&self) {
+        let me = self.clone();
+        crate::agent::spawn_supervised("rate-limit-maintenance", move || {
+            let me = me.clone();
+            async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    tick.tick().await;
+                    me.prune(Instant::now());
+                }
+            }
+        });
+    }
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// Refill and consume one token from a local bucket.
@@ -256,6 +341,59 @@ fn take_token(bucket: &mut Bucket, now: Instant, rps: u32, burst: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One client exhausting its bucket must not affect another client.
+    #[tokio::test]
+    async fn client_buckets_are_isolated() {
+        let limiter = RateLimiter::new(0, 0);
+        assert!(limiter.check("cdn.test|10.1.0.0/24", 1, 1).await);
+        assert!(
+            !limiter.check("cdn.test|10.1.0.0/24", 1, 1).await,
+            "the same client group must be limited"
+        );
+        assert!(
+            limiter.check("cdn.test|10.2.0.0/24", 1, 1).await,
+            "another client group must still have its own budget"
+        );
+    }
+
+    /// The domain gate is wider than a client bucket and still finite.
+    #[tokio::test]
+    async fn domain_gate_scales_the_limit() {
+        let limiter = RateLimiter {
+            gate_factor: 4,
+            ..RateLimiter::new(0, 0)
+        };
+        for _ in 0..4 {
+            assert!(limiter.check_domain_gate("cdn.test", 1, 1).await);
+        }
+        assert!(!limiter.check_domain_gate("cdn.test", 1, 1).await);
+    }
+
+    #[test]
+    fn maintenance_prunes_idle_buckets_and_enforces_the_cap() {
+        let limiter = RateLimiter {
+            max_buckets: 2,
+            ..RateLimiter::new(0, 0)
+        };
+        let now = Instant::now();
+        let bucket = |last| Bucket {
+            tokens: 0.0,
+            last,
+            rps: 1.0,
+            burst: 1.0,
+        };
+        limiter
+            .inner
+            .insert("old".into(), bucket(now - Duration::from_secs(700)));
+        limiter.inner.insert("a".into(), bucket(now));
+        limiter.inner.insert("b".into(), bucket(now));
+
+        limiter.prune(now);
+
+        assert!(!limiter.inner.contains_key("old"), "idle bucket must go");
+        assert!(limiter.inner.len() <= 2, "the map must respect its cap");
+    }
 
     #[tokio::test]
     async fn local_bucket_enforces_burst_then_refills() {

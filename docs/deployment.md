@@ -246,6 +246,7 @@ RUST_LOG=control=info,tower_http=warn,sqlx=warn
 | `JWT_SECRET` | 生产必填 | 开发默认值 | 登录 JWT 的签名密钥。修改后所有已登录会话失效。建议 `openssl rand -base64 48`。 |
 | `CONTROL_BIND` | 是 | `0.0.0.0:8080` | 控制面监听地址。生产放在 Caddy 后面时用 `127.0.0.1:8080`，只让本机访问。 |
 | `AGENT_TOKEN` | 生产必填 | 空 | DNS 调度接口的全局令牌，也是旧节点回调的兜底令牌。**边缘心跳/配置必须使用节点 `auth_token`，不能使用该全局令牌**；为空只影响调度接口，不会放行未注册边缘。详见 4.3。 |
+| `AGENT_TLS_CA_FILE` | 否 | 空 | 控制面回调 `https://` 管理面时额外信任的私有 CA PEM。WebPKI 根证书始终可用；边缘管理面使用自签/内部 CA 时填写。 |
 | `CONTROL_PUBLIC_URL` | 推荐 | 空 | 控制台公网地址，用于生成节点安装命令。为空时按请求 Host 推导；反向代理场景建议显式设置。 |
 | `TRUSTED_PROXIES` | 否 | `127.0.0.1,::1` | 可信反向代理 IP/CIDR，逗号分隔。只有来自这些地址的 `X-Forwarded-For` / `X-Real-IP` 才会被登录限流和登录日志采信；直连请求使用 TCP 对端地址。Caddy 不在本机或前面还有 CDN 时，把对应回源网段加入这里。 |
 | `GEOIP_PATH` | 调度必填 | `./data/ip2region_v4.xdb` | 地理位置库：推荐 ip2region XDB；兼容 V2Ray/Loyalsoldier `geoip.dat` 与旧版 CIDR JSON。缺失时按权重/负载调度；启动时加载，修改后需重启。 |
@@ -752,6 +753,10 @@ curl https://console.example.com/api/v1/certs/jobs \
 > HEAD 由同进程引擎处理并复用 GET cache key；health/ACME/challenge verify 和管理接口
 > 由 Pingora 直接响应；未知/旧模式域名在进程内调用旧引擎，不再启动 loopback 监听。
 > `EDGE_ADMIN_LISTEN` 设置时管理接口只在该端口接受，数据口返回 405。
+> **管理面默认是明文 HTTP**：节点令牌与 `/certs/load` 的证书私钥都会明文过网。生产
+> 建议配置 `EDGE_ADMIN_TLS_CERT`/`EDGE_ADMIN_TLS_KEY`（并用 `AGENT_TLS_CA_FILE`
+> 让控制面信任内部 CA），或至少把端口限制在控制面来源 IP/内网；非 loopback 的明文
+> 管理面会在 Edge 启动时打印 WARN。
 > 公共 TLS 只由 Pingora 终止；旧 `EDGE_TLS_CERT` / `EDGE_TLS_KEY` 配置已移除。
 > 编译使用 vendored OpenSSL，构建机需要 `perl`/`make`；musl 静态构建仍可用。
 
@@ -803,6 +808,8 @@ RUST_LOG=edge=info,tower_http=warn
 | `AGENT_URL` | 是 | 根据 `EDGE_ADMIN_LISTEN` / `EDGE_LISTEN` 推导 | 控制面回调边缘的地址（purge、证书、ACME）。应指向 **`EDGE_ADMIN_LISTEN` 管理端口**，例如 `http://IP:8081`；控制面必须能访问。 |
 | `EDGE_LISTEN` | 是 | `0.0.0.0:8081` | Pingora 公共 HTTP 监听：CDN 用户流量、WAF challenge verify、ACME HTTP-01 challenge。生产用 80。绑定具体 IP 时，Edge 会额外监听同端口的 loopback 地址，供内部缓存预热使用。 |
 | `EDGE_ADMIN_LISTEN` | 推荐 | 空 | 管理面监听：purge、证书加载、ACME challenge 下发、access-log、metrics。与控制面通信使用此端口；**不要对公网开放**，只允许控制面来源 IP（见「防火墙」）。为空时兼容旧模式，管理接口仍留在数据面。所有管理端点都要求节点 token；metrics 也可用 `METRICS_TOKEN`。 |
+| `EDGE_ADMIN_TLS_CERT` / `EDGE_ADMIN_TLS_KEY` | 否 | 空 | 管理端口的 TLS 证书链/私钥 PEM 路径，必须同时设置。设置后管理面只接受 HTTPS，控制面需配置 `AGENT_TLS_CA_FILE`（自签/内部 CA 时）。 |
+| `EDGE_ADMIN_REQUIRE_TLS` | 否 | `false` | 为 `true` 时，明文管理面会拒绝 `/certs/load`（证书私钥推送），启动时要求同时配置管理面 TLS。 |
 | `EDGE_HTTPS_LISTEN` | 否 | 空 | Pingora 公共 HTTPS 监听。生产用 `0.0.0.0:443`，需要已同步证书。为空表示不启用 TLS。 |
 | `EDGE_HTTPS_REDIRECT_PORT` | 否 | 从 HTTPS 监听推导 | 域名开启 HTTPS 后，HTTP→HTTPS 跳转使用的端口。`443` 可省略；开发 8443 时写 8443。它只影响跳转 URL，不改变监听。 |
 | `CACHE_BACKEND` | 否 | `memory` | `memory`：内存；`disk`：磁盘；`hybrid`：内存+磁盘。生产大文件建议 `hybrid`。 |
