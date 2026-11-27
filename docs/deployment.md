@@ -993,6 +993,69 @@ curl --cacert /etc/lagran/edge-admin-ca.pem \
 # 期望：{"ok":true,"reloading":true}
 ```
 
+#### 通配证书（多节点共享）
+
+如果节点使用固定的内部域名（如 `*.edge.internal`），可以让同一个私有 CA 签发一张
+通配证书，所有节点共享同一份证书/私钥（或按区域拆分成 `*.gz.edge.internal`）。证书
+生成方式与上面的单节点示例相同，只换 CN/SAN：
+
+```bash
+openssl genrsa -out wildcard-edge.key 2048
+openssl req -new -key wildcard-edge.key -out wildcard-edge.csr \
+  -subj "/CN=*.edge.internal"
+
+cat > wildcard-edge.ext <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+# 通配符不覆盖裸域；若 AGENT_URL 可能写成 edge.internal，必须一起加进 SAN
+subjectAltName=DNS:*.edge.internal,DNS:edge.internal
+EOF
+
+openssl x509 -req -in wildcard-edge.csr \
+  -CA edge-admin-ca.crt -CAkey edge-admin-ca.key -CAcreateserial \
+  -out wildcard-edge.crt -days 825 -sha256 -extfile wildcard-edge.ext
+```
+
+各节点 `edge.env`：
+
+```env
+AGENT_URL=https://edge-01.edge.internal:8082
+# 域名形式的 AGENT_URL 无法被控制面推导成绑定地址，必须显式绑定节点内网 IP
+EDGE_ADMIN_LISTEN=10.0.0.21:8082
+EDGE_ADMIN_TLS_CERT=/etc/lagran/admin/wildcard-edge.crt
+EDGE_ADMIN_TLS_KEY=/etc/lagran/admin/wildcard-edge.key
+EDGE_ADMIN_REQUIRE_TLS=true
+```
+
+控制面仍只信任 CA（`AGENT_TLS_CA_FILE=/etc/lagran/edge-admin-ca.pem`），并且必须能
+解析 `edge-01.edge.internal`（内部 DNS 或 `/etc/hosts`）。验证：
+
+```bash
+# 控制面机器（有内部 DNS）
+curl --cacert /etc/lagran/edge-admin-ca.pem \
+  https://edge-01.edge.internal:8082/__lagran/health
+
+# 没有 DNS 时临时指定解析
+curl --cacert /etc/lagran/edge-admin-ca.pem \
+  --resolve edge-01.edge.internal:8082:10.0.0.21 \
+  https://edge-01.edge.internal:8082/__lagran/health
+```
+
+通配证书的约束：
+
+- 只匹配**一级**标签：`*.edge.internal` 匹配 `edge-01.edge.internal`，不匹配
+  `a.edge-01.edge.internal`；
+- 不匹配裸域：需要显式加入 SAN `DNS:edge.internal`；
+- 不匹配 IP：`AGENT_URL` 不能用 IP；只有 IP 的节点仍需单独签发带 `IP:` SAN 的证书；
+- 私钥共享范围扩大：一张通配证书泄露会影响整批节点，生产更推荐每节点叶子证书，或按
+  区域拆分通配证书，并严格限制私钥权限（`0640 root:lagran-edge`）；
+- 续期时要更新所有使用该证书的节点并重启。
+
+可用 `WILDCARD=1 bash tests/integration/admin-tls.sh` 回归：脚本会生成 `*.edge.test`
+证书，验证 `edge-01.edge.test` 通过、裸域通过（SAN 显式包含）、二级子域与 IP 访问被
+拒绝。
+
 说明：
 
 - `AGENT_TLS_CA_FILE` 在控制面首次创建 agent HTTP 客户端时读取，**修改后必须重启
@@ -1001,7 +1064,8 @@ curl --cacert /etc/lagran/edge-admin-ca.pem \
   与控制面 `AGENT_TLS_CA_FILE`。
 - 不要复用公共数据面的证书/私钥；管理面私钥只用于管理端口。
 - 回归测试：`tests/integration/admin-tls.sh` 会用临时私有 CA 启动管理面 HTTPS，验证
-  `curl --cacert` 成功、错误 CA 被拒、明文连接失败、metrics 鉴权仍生效。
+  `curl --cacert` 成功、错误 CA 被拒、明文连接失败、metrics 鉴权仍生效；
+  `WILDCARD=1` 模式额外验证通配证书的一级匹配、裸域 SAN、二级子域/IP 拒绝。
 
 ### 5.3 systemd
 
