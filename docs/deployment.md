@@ -893,6 +893,116 @@ curl -fsSL   -H "X-Lagran-Agent-Token: <节点令牌>"   "https://console.exampl
 处于全局可读状态。旧节点如果没有保存过渲染配置，在控制台节点详情里点一次
 「保存画像」，或重新走一遍向导即可补齐。
 
+### 5.2.2 管理面 TLS（自签证书示例）
+
+管理面承载节点令牌与 `/__lagran/certs/load` 的证书私钥，默认是明文 HTTP。推荐用**私有
+CA + 每节点服务端证书**：控制面只信任这个 CA，节点之间互不共享私钥。`AGENT_URL` 的
+主机名/IP 必须出现在证书 SAN 中。
+
+以 `edge-01`、内网地址 `10.0.0.21`、DNS 名 `edge-01.internal` 为例：
+
+```bash
+# 1) 私有 CA（10 年；CA 私钥离线保存或严格限权，不要拷到节点）
+mkdir -p ~/lagran-admin-tls && cd ~/lagran-admin-tls
+openssl genrsa -out edge-admin-ca.key 4096
+openssl req -x509 -new -nodes -sha256 -days 3650 \
+  -key edge-admin-ca.key -out edge-admin-ca.crt \
+  -subj "/CN=Lagran Edge Admin CA"
+
+# 2) 节点私钥 + CSR
+openssl genrsa -out edge-01.key 2048
+openssl req -new -key edge-01.key -out edge-01.csr -subj "/CN=edge-01.internal"
+
+# 3) SAN 与用途（AGENT_URL 用 IP 就写 IP，用域名就写 DNS，可同时写）
+cat > edge-01.ext <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:edge-01.internal,IP:10.0.0.21
+EOF
+
+# 4) CA 签发服务端证书（825 天，到期前轮换叶子证书即可）
+openssl x509 -req -in edge-01.csr \
+  -CA edge-admin-ca.crt -CAkey edge-admin-ca.key -CAcreateserial \
+  -out edge-01.crt -days 825 -sha256 -extfile edge-01.ext
+
+openssl x509 -in edge-01.crt -noout -text | grep -A1 "Subject Alternative Name"
+```
+
+节点侧部署（默认服务用户/组为 `lagran-edge`；如改过用户请同步）：
+
+```bash
+sudo mkdir -p /etc/lagran/admin
+sudo install -m 0644 edge-01.crt /etc/lagran/admin/edge-01.crt
+sudo install -m 0640 edge-01.key /etc/lagran/admin/edge-01.key
+sudo chown root:lagran-edge /etc/lagran/admin/edge-01.key
+# 若叶子证书带中间证书：把“叶子 + 中间证书”按顺序拼接成一个 crt 文件
+```
+
+`/etc/lagran/edge.env` 增加：
+
+```env
+# 管理面绑定控制面可达的内网地址；不要 0.0.0.0
+EDGE_ADMIN_LISTEN=10.0.0.21:8082
+EDGE_ADMIN_TLS_CERT=/etc/lagran/admin/edge-01.crt
+EDGE_ADMIN_TLS_KEY=/etc/lagran/admin/edge-01.key
+# 证书/私钥未配置时启动直接失败；同时拒绝明文管理面的证书推送
+EDGE_ADMIN_REQUIRE_TLS=true
+AGENT_URL=https://10.0.0.21:8082
+```
+
+控制面侧只需要 CA 证书（**不要**拷 CA/节点私钥）：
+
+```bash
+sudo install -m 0644 edge-admin-ca.crt /etc/lagran/edge-admin-ca.pem
+```
+
+`/etc/lagran/control.env` 增加：
+
+```env
+AGENT_TLS_CA_FILE=/etc/lagran/edge-admin-ca.pem
+```
+
+控制台创建/编辑该节点时，`Agent URL` 填 `https://10.0.0.21:8082`。如果 `AGENT_URL`
+用域名而不是 IP，必须**显式**设置 `EDGE_ADMIN_LISTEN` 为控制面可达地址（不要让控制面
+从域名推导，否则会退化为 `127.0.0.1:<port>`），并确保 DNS 在控制面可解析。
+
+重启并验证：
+
+```bash
+sudo systemctl restart lagran-edge
+sudo journalctl -u lagran-edge -n 20 | grep -i "management listener"
+# 期望：management listener uses TLS
+
+# 在 Edge 本机：证书链与健康检查
+curl --cacert /etc/lagran/admin/edge-admin-ca.crt \
+  https://10.0.0.21:8082/__lagran/health
+echo | openssl s_client -connect 10.0.0.21:8082 -servername edge-01.internal \
+  -CAfile /etc/lagran/admin/edge-admin-ca.crt 2>/dev/null \
+  | grep "Verify return code"
+# 期望：Verify return code: 0 (ok)
+
+sudo systemctl restart lagran-control
+sudo journalctl -u lagran-control -n 20 | grep -i "private CA"
+# 期望：trusting private CA for edge agent callbacks ... certs=1
+
+# 在控制面机器上：模拟一次真实回调（节点令牌从控制台/节点 env 获取）
+curl --cacert /etc/lagran/edge-admin-ca.pem \
+  -H "X-Lagran-Agent-Token: $AGENT_TOKEN" \
+  -X POST https://10.0.0.21:8082/__lagran/config/reload
+# 期望：{"ok":true,"reloading":true}
+```
+
+说明：
+
+- `AGENT_TLS_CA_FILE` 在控制面首次创建 agent HTTP 客户端时读取，**修改后必须重启
+  `lagran-control`**；该文件可以包含多个 CA PEM。
+- 轮换：只换叶子证书时重启 Edge 即可，控制面 CA 不变；轮换 CA 时需同时更新各节点证书
+  与控制面 `AGENT_TLS_CA_FILE`。
+- 不要复用公共数据面的证书/私钥；管理面私钥只用于管理端口。
+- 回归测试：`tests/integration/admin-tls.sh` 会用临时私有 CA 启动管理面 HTTPS，验证
+  `curl --cacert` 成功、错误 CA 被拒、明文连接失败、metrics 鉴权仍生效。
+
 ### 5.3 systemd
 
 `/etc/systemd/system/lagran-edge.service`：
