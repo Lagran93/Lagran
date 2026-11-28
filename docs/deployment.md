@@ -28,13 +28,14 @@
 
 ```
                     ┌──────────────────────────────┐
- console.example.com│  Caddy :443                   │
+ console.example.com│  Caddy/Nginx :443              │
                     │  /opt/lagran/web 静态前端      │
                     └──────────────┬───────────────┘
                                    │ /api/* 反代
                     ┌──────────────▼───────────────┐
                     │  lagran-control :8080        │
                     │  PostgreSQL :5432            │
+                    │  Redis :6379（可选）          │
                     └───────┬─────────────┬─────────┘
                             │             │
                     ┌───────▼──────┐ ┌────▼─────────┐
@@ -76,10 +77,11 @@ DNS:    203.0.113.53、203.0.113.54
 
 | 机器 | 对公网开放 | 仅内网/本机 |
 |---|---|---|
-| 控制台 | 80、443（Caddy） | 8080（控制面） |
+| 控制台 | 80、443（Caddy/Nginx） | 8080（控制面） |
 | 边缘 | 80、443 | Agent 端口（如果独立） |
 | DNS | 53 UDP、53 TCP | — |
 | PostgreSQL | — | 5432 |
+| Redis（可选） | — | 6379 |
 
 ### 2.3 系统依赖
 
@@ -90,6 +92,9 @@ sudo apt update
 sudo apt install -y build-essential pkg-config libssl-dev perl \
   postgresql postgresql-contrib curl jq git rsync
 ```
+
+> Redis、Caddy/Nginx、Certbot 都是可选组件，分别在 4.2、4.6 安装；
+> 只部署单机最小环境时可以先只装上面的 PostgreSQL。
 
 构建机安装 Rust：
 
@@ -123,12 +128,11 @@ sudo mkdir -p /opt/lagran/{bin,web} /var/lib/lagran/{cache,certs}
 sudo chown -R lagran:lagran /var/lib/lagran /opt/lagran
 ```
 
-Caddy 日志目录（控制台机器）：
+反向代理日志目录：
 
-```bash
-sudo mkdir -p /var/log/caddy
-sudo chown -R caddy:caddy /var/log/caddy
-```
+- Caddy：安装后在 4.6.1 创建 `/var/log/caddy`；
+- Nginx：软件包会自动创建 `/var/log/nginx`，无需手工建。
+
 
 ---
 
@@ -185,37 +189,430 @@ npm ci
 npm run generate
 ```
 
-产物在 `.output/public/`。控制台安装到 Caddy：
+产物在 `.output/public/`。控制台安装到反向代理静态目录：
 
 ```bash
+sudo mkdir -p /opt/lagran/web
 sudo rsync -a --delete .output/public/ /opt/lagran/web/
-sudo chown -R caddy:caddy /opt/lagran/web
+sudo chown -R root:root /opt/lagran/web
 sudo chmod -R a+rX /opt/lagran/web
 ```
+
+静态文件只需要可读，不依赖 Caddy/Nginx 的运行用户；这样两种反代都能直接使用。
 
 ---
 
 ## 4. 部署 Control
 
-### 4.1 数据库
+推荐按下面的顺序完成 Control：
+
+```text
+4.1 PostgreSQL → 4.2 Redis（可选）→ 4.3 control.env → 4.5 systemd
+→ 4.6 反向代理（Caddy/Nginx）→ 4.7 前端 → 4.8 管理员 → 4.9 证书
+```
+
+### 4.1 PostgreSQL（数据库）
+
+控制面把域名、规则、节点、WAF、证书、审计等数据全部保存在 PostgreSQL。
+`lagran-control` 启动时会自动执行 `apps/control/migrations`，不需要手工建表。
+
+推荐 PostgreSQL 14+：
+
+| 系统 | 默认版本 | 说明 |
+|---|---|---|
+| Ubuntu 24.04 LTS | PostgreSQL 16 | 推荐 |
+| Ubuntu 22.04 LTS | PostgreSQL 14 | 满足要求 |
+| Debian 12 | PostgreSQL 15 | 满足要求 |
+
+> 已有托管 PostgreSQL（RDS、Cloud SQL、自建主从）时，跳过 4.1.1 的安装，
+> 直接从 4.1.3 创建库和用户，并按 4.1.5 配置 TLS/网络。
+
+#### 4.1.1 安装 PostgreSQL
+
+Debian/Ubuntu：
 
 ```bash
-sudo -u postgres psql <<'SQL'
-CREATE USER lagran WITH PASSWORD '替换成强密码';
-CREATE DATABASE lagran OWNER lagran;
+sudo apt update
+sudo apt install -y postgresql postgresql-contrib
+sudo systemctl enable --now postgresql
+```
+
+确认版本、集群和服务状态：
+
+```bash
+psql --version
+pg_lsclusters
+sudo systemctl status postgresql --no-pager
+pg_isready -h 127.0.0.1 -p 5432
+```
+
+`pg_lsclusters` 会显示版本、端口、数据目录和状态，例如：
+
+```text
+Ver Cluster Port Status Owner    Data directory              Log file
+16  main    5432 online postgres /var/lib/postgresql/16/main /var/log/postgresql/postgresql-16-main.log
+```
+
+下面的 `16/main` 要替换成实际的版本/集群名。
+
+#### 4.1.2 本地认证与监听
+
+先确认配置文件位置：
+
+```bash
+sudo -u postgres psql -c "SHOW hba_file;"
+sudo -u postgres psql -c "SHOW config_file;"
+```
+
+Debian/Ubuntu 默认的 `pg_hba.conf` 通常已经包含：
+
+```text
+local   all             postgres                                peer
+local   all             all                                     peer
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+```
+
+控制面走 TCP 连接 `127.0.0.1:5432`，所以必须保留两行 `host ... scram-sha-256`。
+不要为了省事改成 `trust`。修改后 reload：
+
+```bash
+sudo systemctl reload postgresql
+```
+
+确认密码加密方式：
+
+```bash
+sudo -u postgres psql -c "SHOW password_encryption;"
+# 期望：scram-sha-256
+```
+
+如果数据库只给本机控制面使用，确认 `postgresql.conf`：
+
+```conf
+listen_addresses = 'localhost'
+port = 5432
+```
+
+修改后：
+
+```bash
+sudo systemctl restart postgresql
+sudo ss -lntp | grep 5432
+# 期望只看到 127.0.0.1:5432 / [::1]:5432，而不是 0.0.0.0:5432
+```
+
+> 不要把 5432 暴露到公网。远程数据库必须走内网/VPC、防火墙白名单，
+> 并启用 TLS（见 4.1.5）。
+
+#### 4.1.3 创建数据库用户与库
+
+生成一个只含十六进制的随机密码，避免 `@ : / ? #` 等字符破坏连接串：
+
+```bash
+PGPASSWORD="$(openssl rand -hex 24)"
+echo "$PGPASSWORD"
+```
+
+创建角色和数据库（在 `postgres` 系统用户下执行）：
+
+```bash
+sudo -u postgres psql <<SQL
+CREATE ROLE lagran LOGIN PASSWORD '$PGPASSWORD';
+CREATE DATABASE lagran
+    OWNER lagran
+    ENCODING 'UTF8'
+    TEMPLATE template0;
+REVOKE ALL ON DATABASE lagran FROM PUBLIC;
+GRANT CONNECT ON DATABASE lagran TO lagran;
 SQL
 ```
+
+说明：
+
+- `OWNER lagran` 让 `lagran` 拥有库并可在 `public` schema 建表；
+- `TEMPLATE template0` 避免从模板库继承意外的编码/扩展；
+- 不要用 PostgreSQL 超级用户 `postgres` 跑控制面；
+- 若角色已存在，先确认是否要改密码：
+  `ALTER ROLE lagran WITH PASSWORD '...';`
+
+验证角色和库：
+
+```bash
+sudo -u postgres psql -c "\du lagran"
+sudo -u postgres psql -c "\l lagran"
+```
+
+#### 4.1.4 用 TCP 验证连接
+
+```bash
+PGPASSWORD="$PGPASSWORD" psql \
+  "host=127.0.0.1 port=5432 user=lagran dbname=lagran sslmode=disable" \
+  -c "select current_user, current_database(), version();"
+```
+
+期望返回 `lagran | lagran | PostgreSQL 16...`。
+
+生成并导出 `DATABASE_URL`：
+
+```bash
+export DATABASE_URL="postgres://lagran:${PGPASSWORD}@127.0.0.1:5432/lagran?sslmode=disable"
+echo "$DATABASE_URL"
+```
+
+将结果写入 `/etc/lagran/control.env` 的 `DATABASE_URL=`。
+注意：`/etc/lagran/control.env` 由 systemd 直接读取，**不会展开 `${PGPASSWORD}`**，
+必须写入展开后的完整连接串。
+
+如果密码不是十六进制（手工设置、包含特殊字符），必须 URL 编码：
+
+```bash
+python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$PGPASSWORD"
+```
+
+例如 `p@ss/word` 要写成 `p%40ss%2Fword`。
+
+#### 4.1.5 生产参数与远程数据库
+
+控制面每个进程默认最多 32 个连接。多副本部署时先算总连接数：
+
+```text
+总连接数 ≈ control 副本数 × DATABASE_MAX_CONNECTIONS + 运维/备份预留
+```
+
+例如 3 个 control 副本、每进程 32 个连接，至少给 PostgreSQL 预留 120–150，
+再确认 `max_connections` 足够。连接不够时控制面日志会出现
+`pool timed out while waiting for an open connection`。
+
+单机小规模部署可从下面的保守值开始（以 4 GB+ 内存为例），按实际内存和并发调整：
+
+```conf
+# /etc/postgresql/16/main/postgresql.conf
+max_connections = 200
+shared_buffers = 1GB              # 约物理内存的 25%
+effective_cache_size = 3GB        # 约物理内存的 50%–75%
+work_mem = 8MB                    # 复杂查询多时再调大
+maintenance_work_mem = 256MB
+```
+
+修改后重启 PostgreSQL，并用 `pg_stat_activity` 观察连接数。
+
+远程数据库（RDS/Cloud SQL/独立数据库机）：
+
+1. 只允许控制面所在内网/VPC 的出口 IP 访问 5432；
+2. 数据库启用 TLS，连接串使用 `sslmode=verify-full`（或至少 `require`）；
+3. 应用账号只拥有业务库权限，不使用超级用户；
+4. 把云厂商 CA 放到控制面机器，例如 `/etc/lagran/rds-ca.pem`；
+5. 连接串示例：
+
+```text
+postgres://lagran:密码@db.internal:5432/lagran?sslmode=verify-full&sslrootcert=/etc/lagran/rds-ca.pem
+```
+
+#### 4.1.6 迁移、备份与升级
+
+- 首次启动 `lagran-control` 会自动执行 migrations；
+- 升级前先备份，并确认迁移日志没有失败；
+- 大表升级前请先读 4.4.1「升级前预建索引」；
+- 查看迁移状态：
+
+```bash
+PGPASSWORD="$PGPASSWORD" psql "$DATABASE_URL" \
+  -c "select version, description, success from _sqlx_migrations order by version;"
+```
+
+日常备份见第 10 章「备份」；最低要求是每天一次 `pg_dump`，并定期做恢复演练。
+
+#### 4.1.7 常见错误
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `password authentication failed` | `pg_hba.conf` 仍是 peer/ident，或密码不一致 | 确认有 `host ... scram-sha-256`，reload 后重试 |
+| `database "lagran" does not exist` | 库名写错或没建库 | 用 `\l` 确认，重新执行 4.1.3 |
+| `too many connections` | 连接池总和超过 `max_connections` | 调大 `max_connections` 或降低每进程池上限 |
+| `invalid URL` / 认证串解析失败 | 密码含 `@ : /` 等未编码 | 用 4.1.4 的 URL 编码 |
+| 启动时报 migration 失败 | 数据库权限不足/磁盘满/锁等待 | 看 `journalctl -u lagran-control` 和 PostgreSQL 日志 |
+
+
+### 4.2 Redis（可选，生产建议启用）
+
+Redis 不是控制面的权威数据库，但启用后可以把以下状态从单进程提升为跨副本共享：
+
+- 登录限流、验证码、会话缓存；
+- 配置缓存与分布式锁；
+- 实时统计/CC 计数；
+- Edge 的跨节点 CC 与普通限流。
+
+不配置 Redis 时，控制面会回退到进程内状态或 PostgreSQL，单机可用；
+多副本控制面、或希望重启后少打数据库时，建议部署 Redis 6+（ACL 需要 Redis 6）。
+
+#### 4.2.1 安装
+
+Debian/Ubuntu：
+
+```bash
+sudo apt update
+sudo apt install -y redis-server
+sudo systemctl enable --now redis-server
+redis-cli ping
+# 期望：PONG
+```
+
+确认版本：
+
+```bash
+redis-server --version
+# 需要 6.0+，推荐 7.x
+```
+
+#### 4.2.2 基础配置
+
+编辑 `/etc/redis/redis.conf`，至少确认：
+
+```conf
+bind 127.0.0.1 ::1
+protected-mode yes
+port 6379
+timeout 0
+tcp-keepalive 300
+```
+
+容量和淘汰策略按用途选择：
+
+```conf
+# 只作为缓存/会话/限流状态时，给一个明确上限，避免吃满内存
+maxmemory 1gb
+maxmemory-policy noeviction
+```
+
+- `noeviction`：内存满时写失败，应用会走降级路径；适合不想静默丢锁/限流状态的场景。
+- `allkeys-lru`：只建议把 Redis 当纯缓存、且能接受会话/限流状态被淘汰时使用。
+- 不要把 Redis 当唯一数据源；控制面的权威数据始终在 PostgreSQL。
+
+本项目的 Redis 数据可以丢失，是否持久化取决于你是否希望重启后保留限流/会话：
+
+```conf
+# 推荐：临时状态不落盘，降低 I/O
+# 先注释掉原有的 save 3600 1 / save 300 10 等行，再写：
+appendonly no
+save ""
+
+# 如果希望重启后保留短时间状态，可改为：
+# appendonly yes
+# appendfsync everysec
+```
+
+重启并确认只监听回环：
+
+```bash
+sudo systemctl restart redis-server
+sudo ss -lntp | grep 6379
+# 期望只有 127.0.0.1:6379 / [::1]:6379
+```
+
+> 远程 Redis 必须走内网/VPC、防火墙白名单，并启用 TLS（`rediss://`）。
+> 不要把 6379 暴露到公网；Redis 未授权访问是常见入侵入口。
+
+#### 4.2.3 创建 ACL 用户
+
+不要直接把 `requirepass` 的 default 用户交给应用。使用 Redis ACL 限制
+key 前缀和危险命令：
+
+```bash
+REDIS_PASSWORD="$(openssl rand -hex 24)"
+echo "$REDIS_PASSWORD"
+```
+
+生成 ACL 文件 `/etc/redis/users.acl`：
+
+```bash
+sudo tee /etc/redis/users.acl >/dev/null <<EOF
+user default off
+user lagran on >$REDIS_PASSWORD ~lagran:* +@all -@admin -@dangerous
+EOF
+sudo chown redis:redis /etc/redis/users.acl
+sudo chmod 640 /etc/redis/users.acl
+```
+
+启用 ACL 文件：
+
+```bash
+# 如果 redis.conf 里已有 aclfile 行，改成下面这行；没有就追加
+sudo sed -i 's|^[# ]*aclfile .*|aclfile /etc/redis/users.acl|' /etc/redis/redis.conf
+grep -q '^aclfile ' /etc/redis/redis.conf || \
+  echo 'aclfile /etc/redis/users.acl' | sudo tee -a /etc/redis/redis.conf
+
+sudo systemctl restart redis-server
+```
+
+ACL 说明：
+
+| 规则 | 作用 |
+|---|---|
+| `user default off` | 关闭无密码的默认用户，避免空认证 |
+| `~lagran:*` | 只允许读写 `lagran:` 开头的 key；控制面/Edge 的 key 都使用该前缀 |
+| `+@all -@admin -@dangerous` | 允许业务命令，禁止 ACL/CONFIG/FLUSHALL 等管理与危险命令 |
+| `>密码` | 设置该用户密码 |
+
+如果你修改了 `CACHE_REDIS_PREFIX`、`CC_REDIS_PREFIX` 或 `RATE_LIMIT_REDIS_PREFIX`，
+必须同步调整 ACL 的 `~lagran:*` 模式，否则会出现 `NOPERM`。建议保持默认前缀。
+
 
 验证：
 
 ```bash
-psql "postgres://lagran:替换成强密码@127.0.0.1:5432/lagran" -c 'select 1;'
-# 注意：如果密码中含有保留字符（比如@），需要进行 URL 编码（@->%40）
+redis-cli --user lagran --pass "$REDIS_PASSWORD" --no-auth-warning ping
+# PONG
+
+redis-cli --user lagran --pass "$REDIS_PASSWORD" --no-auth-warning \
+  set lagran:test ok
+redis-cli --user lagran --pass "$REDIS_PASSWORD" --no-auth-warning \
+  get lagran:test
+# ok
+
+# 越界 key 必须被拒绝（NOPERM）
+redis-cli --user lagran --pass "$REDIS_PASSWORD" --no-auth-warning \
+  set other:test nope
 ```
 
-控制面启动时自动执行 `apps/control/migrations`。
+如果后续要在线调整 ACL，使用本机 root 编辑 `/etc/redis/users.acl` 后
+`systemctl restart redis-server`；应用用户没有 `@admin`，不能自己改 ACL。
+修改 ACL 后不要忘记验证 `REDIS_URL` 仍能连接。
 
-### 4.2 `control.env` 参数详解
+#### 4.2.4 接入 control.env
+
+十六进制密码不需要 URL 编码。把密码替换成 4.2.3 生成的实际值：
+
+```env
+REDIS_URL=redis://lagran:替换成上面生成的密码@127.0.0.1:6379/0
+```
+
+> systemd 的 `EnvironmentFile` 不会展开 shell 变量。不要写成
+> `${REDIS_PASSWORD}`，否则控制面会拿这个字面量去认证并得到 `WRONGPASS`。
+
+写入 `/etc/lagran/control.env` 后重启控制面，检查：
+
+```bash
+sudo systemctl restart lagran-control
+sudo journalctl -u lagran-control -n 50 --no-pager | grep -i redis
+# 期望看到 Redis 连接/会话缓存启用；没有 Redis 也不影响启动
+redis-cli --user lagran --pass "$REDIS_PASSWORD" --no-auth-warning info keyspace
+```
+
+多副本控制面必须使用同一个 Redis；不同副本的 `REDIS_URL` 指向不同库会导致
+限流和锁各算各的。
+
+#### 4.2.5 常见错误
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `NOAUTH Authentication required` | 应用没带密码/仍用 default | 检查 `REDIS_URL` 是否含用户和密码 |
+| `WRONGPASS` | 密码错误或 ACL 未加载 | 用 4.2.3 的 `redis-cli --user ...` 验证 |
+| `NOPERM ...` | key 前缀不在 `~lagran:*` 内 | 检查 `REDIS_URL` 的库/前缀配置 |
+| `OOM command not allowed` | `maxmemory` 满且 `noeviction` | 扩容、清理无用 key，或评估改用 `allkeys-lru` |
+| 控制面正常但多副本限流不准 | 副本连了不同 Redis/DB | 统一 `REDIS_URL` 和 DB 编号 |
+
+### 4.3 `control.env` 参数详解
 
 `/etc/lagran/control.env`：
 
@@ -223,8 +620,20 @@ psql "postgres://lagran:替换成强密码@127.0.0.1:5432/lagran" -c 'select 1;'
 DATABASE_URL=postgres://lagran:强密码@127.0.0.1:5432/lagran
 JWT_SECRET=替换成至少32字节随机串
 CONTROL_BIND=127.0.0.1:8080
-AGENT_TOKEN=替换成强随机串
 CONTROL_PUBLIC_URL=https://console.example.com
+REQUIRE_SECURE_SECRETS=true
+
+# 节点/DNS 调度令牌
+AGENT_TOKEN=替换成强随机串
+# 指标抓取令牌；留空回退 AGENT_TOKEN
+METRICS_TOKEN=替换成另一条强随机串
+# 必须与所有 Edge 的 WAF_RULEPACK_SECRET 完全一致
+WAF_RULEPACK_SECRET=替换成与Edge一致的强随机串
+
+# 可选共享状态；不启用 Redis 时留空
+REDIS_URL=redis://lagran:密码@127.0.0.1:6379/0
+# 反向代理与控制面同机时保持默认；异机部署时改成代理回源网段
+# TRUSTED_PROXIES=127.0.0.1,::1
 
 GEOIP_PATH=/var/lib/lagran/ip2region_v4.xdb
 # 可选：IPv6 客户端
@@ -244,11 +653,20 @@ RUST_LOG=control=info,tower_http=warn,sqlx=warn
 |---|---|---|---|
 | `DATABASE_URL` | 是 | 无 | PostgreSQL 连接串。控制面所有域名、规则、节点、WAF、证书、审计数据都在这里。密码含特殊字符时要 URL 编码。 |
 | `JWT_SECRET` | 生产必填 | 开发默认值 | 登录 JWT 的签名密钥。修改后所有已登录会话失效。建议 `openssl rand -base64 48`。 |
-| `CONTROL_BIND` | 是 | `0.0.0.0:8080` | 控制面监听地址。生产放在 Caddy 后面时用 `127.0.0.1:8080`，只让本机访问。 |
-| `AGENT_TOKEN` | 生产必填 | 空 | DNS 调度接口的全局令牌，也是旧节点回调的兜底令牌。**边缘心跳/配置必须使用节点 `auth_token`，不能使用该全局令牌**；为空只影响调度接口，不会放行未注册边缘。详见 4.3。 |
+| `CONTROL_BIND` | 是 | `0.0.0.0:8080` | 控制面监听地址。生产放在 Caddy/Nginx 后面时用 `127.0.0.1:8080`，只让本机访问。 |
+| `AGENT_TOKEN` | 生产必填 | 空 | DNS 调度接口的全局令牌，也是旧节点回调的兜底令牌。**边缘心跳/配置必须使用节点 `auth_token`，不能使用该全局令牌**；为空只影响调度接口，不会放行未注册边缘。详见 4.4。 |
 | `AGENT_TLS_CA_FILE` | 否 | 空 | 控制面回调 `https://` 管理面时额外信任的私有 CA PEM。WebPKI 根证书始终可用；边缘管理面使用自签/内部 CA 时填写。 |
 | `CONTROL_PUBLIC_URL` | 推荐 | 空 | 控制台公网地址，用于生成节点安装命令。为空时按请求 Host 推导；反向代理场景建议显式设置。 |
-| `TRUSTED_PROXIES` | 否 | `127.0.0.1,::1` | 可信反向代理 IP/CIDR，逗号分隔。只有来自这些地址的 `X-Forwarded-For` / `X-Real-IP` 才会被登录限流和登录日志采信；直连请求使用 TCP 对端地址。Caddy 不在本机或前面还有 CDN 时，把对应回源网段加入这里。 |
+| `TRUSTED_PROXIES` | 否 | `127.0.0.1,::1` | 可信反向代理 IP/CIDR，逗号分隔。只有来自这些地址的 `X-Forwarded-For` / `X-Real-IP` 才会被登录限流和登录日志采信；直连请求使用 TCP 对端地址。Caddy/Nginx 不在本机或前面还有 CDN 时，把对应回源网段加入这里。 |
+| `DATABASE_MAX_CONNECTIONS` | 否 | `32` | 每个控制面进程的连接池上限，代码钳制 2–200。多副本时用「副本数 × 本值」核算 PostgreSQL `max_connections`。 |
+| `REDIS_URL` | 否 | 空 | 可选共享状态；配置后登录限流、会话缓存、锁、实时统计走 Redis。详见 4.2。 |
+| `REQUIRE_SECURE_SECRETS` | 推荐 | 代码 `false`，示例 `true` | 为 true 时拒绝默认/过短的 JWT 密钥，以及缺失 `WAF_RULEPACK_SECRET` 的启动。生产建议 true。 |
+| `METRICS_TOKEN` | 推荐 | 空 | `/metrics` 的 Bearer 令牌；为空回退 `AGENT_TOKEN`，两者都空返回 401。 |
+| `WAF_RULEPACK_SECRET` | 生产必填 | 空 | 规则包签名密钥，必须与所有 Edge 完全一致；为空时发布接口 503、Edge 拒绝签名规则包。 |
+| `ALLOW_REGISTER` | 否 | `false` | 是否开放自助注册；首次管理员通过临时开启后立即关闭，见 4.8。 |
+| `CAPTCHA_ENABLED` | 否 | `true` | 登录/注册图片验证码；集成测试或纯内网可关闭。 |
+| `CORS_ALLOWED_ORIGINS` | 否 | 空 | 控制台与 API 不同源时填写允许的 Origin；同源部署留空即可。 |
+| `SEED_DEMO` | 否 | `false` | 仅本地体验；生产禁止与 `REQUIRE_SECURE_SECRETS=true` 同时开启。 |
 | `GEOIP_PATH` | 调度必填 | `./data/ip2region_v4.xdb` | 地理位置库：推荐 ip2region XDB；兼容 V2Ray/Loyalsoldier `geoip.dat` 与旧版 CIDR JSON。缺失时按权重/负载调度；启动时加载，修改后需重启。 |
 | `GEOIP_IPV6_PATH` | 否 | 空 | 可选 ip2region IPv6 XDB（`ip2region_v6.xdb`）。 |
 | `GEOIP_JSON_PATH` | 否 | 空 | 兼容旧配置的 JSON 路径别名；设置了 `GEOIP_PATH` 时以 `GEOIP_PATH` 为准。 |
@@ -268,7 +686,7 @@ sudo chown root:lagran /etc/lagran/control.env
 
 如果 `lagran` 组不存在，见 2.4；也可以 `chown root:root` + `chmod 600`，systemd 以 root 读取 EnvironmentFile。
 
-### 4.3 Agent Token 关系（重要）
+### 4.4 Agent Token 关系（重要）
 
 边缘路由和 DNS 调度路由使用不同的鉴权策略：
 
@@ -279,7 +697,7 @@ sudo chown root:lagran /etc/lagran/control.env
 | `AGENT_TOKEN` | `dns.env` | DNS 调用 `/api/v1/schedule` 的全局 token |
 | `AGENT_TOKEN` | `control.env` | 全局 token；仅用于 DNS 调度，以及旧节点回调的兜底 |
 
-### 边缘 → 控制面
+#### 边缘 → 控制面
 
 边缘的配置上报、心跳、指标、日志、WAF、证书同步等接口使用
 `AgentAuth`，只接受 **`edge_nodes.auth_token` 中的节点 token**：
@@ -295,7 +713,7 @@ sudo chown root:lagran /etc/lagran/control.env
 - 控制面不再自动创建未知节点
 - 节点 token 验证带 30 秒正向缓存（进程内 + 可选 Redis）：同一控制面在节点改名/禁用/删除时立即失效；其他控制副本最多延迟 30 秒。缓存键使用 token 的 SHA-256，不把原始 token 写入 Redis。
 
-### DNS → 控制面
+#### DNS → 控制面
 
 DNS 只调用 `/api/v1/schedule`，使用 `ScheduleAuth`：
 
@@ -312,7 +730,7 @@ Agent 调度接口只按 `ip` / `subnet` 推导地理信息，忽略 `country` /
 `isp` 覆盖；这些覆盖只用于管理员预览 `/api/v1/schedule/test`。响应的
 `candidates[].public_ip` 对 agent 为空，避免任一节点令牌枚举全部节点公网 IP。
 
-### 控制面 → 边缘
+#### 控制面 → 边缘
 
 控制面下发 purge、证书、ACME challenge 时：
 
@@ -330,7 +748,7 @@ dns.AGENT_TOKEN     = G
 edge.AGENT_TOKEN    = 该节点的 auth_token（安装命令自动带）
 ```
 
-### 4.3.1 升级前预建索引（大表必读）
+#### 4.4.1 升级前预建索引（大表必读）
 
 新版本为遥测表和节点表增加了索引。迁移本身可以正常运行，但 `CREATE INDEX` 会在
 `access_logs` / `waf_events` 上持写锁直到建完；这两张表在长期运行的环境里通常是全库最大的，
@@ -365,7 +783,7 @@ DROP INDEX CONCURRENTLY IF EXISTS idx_access_logs_status_ts;
 DROP INDEX CONCURRENTLY IF EXISTS idx_waf_events_action_ts;
 ```
 
-#### `edge_nodes.name` 唯一索引
+##### `edge_nodes.name` 唯一索引
 
 这条**不建议预建**，因为迁移需要先把可能存在的重名节点改名，预建唯一索引会在有重名时失败。
 先确认没有重名即可（正常情况下不会有）：
@@ -382,7 +800,7 @@ psql "$DATABASE_URL" -c \
 > 唯一索引在并发构建的第二次扫描开始时就会对其他事务生效，构建若失败还会留下一个
 > 仍在强制唯一性的 `INVALID` 索引，清理起来比普通构建更麻烦。
 
-### 升级顺序（重要）
+#### 升级顺序（重要）
 
 该版本开始，边缘接口不再接受全局 `AGENT_TOKEN`，也不会自动创建未知节点。升级时建议按以下顺序：
 
@@ -393,7 +811,7 @@ psql "$DATABASE_URL" -c \
 
 如果先升级 control，旧 edge 会立即 401，直到改为节点 token。
 
-### 常见问题
+#### 常见问题
 
 **未预注册节点，直接用全局 token 启动 edge**
 
@@ -434,7 +852,7 @@ psql "$DATABASE_URL" -c \
 
 所有运行中的 edge 都必须是 `has_token = true`，且 `edge.env` 的 `AGENT_TOKEN` 与数据库一致。
 
-### 4.4 systemd
+### 4.5 systemd
 
 `/etc/systemd/system/lagran-control.service`：
 
@@ -443,6 +861,9 @@ psql "$DATABASE_URL" -c \
 Description=Lagran Control Plane
 After=network.target postgresql.service
 Wants=postgresql.service
+# 本机 Redis 建议再加：
+# After=redis-server.service
+# Wants=redis-server.service
 
 [Service]
 Type=simple
@@ -474,11 +895,32 @@ curl -s http://127.0.0.1:8080/health
 
 首次启动会：
 
-- 执行迁移
-- 创建 demo 管理员 `demo@lagran.dev / demo123`
-- 创建示例域名 `cdn.example.com`
+- 执行数据库迁移；
+- **仅当 `SEED_DEMO=true`** 时创建 demo 账号 `demo@lagran.dev / demo123` 和示例域名
+  `cdn.example.com`；生产默认 `SEED_DEMO=false`，不会创建任何账号，需按 4.8 初始化管理员。
 
-### 4.5 Caddy 控制台
+### 4.6 反向代理与控制台
+
+控制台静态文件与 `/api/*` 由同一个域名提供：
+
+```text
+浏览器
+  ├── /            → /opt/lagran/web 静态文件（SPA）
+  └── /api/*       → 127.0.0.1:8080（lagran-control）
+```
+
+反向代理二选一即可：**Caddy（推荐，自动 HTTPS）** 或 **Nginx（已有 Nginx 体系时）**。
+不要同时让 Caddy 和 Nginx 监听 80/443。
+
+无论选哪个，先确认：
+
+- `console.example.com` 的 A/AAAA 记录已指向本机；
+- 公网 80/443 可访问（80 用于 ACME/重定向，443 用于控制台）；
+- 控制面只监听 `127.0.0.1:8080`（`CONTROL_BIND=127.0.0.1:8080`）；
+- 前端已构建到 `/opt/lagran/web`（见第 3.3 节）；
+- 反向代理与控制面同机时，控制面默认信任 `127.0.0.1/::1` 的转发头。
+
+#### 4.6.1 Caddy（推荐）
 
 安装 Caddy：
 
@@ -493,6 +935,13 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
 
 sudo apt update
 sudo apt install -y caddy
+```
+
+创建 Caddy 日志目录（Caddyfile 示例会写 `/var/log/caddy/console-access.log`）：
+
+```bash
+sudo mkdir -p /var/log/caddy
+sudo chown -R caddy:caddy /var/log/caddy
 ```
 
 如果之前装过 Nginx：
@@ -511,7 +960,7 @@ sudo systemctl disable --now nginx 2>/dev/null || true
 console.example.com {
     encode zstd gzip
 
-    @api path /api/* /health
+    @api path /api/* /health /ready
     handle @api {
         reverse_proxy 127.0.0.1:8080 {
             header_up Host {host}
@@ -548,7 +997,7 @@ Caddyfile 参数说明：
 | `email` | Caddy 控制台证书的 ACME 账号邮箱；与「证书管理」里的 Let's Encrypt 证书无关。可省略。 |
 | `console.example.com` | 站点地址；Caddy 自动申请/续期 HTTPS 证书。域名必须先解析到本机，80/443 可访问。 |
 | `encode zstd gzip` | 对静态资源做压缩。 |
-| `@api path /api/* /health` | 命名匹配器：API 与健康检查。 |
+| `@api path /api/* /health /ready` | 命名匹配器：API、健康检查与就绪检查。 |
 | `handle @api` | API 请求走反代；`handle` 之间互斥，顺序影响匹配。 |
 | `reverse_proxy 127.0.0.1:8080` | 转发到控制面。 |
 | `header_up Host {host}` | 保留原始 Host；`CONTROL_PUBLIC_URL` 未设置时安装命令依赖它。 |
@@ -567,9 +1016,237 @@ sudo systemctl enable --now caddy
 sudo systemctl reload caddy
 curl -I https://console.example.com/
 curl -s https://console.example.com/health
+curl -s https://console.example.com/ready
 ```
 
-### 4.6 前端 API 地址
+> 如果域名在 Cloudflare 橙色云后面，Caddy 的 HTTP-01 校验可能被代理拦截；
+> 先把记录改为 DNS only，或改用 DNS-01。控制台登录也应确认
+> `TRUSTED_PROXIES` 包含实际回源网段。
+
+#### 4.6.2 Nginx（替代 Caddy）
+
+已有 Nginx 资产或团队统一使用 Nginx 时，可以用下面的配置替代 Caddy。
+如果机器上已经装了 Caddy，先停掉，避免争抢 80/443：
+
+```bash
+sudo systemctl disable --now caddy 2>/dev/null || true
+```
+
+##### 安装 Nginx 与 Certbot
+
+Debian/Ubuntu：
+
+```bash
+sudo apt update
+sudo apt install -y nginx certbot python3-certbot-nginx
+sudo systemctl enable --now nginx
+nginx -v
+```
+
+确认 80 端口可用：
+
+```bash
+sudo ss -lntp | grep ':80 '
+```
+
+##### 申请证书（webroot 方式）
+
+先在 DNS 服务商把 `console.example.com` 指向本机，并放行 80/443。
+创建 ACME 挑战目录：
+
+```bash
+sudo mkdir -p /var/www/html
+```
+
+写入一个只用于签发的临时 HTTP 站点：
+
+```nginx
+# /etc/nginx/sites-available/lagran-console
+server {
+    listen 80;
+    listen [::]:80;
+    server_name console.example.com;
+    root /var/www/html;
+
+    location /.well-known/acme-challenge/ {
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+```
+
+启用并校验：
+
+```bash
+sudo ln -sf /etc/nginx/sites-available/lagran-console \
+  /etc/nginx/sites-enabled/lagran-console
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+申请证书：
+
+```bash
+sudo certbot certonly --webroot -w /var/www/html \
+  -d console.example.com \
+  --agree-tos --no-eff-email \
+  -m admin@lagran.dev
+```
+
+成功后证书位于：
+
+```text
+/etc/letsencrypt/live/console.example.com/fullchain.pem
+/etc/letsencrypt/live/console.example.com/privkey.pem
+```
+
+增加续期后的 Nginx reload hook（`certonly` 不会自动改 Nginx 配置）：
+
+```bash
+sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh >/dev/null <<'EOF'
+#!/bin/sh
+systemctl reload nginx
+EOF
+sudo chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+```
+
+如果使用其他 CA/已有证书，替换下面配置里的证书路径即可。
+
+##### 完整 HTTPS 配置
+
+用下面的内容覆盖 `/etc/nginx/sites-available/lagran-console`：
+
+```nginx
+# /etc/nginx/sites-available/lagran-console
+server {
+    listen 80;
+    listen [::]:80;
+    server_name console.example.com;
+
+    # 续期时仍然放行 ACME challenge
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name console.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/console.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/console.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # 可选：确认全站 HTTPS 后再启用 HSTS
+    # add_header Strict-Transport-Security "max-age=31536000" always;
+
+    server_tokens off;
+    root /opt/lagran/web;
+    index index.html;
+    client_max_body_size 20m;
+
+    # 可选：压缩静态资源与 API JSON
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/json application/javascript
+               application/xml image/svg+xml;
+
+    # 安全响应头
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    # 控制面 API 与健康检查
+    location ^~ /api/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+
+    location = /health {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /ready {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # SPA 路由回退：刷新 /domains、/waf 等路径不能 404
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # 静态资源缓存（不带 hash 的入口文件仍走上面的 location /）
+    location ~* \.(?:js|css|png|jpg|jpeg|gif|svg|ico|woff2?)$ {
+        expires 1h;
+        access_log off;
+    }
+}
+```
+
+校验、重载并测试：
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+
+curl -I https://console.example.com/
+curl -s https://console.example.com/health
+curl -s -o /dev/null -w '%{http_code}\n' https://console.example.com/api/v1/auth/login
+# 405（方法不允许）说明请求已经到达控制面，而不是被静态文件吞掉
+```
+
+续期检查：
+
+```bash
+sudo certbot renew --dry-run
+systemctl list-timers | grep -i certbot
+```
+
+Nginx 配置要点：
+
+| 配置 | 说明 |
+|---|---|
+| `listen 443 ssl http2` | 启用 HTTPS 与 HTTP/2；旧版 Nginx 也兼容这种写法。 |
+| `proxy_pass http://127.0.0.1:8080` | 只反代到本机回环，不要把 8080 暴露到公网。 |
+| `X-Real-IP` / `X-Forwarded-For` / `X-Forwarded-Proto` | 控制面需要真实客户端 IP 与协议；同机代理默认被 `TRUSTED_PROXIES=127.0.0.1,::1` 信任。 |
+| `location ^~ /api/` | `^~` 让 API 前缀优先于静态资源正则，避免 `/api/*.js` 被当成静态文件。 |
+| `try_files $uri $uri/ /index.html` | 前端 SPA 路由回退。 |
+| `client_max_body_size 20m` | 给 WAF 规则包/资源上传留余量；按实际需求调整。 |
+| `ssl_certificate` | 指向 Certbot 的 `fullchain.pem`/`privkey.pem`；证书路径换了要同步修改。 |
+
+> Nginx 在另一台机器或前面还有 Cloudflare/SLB 时，控制面的
+> `TRUSTED_PROXIES` 必须加入 Nginx 的回源网段；否则控制面看到的是代理 IP。
+> 同时把真实客户端 IP 头配置正确，避免登录限流把所有用户算成同一个 IP。
+
+### 4.7 前端 API 地址
 
 生产构建默认走同源：
 
@@ -577,7 +1254,7 @@ curl -s https://console.example.com/health
 POST https://console.example.com/api/v1/auth/login
 ```
 
-由 Caddy 反代到控制面。一般不需要设置 `NUXT_PUBLIC_API_BASE`。
+由 Caddy 或 Nginx 反代到控制面。一般不需要设置 `NUXT_PUBLIC_API_BASE`。
 
 如果旧构建出现：
 
@@ -604,7 +1281,7 @@ npm run generate
 | 设置 `https://console.example.com` | 使用绝对地址；需要控制面允许 CORS |
 | 设置其他地址 | 构建时写入静态文件，修改后必须重新 `generate` |
 
-### 4.7 创建管理员
+### 4.8 创建管理员
 
 **这一步不能跳过。** `SEED_DEMO` 在 `REQUIRE_SECURE_SECRETS=true` 时会被拒绝启动，
 若库中没有任何账户，控制台将无人可登录。
@@ -640,7 +1317,7 @@ psql "$DATABASE_URL" -c "SELECT email, role FROM users;"
 
 确认新管理员可登录后，删除示例域名 `cdn.example.com`，并限制/删除 demo 账号。
 
-### 4.8 Let's Encrypt 证书签发
+### 4.9 Let's Encrypt 证书签发
 
 控制台「证书管理」→「自动签发」支持三种方式：
 
@@ -1126,7 +1803,7 @@ curl -s http://127.0.0.1:8081/__lagran/health
 证书有两种来源：
 
 1. 控制台「证书管理」上传已有证书/私钥
-2. 控制台「证书管理」→「自动签发」使用 Let's Encrypt（见 4.8）
+2. 控制台「证书管理」→「自动签发」使用 Let's Encrypt（见 4.9）
 
 步骤：
 
@@ -1149,7 +1826,7 @@ curl -I https://cdn.example.com/
 
 ### 5.5 同机部署冲突
 
-Caddy 在控制台机器占用 443，边缘不能同时用 443。生产建议分机；同机时使用不同 IP 的 `bind`，或让边缘使用其他端口。
+Caddy/Nginx 在控制台机器占用 443，边缘不能同时用 443。生产建议分机；同机时使用不同 IP 的 `bind`，或让边缘使用其他端口。
 
 ---
 
@@ -1386,7 +2063,7 @@ sudo ufw allow 443/tcp
 sudo ufw enable
 ```
 
-8080/5432 只允许本机/内网。
+8080/5432/6379 只允许本机/内网；Redis 不要对公网开放。
 
 边缘：
 
@@ -1475,8 +2152,9 @@ cd apps/frontend
 npm ci
 npm run generate
 sudo rsync -a --delete .output/public/ /opt/lagran/web/
-sudo chown -R caddy:caddy /opt/lagran/web
-sudo systemctl reload caddy
+sudo chown -R root:root /opt/lagran/web
+sudo chmod -R a+rX /opt/lagran/web
+sudo systemctl reload caddy 2>/dev/null || sudo systemctl reload nginx
 ```
 
 #### 升级按钮报 `cannot write update request`
@@ -1530,7 +2208,8 @@ pg_dump "$DATABASE_URL" > /var/backups/lagran-$(date +%F).sql
 - `/etc/lagran/*.env`
 - `/var/lib/lagran/certs`
 - `/var/lib/lagran/ip2region_v4.xdb`（可选 `ip2region_v6.xdb`）
-- `/var/lib/caddy`（Caddy 证书）
+- `/var/lib/caddy`（Caddy 自动证书）
+- `/etc/letsencrypt`（Nginx/Certbot 证书与续期配置）
 - `/opt/lagran/web`
 
 ### 日志
@@ -1539,8 +2218,10 @@ pg_dump "$DATABASE_URL" > /var/backups/lagran-$(date +%F).sql
 journalctl -u lagran-control -f
 journalctl -u lagran-edge -f
 journalctl -u lagran-dns -f
-journalctl -u caddy -f
+journalctl -u caddy -f          # Caddy
+journalctl -u nginx -f          # Nginx
 tail -f /var/log/caddy/console-access.log
+tail -f /var/log/nginx/access.log
 ```
 
 ---
@@ -1553,7 +2234,7 @@ tail -f /var/log/caddy/console-access.log
 [POST] "http://localhost:8080/api/v1/auth/login": Failed to fetch
 ```
 
-前端构建时写死了 API 地址。重新 `npm run generate`，上传后硬刷新。确认 Caddy `/api/*` 反代生效：
+前端构建时写死了 API 地址。重新 `npm run generate`，上传后硬刷新。确认反向代理 `/api/*` 生效：
 
 ```bash
 curl -i https://console.example.com/api/v1/auth/login \
@@ -1599,24 +2280,34 @@ sudo chown root:lagran /etc/lagran/control.env
 
 ### 心跳正常但 purge/证书 401
 
-`edge.AGENT_TOKEN` 与 `edge_nodes.auth_token` 不一致。见 4.3。
+`edge.AGENT_TOKEN` 与 `edge_nodes.auth_token` 不一致。见 4.4。
 
-### Caddy 证书失败
+### 反向代理证书失败（Caddy / Nginx）
 
 ```bash
+# Caddy
 journalctl -u caddy -f
+
+# Nginx + Certbot
+sudo nginx -t
+sudo certbot certificates
+sudo tail -n 100 /var/log/letsencrypt/letsencrypt.log
 ```
 
-检查域名解析、80/443、Cloudflare 代理状态。
+检查域名解析、80/443、Cloudflare 代理状态；Nginx 还需确认
+`/.well-known/acme-challenge/` 没有被 SPA 的 `try_files` 吞掉。
 
-### Caddy 页面 404
+### 反向代理页面 404
 
 ```bash
-ls /opt/lagran/web/index.html
-sudo -u caddy ls /opt/lagran/web
+ls -l /opt/lagran/web/index.html
+sudo -u caddy ls /opt/lagran/web      # Caddy
+sudo -u www-data ls /opt/lagran/web   # Nginx
 ```
 
-Caddyfile 必须有 `try_files {path} /index.html` + `file_server`。
+Caddyfile 必须有 `try_files {path} /index.html` + `file_server`；
+Nginx 必须有 `try_files $uri $uri/ /index.html`，并且 API 使用
+`location ^~ /api/`（`^~` 可避免被静态资源正则截走）。
 
 ### API 502
 
@@ -1676,7 +2367,7 @@ dig @DNS1 ns1.example.com A +short
 1. 准备系统/用户/目录/数据库
 2. 构建 control/edge/lagran-dns + 前端 generate
 3. 启动 lagran-control
-4. 配置 Caddy + 上传前端
+4. 配置 Caddy/Nginx + 上传前端
 5. 登录控制台，创建管理员
 6. 控制台添加节点，得到 auth_token
 7. 配置 edge.env，启动 lagran-edge
