@@ -109,35 +109,28 @@
 
         <!-- 防护设置 -->
         <div v-else-if="tab === 'settings'" class="card-body">
-          <div class="settings-shell">
-            <div class="settings-hero" :class="{ 'is-off': !settings.enabled }">
-              <div class="settings-hero-main">
-                <div class="settings-hero-icon">
-                  <AppIcon name="shield" :size="18" />
-                </div>
-                <div class="settings-hero-text">
-                  <div class="settings-hero-title">
-                    WAF 防护
-                    <StatusTag :tone="settings.enabled ? 'success' : 'neutral'" dot>
-                      {{ settings.enabled ? '已启用' : '已关闭' }}
-                    </StatusTag>
-                  </div>
-                  <div class="settings-hero-desc">
+          <div class="waf-settings">
+            <div class="waf-settings-status">
+              <div class="waf-settings-status-main">
+                <div>
+                  <div class="waf-settings-eyebrow">策略控制</div>
+                <div class="waf-settings-status-title">WAF 防护设置</div>
+                  <p class="waf-settings-status-desc">
                     <template v-if="!settings.enabled">关闭后 IP 名单、托管规则与自定义规则全部不生效。</template>
-                    <template v-else-if="settings.mode === 'block'">拦截模式：命中规则直接返回 403；建议先观察再切换。</template>
-                    <template v-else>观察模式：只记录事件、不拦截请求，适合上线灰度。</template>
-                  </div>
+                    <template v-else-if="settings.mode === 'block'">命中规则直接返回 403；上线初期建议先用观察模式确认没有误报。</template>
+                    <template v-else>只记录事件、不拦截请求；确认规则准确后再切换为拦截模式。</template>
+                  </p>
                 </div>
               </div>
-              <div class="settings-hero-controls">
-                <div class="settings-inline">
-                  <span>启用</span>
+              <div class="waf-settings-status-actions">
+                <div class="waf-inline-toggle">
+                  <span>启用防护</span>
                   <label class="switch" :class="{ on: settings.enabled }">
                     <span class="switch-track" />
                     <input v-model="settings.enabled" type="checkbox" style="display: none" />
                   </label>
                 </div>
-                <div class="segmented compact">
+                <div class="segmented">
                   <button type="button" :class="{ active: settings.mode === 'monitor' }" @click="settings.mode = 'monitor'">
                     观察
                   </button>
@@ -148,150 +141,86 @@
               </div>
             </div>
 
-            <div class="settings-grid-2">
-              <section class="settings-card">
-                <div class="settings-card-head">
-                  <div>
-                    <div class="settings-card-title">安全级别</div>
-                    <div class="settings-card-desc">对文档导航与可疑请求的质询强度</div>
-                  </div>
-                </div>
-                <div class="segmented level-seg compact">
-                  <button v-for="l in securityLevels" :key="l.value" type="button"
-                    :class="{ active: settings.security_level === l.value }"
-                    @click="settings.security_level = l.value">
-                    {{ l.label }}
-                  </button>
-                </div>
-                <p class="settings-hint">{{ levelHint }}</p>
-              </section>
-
-              <section class="settings-card">
-                <div class="settings-card-head">
-                  <div>
-                    <div class="settings-card-title">请求体检查</div>
-                    <div class="settings-card-desc">检查 JSON / form / text / multipart 文本 body</div>
-                  </div>
-                  <label class="switch" :class="{ on: settings.body.enabled }">
-                    <span class="switch-track" />
-                    <input v-model="settings.body.enabled" type="checkbox" style="display: none" />
-                  </label>
-                </div>
-                <p v-if="!settings.body.enabled" class="settings-hint">
-                  关闭时 WAF 只检查 URL/头；开启后会先缓冲 body（64 KiB 上限）再检查。
-                </p>
-                <template v-else>
-                  <div class="body-config-grid">
-                    <div class="field">
-                      <label class="field-label">最大字节数</label>
-                      <input v-model.number="settings.body.max_bytes" class="input" type="number"
-                        min="1024" max="65536" step="1024" />
-                      <span class="field-hint">1024–65536，硬上限 64 KiB。</span>
-                    </div>
-                    <div class="field">
-                      <label class="field-label">读取超时（ms）</label>
-                      <input v-model.number="settings.body.timeout_ms" class="input" type="number"
-                        min="100" max="5000" step="100" />
-                      <span class="field-hint">超时返回 408。</span>
-                    </div>
-                    <div class="field">
-                      <label class="field-label">检查方法</label>
-                      <input v-model="bodyMethodsText" class="input" type="text" />
-                      <span class="field-hint">逗号分隔，支持 POST/PUT/PATCH。</span>
-                    </div>
-                    <div class="field">
-                      <label class="field-label">Content-Type</label>
-                      <input v-model="bodyContentTypesText" class="input" type="text" />
-                      <span class="field-hint">支持 text/*、*/*；multipart 只扫描文本 part。</span>
-                    </div>
-                    <div class="field">
-                      <label class="field-label">超过上限时</label>
-                      <select v-model="settings.body.oversize_policy" class="select">
-                        <option value="log">log（放行并记录）</option>
-                        <option value="block">block（413）</option>
-                        <option value="allow">allow（静默放行）</option>
-                      </select>
-                    </div>
-                    <div class="field">
-                      <label class="field-label">无法检查时</label>
-                      <select v-model="settings.body.uninspectable_policy" class="select">
-                        <option value="log">log（放行并记录）</option>
-                        <option value="block">block（415）</option>
-                        <option value="allow">allow（静默放行）</option>
-                      </select>
-                    </div>
-                  </div>
-                  <div class="option-grid">
-                    <label class="option-toggle" :class="{ on: settings.body.inspect_unknown_length }">
-                      <input v-model="settings.body.inspect_unknown_length" type="checkbox" />
-                      <span>无长度 / 分块</span>
-                    </label>
-                    <label class="option-toggle" :class="{ on: settings.body.decompress_gzip }">
-                      <input v-model="settings.body.decompress_gzip" type="checkbox" />
-                      <span>解压 gzip</span>
-                    </label>
-                    <label class="option-toggle" :class="{ on: settings.body.decompress_brotli }">
-                      <input v-model="settings.body.decompress_brotli" type="checkbox" />
-                      <span>解压 br</span>
-                    </label>
-                    <label class="option-toggle" :class="{ on: settings.body.decompress_zstd }">
-                      <input v-model="settings.body.decompress_zstd" type="checkbox" />
-                      <span>解压 zstd</span>
-                    </label>
-                    <label class="option-toggle" :class="{ on: settings.body.decompress_deflate }">
-                      <input v-model="settings.body.decompress_deflate" type="checkbox" />
-                      <span>解压 deflate</span>
-                    </label>
-                  </div>
-                  <p class="settings-hint">
-                    解压后最多扫描 256 KiB；无长度请求读到上限，超限返回 413。
-                  </p>
-                </template>
-              </section>
-            </div>
-
-            <section class="settings-card">
-              <div class="settings-card-head">
+            <section class="waf-section">
+              <div class="waf-section-head">
                 <div>
-                  <div class="settings-card-title">托管规则集</div>
-                  <div class="settings-card-desc">增量启用，规则集版本由控制面统一维护</div>
+                  <h3 class="waf-section-title">质询与安全级别</h3>
+                  <p class="waf-section-desc">控制文档导航与可疑请求的质询强度，以及免质询有效期</p>
                 </div>
-                <span class="settings-count">{{ settings.managed_rulesets.length }}/{{ rulesets.length }}</span>
               </div>
-              <div class="ruleset-grid">
-                <label v-for="rs in rulesets" :key="rs.id" class="ruleset-card"
-                  :class="{ on: settings.managed_rulesets.includes(rs.id) }">
-                  <input type="checkbox" :checked="settings.managed_rulesets.includes(rs.id)"
-                    @change="toggleRuleset(rs.id)" />
-                  <span class="ruleset-body">
-                    <span class="ruleset-head">
-                      <strong>{{ rs.name }}</strong>
-                      <span class="ruleset-version">{{ rs.version }}</span>
-                      <span v-if="rs.recommended" class="ruleset-badge">推荐</span>
-                    </span>
-                    <small>{{ rs.description }}</small>
-                    <span class="ruleset-categories">
-                      <span v-for="(label, i) in rs.category_labels" :key="rs.categories[i]" class="ruleset-chip">
-                        {{ label }}
+              <div class="waf-section-body">
+                <div class="waf-level-row">
+                  <div class="segmented level-seg">
+                    <button v-for="l in securityLevels" :key="l.value" type="button"
+                      :class="{ active: settings.security_level === l.value }"
+                      @click="settings.security_level = l.value">
+                      {{ l.label }}
+                    </button>
+                  </div>
+                  <span class="waf-note inline">{{ levelHint }}</span>
+                </div>
+                <div class="form-grid waf-challenge-grid">
+                  <div class="field">
+                    <label class="field-label">质询难度（前导 0 位数）</label>
+                    <input v-model.number="settings.challenge_difficulty" class="input" type="number" min="1" max="6" />
+                    <span class="field-hint">1 最轻、6 最重，默认 4。</span>
+                  </div>
+                  <div class="field">
+                    <label class="field-label">免质询有效期（秒）</label>
+                    <input v-model.number="settings.challenge_ttl_secs" class="input" type="number" min="60" max="86400" />
+                    <span class="field-hint">通过后签发 HttpOnly Cookie，默认 1800 秒。</span>
+                  </div>
+                </div>
+                <p class="waf-note">
+                  仅对 GET/HEAD 且 Accept 包含 text/html 的文档导航返回 JS 质询页；API/XHR/POST
+                  会跳过质询，如需限制请使用 block 规则或限流。
+                </p>
+              </div>
+            </section>
+
+            <section class="waf-section">
+              <div class="waf-section-head">
+                <div>
+                  <h3 class="waf-section-title">托管规则集</h3>
+                  <p class="waf-section-desc">增量启用；规则集版本由控制面统一维护</p>
+                </div>
+                <span class="waf-count">{{ settings.managed_rulesets.length }}/{{ rulesets.length }}</span>
+              </div>
+              <div class="waf-section-body">
+                <div class="waf-ruleset-grid">
+                  <label v-for="rs in rulesets" :key="rs.id" class="ruleset-card"
+                    :class="{ on: settings.managed_rulesets.includes(rs.id) }">
+                    <input type="checkbox" :checked="settings.managed_rulesets.includes(rs.id)"
+                      @change="toggleRuleset(rs.id)" />
+                    <span class="ruleset-body">
+                      <span class="ruleset-head">
+                        <strong>{{ rs.name }}</strong>
+                        <span class="ruleset-version">{{ rs.version }}</span>
+                        <span v-if="rs.recommended" class="ruleset-badge">推荐</span>
+                      </span>
+                      <small>{{ rs.description }}</small>
+                      <span class="ruleset-categories">
+                        <span v-for="(label, i) in rs.category_labels" :key="rs.categories[i]" class="ruleset-chip">
+                          {{ label }}
+                        </span>
                       </span>
                     </span>
-                  </span>
-                  <AppIcon :name="settings.managed_rulesets.includes(rs.id) ? 'check' : 'plus'" :size="15" />
-                </label>
-                <div v-if="!rulesets.length" class="text-muted" style="font-size: 13px">
-                  正在加载托管规则集…
+                  </label>
+                  <div v-if="!rulesets.length" class="text-muted" style="font-size: 13px">
+                    正在加载托管规则集…
+                  </div>
                 </div>
               </div>
             </section>
 
-            <details class="settings-card settings-details">
-              <summary class="settings-summary">
-                <span class="settings-summary-title">规则包版本与灰度</span>
-                <span class="settings-summary-meta">
-                  {{ settings.waf_rulepack_version || '跟随 active' }} · 灰度 {{ settings.waf_gray_percent }}%
-                </span>
-              </summary>
-              <div class="settings-details-body">
+            <section class="waf-section">
+              <div class="waf-section-head">
+                <div>
+                  <h3 class="waf-section-title">规则包版本与灰度</h3>
+                  <p class="waf-section-desc">固定版本用于单域名验证/回滚；灰度按域名稳定哈希切分</p>
+                </div>
+              </div>
+              <div class="waf-section-body">
                 <div class="form-grid">
                   <div class="field">
                     <label class="field-label">规则包版本</label>
@@ -306,19 +235,27 @@
                   <div class="field">
                     <label class="field-label">灰度比例</label>
                     <input v-model.number="settings.waf_gray_percent" class="input" type="number" min="0" max="100" />
-                    <span class="field-hint">0 = 全量 active；1~99 按域名稳定哈希切分。</span>
+                    <span class="field-hint">0 = 全量 active；1~99 按域名稳定哈希切分到 active/previous。</span>
                   </div>
                 </div>
                 <div v-if="auth.isAdmin" class="rulepack-admin">
-                  <div class="flex-between">
-                    <span class="text-muted" style="font-size: 12px">
-                      规则包由 Control 签名，Edge 验签后缓存；回滚只切换 active/previous。
+                  <div class="rulepack-summary">
+                    <span class="rulepack-summary-text">
+                      当前生效
+                      <b class="mono">{{ activeRulepackVersion || '未发布' }}</b>
+                      <span class="text-muted"> · 规则包由 Control 签名，回滚只切换 active/previous</span>
                     </span>
-                    <button class="btn btn-default btn-sm" type="button" :disabled="rulepackBusy" @click="publishRulepack">
-                      发布新版本
-                    </button>
+                    <div class="flex gap-8">
+                      <button class="btn btn-default btn-sm" type="button" @click="rulepackAdminOpen = !rulepackAdminOpen">
+                        {{ rulepackAdminOpen ? '收起版本' : '管理版本' }}
+                      </button>
+                      <button v-if="rulepackAdminOpen" class="btn btn-default btn-sm" type="button"
+                        :disabled="rulepackBusy" @click="publishRulepack">
+                        发布新版本
+                      </button>
+                    </div>
                   </div>
-                  <div v-if="rulepackVersions.length" class="rulepack-versions">
+                  <div v-if="rulepackAdminOpen && rulepackVersions.length" class="rulepack-versions">
                     <div v-for="p in rulepackVersions" :key="p.version" class="rulepack-version-row"
                       :class="`slot-${p.slot}`">
                       <div class="version-main">
@@ -359,56 +296,119 @@
                   </div>
                 </div>
               </div>
-            </details>
+            </section>
 
-            <details class="settings-card settings-details">
-              <summary class="settings-summary">
-                <span class="settings-summary-title">单条托管规则</span>
-                <span class="settings-summary-meta">
-                  已启用 {{ managedRules.filter((m) => settings[m.key]).length }}/{{ managedRules.length }}
-                </span>
-              </summary>
-              <div class="settings-details-body">
-                <div class="managed-grid">
+            <section class="waf-section">
+              <div class="waf-section-head">
+                <div>
+                  <h3 class="waf-section-title">单条托管规则</h3>
+                  <p class="waf-section-desc">规则集之外可按类别单独启用；不会与规则集互相关闭</p>
+                </div>
+                <span class="waf-count">{{ managedRules.filter((m) => settings[m.key]).length }}/{{ managedRules.length }}</span>
+              </div>
+              <div class="waf-section-body">
+                <div class="waf-managed-grid">
                   <label v-for="m in managedRules" :key="m.key" class="managed-item" :class="{ on: settings[m.key] }">
                     <input v-model="settings[m.key]" type="checkbox" />
                     <span class="managed-info">
                       <strong>{{ m.label }}</strong>
                       <small>{{ m.desc }}</small>
                     </span>
-                    <AppIcon :name="settings[m.key] ? 'check' : 'plus'" :size="15" />
                   </label>
                 </div>
               </div>
-            </details>
+            </section>
 
-            <details class="settings-card settings-details">
-              <summary class="settings-summary">
-                <span class="settings-summary-title">浏览器质询</span>
-                <span class="settings-summary-meta">{{ settings.challenge_difficulty }} 级 · {{ settings.challenge_ttl_secs }}s</span>
-              </summary>
-              <div class="settings-details-body">
-                <div class="form-grid">
-                  <div class="field">
-                    <label class="field-label">质询难度（前导 0 位数）</label>
-                    <input v-model.number="settings.challenge_difficulty" class="input" type="number" min="1" max="6" />
-                    <span class="field-hint">1 最轻、6 最重，默认 4。</span>
-                  </div>
-                  <div class="field">
-                    <label class="field-label">免质询有效期（秒）</label>
-                    <input v-model.number="settings.challenge_ttl_secs" class="input" type="number" min="60" max="86400" />
-                    <span class="field-hint">通过后签发 HttpOnly Cookie，默认 1800 秒。</span>
-                  </div>
+            <section class="waf-section">
+              <div class="waf-section-head">
+                <div>
+                  <h3 class="waf-section-title">请求体检查</h3>
+                  <p class="waf-section-desc">检查 JSON / form / text / multipart 文本 body；默认关闭</p>
                 </div>
-                <p class="settings-hint">
-                  规则动作选择「质询」时生效；仅对 GET/HEAD 且 Accept 包含 text/html 的文档导航返回质询页。
-                  API/XHR/POST 会跳过质询，如需限制请用 block 规则或限流。
-                </p>
+                <label class="switch" :class="{ on: settings.body.enabled }">
+                  <span class="switch-track" />
+                  <input v-model="settings.body.enabled" type="checkbox" style="display: none" />
+                </label>
               </div>
-            </details>
+              <div class="waf-section-body">
+                <p v-if="!settings.body.enabled" class="waf-note">
+                  关闭时 WAF 只检查 URL/头；开启后会先缓冲 body（64 KiB 上限）再检查。
+                </p>
+                <template v-else>
+                  <div class="waf-body-grid">
+                    <div class="field">
+                      <label class="field-label">最大字节数</label>
+                      <input v-model.number="settings.body.max_bytes" class="input" type="number"
+                        min="1024" max="65536" step="1024" />
+                      <span class="field-hint">1024–65536，硬上限 64 KiB。</span>
+                    </div>
+                    <div class="field">
+                      <label class="field-label">读取超时（ms）</label>
+                      <input v-model.number="settings.body.timeout_ms" class="input" type="number"
+                        min="100" max="5000" step="100" />
+                      <span class="field-hint">读取整个 body 的总超时，超时返回 408。</span>
+                    </div>
+                    <div class="field">
+                      <label class="field-label">检查方法</label>
+                      <input v-model="bodyMethodsText" class="input" type="text" />
+                      <span class="field-hint">逗号分隔，支持 POST/PUT/PATCH。</span>
+                    </div>
+                    <div class="field span-2">
+                      <label class="field-label">Content-Type</label>
+                      <input v-model="bodyContentTypesText" class="input" type="text" />
+                      <span class="field-hint">
+                        逗号分隔；支持 text/*、*/*。检查 multipart 时加入 multipart/form-data
+                        （只扫描文本 part，跳过二进制文件）。
+                      </span>
+                    </div>
+                    <div class="field">
+                      <label class="field-label">超过上限时</label>
+                      <select v-model="settings.body.oversize_policy" class="select">
+                        <option value="log">log（放行并记录）</option>
+                        <option value="block">block（413）</option>
+                        <option value="allow">allow（静默放行）</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label class="field-label">无法检查时</label>
+                      <select v-model="settings.body.uninspectable_policy" class="select">
+                        <option value="log">log（放行并记录）</option>
+                        <option value="block">block（415）</option>
+                        <option value="allow">allow（静默放行）</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="waf-option-grid">
+                    <label class="waf-option" :class="{ on: settings.body.inspect_unknown_length }">
+                      <input v-model="settings.body.inspect_unknown_length" type="checkbox" />
+                      <span>无长度 / 分块</span>
+                    </label>
+                    <label class="waf-option" :class="{ on: settings.body.decompress_gzip }">
+                      <input v-model="settings.body.decompress_gzip" type="checkbox" />
+                      <span>解压 gzip</span>
+                    </label>
+                    <label class="waf-option" :class="{ on: settings.body.decompress_brotli }">
+                      <input v-model="settings.body.decompress_brotli" type="checkbox" />
+                      <span>解压 br</span>
+                    </label>
+                    <label class="waf-option" :class="{ on: settings.body.decompress_zstd }">
+                      <input v-model="settings.body.decompress_zstd" type="checkbox" />
+                      <span>解压 zstd</span>
+                    </label>
+                    <label class="waf-option" :class="{ on: settings.body.decompress_deflate }">
+                      <input v-model="settings.body.decompress_deflate" type="checkbox" />
+                      <span>解压 deflate</span>
+                    </label>
+                  </div>
+                  <p class="waf-note">
+                    解压后最多扫描 256 KiB；无长度请求读到上限，超限返回 413。
+                  </p>
+                </template>
+              </div>
+            </section>
 
-            <div class="settings-footer">
-              <span class="settings-hint">
+            <div class="waf-settings-footer">
+              <span class="waf-note">
                 托管规则匹配 URL、查询串、UA 与 Referer；开启请求体检查后还会检查 body。
               </span>
               <button class="btn btn-primary" type="button" :disabled="saving" @click="saveSettings">
@@ -1102,6 +1102,10 @@ const rules = ref<any[]>([])
 const rulesets = ref<any[]>([])
 const rulepackVersions = ref<any[]>([])
 const rulepackBusy = ref(false)
+const rulepackAdminOpen = ref(false)
+const activeRulepackVersion = computed(
+  () => rulepackVersions.value.find((p: any) => p.slot === 'active')?.version || '',
+)
 const ips = ref<any[]>([])
 const geoRules = ref<any[]>([])
 const geoPage = ref(1)
@@ -2361,260 +2365,244 @@ onMounted(reload)
   }
 }
 
-.settings-shell {
+.waf-settings {
   display: flex;
   flex-direction: column;
-  gap: 14px;
 }
 
-.settings-hero {
+.waf-settings-status {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
+  gap: 24px;
   padding: 16px 18px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--divider);
   border-radius: var(--radius-lg);
-  background: linear-gradient(135deg, var(--card), var(--brand-bg) 160%);
+  background: var(--bg);
 }
 
-.settings-hero.is-off {
-  background: var(--card);
-  opacity: 0.92;
-}
-
-.settings-hero-main {
+.waf-settings-status-main {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
   min-width: 0;
 }
 
-.settings-hero-icon {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  color: var(--brand);
-  background: var(--brand-bg);
-  flex: 0 0 auto;
+.waf-settings-eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
 }
 
-.settings-hero-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 15px;
+.waf-settings-status-title {
+  margin-top: 5px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--text);
 }
 
-.settings-hero-desc {
-  margin-top: 3px;
-  font-size: 12px;
-  line-height: 1.5;
+.waf-settings-status-desc {
+  margin-top: 5px;
+  max-width: 720px;
+  font-size: 12.5px;
+  line-height: 1.55;
   color: var(--text-3);
 }
 
-.settings-hero-controls {
+.waf-settings-status-actions {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 16px;
   flex: 0 0 auto;
 }
 
-.settings-inline {
+.waf-inline-toggle {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
-  color: var(--text-3);
+  font-size: 12.5px;
+  color: var(--text-2);
+  white-space: nowrap;
 }
 
-.segmented.compact button {
-  padding: 5px 10px;
-  font-size: 12px;
+.waf-section {
+  padding: 19px 2px;
+  border-bottom: 1px solid var(--divider);
 }
 
-.settings-grid-2 {
-  display: grid;
-  grid-template-columns: minmax(230px, 0.8fr) minmax(0, 1.6fr);
-  gap: 14px;
-  align-items: start;
+.waf-section:last-of-type {
+  border-bottom: 0;
 }
 
-.settings-card {
-  padding: 15px 16px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--card);
-}
-
-.settings-card-head {
+.waf-section-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
 }
 
-.settings-card-title {
-  font-size: 14px;
+.waf-section-title {
+  margin: 0;
+  font-size: 15px;
   font-weight: 600;
+  letter-spacing: -0.01em;
   color: var(--text);
 }
 
-.settings-card-desc {
-  margin-top: 2px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text-3);
-}
-
-.settings-count {
-  flex: 0 0 auto;
-  font-size: 11px;
-  line-height: 22px;
-  padding: 0 8px;
-  border-radius: 11px;
-  color: var(--text-3);
-  background: var(--bg);
-}
-
-.settings-hint {
-  margin: 8px 0 0;
-  font-size: 12px;
+.waf-section-desc {
+  margin-top: 3px;
+  font-size: 12.5px;
   line-height: 1.55;
   color: var(--text-3);
 }
 
-.body-config-grid {
+.waf-section-body {
+  margin-top: 12px;
+}
+
+.waf-level-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.waf-level-row .waf-note.inline {
+  margin: 0;
+}
+
+.waf-challenge-grid {
+  margin-top: 14px;
+}
+
+.waf-count {
+  flex: 0 0 auto;
+  padding: 0 8px;
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 20px;
+}
+
+.waf-ruleset-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 12px;
-  margin-top: 11px;
+  gap: 10px;
 }
 
-.body-config-grid .field-hint {
-  margin-top: 3px;
-  font-size: 11px;
+.waf-managed-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
 }
 
-.option-grid {
+.waf-body-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 14px;
+}
+
+.waf-body-grid .span-2 {
+  grid-column: span 2;
+}
+
+.waf-option-grid {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
-  margin-top: 11px;
+  gap: 8px;
+  margin-top: 13px;
 }
 
-.option-toggle {
+.waf-option {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 9px;
+  padding: 5px 10px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  font-size: 12px;
+  background: var(--card);
   color: var(--text-2);
+  font-size: 12px;
   cursor: pointer;
   user-select: none;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
 }
 
-.option-toggle input {
+.waf-option:hover {
+  border-color: var(--border-strong);
+}
+
+.waf-option input {
   margin: 0;
   accent-color: var(--brand);
 }
 
-.option-toggle.on {
+.waf-option.on {
   border-color: var(--brand-bg-strong);
   background: var(--brand-bg);
   color: var(--brand);
 }
 
-.settings-details {
-  padding: 0;
-}
-
-.settings-summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 14px 16px;
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
-}
-
-.settings-summary::-webkit-details-marker {
-  display: none;
-}
-
-.settings-summary::after {
-  content: '⌄';
-  flex: 0 0 auto;
-  font-size: 14px;
-  color: var(--text-3);
-  transition: transform 0.15s ease;
-}
-
-.settings-details[open] > .settings-summary::after {
-  transform: rotate(180deg);
-}
-
-.settings-summary-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.settings-summary-meta {
-  margin-left: auto;
-  font-size: 11px;
+.waf-note {
+  margin: 9px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
   color: var(--text-3);
 }
 
-.settings-details-body {
-  padding: 0 16px 16px;
-}
-
-.settings-footer {
+.waf-settings-footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding-top: 2px;
+  gap: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--divider);
 }
 
-.settings-footer .settings-hint {
+.waf-settings-footer .waf-note {
   margin: 0;
 }
 
-@media (max-width: 1100px) {
-  .managed-grid,
-  .ruleset-grid {
+@media (max-width: 1280px) {
+  .waf-managed-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1000px) {
+  .waf-body-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .waf-managed-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 760px) {
-  .settings-grid-2,
-  .body-config-grid,
-  .managed-grid,
-  .ruleset-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .settings-hero {
+  .waf-settings-status {
     flex-direction: column;
     align-items: stretch;
   }
 
-  .settings-hero-controls {
+  .waf-settings-status-actions {
     justify-content: space-between;
   }
 
-  .settings-footer {
+  .waf-ruleset-grid,
+  .waf-managed-grid,
+  .waf-body-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .waf-body-grid .span-2 {
+    grid-column: auto;
+  }
+
+  .waf-settings-footer {
     flex-direction: column;
     align-items: stretch;
   }
@@ -2665,8 +2653,8 @@ onMounted(reload)
 }
 
 .managed-item.on {
-  border-color: #bedaff;
-  background: #f7faff;
+  border-color: var(--brand-bg-strong);
+  background: var(--brand-bg);
 }
 
 .managed-item input {
@@ -2809,10 +2797,27 @@ onMounted(reload)
 /* rulepack version / rollout */
 .rulepack-admin {
   margin-top: 14px;
-  padding: 12px 14px;
+  padding: 11px 13px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg);
+}
+
+.rulepack-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.rulepack-summary-text {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.rulepack-summary-text .mono {
+  color: var(--text);
 }
 
 .rulepack-versions {
