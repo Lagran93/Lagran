@@ -170,6 +170,12 @@ pub struct EdgeMetrics {
     /// control plane now falls back to built-in categories, so a non-zero value
     /// means an edge is running an older pairing and may be under-protected.
     rulepack_missing_rulesets: AtomicU64,
+    /// WAF request-body inspection (P2).
+    waf_body_inspected: AtomicU64,
+    waf_body_skipped: AtomicU64,
+    waf_body_blocked: AtomicU64,
+    waf_body_errors: AtomicU64,
+    waf_body_bytes: AtomicU64,
     chunk_requests: AtomicU64,
     chunk_origin_runs: AtomicU64,
     chunk_fallbacks: AtomicU64,
@@ -194,6 +200,11 @@ pub struct GlobalSnapshot {
     pub origin_errors: u64,
     pub config_errors: u64,
     pub rulepack_missing_rulesets: u64,
+    pub waf_body_inspected: u64,
+    pub waf_body_skipped: u64,
+    pub waf_body_blocked: u64,
+    pub waf_body_errors: u64,
+    pub waf_body_bytes: u64,
     pub stream_requests: u64,
     pub stream_bytes: u64,
     pub stream_errors: u64,
@@ -324,6 +335,43 @@ impl EdgeMetrics {
         self.rulepack_missing_rulesets.load(Ordering::Relaxed)
     }
 
+    pub fn record_waf_body_inspected(&self, bytes: u64) {
+        self.waf_body_inspected.fetch_add(1, Ordering::Relaxed);
+        self.waf_body_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_waf_body_skipped(&self) {
+        self.waf_body_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_waf_body_blocked(&self) {
+        self.waf_body_blocked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_waf_body_error(&self) {
+        self.waf_body_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn waf_body_inspected(&self) -> u64 {
+        self.waf_body_inspected.load(Ordering::Relaxed)
+    }
+
+    pub fn waf_body_skipped(&self) -> u64 {
+        self.waf_body_skipped.load(Ordering::Relaxed)
+    }
+
+    pub fn waf_body_blocked(&self) -> u64 {
+        self.waf_body_blocked.load(Ordering::Relaxed)
+    }
+
+    pub fn waf_body_errors(&self) -> u64 {
+        self.waf_body_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn waf_body_bytes(&self) -> u64 {
+        self.waf_body_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn record_stream_start(&self) {
         self.stream_requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -427,6 +475,11 @@ impl EdgeMetrics {
             origin_errors: self.origin_errors.load(Ordering::Relaxed),
             config_errors: self.config_errors.load(Ordering::Relaxed),
             rulepack_missing_rulesets: self.rulepack_missing_rulesets.load(Ordering::Relaxed),
+            waf_body_inspected: self.waf_body_inspected.load(Ordering::Relaxed),
+            waf_body_skipped: self.waf_body_skipped.load(Ordering::Relaxed),
+            waf_body_blocked: self.waf_body_blocked.load(Ordering::Relaxed),
+            waf_body_errors: self.waf_body_errors.load(Ordering::Relaxed),
+            waf_body_bytes: self.waf_body_bytes.load(Ordering::Relaxed),
             stream_requests: self.stream_requests.load(Ordering::Relaxed),
             stream_bytes: self.stream_bytes.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),

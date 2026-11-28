@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use uuid::Uuid;
 
-const FIELDS: [&str; 6] = ["path", "query", "user_agent", "referer", "method", "ip"];
+const FIELDS: [&str; 7] = ["path", "query", "user_agent", "referer", "method", "ip", "body"];
 const OPERATORS: [&str; 4] = ["contains", "equals", "prefix", "suffix"];
 const ACTIONS: [&str; 4] = ["block", "allow", "log", "challenge"];
 
@@ -137,6 +137,48 @@ pub struct WafSettingsDto {
     pub managed_rulesets: Vec<String>,
     pub waf_rulepack_version: String,
     pub waf_gray_percent: u8,
+    pub body: BodyInspectionDto,
+}
+
+/// Per-domain request-body inspection policy, as exposed by the settings API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BodyInspectionDto {
+    pub enabled: bool,
+    pub max_bytes: u32,
+    pub methods: Vec<String>,
+    pub content_types: Vec<String>,
+    pub oversize_policy: String,
+    pub uninspectable_policy: String,
+    pub timeout_ms: u32,
+}
+
+impl Default for BodyInspectionDto {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_bytes: 32_768,
+            methods: vec!["POST".into(), "PUT".into(), "PATCH".into()],
+            content_types: vec![
+                "application/json".into(),
+                "application/x-www-form-urlencoded".into(),
+                "text/*".into(),
+            ],
+            oversize_policy: "log".into(),
+            uninspectable_policy: "log".into(),
+            timeout_ms: 1000,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct BodyInspectionRequest {
+    pub enabled: Option<bool>,
+    pub max_bytes: Option<u32>,
+    pub methods: Option<Vec<String>>,
+    pub content_types: Option<Vec<String>>,
+    pub oversize_policy: Option<String>,
+    pub uninspectable_policy: Option<String>,
+    pub timeout_ms: Option<u32>,
 }
 
 impl Default for WafSettingsDto {
@@ -165,6 +207,7 @@ impl Default for WafSettingsDto {
             managed_rulesets: Vec::new(),
             waf_rulepack_version: String::new(),
             waf_gray_percent: 0,
+            body: BodyInspectionDto::default(),
         }
     }
 }
@@ -195,8 +238,28 @@ impl From<repository::WafSettingsRow> for WafSettingsDto {
             managed_rulesets: crate::waf_rulesets::parse_csv(&r.managed_rulesets),
             waf_rulepack_version: r.waf_rulepack_version,
             waf_gray_percent: r.waf_gray_percent.clamp(0, 100) as u8,
+            body: BodyInspectionDto {
+                enabled: r.body_inspection,
+                max_bytes: r.body_max_bytes.clamp(1024, 65_536) as u32,
+                methods: parse_body_csv(&r.body_methods)
+                    .into_iter()
+                    .map(|m| m.to_ascii_uppercase())
+                    .collect(),
+                content_types: parse_body_csv(&r.body_content_types),
+                oversize_policy: r.body_oversize_policy,
+                uninspectable_policy: r.body_uninspectable_policy,
+                timeout_ms: r.body_timeout_ms.clamp(100, 5000) as u32,
+            },
         }
     }
+}
+
+fn parse_body_csv(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 pub async fn get_settings(
@@ -543,6 +606,9 @@ pub struct SettingsRequest {
     pub managed_rulesets: Option<Vec<String>>,
     pub waf_rulepack_version: Option<String>,
     pub waf_gray_percent: Option<u8>,
+    /// Nested so the console can send only the body-inspection block; omitted
+    /// fields keep their current value.
+    pub body: Option<BodyInspectionRequest>,
 }
 
 pub async fn put_settings(
@@ -612,6 +678,7 @@ pub async fn put_settings(
         .waf_gray_percent
         .unwrap_or(current.waf_gray_percent)
         .min(100) as i32;
+    let body = merge_body(&current.body, req.body)?;
 
     let row = repository::upsert_waf_settings(
         &state.pool,
@@ -643,6 +710,13 @@ pub async fn put_settings(
         &managed_csv,
         &waf_rulepack_version,
         waf_gray_percent,
+        body.enabled,
+        body.max_bytes as i32,
+        &body.methods.join(","),
+        &body.content_types.join(","),
+        &body.oversize_policy,
+        &body.uninspectable_policy,
+        body.timeout_ms as i32,
     )
     .await
     .map_err(|e| {
@@ -658,7 +732,8 @@ pub async fn put_settings(
         &format!(
             "enabled={} mode={mode} level={} sqli={} xss={} traversal={} scanners={} \
              rce={} ssrf={} xxe={} log4shell={} crlf={} ssti={} nosql={} ldap={} \
-             java={} webshell={} protocol={} rulesets={} rulepack={} gray={}% challenge={}/{}s",
+             java={} webshell={} protocol={} rulesets={} rulepack={} gray={}% challenge={}/{}s \
+             body={}({}) max={} methods={} types={} oversize={} uninspectable={}",
             row.enabled,
             row.security_level,
             row.sqli,
@@ -680,13 +755,129 @@ pub async fn put_settings(
             waf_rulepack_version,
             waf_gray_percent,
             row.challenge_difficulty,
-            row.challenge_ttl_secs
+            row.challenge_ttl_secs,
+            row.body_inspection,
+            if row.body_inspection { "on" } else { "off" },
+            row.body_max_bytes,
+            row.body_methods,
+            row.body_content_types,
+            row.body_oversize_policy,
+            row.body_uninspectable_policy
         ),
     )
     .await;
 
     record_waf_version(&state, domain_id, &actor, "waf.settings", "更新 WAF 设置").await;
     Ok(Json(row.into()))
+}
+
+/// Merge a partial body-inspection update over the stored values and validate
+/// every field the Edge will act on.
+fn merge_body(
+    current: &BodyInspectionDto,
+    req: Option<BodyInspectionRequest>,
+) -> Result<BodyInspectionDto, (StatusCode, Json<ErrorBody>)> {
+    let Some(req) = req else {
+        return Ok(current.clone());
+    };
+    let mut methods = req.methods.unwrap_or_else(|| current.methods.clone());
+    methods = methods
+        .into_iter()
+        .map(|m| m.trim().to_ascii_uppercase())
+        .filter(|m| !m.is_empty())
+        .collect();
+    methods.dedup();
+    if methods.is_empty() {
+        return Err(bad_request("body.methods must not be empty".into()));
+    }
+    if methods
+        .iter()
+        .any(|m| !matches!(m.as_str(), "POST" | "PUT" | "PATCH"))
+    {
+        return Err(bad_request(
+            "body.methods may only contain POST, PUT, PATCH".into(),
+        ));
+    }
+
+    let mut content_types = req
+        .content_types
+        .unwrap_or_else(|| current.content_types.clone());
+    content_types = content_types
+        .into_iter()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    content_types.dedup();
+    if content_types.is_empty() {
+        return Err(bad_request("body.content_types must not be empty".into()));
+    }
+    for content_type in &content_types {
+        if !valid_media_pattern(content_type) {
+            return Err(bad_request(format!(
+                "invalid body.content_types entry: {content_type}"
+            )));
+        }
+    }
+
+    let oversize_policy = req
+        .oversize_policy
+        .as_deref()
+        .unwrap_or(&current.oversize_policy)
+        .trim()
+        .to_ascii_lowercase();
+    validate_body_policy("body.oversize_policy", &oversize_policy)?;
+    let uninspectable_policy = req
+        .uninspectable_policy
+        .as_deref()
+        .unwrap_or(&current.uninspectable_policy)
+        .trim()
+        .to_ascii_lowercase();
+    validate_body_policy("body.uninspectable_policy", &uninspectable_policy)?;
+
+    Ok(BodyInspectionDto {
+        enabled: req.enabled.unwrap_or(current.enabled),
+        max_bytes: req
+            .max_bytes
+            .unwrap_or(current.max_bytes)
+            .clamp(1024, 65_536),
+        methods,
+        content_types,
+        oversize_policy,
+        uninspectable_policy,
+        timeout_ms: req
+            .timeout_ms
+            .unwrap_or(current.timeout_ms)
+            .clamp(100, 5000),
+    })
+}
+
+fn validate_body_policy(field: &str, value: &str) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if matches!(value, "log" | "block" | "allow") {
+        Ok(())
+    } else {
+        Err(bad_request(format!(
+            "{field} must be one of log, block, allow"
+        )))
+    }
+}
+
+/// Accept `type/subtype`, `type/*` and `*/*`; reject parameters (the Edge strips
+/// them from request headers) and anything shell/metacharacter-ish.
+fn valid_media_pattern(value: &str) -> bool {
+    if value.len() > 128 {
+        return false;
+    }
+    let Some((kind, subtype)) = value.split_once('/') else {
+        return false;
+    };
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'*'))
+    };
+    // `*/*` is the only wildcard type; `type/*` is supported per subtype.
+    valid(kind) && valid(subtype) && (kind != "*" || subtype == "*")
 }
 
 #[derive(Serialize)]
@@ -1921,6 +2112,65 @@ mod tests {
         assert_eq!(
             normalize_cidr("2001:db8::/32").as_deref(),
             Some("2001:db8::/32")
+        );
+    }
+
+    #[test]
+    fn body_is_a_valid_rule_field() {
+        let mut request = rule_request("body-rule", "union select");
+        request.field = "body".into();
+        assert!(validate_rule(&request).is_ok());
+    }
+
+    #[test]
+    fn merge_body_clamps_and_normalizes() {
+        let current = BodyInspectionDto::default();
+        let body = merge_body(
+            &current,
+            Some(BodyInspectionRequest {
+                enabled: Some(true),
+                max_bytes: Some(10),
+                methods: Some(vec![" post ".into()]),
+                content_types: Some(vec!["Application/JSON".into(), "text/*".into()]),
+                oversize_policy: Some("BLOCK".into()),
+                uninspectable_policy: None,
+                timeout_ms: Some(10),
+            }),
+        )
+        .unwrap_or_else(|_| panic!("valid body policy was rejected"));
+        assert!(body.enabled);
+        assert_eq!(body.max_bytes, 1024);
+        assert_eq!(body.methods, vec!["POST".to_string()]);
+        assert_eq!(
+            body.content_types,
+            vec!["application/json".to_string(), "text/*".to_string()]
+        );
+        assert_eq!(body.oversize_policy, "block");
+        assert_eq!(body.uninspectable_policy, "log");
+        assert_eq!(body.timeout_ms, 100);
+    }
+
+    #[test]
+    fn merge_body_rejects_unsafe_values() {
+        let current = BodyInspectionDto::default();
+        let request = |field: fn(&mut BodyInspectionRequest)| {
+            let mut req = BodyInspectionRequest::default();
+            field(&mut req);
+            merge_body(&current, Some(req))
+        };
+
+        assert!(request(|r| r.methods = Some(vec!["GET".into()])).is_err());
+        assert!(request(|r| r.methods = Some(vec![])).is_err());
+        assert!(request(|r| r.content_types = Some(vec![])).is_err());
+        assert!(
+            request(|r| r.content_types = Some(vec!["application/json; charset=utf-8".into()]))
+                .is_err()
+        );
+        assert!(request(|r| r.oversize_policy = Some("drop".into())).is_err());
+        assert!(request(|r| r.uninspectable_policy = Some("x".into())).is_err());
+        assert!(
+            request(|r| r.content_types = Some(vec!["*/*".into()])).is_ok(),
+            "the all-types wildcard is intentional"
         );
     }
 

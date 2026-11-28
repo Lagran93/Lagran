@@ -825,11 +825,12 @@ RUST_LOG=edge=info,tower_http=warn
 | `CHALLENGE_SECRET` | 多节点必填 | 空 | WAF 质询 nonce/免质询 Cookie 的 HMAC 密钥。多节点必须一致；为空时用 `AGENT_TOKEN` 派生或进程随机（重启失效）。 |
 | `WAF_REPORT` | 否 | `true` | 是否上报 WAF 事件。 |
 | `WAF_REPORT_INTERVAL` | 否 | `5` | WAF 事件上报间隔（秒）。 |
-| `WAF_BODY_INSPECTION` | 否 | `false` | **预览**：为所有已启用 WAF 的域名强制开启请求体检查（控制台按域名开关在下一阶段接入）。只检查带 `Content-Length` 的 `POST/PUT/PATCH` JSON/form/text body，硬上限 64 KiB。 |
+| `WAF_BODY_INSPECTION` | 否 | `false` | 运维覆盖：为所有已启用 WAF 的域名强制开启请求体检查；按域名配置在控制面 WAF 设置。只检查带 `Content-Length` 的 `POST/PUT/PATCH` JSON/form/text body，硬上限 64 KiB。 |
 | `WAF_BODY_MAX_BYTES` | 否 | `32768` | 请求体检查上限，范围 1024–65536；超过后按 `WAF_BODY_OVERSIZE_POLICY` 处理。 |
 | `WAF_BODY_OVERSIZE_POLICY` | 否 | `log` | 超限策略：`log`（放行并记录）/ `block`（413）/ `allow`。 |
 | `WAF_BODY_UNINSPECTABLE_POLICY` | 否 | `log` | chunked/无长度、压缩、multipart、`Expect: 100-continue` 等无法检查时的策略。 |
 | `WAF_BODY_TIMEOUT_MS` | 否 | `1000` | 读取完整 body 的总超时，范围 100–5000ms；超时返回 408。 |
+| `WAF_BODY_MAX_CONCURRENT` | 否 | `256` | 同时读取 body 的请求上限（1–4096）；超过的请求按跳过策略处理。 |
 | `HEARTBEAT_INTERVAL` | 否 | `15` | 心跳间隔（秒）。控制面约 60 秒无心跳标记离线。 |
 | `CC_SYNC_INTERVAL` | 否 | `5` | 跨节点共享 CC 封禁拉取间隔（秒，最小 2）。 |
 | `RUST_LOG` | 否 | `edge=debug,tower_http=info` | 日志级别。注意二进制自身的目标是 `lagran_edge`，只写 `edge=...` 会过滤掉它（启动摘要、CC 跨节点状态、优雅关闭都会消失，而 `edge::cache` 等库日志照常输出）。要看到全部，用 `lagran_edge=info,edge=info,tower_http=info`。 |

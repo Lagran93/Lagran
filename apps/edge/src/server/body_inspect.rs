@@ -15,7 +15,9 @@ use crate::waf::body::{BodyFacts, BodyInspection, BodyPolicy};
 use axum::http::{HeaderMap, Method, StatusCode};
 use bytes::Bytes;
 use pingora::proxy::Session;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// What the request path should do with this body.
 #[derive(Debug, Clone)]
@@ -161,6 +163,25 @@ pub async fn read(
             Err(_) => return Err(ReadError::Timeout),
         }
     }
+}
+
+/// Bound how many bodies are read concurrently. Slow clients can otherwise
+/// occupy a worker and buffer per request; requests over the limit follow the
+/// same skip path as other uninspectable bodies.
+pub fn try_acquire() -> Option<OwnedSemaphorePermit> {
+    body_limit().clone().try_acquire_owned().ok()
+}
+
+fn body_limit() -> &'static Arc<Semaphore> {
+    static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMIT.get_or_init(|| {
+        let permits = std::env::var("WAF_BODY_MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(256)
+            .clamp(1, 4096);
+        Arc::new(Semaphore::new(permits))
+    })
 }
 
 /// `Content-Length` as an integer, if present and valid.

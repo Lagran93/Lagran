@@ -122,6 +122,37 @@ pub struct WafConfigOut {
     pub challenge_difficulty: u8,
     pub challenge_ttl_secs: u64,
     pub security_level: String,
+    #[serde(default)]
+    pub body: WafBodyOut,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WafBodyOut {
+    pub enabled: bool,
+    pub max_bytes: u32,
+    pub methods: Vec<String>,
+    pub content_types: Vec<String>,
+    pub oversize_policy: String,
+    pub uninspectable_policy: String,
+    pub timeout_ms: u32,
+}
+
+impl Default for WafBodyOut {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_bytes: 32_768,
+            methods: vec!["POST".into(), "PUT".into(), "PATCH".into()],
+            content_types: vec![
+                "application/json".into(),
+                "application/x-www-form-urlencoded".into(),
+                "text/*".into(),
+            ],
+            oversize_policy: "log".into(),
+            uninspectable_policy: "log".into(),
+            timeout_ms: 1000,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -398,7 +429,27 @@ fn waf_config_from(
         challenge_difficulty: settings.challenge_difficulty.clamp(1, 6) as u8,
         challenge_ttl_secs: settings.challenge_ttl_secs.clamp(60, 86_400) as u64,
         security_level: settings.security_level,
+        body: WafBodyOut {
+            enabled: settings.body_inspection,
+            max_bytes: settings.body_max_bytes.clamp(1024, 65_536) as u32,
+            methods: csv_items(&settings.body_methods)
+                .into_iter()
+                .map(|m| m.to_ascii_uppercase())
+                .collect(),
+            content_types: csv_items(&settings.body_content_types),
+            oversize_policy: settings.body_oversize_policy,
+            uninspectable_policy: settings.body_uninspectable_policy,
+            timeout_ms: settings.body_timeout_ms.clamp(100, 5000) as u32,
+        },
     }
+}
+
+fn csv_items(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 pub(crate) fn build(
@@ -927,6 +978,13 @@ mod tests {
             managed_rulesets: String::new(),
             waf_rulepack_version: String::new(),
             waf_gray_percent: 0,
+            body_inspection: false,
+            body_max_bytes: 32768,
+            body_methods: "POST,PUT,PATCH".into(),
+            body_content_types: "application/json,application/x-www-form-urlencoded,text/*".into(),
+            body_oversize_policy: "log".into(),
+            body_uninspectable_policy: "log".into(),
+            body_timeout_ms: 1000,
         }
     }
 
@@ -1175,6 +1233,26 @@ mod tests {
     ///
     /// This used to fail for `managed_rulesets`: the hash listed fields by hand
     /// and that one was missing.
+    #[test]
+    fn body_settings_reach_the_edge_config() {
+        let mut settings = settings();
+        settings.body_inspection = true;
+        settings.body_max_bytes = 65_536;
+        settings.body_methods = "post,put,patch".into();
+        settings.body_content_types = "application/json,text/*".into();
+        settings.body_oversize_policy = "block".into();
+        settings.body_uninspectable_policy = "allow".into();
+        settings.body_timeout_ms = 5000;
+        let waf = waf_config_from("example.com", settings, vec![], vec![], vec![], &[]);
+        assert!(waf.body.enabled);
+        assert_eq!(waf.body.max_bytes, 65_536);
+        assert_eq!(waf.body.methods, vec!["POST", "PUT", "PATCH"]);
+        assert_eq!(waf.body.content_types, vec!["application/json", "text/*"]);
+        assert_eq!(waf.body.oversize_policy, "block");
+        assert_eq!(waf.body.uninspectable_policy, "allow");
+        assert_eq!(waf.body.timeout_ms, 5000);
+    }
+
     #[test]
     fn version_changes_when_managed_rulesets_change() {
         let base = waf_config_from(

@@ -684,7 +684,8 @@ CC_SYNC_INTERVAL=5   # 共享封禁拉取间隔（秒），最小 2
 
 - `TRUST_PROXY_HEADERS=true` 时 WAF 信任 `X-Forwarded-For` 的第一个地址。
   只有边缘前面是可信代理（SLB/网关）时才可开启，否则攻击者可以伪造白名单 IP。
-- 当前不做请求体检查（WAF 在读取 body 之前执行），不支持正则，也没有 IP 信誉库/地域封禁。
+- 请求体检查需按域名开启（`PUT /waf` 的 `body` 字段），只支持带 `Content-Length` 的
+  POST/PUT/PATCH JSON/form/text body，硬上限 64 KiB；不支持正则，也没有 IP 信誉库/地域封禁。
 - 安全级别「攻击中」会质询所有非静态资源的 GET/HEAD，包括 API 请求；这类客户端无法执行 JS 时会收到 403，
   建议仅在应急时开启，或配合放行规则豁免 API 路径。
 

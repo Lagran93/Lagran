@@ -5,8 +5,9 @@
 #   * a custom DSL `body contains "..."" rule is evaluated
 #   * oversized bodies follow the configured policy (default `log` = forward)
 #
-# The console/control fields for body inspection land in P2; this script uses
-# the edge preview switch `WAF_BODY_INSPECTION=true`.
+# Body policy is configured through the control-plane WAF settings API (P2).
+# The last phase restarts the edge with WAF_BODY_OVERSIZE_POLICY=block to cover
+# the operator env override.
 #
 #   bash tests/integration/waf-body.sh
 #
@@ -88,9 +89,19 @@ DOMAIN_ID=$(curl -s -H "$AUTH" "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" \
   | jq -r --arg n "$DOMAIN" '.[] | select(.name == $n) | .id')
 [[ -n "$DOMAIN_ID" ]] || { echo "domain not found"; exit 1; }
 
+BODY_SETTINGS='{"enabled":true,"max_bytes":1024,"methods":["POST","PUT","PATCH"],"content_types":["application/json"],"oversize_policy":"log","uninspectable_policy":"log","timeout_ms":1000}'
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H "$AUTH" \
   -H 'content-type: application/json' \
-  -d '{"enabled":true,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true,"rce":true,"ssrf":true,"xxe":true,"log4shell":true,"crlf":true,"ssti":true,"nosql":true,"ldap":true,"java":true,"webshell":true,"protocol":true,"challenge_difficulty":2,"challenge_ttl_secs":300}' >/dev/null
+  -d '{"enabled":true,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true,"rce":true,"ssrf":true,"xxe":true,"log4shell":true,"crlf":true,"ssti":true,"nosql":true,"ldap":true,"java":true,"webshell":true,"protocol":true,"challenge_difficulty":2,"challenge_ttl_secs":300,"body":'"$BODY_SETTINGS"'}' >/dev/null
+
+INVALID=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H "$AUTH" \
+  -H 'content-type: application/json' \
+  -d '{"body":{"methods":["GET"]}}')
+check "invalid body.methods rejected" "$INVALID" "400"
+SETTINGS=$(curl -s -H "$AUTH" "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf")
+check "settings expose body.enabled" "$(printf '%s' "$SETTINGS" | jq -r '.body.enabled')" "true"
+check "settings expose body.max_bytes" "$(printf '%s' "$SETTINGS" | jq -r '.body.max_bytes')" "1024"
 curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf/rules" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"name":"请求体黑名单","field":"path","operator":"contains","value":"evil-body","expr":"body contains \"evil-body\"","action":"block","priority":10}' >/dev/null
@@ -101,18 +112,15 @@ NODE=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/nodes" -H "$AUTH" 
 NODE_TOKEN=$(printf '%s' "$NODE" | jq -r '.token // empty')
 [[ -n "$NODE_TOKEN" ]] || { echo "node failed: $NODE"; exit 1; }
 
-echo "== start edge with WAF_BODY_INSPECTION=true =="
+echo "== start edge with per-domain body policy =="
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
+EDGE_ADMIN_LISTEN= \
 AGENT_URL="http://127.0.0.1:$EDGE_PORT" \
 AGENT_TOKEN="$NODE_TOKEN" \
 NODE_ID="waf-body-edge-$$" \
 CACHE_BACKEND=memory \
 CACHE_TTL=60 \
-WAF_BODY_INSPECTION=true \
-WAF_BODY_MAX_BYTES=1024 \
-WAF_BODY_OVERSIZE_POLICY=log \
-WAF_BODY_UNINSPECTABLE_POLICY=log \
 RUST_LOG=lagran_edge=debug,edge=debug \
 ./target/debug/lagran-edge >"$LOG_DIR/edge.log" 2>&1 &
 EDGE_PID=$!
@@ -152,11 +160,27 @@ CODE=$(body_request "{\"data\":\"$PADDING\"}")
 check "oversize body forwarded under log policy" "$CODE" "200"
 contains "edge logged the uninspected body" "$(cat "$LOG_DIR/edge.log")" "WAF body inspection skipped"
 
+echo "== body metrics are exported =="
+METRICS_CODE=$(curl -s -o "$LOG_DIR/metrics" -w '%{http_code}' -H "x-lagran-agent-token: $NODE_TOKEN" \
+  "http://127.0.0.1:$EDGE_PORT/__lagran/metrics")
+METRICS=$(cat "$LOG_DIR/metrics")
+check "metrics endpoint accepts the node token" "$METRICS_CODE" "200"
+contains "metrics expose inspected counter" "$METRICS" "lagran_edge_waf_body_inspected_total"
+contains "metrics expose blocked counter" "$METRICS" "lagran_edge_waf_body_blocked_total"
+INSPECTED=$(printf '%s' "$METRICS" | awk '/^lagran_edge_waf_body_inspected_total /{print $2; exit}')
+BLOCKED=$(printf '%s' "$METRICS" | awk '/^lagran_edge_waf_body_blocked_total /{print $2; exit}')
+if [[ "${INSPECTED:-0}" -ge 2 && "${BLOCKED:-0}" -ge 2 ]]; then
+  pass "body counters advanced (inspected=$INSPECTED blocked=$BLOCKED)"
+else
+  fail "body counters stale (inspected=${INSPECTED:-0} blocked=${BLOCKED:-0})"
+fi
+
 echo "== oversize block policy rejects before reading =="
 kill "$EDGE_PID" 2>/dev/null
 wait "$EDGE_PID" 2>/dev/null
 CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
 EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
+EDGE_ADMIN_LISTEN= \
 AGENT_URL="http://127.0.0.1:$EDGE_PORT" \
 AGENT_TOKEN="$NODE_TOKEN" \
 NODE_ID="waf-body-edge-$$" \

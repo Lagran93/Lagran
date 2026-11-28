@@ -3060,6 +3060,13 @@ pub struct WafSettingsRow {
     pub managed_rulesets: String,
     pub waf_rulepack_version: String,
     pub waf_gray_percent: i32,
+    pub body_inspection: bool,
+    pub body_max_bytes: i32,
+    pub body_methods: String,
+    pub body_content_types: String,
+    pub body_oversize_policy: String,
+    pub body_uninspectable_policy: String,
+    pub body_timeout_ms: i32,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -3126,7 +3133,16 @@ pub async fn get_waf_settings(
                challenge_difficulty, challenge_ttl_secs, security_level,
                COALESCE(managed_rulesets, '') AS managed_rulesets,
                COALESCE(waf_rulepack_version, '') AS waf_rulepack_version,
-               COALESCE(waf_gray_percent, 0) AS waf_gray_percent
+               COALESCE(waf_gray_percent, 0) AS waf_gray_percent,
+               COALESCE(body_inspection, FALSE) AS body_inspection,
+               COALESCE(body_max_bytes, 32768) AS body_max_bytes,
+               COALESCE(body_methods, 'POST,PUT,PATCH') AS body_methods,
+               COALESCE(body_content_types,
+                        'application/json,application/x-www-form-urlencoded,text/*')
+                   AS body_content_types,
+               COALESCE(body_oversize_policy, 'log') AS body_oversize_policy,
+               COALESCE(body_uninspectable_policy, 'log') AS body_uninspectable_policy,
+               COALESCE(body_timeout_ms, 1000) AS body_timeout_ms
         FROM waf_settings WHERE domain_id = $1
         "#,
     )
@@ -3162,6 +3178,13 @@ pub async fn upsert_waf_settings(
     managed_rulesets: &str,
     waf_rulepack_version: &str,
     waf_gray_percent: i32,
+    body_inspection: bool,
+    body_max_bytes: i32,
+    body_methods: &str,
+    body_content_types: &str,
+    body_oversize_policy: &str,
+    body_uninspectable_policy: &str,
+    body_timeout_ms: i32,
 ) -> sqlx::Result<WafSettingsRow> {
     sqlx::query_as::<_, WafSettingsRow>(
         r#"
@@ -3170,9 +3193,12 @@ pub async fn upsert_waf_settings(
              rce, ssrf, xxe, log4shell, crlf,
              ssti, nosql, ldap, java, webshell, protocol,
              challenge_difficulty, challenge_ttl_secs, security_level,
-             managed_rulesets, waf_rulepack_version, waf_gray_percent)
+             managed_rulesets, waf_rulepack_version, waf_gray_percent,
+             body_inspection, body_max_bytes, body_methods, body_content_types,
+             body_oversize_policy, body_uninspectable_policy, body_timeout_ms)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+                $25, $26, $27, $28, $29, $30, $31)
         ON CONFLICT (domain_id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
           mode = EXCLUDED.mode,
@@ -3197,12 +3223,21 @@ pub async fn upsert_waf_settings(
           managed_rulesets = EXCLUDED.managed_rulesets,
           waf_rulepack_version = EXCLUDED.waf_rulepack_version,
           waf_gray_percent = EXCLUDED.waf_gray_percent,
+          body_inspection = EXCLUDED.body_inspection,
+          body_max_bytes = EXCLUDED.body_max_bytes,
+          body_methods = EXCLUDED.body_methods,
+          body_content_types = EXCLUDED.body_content_types,
+          body_oversize_policy = EXCLUDED.body_oversize_policy,
+          body_uninspectable_policy = EXCLUDED.body_uninspectable_policy,
+          body_timeout_ms = EXCLUDED.body_timeout_ms,
           updated_at = NOW()
         RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners,
                   rce, ssrf, xxe, log4shell, crlf,
                   ssti, nosql, ldap, java, webshell, protocol,
                   challenge_difficulty, challenge_ttl_secs, security_level,
-                  managed_rulesets, waf_rulepack_version, waf_gray_percent
+                  managed_rulesets, waf_rulepack_version, waf_gray_percent,
+                  body_inspection, body_max_bytes, body_methods, body_content_types,
+                  body_oversize_policy, body_uninspectable_policy, body_timeout_ms
         "#,
     )
     .bind(domain_id)
@@ -3229,6 +3264,13 @@ pub async fn upsert_waf_settings(
     .bind(managed_rulesets)
     .bind(waf_rulepack_version)
     .bind(waf_gray_percent)
+    .bind(body_inspection)
+    .bind(body_max_bytes)
+    .bind(body_methods)
+    .bind(body_content_types)
+    .bind(body_oversize_policy)
+    .bind(body_uninspectable_policy)
+    .bind(body_timeout_ms)
     .fetch_one(pool)
     .await
 }
@@ -3242,7 +3284,16 @@ pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSetting
                challenge_difficulty, challenge_ttl_secs, security_level,
                COALESCE(managed_rulesets, '') AS managed_rulesets,
                COALESCE(waf_rulepack_version, '') AS waf_rulepack_version,
-               COALESCE(waf_gray_percent, 0) AS waf_gray_percent
+               COALESCE(waf_gray_percent, 0) AS waf_gray_percent,
+               COALESCE(body_inspection, FALSE) AS body_inspection,
+               COALESCE(body_max_bytes, 32768) AS body_max_bytes,
+               COALESCE(body_methods, 'POST,PUT,PATCH') AS body_methods,
+               COALESCE(body_content_types,
+                        'application/json,application/x-www-form-urlencoded,text/*')
+                   AS body_content_types,
+               COALESCE(body_oversize_policy, 'log') AS body_oversize_policy,
+               COALESCE(body_uninspectable_policy, 'log') AS body_uninspectable_policy,
+               COALESCE(body_timeout_ms, 1000) AS body_timeout_ms
         FROM waf_settings
         "#,
     )

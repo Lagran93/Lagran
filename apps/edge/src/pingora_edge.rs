@@ -883,6 +883,9 @@ impl ProxyHttp for DataPlaneProxy {
                 body_inspect::decide(&domain, &ctx.method, &session.req_header().headers);
             let body_text = match decision {
                 body_inspect::Decision::Skip { reason, log } => {
+                    if !matches!(reason, "disabled" | "method" | "upgrade" | "empty") {
+                        self.state.metrics.record_waf_body_skipped();
+                    }
                     if log {
                         // Per-request WARN here would let a normal upload path
                         // flood the logs. Metrics cover the aggregate; keep the
@@ -896,6 +899,7 @@ impl ProxyHttp for DataPlaneProxy {
                     None
                 }
                 body_inspect::Decision::Reject { status, reason } => {
+                    self.state.metrics.record_waf_body_skipped();
                     ctx.status = status.as_u16();
                     ctx.cache_label = "BYPASS";
                     ctx.cache_reason = Some(reason);
@@ -909,50 +913,62 @@ impl ProxyHttp for DataPlaneProxy {
                     return Ok(true);
                 }
                 body_inspect::Decision::Inspect { max_bytes, timeout } => {
-                    match body_inspect::read(session, max_bytes, timeout).await {
-                        Ok(bytes) => {
-                            let expected =
-                                body_inspect::content_length(&session.req_header().headers);
-                            if expected.is_some_and(|length| length != bytes.len()) {
-                                ctx.status = 400;
+                    if let Some(_permit) = body_inspect::try_acquire() {
+                        match body_inspect::read(session, max_bytes, timeout).await {
+                            Ok(bytes) => {
+                                let expected =
+                                    body_inspect::content_length(&session.req_header().headers);
+                                if expected.is_some_and(|length| length != bytes.len()) {
+                                    ctx.status = 400;
+                                    ctx.cache_label = "BYPASS";
+                                    ctx.cache_reason = Some("content-length-mismatch");
+                                    write_plain(
+                                        session,
+                                        400,
+                                        "text/plain; charset=utf-8",
+                                        Bytes::from_static(b"request body length mismatch"),
+                                    )
+                                    .await;
+                                    return Ok(true);
+                                }
+                                let content_type = session
+                                    .req_header()
+                                    .headers
+                                    .get(axum::http::header::CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("");
+                                self.state.metrics.record_waf_body_inspected(bytes.len() as u64);
+                                Some(decode_for_scan(content_type, &bytes))
+                            }
+                            Err(error) => {
+                                self.state.metrics.record_waf_body_error();
+                                tracing::warn!(
+                                    domain = %domain.domain,
+                                    reason = error.reason(),
+                                    error = ?error,
+                                    "WAF body read failed; request rejected"
+                                );
+                                ctx.status = error.status().as_u16();
                                 ctx.cache_label = "BYPASS";
-                                ctx.cache_reason = Some("content-length-mismatch");
+                                ctx.cache_reason = Some(error.reason());
                                 write_plain(
                                     session,
-                                    400,
+                                    error.status().as_u16(),
                                     "text/plain; charset=utf-8",
-                                    Bytes::from_static(b"request body length mismatch"),
+                                    Bytes::from_static(b"request body could not be inspected"),
                                 )
                                 .await;
                                 return Ok(true);
                             }
-                            let content_type = session
-                                .req_header()
-                                .headers
-                                .get(axum::http::header::CONTENT_TYPE)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            Some(decode_for_scan(content_type, &bytes))
                         }
-                        Err(error) => {
-                            tracing::warn!(
-                                domain = %domain.domain,
-                                reason = error.reason(),
-                                error = ?error,
-                                "WAF body read failed; request rejected"
-                            );
-                            ctx.status = error.status().as_u16();
-                            ctx.cache_label = "BYPASS";
-                            ctx.cache_reason = Some(error.reason());
-                            write_plain(
-                                session,
-                                error.status().as_u16(),
-                                "text/plain; charset=utf-8",
-                                Bytes::from_static(b"request body could not be inspected"),
-                            )
-                            .await;
-                            return Ok(true);
-                        }
+                    } else {
+                        self.state.metrics.record_waf_body_skipped();
+                        tracing::debug!(
+                            domain = %domain.domain,
+                            reason = "concurrency",
+                            "WAF body inspection skipped; request forwarded uninspected"
+                        );
+                        None
                     }
                 }
             };
@@ -973,6 +989,9 @@ impl ProxyHttp for DataPlaneProxy {
                 pipeline.preflight(&domain, &facts).await
             };
             if let Some(resp) = preflight {
+                if body_text.is_some() && resp.headers().contains_key("x-lagran-waf") {
+                    self.state.metrics.record_waf_body_blocked();
+                }
                 let is_head = ctx.method == Method::HEAD;
                 write_axum_response(session, resp, is_head, Some(&self.compression)).await;
                 return Ok(true);
@@ -4997,10 +5016,30 @@ impl DataPlaneProxy {
                      lagran_edge_config_errors_total {}\n\
                      # HELP lagran_edge_rulepack_missing_rulesets Enabled WAF rulesets missing from the pinned rulepack\n\
                      # TYPE lagran_edge_rulepack_missing_rulesets gauge\n\
-                     lagran_edge_rulepack_missing_rulesets {}
+                     lagran_edge_rulepack_missing_rulesets {}\n\
+                     # HELP lagran_edge_waf_body_inspected_total Requests whose body was inspected\n\
+                     # TYPE lagran_edge_waf_body_inspected_total counter\n\
+                     lagran_edge_waf_body_inspected_total {}\n\
+                     # HELP lagran_edge_waf_body_bytes_total Inspected request-body bytes\n\
+                     # TYPE lagran_edge_waf_body_bytes_total counter\n\
+                     lagran_edge_waf_body_bytes_total {}\n\
+                     # HELP lagran_edge_waf_body_skipped_total Requests whose body inspection was skipped\n\
+                     # TYPE lagran_edge_waf_body_skipped_total counter\n\
+                     lagran_edge_waf_body_skipped_total {}\n\
+                     # HELP lagran_edge_waf_body_blocked_total WAF blocks after body inspection\n\
+                     # TYPE lagran_edge_waf_body_blocked_total counter\n\
+                     lagran_edge_waf_body_blocked_total {}\n\
+                     # HELP lagran_edge_waf_body_errors_total Body read/inspection failures\n\
+                     # TYPE lagran_edge_waf_body_errors_total counter\n\
+                     lagran_edge_waf_body_errors_total {}
 ",
                     self.state.metrics.config_errors(),
                     self.state.metrics.rulepack_missing_rulesets(),
+                    self.state.metrics.waf_body_inspected(),
+                    self.state.metrics.waf_body_bytes(),
+                    self.state.metrics.waf_body_skipped(),
+                    self.state.metrics.waf_body_blocked(),
+                    self.state.metrics.waf_body_errors(),
                 ));
                 write_plain(
                     session,

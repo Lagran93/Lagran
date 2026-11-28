@@ -250,6 +250,21 @@ async fn prometheus_metrics(
          # HELP lagran_edge_rulepack_missing_rulesets Enabled WAF rulesets missing from the pinned rulepack\n\
          # TYPE lagran_edge_rulepack_missing_rulesets gauge\n\
          lagran_edge_rulepack_missing_rulesets {}\n\
+         # HELP lagran_edge_waf_body_inspected_total Requests whose body was inspected\n\
+         # TYPE lagran_edge_waf_body_inspected_total counter\n\
+         lagran_edge_waf_body_inspected_total {}\n\
+         # HELP lagran_edge_waf_body_bytes_total Inspected request-body bytes\n\
+         # TYPE lagran_edge_waf_body_bytes_total counter\n\
+         lagran_edge_waf_body_bytes_total {}\n\
+         # HELP lagran_edge_waf_body_skipped_total Requests whose body inspection was skipped\n\
+         # TYPE lagran_edge_waf_body_skipped_total counter\n\
+         lagran_edge_waf_body_skipped_total {}\n\
+         # HELP lagran_edge_waf_body_blocked_total WAF blocks after body inspection\n\
+         # TYPE lagran_edge_waf_body_blocked_total counter\n\
+         lagran_edge_waf_body_blocked_total {}\n\
+         # HELP lagran_edge_waf_body_errors_total Body read/inspection failures\n\
+         # TYPE lagran_edge_waf_body_errors_total counter\n\
+         lagran_edge_waf_body_errors_total {}\n\
          # HELP lagran_edge_origin_stream_requests_total Streaming origin responses\n\
          # TYPE lagran_edge_origin_stream_requests_total counter\n\
          lagran_edge_origin_stream_requests_total {}\n\
@@ -308,6 +323,11 @@ async fn prometheus_metrics(
         global.origin_errors,
         global.config_errors,
         global.rulepack_missing_rulesets,
+        global.waf_body_inspected,
+        global.waf_body_bytes,
+        global.waf_body_skipped,
+        global.waf_body_blocked,
+        global.waf_body_errors,
         global.stream_requests,
         global.stream_bytes,
         global.stream_errors,
