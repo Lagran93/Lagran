@@ -2904,6 +2904,37 @@ CACHE_KEY_IGNORE_HEADERS=accept-language,origin
 
 ---
 
+### 5.11 内容压缩
+
+可缓存回源请求统一使用 `Accept-Encoding: identity`，缓存主对象只保存 identity；
+压缩在下发阶段按客户端 `Accept-Encoding` 协商：
+
+```text
+支持：gzip、zstd、deflate（zlib 包装，RFC 1950）
+默认：仅 gzip
+同 q 值优先级：zstd > gzip > deflate
+```
+
+配置：
+
+```env
+EDGE_COMPRESSION=on
+# 逗号分隔；默认 gzip。启用 zstd/deflate 需显式列出。
+EDGE_COMPRESSION_ALGORITHMS=gzip,zstd,deflate
+EDGE_COMPRESSION_MIN_BYTES=1024
+EDGE_COMPRESSION_LEVEL=4      # gzip 1–9
+EDGE_ZSTD_LEVEL=3             # zstd 1–19
+EDGE_DEFLATE_LEVEL=4          # deflate 1–9
+```
+
+- 压缩发生在缓存写入之后，缓存命中同样按客户端编码下发；
+- gzip/zstd/deflate 各自有独立的预压缩内存副本缓存（`EDGE_COMPRESSED_CACHE_*`），
+  不同编码不会串用；
+- `Content-Encoding`、`Vary: Accept-Encoding` 与 ETag weaken 自动处理；
+- 206 / HEAD / 204 / `Cache-Control: no-transform` / 已编码源站响应不压缩；
+- 源站返回的已编码响应（包括 zstd/deflate/br）原样透传，不会解压后重新压缩；
+- `deflate` 使用 zlib 包装，不是 raw deflate。
+
 ## 6. WAF、CC 与共享封禁
 
 ### 6.1 CC 客户端聚合

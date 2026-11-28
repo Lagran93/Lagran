@@ -444,6 +444,21 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
                     ("Cache-Control", "public, max-age=3600".into()),
                 ],
             ),
+            "/html-large" => (
+                200,
+                {
+                    let mut body = String::from("<!doctype html><html><body>");
+                    for _ in 0..200 {
+                        body.push_str("downstream-compression-test ");
+                    }
+                    body.push_str("</body></html>");
+                    body.into_bytes()
+                },
+                vec![
+                    ("Content-Type", "text/html; charset=utf-8".into()),
+                    ("Cache-Control", "public, max-age=3600".into()),
+                ],
+            ),
             // Static asset that varies on Cookie. Even an ignore_cookie rule cannot
             // store it: Cookie is not in the cache key, so variants would be mixed.
             // `cache-rules.sh` asserts the second request stays a MISS.

@@ -24,7 +24,9 @@ use crate::security::signed_url;
 use crate::server::body_inspect;
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
-use crate::server::compression::{CompressionConfig, GzipEncoder, replay_chunk, should_compress};
+use crate::server::compression::{
+    replay_chunk, select_encoding, CompressionConfig, Encoding, StreamEncoder,
+};
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::state::AppState;
 use crate::server::shared::{
@@ -336,12 +338,12 @@ struct ReqCtx {
     response_policy: Option<ResponsePolicySlot>,
     range_fill: Option<RangeFill>,
     range_sink: Option<RangeSink>,
-    /// Active gzip encoder for this response; set in `response_filter`.
-    gzip: Option<GzipEncoder>,
-    /// Pre-compressed body to replay instead of re-gzipping this response.
-    gzip_replay: Option<Bytes>,
-    /// Accumulates gzip output on the first request so it can be reused later.
-    gzip_store: Option<(String, BytesMut)>,
+    /// Active streaming encoder for this response; set in `response_filter`.
+    encoding: Option<StreamEncoder>,
+    /// Pre-compressed body to replay instead of re-encoding this response.
+    encoded_replay: Option<Bytes>,
+    /// Accumulates encoded output on the first request so it can be reused.
+    encoded_store: Option<(String, BytesMut)>,
     /// Remaining lifetime of the identity entry, reused as the variant TTL.
     identity_ttl_secs: Option<u64>,
     flight_guard: Option<crate::cache::flight::FlightGuard>,
@@ -383,9 +385,9 @@ impl Default for ReqCtx {
             response_policy: None,
             range_fill: None,
             range_sink: None,
-            gzip: None,
-            gzip_replay: None,
-            gzip_store: None,
+            encoding: None,
+            encoded_replay: None,
+            encoded_store: None,
             identity_ttl_secs: None,
             flight_guard: None,
             upstream_start: None,
@@ -1922,11 +1924,15 @@ impl ProxyHttp for DataPlaneProxy {
         Self::apply_cors_and_custom(response, &plan.domain.response_headers);
         // Compress here, not upstream: the cache has already stored the
         // identity body, so one object serves every Accept-Encoding.
-        if !plan.is_head && !plan.is_websocket && ctx.gzip.is_none() && ctx.gzip_replay.is_none() {
-            let (compress, request_version) = {
+        if !plan.is_head
+            && !plan.is_websocket
+            && ctx.encoding.is_none()
+            && ctx.encoded_replay.is_none()
+        {
+            let (selected, request_version) = {
                 let req = session.req_header();
                 (
-                    should_compress(
+                    select_encoding(
                         &self.compression,
                         req.version,
                         &req.method,
@@ -1937,9 +1943,10 @@ impl ProxyHttp for DataPlaneProxy {
                     req.version,
                 )
             };
-            if compress {
-                // Key variants by the validator so a changed object can never
-                // be served from a stale compressed copy.
+            if let Some(coding) = selected {
+                // Key variants by validator + coding so a changed object can
+                // never be served from a stale compressed copy, and gzip/zstd/
+                // deflate variants never collide.
                 let etag = response
                     .headers
                     .get(header::ETAG)
@@ -1948,19 +1955,19 @@ impl ProxyHttp for DataPlaneProxy {
                     .map(str::to_string);
                 let variant_key = if plan.cacheable && ctx.identity_ttl_secs.is_some() {
                     etag.as_deref()
-                        .map(|etag| compressed_variant_key(&plan.key, etag))
+                        .map(|etag| compressed_variant_key(&plan.key, coding, etag))
                 } else {
                     None
                 };
                 if let Some(key) = variant_key.as_deref() {
                     if let Some(cached) = self.state.compressed.get(key).await {
                         if !cached.body.is_empty() {
-                            ctx.gzip_replay = Some(cached.body);
+                            ctx.encoded_replay = Some(cached.body);
                         }
                     }
                 }
 
-                response.insert_header(header::CONTENT_ENCODING, "gzip")?;
+                response.insert_header(header::CONTENT_ENCODING, coding.as_str())?;
                 // The compressed length is not known up front.
                 response.remove_header(&header::CONTENT_LENGTH);
                 vary_on_accept_encoding(response)?;
@@ -1971,11 +1978,11 @@ impl ProxyHttp for DataPlaneProxy {
                 }
                 weaken_etag(response)?;
 
-                if ctx.gzip_replay.is_none() {
-                    ctx.gzip = Some(GzipEncoder::new(self.compression.level));
+                if ctx.encoded_replay.is_none() {
+                    ctx.encoding = Some(StreamEncoder::new(coding, &self.compression));
                     if let Some(key) = variant_key {
                         if self.compression.variant_max_object_bytes > 0 {
-                            ctx.gzip_store = Some((key, BytesMut::new()));
+                            ctx.encoded_store = Some((key, BytesMut::new()));
                         }
                     }
                 }
@@ -2091,41 +2098,41 @@ impl ProxyHttp for DataPlaneProxy {
                 }
             }
         }
-        if ctx.gzip_replay.is_some() || ctx.gzip.is_some() {
+        if ctx.encoded_replay.is_some() || ctx.encoding.is_some() {
             // Replay path: the compressed copy is already in memory. The
             // identity body is still streamed by the cache layer, so it is
             // dropped here instead of being re-compressed.
-            if let Some(replay) = ctx.gzip_replay.as_mut() {
+            if let Some(replay) = ctx.encoded_replay.as_mut() {
                 let input_len = body.as_ref().map(|chunk| chunk.len()).unwrap_or(0);
                 let out = replay_chunk(replay, input_len, end_of_stream);
                 *body = if out.is_empty() { None } else { Some(out) };
                 if end_of_stream {
-                    ctx.gzip_replay = None;
+                    ctx.encoded_replay = None;
                 }
                 return Ok(None);
             }
 
             let mut encoded = BytesMut::new();
             if let Some(chunk) = body.as_ref() {
-                if let Some(encoder) = ctx.gzip.as_mut() {
+                if let Some(encoder) = ctx.encoding.as_mut() {
                     encoded.extend_from_slice(&encoder.write(chunk));
                 }
             }
             if end_of_stream {
-                if let Some(encoder) = ctx.gzip.take() {
+                if let Some(encoder) = ctx.encoding.take() {
                     encoded.extend_from_slice(&encoder.finish());
                 }
             }
-            if let Some((_, buffer)) = ctx.gzip_store.as_mut() {
+            if let Some((_, buffer)) = ctx.encoded_store.as_mut() {
                 if buffer.len() + encoded.len() <= self.compression.variant_max_object_bytes {
                     buffer.extend_from_slice(&encoded);
                 } else {
                     // Too large to retain; keep streaming without the store.
-                    ctx.gzip_store = None;
+                    ctx.encoded_store = None;
                 }
             }
             if end_of_stream {
-                if let Some((key, buffer)) = ctx.gzip_store.take() {
+                if let Some((key, buffer)) = ctx.encoded_store.take() {
                     let ttl = ctx
                         .identity_ttl_secs
                         .unwrap_or(self.compression.variant_ttl_secs)
@@ -5536,13 +5543,13 @@ fn head_content_length_for_protocol(_is_h2: bool, body_len: usize) -> String {
 /// without this every request that falls back to the engine — an unregistered
 /// domain, a rejected host, an error page — was served uncompressed no matter how
 /// the edge was configured.
-/// gzip a finished engine response body, or `None` to send it as-is.
+/// Compress a finished engine response body, or `None` to send it as-is.
 ///
 /// Separated from `write_axum_response` so the decision *and* the encoding are
 /// testable without a live `Session`. The engine path bypasses `response_filter`,
 /// so this is the only place compression can happen for it.
 #[allow(clippy::too_many_arguments)]
-fn gzip_engine_body(
+fn compress_engine_body(
     cfg: &CompressionConfig,
     is_head: bool,
     version: http::Version,
@@ -5551,27 +5558,19 @@ fn gzip_engine_body(
     response_headers: &http::HeaderMap,
     request_headers: &http::HeaderMap,
     body: &Bytes,
-) -> Option<Bytes> {
+) -> Option<(Encoding, Bytes)> {
     if is_head || body.is_empty() {
         return None;
     }
-    if !should_compress(
+    let coding = select_encoding(
         cfg,
         version,
         method,
         status,
         response_headers,
         request_headers,
-    ) {
-        return None;
-    }
-    let mut encoder = GzipEncoder::new(cfg.level);
-    let head = encoder.write(body);
-    let tail = encoder.finish();
-    let mut out = BytesMut::with_capacity(head.len() + tail.len());
-    out.extend_from_slice(&head);
-    out.extend_from_slice(&tail);
-    Some(out.freeze())
+    )?;
+    Some((coding, StreamEncoder::encode_all(coding, cfg, body)))
 }
 
 async fn write_axum_response(
@@ -5599,8 +5598,8 @@ async fn write_axum_response(
     let request_version = session.req_header().version;
     let request_method = session.req_header().method.clone();
     let request_headers = session.req_header().headers.clone();
-    let would_compress = compression.is_some_and(|cfg| {
-        should_compress(
+    let selected_encoding = compression.and_then(|cfg| {
+        select_encoding(
             cfg,
             request_version,
             &request_method,
@@ -5618,7 +5617,7 @@ async fn write_axum_response(
     // delimited by closing the connection. Keep the previous buffered behaviour
     // for those clients instead of silently changing keep-alive semantics.
     let http10 = request_version == Version::HTTP_10;
-    if !is_head && !no_content && !would_compress && !body_is_empty && !http10 {
+    if !is_head && !no_content && selected_encoding.is_none() && !body_is_empty && !http10 {
         // Pass the known length down: a streamed response that advertises no
         // `Content-Length` can only be delimited by closing the connection, and on
         // a keep-alive session that leaves the client waiting for an EOF that never
@@ -5638,11 +5637,11 @@ async fn write_axum_response(
             return;
         }
     };
-    // gzip in the engine path. `should_compress` applies the same rules the
-    // Pingora path uses (status, content type, size floor, Accept-Encoding), so the
-    // two data planes agree on what gets compressed.
+    // Compression in the engine path. `select_encoding` applies the same rules
+    // the Pingora path uses (status, content type, size floor, Accept-Encoding),
+    // so the two data planes agree on what gets compressed.
     if let Some(cfg) = compression {
-        if let Some(compressed) = gzip_engine_body(
+        if let Some((coding, compressed)) = compress_engine_body(
             cfg,
             is_head,
             request_version,
@@ -5656,7 +5655,7 @@ async fn write_axum_response(
             parts.headers.remove(axum::http::header::CONTENT_LENGTH);
             parts.headers.insert(
                 axum::http::header::CONTENT_ENCODING,
-                HeaderValue::from_static("gzip"),
+                coding.as_str().parse().unwrap(),
             );
             // Caches must key on the encoding they were served.
             if !parts.headers.contains_key(axum::http::header::VARY) {
@@ -6113,8 +6112,8 @@ pub(crate) fn effective_connect_timeout_ms(domain_override_ms: u32, global_ms: u
 /// Embedding the validator means a changed object can never be served from a
 /// stale compressed copy: the key changes with the ETag and the old variant
 /// simply ages out.
-fn compressed_variant_key(cache_key: &str, etag: &str) -> String {
-    format!("{cache_key}\u{0}gzip\u{0}{etag}")
+fn compressed_variant_key(cache_key: &str, coding: Encoding, etag: &str) -> String {
+    format!("{cache_key}\u{0}{}\u{0}{etag}", coding.as_str())
 }
 
 /// Add `Accept-Encoding` to `Vary` without discarding existing values.
@@ -6435,8 +6434,13 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
         dns_cache: OriginDnsCache::new(),
         compression: CompressionConfig {
             enabled: config.compression_enabled,
+            algorithms: crate::server::compression::Algorithms::from_csv(
+                &config.compression_algorithms,
+            ),
             min_bytes: config.compression_min_bytes,
             level: config.compression_level,
+            zstd_level: config.compression_zstd_level,
+            deflate_level: config.compression_deflate_level,
             // Reuse is only possible when the variant store has room.
             variant_max_object_bytes: if config.compressed_cache_bytes == 0
                 || config.compressed_cache_entries == 0
@@ -6507,12 +6511,13 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 mod tests {
     use super::{
         DataPlaneProxy, ResponsePolicySlot, cached_response_policy, compressed_variant_key,
-        effective_connect_timeout_ms, fill_window, gzip_engine_body,
+        effective_connect_timeout_ms, fill_window, compress_engine_body,
         head_content_length_for_protocol, is_strict_revalidation, merge_multipart_spans,
         needs_loopback_listener, parse_multi_ranges, parse_single_range,
         range_fill_is_candidate, valid_release_tag, vary_on_accept_encoding, weaken_etag,
     };
     use crate::cache::policy::ResolvedPolicy;
+    use crate::server::compression::Encoding;
     use crate::server::response_headers::ResponseHeaderOverrides;
     use bytes::Bytes;
     use pingora::http::ResponseHeader;
@@ -6599,13 +6604,21 @@ mod tests {
     /// object (new ETag) must never hit a stale compressed copy.
     #[test]
     fn compressed_variant_key_tracks_the_validator() {
-        let a = compressed_variant_key("GET:a.test/x", "\"v1\"");
-        let b = compressed_variant_key("GET:a.test/x", "\"v2\"");
-        let other = compressed_variant_key("GET:b.test/x", "\"v1\"");
+        let a = compressed_variant_key("GET:a.test/x", Encoding::Gzip, "\"v1\"");
+        let b = compressed_variant_key("GET:a.test/x", Encoding::Gzip, "\"v2\"");
+        let other = compressed_variant_key("GET:b.test/x", Encoding::Gzip, "\"v1\"");
         assert_ne!(a, b, "a new ETag must produce a new variant key");
         assert_ne!(a, other, "different objects must not share a variant");
+        assert_ne!(
+            a,
+            compressed_variant_key("GET:a.test/x", Encoding::Zstd, "\"v1\""),
+            "different codings must not share a variant"
+        );
         assert!(a.starts_with("GET:a.test/x"));
-        assert_eq!(a, compressed_variant_key("GET:a.test/x", "\"v1\""));
+        assert_eq!(
+            a,
+            compressed_variant_key("GET:a.test/x", Encoding::Gzip, "\"v1\"")
+        );
     }
 
     /// A per-domain value of 0 must inherit the cluster default; any positive
@@ -6877,8 +6890,11 @@ mod tests {
 
         let cfg = CompressionConfig {
             enabled: true,
+            algorithms: crate::server::compression::Algorithms::default(),
             min_bytes: 100,
             level: 4,
+            zstd_level: 3,
+            deflate_level: 4,
             variant_max_object_bytes: 0,
             variant_ttl_secs: 0,
         };
@@ -6899,7 +6915,7 @@ mod tests {
             http::HeaderValue::from_static("gzip"),
         );
 
-        let out = gzip_engine_body(
+        let (coding, out) = compress_engine_body(
             &cfg,
             false,
             http::Version::HTTP_11,
@@ -6909,7 +6925,8 @@ mod tests {
             &req,
             &body,
         )
-        .expect("an eligible engine response must be gzipped");
+        .expect("an eligible engine response must be compressed");
+        assert_eq!(coding, Encoding::Gzip);
         assert!(
             out.len() < body.len() / 10,
             "8192 repeated bytes should compress hard, got {}",
@@ -6920,7 +6937,7 @@ mod tests {
 
         // A client without gzip gets the identity body.
         assert!(
-            gzip_engine_body(
+            compress_engine_body(
                 &cfg,
                 false,
                 http::Version::HTTP_11,
@@ -6936,7 +6953,7 @@ mod tests {
 
         // HEAD has no body to compress.
         assert!(
-            gzip_engine_body(
+            compress_engine_body(
                 &cfg,
                 true,
                 http::Version::HTTP_11,

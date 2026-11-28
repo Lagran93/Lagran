@@ -77,6 +77,7 @@ tokio-rustls = { workspace = true }
 base64 = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }
+zstd = { workspace = true }
 httpdate = { workspace = true }
 ring = { workspace = true }
 webpki-roots = { workspace = true }

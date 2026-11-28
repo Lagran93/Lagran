@@ -198,6 +198,12 @@ pub struct EdgeConfig {
     pub compression_min_bytes: usize,
     /// gzip level, 1 (fastest) to 9 (smallest).
     pub compression_level: u32,
+    /// Comma-separated downstream codings (`gzip`, `zstd`, `deflate`).
+    pub compression_algorithms: String,
+    /// zstd level, 1..=19.
+    pub compression_zstd_level: i32,
+    /// deflate level, 1..=9.
+    pub compression_deflate_level: u32,
     /// Memory cap for pre-compressed response variants. 0 disables reuse.
     pub compressed_cache_bytes: u64,
     /// Maximum number of pre-compressed variants retained.
@@ -464,6 +470,18 @@ impl Default for EdgeConfig {
                 .unwrap_or(1024)
                 .clamp(0, 1024 * 1024),
             compression_level: std::env::var("EDGE_COMPRESSION_LEVEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4)
+                .clamp(1, 9),
+            compression_algorithms: std::env::var("EDGE_COMPRESSION_ALGORITHMS")
+                .unwrap_or_else(|_| "gzip".into()),
+            compression_zstd_level: std::env::var("EDGE_ZSTD_LEVEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3)
+                .clamp(1, 19),
+            compression_deflate_level: std::env::var("EDGE_DEFLATE_LEVEL")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4)
