@@ -150,6 +150,8 @@ pub struct BodyInspectionDto {
     pub oversize_policy: String,
     pub uninspectable_policy: String,
     pub timeout_ms: u32,
+    pub inspect_unknown_length: bool,
+    pub decompress_gzip: bool,
 }
 
 impl Default for BodyInspectionDto {
@@ -166,6 +168,8 @@ impl Default for BodyInspectionDto {
             oversize_policy: "log".into(),
             uninspectable_policy: "log".into(),
             timeout_ms: 1000,
+            inspect_unknown_length: false,
+            decompress_gzip: false,
         }
     }
 }
@@ -179,6 +183,8 @@ pub struct BodyInspectionRequest {
     pub oversize_policy: Option<String>,
     pub uninspectable_policy: Option<String>,
     pub timeout_ms: Option<u32>,
+    pub inspect_unknown_length: Option<bool>,
+    pub decompress_gzip: Option<bool>,
 }
 
 impl Default for WafSettingsDto {
@@ -249,6 +255,8 @@ impl From<repository::WafSettingsRow> for WafSettingsDto {
                 oversize_policy: r.body_oversize_policy,
                 uninspectable_policy: r.body_uninspectable_policy,
                 timeout_ms: r.body_timeout_ms.clamp(100, 5000) as u32,
+                inspect_unknown_length: r.body_inspect_unknown_length,
+                decompress_gzip: r.body_decompress_gzip,
             },
         }
     }
@@ -717,6 +725,8 @@ pub async fn put_settings(
         &body.oversize_policy,
         &body.uninspectable_policy,
         body.timeout_ms as i32,
+        body.inspect_unknown_length,
+        body.decompress_gzip,
     )
     .await
     .map_err(|e| {
@@ -848,6 +858,10 @@ fn merge_body(
             .timeout_ms
             .unwrap_or(current.timeout_ms)
             .clamp(100, 5000),
+        inspect_unknown_length: req
+            .inspect_unknown_length
+            .unwrap_or(current.inspect_unknown_length),
+        decompress_gzip: req.decompress_gzip.unwrap_or(current.decompress_gzip),
     })
 }
 
@@ -2135,6 +2149,8 @@ mod tests {
                 oversize_policy: Some("BLOCK".into()),
                 uninspectable_policy: None,
                 timeout_ms: Some(10),
+                inspect_unknown_length: None,
+                decompress_gzip: None,
             }),
         )
         .unwrap_or_else(|_| panic!("valid body policy was rejected"));

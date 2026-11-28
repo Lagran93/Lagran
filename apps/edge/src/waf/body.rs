@@ -68,6 +68,12 @@ pub struct BodyInspection {
     /// content type/encoding, `Expect: 100-continue`, or upgrade requests.
     pub uninspectable: BodyPolicy,
     pub timeout_ms: u64,
+    /// Inspect chunked / HTTP/2 bodies without `Content-Length` by reading up to
+    /// [`Self::max_bytes`]. Bodies over the cap are rejected with 413 because
+    /// they can no longer be replayed.
+    pub inspect_unknown_length: bool,
+    /// Decompress `Content-Encoding: gzip` (bounded) before scanning.
+    pub decompress_gzip: bool,
 }
 
 impl Default for BodyInspection {
@@ -80,6 +86,8 @@ impl Default for BodyInspection {
             oversize: BodyPolicy::Log,
             uninspectable: BodyPolicy::Log,
             timeout_ms: 1000,
+            inspect_unknown_length: false,
+            decompress_gzip: false,
         }
     }
 }
@@ -382,6 +390,36 @@ impl<'a> BodyFacts<'a> {
         self.content_encoding
             .is_none_or(|v| v.trim().is_empty() || v.trim().eq_ignore_ascii_case("identity"))
     }
+
+    pub fn is_gzip(&self) -> bool {
+        self.content_encoding
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("gzip"))
+    }
+}
+
+/// Decompressed bodies are scanned through a separate, larger cap; the wire
+/// body itself still has to fit Pingora's retry buffer.
+pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
+    TooLarge,
+    Invalid,
+}
+
+/// Gunzip a request body for scanning, bounded by `max`.
+pub fn gunzip_for_scan(input: &[u8], max: usize) -> Result<Vec<u8>, DecodeError> {
+    use std::io::Read;
+    let decoder = flate2::read::GzDecoder::new(input);
+    let mut out = Vec::new();
+    decoder
+        .take((max as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|_| DecodeError::Invalid)?;
+    if out.len() > max {
+        return Err(DecodeError::TooLarge);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -450,6 +488,23 @@ mod tests {
         assert_eq!(body.content_types, vec!["application/json".to_string()]);
         assert!(body.method_allowed("post"));
         assert!(!body.method_allowed("GET"));
+    }
+
+    #[test]
+    fn gunzip_is_bounded_and_decodes() {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"union select").unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert_eq!(gunzip_for_scan(&compressed, 1024).unwrap(), b"union select");
+        assert_eq!(
+            gunzip_for_scan(&compressed, 4).unwrap_err(),
+            DecodeError::TooLarge
+        );
+        assert_eq!(
+            gunzip_for_scan(b"not gzip", 1024).unwrap_err(),
+            DecodeError::Invalid
+        );
     }
 
     #[test]

@@ -268,6 +268,87 @@
             </label>
           </div>
 
+          <div class="section-label">请求体检查</div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">检查请求体</div>
+              <div class="setting-desc">
+                对 JSON/form/text 请求体执行托管规则与 body 自定义规则；默认关闭。
+              </div>
+            </div>
+            <label class="switch" :class="{ on: settings.body.enabled }">
+              <span class="switch-track" />
+              <input v-model="settings.body.enabled" type="checkbox" style="display: none" />
+            </label>
+          </div>
+          <template v-if="settings.body.enabled">
+            <div class="form-grid">
+              <div class="field">
+                <label class="field-label">最大检查字节数</label>
+                <input v-model.number="settings.body.max_bytes" class="input" type="number"
+                  min="1024" max="65536" step="1024" />
+                <span class="field-hint">1024–65536；硬上限 64 KiB（超过该长度的 body 无法回放）。</span>
+              </div>
+              <div class="field">
+                <label class="field-label">读取超时（毫秒）</label>
+                <input v-model.number="settings.body.timeout_ms" class="input" type="number"
+                  min="100" max="5000" step="100" />
+                <span class="field-hint">读取整个 body 的总超时，超时返回 408。</span>
+              </div>
+              <div class="field">
+                <label class="field-label">检查方法</label>
+                <input v-model="bodyMethodsText" class="input" type="text" />
+                <span class="field-hint">逗号分隔；目前支持 POST、PUT、PATCH。</span>
+              </div>
+              <div class="field">
+                <label class="field-label">Content-Type</label>
+                <input v-model="bodyContentTypesText" class="input" type="text" />
+                <span class="field-hint">逗号分隔；支持 text/* 与 */* 通配。</span>
+              </div>
+              <div class="field">
+                <label class="field-label">超过上限时</label>
+                <select v-model="settings.body.oversize_policy" class="select">
+                  <option value="log">log（放行并记录）</option>
+                  <option value="block">block（413）</option>
+                  <option value="allow">allow（静默放行）</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="field-label">无法检查时</label>
+                <select v-model="settings.body.uninspectable_policy" class="select">
+                  <option value="log">log（放行并记录）</option>
+                  <option value="block">block（415）</option>
+                  <option value="allow">allow（静默放行）</option>
+                </select>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-title">检查无 Content-Length / 分块请求体</div>
+                <div class="setting-desc">
+                  HTTP/2 与 chunked 请求常无 Content-Length；开启后读到上限，超过上限返回 413。
+                </div>
+              </div>
+              <label class="switch" :class="{ on: settings.body.inspect_unknown_length }">
+                <span class="switch-track" />
+                <input v-model="settings.body.inspect_unknown_length" type="checkbox"
+                  style="display: none" />
+              </label>
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-title">解压 gzip 后检查</div>
+                <div class="setting-desc">
+                  仅 Content-Encoding: gzip；解压后最多扫描 256 KiB，失败返回 413/415。
+                </div>
+              </div>
+              <label class="switch" :class="{ on: settings.body.decompress_gzip }">
+                <span class="switch-track" />
+                <input v-model="settings.body.decompress_gzip" type="checkbox" style="display: none" />
+              </label>
+            </div>
+          </template>
+
           <div class="section-label">浏览器质询</div>
           <div class="form-grid">
             <div class="field">
@@ -288,7 +369,8 @@
 
           <div class="flex-between mt-24">
             <span class="text-muted" style="font-size: 12px">
-              托管规则基于常见攻击特征匹配 URL、查询串、UA 与 Referer，不检查请求体。
+              托管规则匹配 URL、查询串、UA 与 Referer；开启「请求体检查」后还会检查
+              JSON/form/text body（受上面的上限与策略约束）。
             </span>
             <button class="btn btn-primary" type="button" :disabled="saving" @click="saveSettings">
               {{ saving ? '保存中…' : '保存设置' }}
@@ -900,6 +982,43 @@ const levelHint = computed(() => {
   return hints[settings.value.security_level] || hints.off
 })
 
+function emptyBody() {
+  return {
+    enabled: false,
+    max_bytes: 32768,
+    methods: ['POST', 'PUT', 'PATCH'],
+    content_types: ['application/json', 'application/x-www-form-urlencoded', 'text/*'],
+    oversize_policy: 'log',
+    uninspectable_policy: 'log',
+    timeout_ms: 1000,
+    inspect_unknown_length: false,
+    decompress_gzip: false,
+  }
+}
+
+function normalizeBody(body: any) {
+  const defaults = emptyBody()
+  if (!body) return defaults
+  return {
+    ...defaults,
+    ...body,
+    methods: Array.isArray(body.methods) && body.methods.length ? body.methods : defaults.methods,
+    content_types:
+      Array.isArray(body.content_types) && body.content_types.length
+        ? body.content_types
+        : defaults.content_types,
+  }
+}
+
+const bodyMethodsText = ref('POST, PUT, PATCH')
+const bodyContentTypesText = ref('application/json, application/x-www-form-urlencoded, text/*')
+
+function syncBodyTexts() {
+  const body = settings.value.body || emptyBody()
+  bodyMethodsText.value = (body.methods || []).join(', ')
+  bodyContentTypesText.value = (body.content_types || []).join(', ')
+}
+
 const settings = ref<any>({
   enabled: false,
   mode: 'block',
@@ -924,6 +1043,7 @@ const settings = ref<any>({
   managed_rulesets: [] as string[],
   waf_rulepack_version: '',
   waf_gray_percent: 0,
+  body: emptyBody(),
 })
 
 const rules = ref<any[]>([])
@@ -1204,7 +1324,9 @@ async function loadSettings() {
       managed_rulesets: Array.isArray(s.managed_rulesets) ? s.managed_rulesets : [],
       waf_rulepack_version: s.waf_rulepack_version || '',
       waf_gray_percent: s.waf_gray_percent ?? 0,
+      body: normalizeBody(s.body),
     }
+    syncBodyTexts()
   } catch {
     settings.value = {
       enabled: false,
@@ -1224,7 +1346,9 @@ async function loadSettings() {
       managed_rulesets: [],
       waf_rulepack_version: '',
       waf_gray_percent: 0,
+      body: emptyBody(),
     }
+    syncBodyTexts()
   }
 }
 
@@ -1511,6 +1635,14 @@ async function saveSettings() {
   if (!domainId.value) return
   saving.value = true
   try {
+    settings.value.body.methods = bodyMethodsText.value
+      .split(',')
+      .map((m: string) => m.trim().toUpperCase())
+      .filter(Boolean)
+    settings.value.body.content_types = bodyContentTypesText.value
+      .split(',')
+      .map((c: string) => c.trim().toLowerCase())
+      .filter(Boolean)
     const s = await api.put<any>(`/api/v1/domains/${domainId.value}/waf`, settings.value)
     settings.value = {
       enabled: !!s.enabled,
@@ -1536,7 +1668,9 @@ async function saveSettings() {
       managed_rulesets: Array.isArray(s.managed_rulesets) ? s.managed_rulesets : [],
       waf_rulepack_version: s.waf_rulepack_version || '',
       waf_gray_percent: s.waf_gray_percent ?? 0,
+      body: normalizeBody(s.body),
     }
+    syncBodyTexts()
     toast.success('WAF 设置已保存，边缘约 15 秒内同步')
   } catch (e: any) {
     toast.error(e?.data?.error || '保存失败')

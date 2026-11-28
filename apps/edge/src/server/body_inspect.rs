@@ -55,7 +55,7 @@ pub fn decide(domain: &DomainEntry, method: &Method, headers: &HeaderMap) -> Dec
             log: false,
         };
     }
-    if !facts.is_identity() {
+    if !facts.is_identity() && !(body.decompress_gzip && facts.is_gzip()) {
         return uninspectable(body, "content-encoding");
     }
     if !body.content_type_allowed(facts.content_type) {
@@ -68,6 +68,10 @@ pub fn decide(domain: &DomainEntry, method: &Method, headers: &HeaderMap) -> Dec
         return uninspectable(body, "expect-continue");
     }
     match facts.content_length {
+        None if body.inspect_unknown_length => Decision::Inspect {
+            max_bytes: body.max_bytes,
+            timeout: body.timeout(),
+        },
         None => uninspectable(body, "no-content-length"),
         Some(0) => Decision::Skip {
             reason: "empty",
@@ -313,6 +317,52 @@ mod tests {
                 reason: "content-encoding",
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn unknown_length_and_gzip_need_explicit_opt_in() {
+        let mut body = BodyInspection {
+            enabled: true,
+            ..BodyInspection::default()
+        };
+        body.finalize();
+        let d = domain(body.clone());
+        match decide(
+            &d,
+            &Method::POST,
+            &headers("POST", "application/json", None),
+        ) {
+            Decision::Skip { reason, .. } => assert_eq!(reason, "no-content-length"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        body.inspect_unknown_length = true;
+        let d = domain(body.clone());
+        assert!(matches!(
+            decide(
+                &d,
+                &Method::POST,
+                &headers("POST", "application/json", None)
+            ),
+            Decision::Inspect { .. }
+        ));
+
+        let mut gzip = headers("POST", "application/json", Some("10"));
+        gzip.insert(
+            axum::http::header::CONTENT_ENCODING,
+            "gzip".parse().unwrap(),
+        );
+        let d = domain(body.clone());
+        match decide(&d, &Method::POST, &gzip) {
+            Decision::Skip { reason, .. } => assert_eq!(reason, "content-encoding"),
+            other => panic!("unexpected {other:?}"),
+        }
+        body.decompress_gzip = true;
+        let d = domain(body);
+        assert!(matches!(
+            decide(&d, &Method::POST, &gzip),
+            Decision::Inspect { .. }
         ));
     }
 

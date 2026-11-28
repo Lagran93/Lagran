@@ -3067,6 +3067,8 @@ pub struct WafSettingsRow {
     pub body_oversize_policy: String,
     pub body_uninspectable_policy: String,
     pub body_timeout_ms: i32,
+    pub body_inspect_unknown_length: bool,
+    pub body_decompress_gzip: bool,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -3142,7 +3144,9 @@ pub async fn get_waf_settings(
                    AS body_content_types,
                COALESCE(body_oversize_policy, 'log') AS body_oversize_policy,
                COALESCE(body_uninspectable_policy, 'log') AS body_uninspectable_policy,
-               COALESCE(body_timeout_ms, 1000) AS body_timeout_ms
+               COALESCE(body_timeout_ms, 1000) AS body_timeout_ms,
+               COALESCE(body_inspect_unknown_length, FALSE) AS body_inspect_unknown_length,
+               COALESCE(body_decompress_gzip, FALSE) AS body_decompress_gzip
         FROM waf_settings WHERE domain_id = $1
         "#,
     )
@@ -3185,6 +3189,8 @@ pub async fn upsert_waf_settings(
     body_oversize_policy: &str,
     body_uninspectable_policy: &str,
     body_timeout_ms: i32,
+    body_inspect_unknown_length: bool,
+    body_decompress_gzip: bool,
 ) -> sqlx::Result<WafSettingsRow> {
     sqlx::query_as::<_, WafSettingsRow>(
         r#"
@@ -3195,10 +3201,11 @@ pub async fn upsert_waf_settings(
              challenge_difficulty, challenge_ttl_secs, security_level,
              managed_rulesets, waf_rulepack_version, waf_gray_percent,
              body_inspection, body_max_bytes, body_methods, body_content_types,
-             body_oversize_policy, body_uninspectable_policy, body_timeout_ms)
+             body_oversize_policy, body_uninspectable_policy, body_timeout_ms,
+             body_inspect_unknown_length, body_decompress_gzip)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-                $25, $26, $27, $28, $29, $30, $31)
+                $25, $26, $27, $28, $29, $30, $31, $32, $33)
         ON CONFLICT (domain_id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
           mode = EXCLUDED.mode,
@@ -3230,6 +3237,8 @@ pub async fn upsert_waf_settings(
           body_oversize_policy = EXCLUDED.body_oversize_policy,
           body_uninspectable_policy = EXCLUDED.body_uninspectable_policy,
           body_timeout_ms = EXCLUDED.body_timeout_ms,
+          body_inspect_unknown_length = EXCLUDED.body_inspect_unknown_length,
+          body_decompress_gzip = EXCLUDED.body_decompress_gzip,
           updated_at = NOW()
         RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners,
                   rce, ssrf, xxe, log4shell, crlf,
@@ -3237,7 +3246,8 @@ pub async fn upsert_waf_settings(
                   challenge_difficulty, challenge_ttl_secs, security_level,
                   managed_rulesets, waf_rulepack_version, waf_gray_percent,
                   body_inspection, body_max_bytes, body_methods, body_content_types,
-                  body_oversize_policy, body_uninspectable_policy, body_timeout_ms
+                  body_oversize_policy, body_uninspectable_policy, body_timeout_ms,
+                  body_inspect_unknown_length, body_decompress_gzip
         "#,
     )
     .bind(domain_id)
@@ -3271,6 +3281,8 @@ pub async fn upsert_waf_settings(
     .bind(body_oversize_policy)
     .bind(body_uninspectable_policy)
     .bind(body_timeout_ms)
+    .bind(body_inspect_unknown_length)
+    .bind(body_decompress_gzip)
     .fetch_one(pool)
     .await
 }
@@ -3293,7 +3305,9 @@ pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSetting
                    AS body_content_types,
                COALESCE(body_oversize_policy, 'log') AS body_oversize_policy,
                COALESCE(body_uninspectable_policy, 'log') AS body_uninspectable_policy,
-               COALESCE(body_timeout_ms, 1000) AS body_timeout_ms
+               COALESCE(body_timeout_ms, 1000) AS body_timeout_ms,
+               COALESCE(body_inspect_unknown_length, FALSE) AS body_inspect_unknown_length,
+               COALESCE(body_decompress_gzip, FALSE) AS body_decompress_gzip
         FROM waf_settings
         "#,
     )

@@ -349,6 +349,10 @@ struct BodyCfg {
     uninspectable_policy: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    inspect_unknown_length: bool,
+    #[serde(default)]
+    decompress_gzip: bool,
 }
 
 fn default_challenge_difficulty() -> u8 {
@@ -615,6 +619,8 @@ fn body_inspection(cfg: &BodyCfg) -> BodyInspection {
         oversize: BodyPolicy::parse(&cfg.oversize_policy),
         uninspectable: BodyPolicy::parse(&cfg.uninspectable_policy),
         timeout_ms: cfg.timeout_ms.unwrap_or(1000),
+        inspect_unknown_length: cfg.inspect_unknown_length,
+        decompress_gzip: cfg.decompress_gzip,
     };
     if env_truthy("WAF_BODY_INSPECTION") {
         body.enabled = true;

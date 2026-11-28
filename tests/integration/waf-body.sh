@@ -89,7 +89,7 @@ DOMAIN_ID=$(curl -s -H "$AUTH" "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" \
   | jq -r --arg n "$DOMAIN" '.[] | select(.name == $n) | .id')
 [[ -n "$DOMAIN_ID" ]] || { echo "domain not found"; exit 1; }
 
-BODY_SETTINGS='{"enabled":true,"max_bytes":1024,"methods":["POST","PUT","PATCH"],"content_types":["application/json"],"oversize_policy":"log","uninspectable_policy":"log","timeout_ms":1000}'
+BODY_SETTINGS='{"enabled":true,"max_bytes":1024,"methods":["POST","PUT","PATCH"],"content_types":["application/json"],"oversize_policy":"log","uninspectable_policy":"log","timeout_ms":1000,"inspect_unknown_length":true,"decompress_gzip":true}'
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"enabled":true,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true,"rce":true,"ssrf":true,"xxe":true,"log4shell":true,"crlf":true,"ssti":true,"nosql":true,"ldap":true,"java":true,"webshell":true,"protocol":true,"challenge_difficulty":2,"challenge_ttl_secs":300,"body":'"$BODY_SETTINGS"'}' >/dev/null
@@ -153,6 +153,49 @@ contains "block page is the WAF page" "$(cat "$LOG_DIR/body")" "安全拦截"
 echo "== custom DSL body rule =="
 CODE=$(body_request '{"x":"evil-body"}')
 check "custom body rule blocked" "$CODE" "403"
+
+echo "== chunked / gzip bodies are inspected =="
+CHUNKED_OK=$(curl -s -o "$LOG_DIR/body" -w '%{http_code}' \
+  -X POST -H "Host: $DOMAIN" -H 'content-type: application/json' \
+  -H 'Transfer-Encoding: chunked' \
+  --data-binary '{"hello":"chunked"}' \
+  "http://127.0.0.1:$EDGE_PORT/api/echo")
+check "benign chunked body is forwarded" "$CHUNKED_OK" "200"
+check "origin received the chunked body unchanged" \
+  "$(jq -r '.echo' "$LOG_DIR/body" 2>/dev/null)" '{"hello":"chunked"}'
+
+python3 - "$LOG_DIR/chunked-evil.json" <<'PY'
+import sys
+open(sys.argv[1], "w").write('{"q":"\' or 1=1"}')
+PY
+CHUNKED=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  -X POST -H "Host: $DOMAIN" -H 'content-type: application/json' \
+  -H 'Transfer-Encoding: chunked' \
+  --data-binary @"$LOG_DIR/chunked-evil.json" \
+  "http://127.0.0.1:$EDGE_PORT/api/echo")
+check "SQLi in a chunked body blocked" "$CHUNKED" "403"
+
+python3 - "$LOG_DIR/evil.json.gz" <<'PY'
+import gzip, sys
+open(sys.argv[1], "wb").write(gzip.compress(b'{"q":"\' or 1=1"}'))
+PY
+GZIP=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  -X POST -H "Host: $DOMAIN" -H 'content-type: application/json' \
+  -H 'Content-Encoding: gzip' \
+  --data-binary @"$LOG_DIR/evil.json.gz" \
+  "http://127.0.0.1:$EDGE_PORT/api/echo")
+check "SQLi in a gzip body blocked" "$GZIP" "403"
+
+python3 - "$LOG_DIR/chunked-big.json" <<'PY'
+import sys
+open(sys.argv[1], "w").write('{"data":"' + "a" * 2048 + '"}')
+PY
+CHUNKED_BIG=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  -X POST -H "Host: $DOMAIN" -H 'content-type: application/json' \
+  -H 'Transfer-Encoding: chunked' \
+  --data-binary @"$LOG_DIR/chunked-big.json" \
+  "http://127.0.0.1:$EDGE_PORT/api/echo")
+check "oversized chunked body rejected (cannot replay)" "$CHUNKED_BIG" "413"
 
 echo "== oversize follows the configured policy =="
 PADDING=$(printf 'a%.0s' $(seq 1 2048))

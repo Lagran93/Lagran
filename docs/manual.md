@@ -570,7 +570,9 @@ PUT /api/v1/domains/{id}/waf
     "content_types": ["application/json", "application/x-www-form-urlencoded", "text/*"],
     "oversize_policy": "log",
     "uninspectable_policy": "log",
-    "timeout_ms": 1000
+    "timeout_ms": 1000,
+    "inspect_unknown_length": false,
+    "decompress_gzip": false
   }
 }
 ```
@@ -594,9 +596,12 @@ WAF_BODY_MAX_CONCURRENT=256     同时读取 body 的请求上限（1–4096）
 
 - 只检查 `POST/PUT/PATCH`，`Content-Type` 为 `application/json`、
   `application/x-www-form-urlencoded` 或 `text/*`；
-- 必须带 `Content-Length` 且不超过上限；**不支持** chunked/无长度、gzip/br 压缩、
-  multipart、`Expect: 100-continue` 和 WebSocket 升级，这些请求按
-  `WAF_BODY_UNINSPECTABLE_POLICY` 处理（默认 `log` 放行）；
+- 默认只检查带 `Content-Length` 且不超过上限的请求；开启
+  `inspect_unknown_length` 后才会读取 chunked/HTTP/2 无长度 body，读到上限为止，
+  超过上限的请求返回 413（已消费的 body 无法再回放）；
+- 开启 `decompress_gzip` 后会解压 `Content-Encoding: gzip` 再扫描，解压后最多
+  256 KiB，解压失败返回 413/415；**不支持** br、multipart、`Expect: 100-continue`
+  和 WebSocket 升级，这些请求按 `uninspectable_policy` 处理（默认 `log` 放行）；
 - 超过 `WAF_BODY_MAX_BYTES` 的请求按 `WAF_BODY_OVERSIZE_POLICY` 处理；
   `block` 时返回 413；
 - 64 KiB 是 Pingora 请求体回放缓冲区的硬上限：允许通过的 body 会先完整读入内存
@@ -641,7 +646,9 @@ DELETE /api/v1/waf/geo/{rule_id}
     "content_types": ["application/json", "application/x-www-form-urlencoded", "text/*"],
     "oversize_policy": "log",
     "uninspectable_policy": "log",
-    "timeout_ms": 1000
+    "timeout_ms": 1000,
+    "inspect_unknown_length": false,
+    "decompress_gzip": false
   }
 }
 ```

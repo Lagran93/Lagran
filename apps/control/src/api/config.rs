@@ -135,6 +135,8 @@ pub struct WafBodyOut {
     pub oversize_policy: String,
     pub uninspectable_policy: String,
     pub timeout_ms: u32,
+    pub inspect_unknown_length: bool,
+    pub decompress_gzip: bool,
 }
 
 impl Default for WafBodyOut {
@@ -151,6 +153,8 @@ impl Default for WafBodyOut {
             oversize_policy: "log".into(),
             uninspectable_policy: "log".into(),
             timeout_ms: 1000,
+            inspect_unknown_length: false,
+            decompress_gzip: false,
         }
     }
 }
@@ -440,6 +444,8 @@ fn waf_config_from(
             oversize_policy: settings.body_oversize_policy,
             uninspectable_policy: settings.body_uninspectable_policy,
             timeout_ms: settings.body_timeout_ms.clamp(100, 5000) as u32,
+            inspect_unknown_length: settings.body_inspect_unknown_length,
+            decompress_gzip: settings.body_decompress_gzip,
         },
     }
 }
@@ -985,6 +991,8 @@ mod tests {
             body_oversize_policy: "log".into(),
             body_uninspectable_policy: "log".into(),
             body_timeout_ms: 1000,
+            body_inspect_unknown_length: false,
+            body_decompress_gzip: false,
         }
     }
 
@@ -1243,6 +1251,8 @@ mod tests {
         settings.body_oversize_policy = "block".into();
         settings.body_uninspectable_policy = "allow".into();
         settings.body_timeout_ms = 5000;
+        settings.body_inspect_unknown_length = true;
+        settings.body_decompress_gzip = true;
         let waf = waf_config_from("example.com", settings, vec![], vec![], vec![], &[]);
         assert!(waf.body.enabled);
         assert_eq!(waf.body.max_bytes, 65_536);
@@ -1251,6 +1261,8 @@ mod tests {
         assert_eq!(waf.body.oversize_policy, "block");
         assert_eq!(waf.body.uninspectable_policy, "allow");
         assert_eq!(waf.body.timeout_ms, 5000);
+        assert!(waf.body.inspect_unknown_length);
+        assert!(waf.body.decompress_gzip);
     }
 
     #[test]

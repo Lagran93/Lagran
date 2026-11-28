@@ -937,8 +937,50 @@ impl ProxyHttp for DataPlaneProxy {
                                     .get(axum::http::header::CONTENT_TYPE)
                                     .and_then(|v| v.to_str().ok())
                                     .unwrap_or("");
+                                let gzip = session
+                                    .req_header()
+                                    .headers
+                                    .get(axum::http::header::CONTENT_ENCODING)
+                                    .and_then(|v| v.to_str().ok())
+                                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("gzip"));
+                                let decompressed = if gzip && domain.waf.body.decompress_gzip {
+                                    match crate::waf::body::gunzip_for_scan(
+                                        &bytes,
+                                        crate::waf::body::MAX_DECOMPRESSED_BYTES,
+                                    ) {
+                                        Ok(decoded) => Some(decoded),
+                                        Err(error) => {
+                                            self.state.metrics.record_waf_body_error();
+                                            let status = match error {
+                                                crate::waf::body::DecodeError::TooLarge => {
+                                                    axum::http::StatusCode::PAYLOAD_TOO_LARGE
+                                                }
+                                                crate::waf::body::DecodeError::Invalid => {
+                                                    axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+                                                }
+                                            };
+                                            ctx.status = status.as_u16();
+                                            ctx.cache_label = "BYPASS";
+                                            ctx.cache_reason = Some("body-decode-error");
+                                            write_plain(
+                                                session,
+                                                status.as_u16(),
+                                                "text/plain; charset=utf-8",
+                                                Bytes::from_static(
+                                                    b"request body could not be decoded",
+                                                ),
+                                            )
+                                            .await;
+                                            return Ok(true);
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                let scan_bytes: &[u8] =
+                                    decompressed.as_deref().unwrap_or(&bytes);
                                 self.state.metrics.record_waf_body_inspected(bytes.len() as u64);
-                                Some(decode_for_scan(content_type, &bytes))
+                                Some(decode_for_scan(content_type, scan_bytes))
                             }
                             Err(error) => {
                                 self.state.metrics.record_waf_body_error();

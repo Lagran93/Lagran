@@ -34,7 +34,8 @@
    优先于白名单）→ Geo/ASN 白名单门槛（配置了才生效，命中任一才继续，**不跳过**后续检查）→
    托管规则（SQLi/XSS/路径穿越/扫描器/RCE/SSRF/XXE/Log4Shell/CRLF）→ 自定义规则（按优先级，
    支持请求头/请求体）→ 安全级别（低/中/高/攻击中）；开启请求体检查时先在 64 KiB 上限内
-   读取并解码 JSON/form/text body（无长度/压缩/超限按策略处理），再按原有顺序评估；
+   读取并解码 JSON/form/text body（可选读取 chunked/无长度、解压 gzip；超限/无法检查按策略
+   处理），再按原有顺序评估；
    动作为拦截时返回 403 页，动作为质询时返回 JS PoW
    页面，通过后签发 HMAC 免质询 Cookie；观察模式只记录事件。
    Geo/ASN 判定使用 Edge 本地 MaxMind GeoLite2-Country / GeoLite2-ASN 查询可信客户端 IP；

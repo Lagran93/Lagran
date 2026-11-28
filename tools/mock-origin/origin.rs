@@ -25,6 +25,52 @@ static HUGE_HEAD_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HUGE_GET_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HUGE_GET_BODY_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Read until `buf` has at least `need` bytes or the peer closes.
+fn fill(stream: &mut TcpStream, buf: &mut Vec<u8>, need: usize) -> std::io::Result<()> {
+    let mut chunk = [0u8; 4096];
+    while buf.len() < need {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(())
+}
+
+fn take_line(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<String> {
+    loop {
+        if let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+            let line = String::from_utf8_lossy(&buf[..pos]).trim().to_string();
+            buf.drain(..=pos);
+            return Ok(line);
+        }
+        fill(stream, buf, buf.len() + 1)?;
+        if buf.is_empty() {
+            return Ok(String::new());
+        }
+    }
+}
+
+/// Decode HTTP/1.1 chunked framing so forwarding tests can assert exact bytes.
+fn read_chunked(stream: &mut TcpStream, mut buf: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line = take_line(stream, &mut buf)?;
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16).unwrap_or(0);
+        if size == 0 {
+            // Consume trailers up to the terminating empty line.
+            while !take_line(stream, &mut buf)?.is_empty() {}
+            break;
+        }
+        fill(stream, &mut buf, size + 2)?;
+        out.extend_from_slice(&buf[..size]);
+        buf.drain(..(size + 2).min(buf.len()));
+    }
+    Ok(out)
+}
+
 fn main() {
     let port: u16 = std::env::args()
         .nth(1)
@@ -99,6 +145,7 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
     }
 
     let mut content_length = 0usize;
+    let mut chunked = false;
     let mut custom_header = String::new();
     let mut cookie = String::new();
     let mut accept_language = String::new();
@@ -112,6 +159,8 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
             let value = value.trim();
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                chunked = value.to_ascii_lowercase().contains("chunked");
             } else if name.eq_ignore_ascii_case("host") {
                 host = value.to_string();
             } else if name.eq_ignore_ascii_case("x-custom") {
@@ -161,12 +210,16 @@ fn handle(mut stream: TcpStream, port: u16, root_status: u16, slow: bool) -> std
     }
 
     let mut body = buf[head_end..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            break;
+    if chunked {
+        body = read_chunked(&mut stream, body)?;
+    } else {
+        while body.len() < content_length {
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
         }
-        body.extend_from_slice(&chunk[..n]);
     }
 
     let (status, payload, extra): (u16, Vec<u8>, Vec<(&str, String)>) = match method.as_str() {

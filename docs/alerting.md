@@ -75,6 +75,41 @@ groups:
         annotations:
           summary: 回源错误率升高
           description: 检查源站健康、DNS、TLS、502/504 与连接池。
+
+      - alert: LagranWafBodyErrors
+        expr: sum(rate(lagran_edge_waf_body_errors_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: WAF 请求体读取/解压失败
+          description: 检查慢速 body、客户端长度不一致、gzip 损坏与 WAF_BODY_TIMEOUT_MS。
+
+      - alert: LagranWafBodySkipRatio
+        expr: |
+          sum(rate(lagran_edge_waf_body_skipped_total[5m]))
+          /
+          clamp_min(
+            sum(rate(lagran_edge_waf_body_inspected_total[5m]))
+            + sum(rate(lagran_edge_waf_body_skipped_total[5m])),
+            1
+          )
+          > 0.3
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 请求体检查跳过比例过高
+          description: 检查是否大量 chunked/gzip/multipart/超限请求；确认策略是误放行还是预期。
+
+      - alert: LagranWafBodyBlockSpike
+        expr: sum(rate(lagran_edge_waf_body_blocked_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 请求体命中 WAF 的数量突增
+          description: 查看 WAF 事件中的 body 命中类别，确认是攻击还是规则误报。
 ```
 
 ## 访问日志补充
