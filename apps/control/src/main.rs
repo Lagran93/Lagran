@@ -40,6 +40,11 @@ async fn main() -> anyhow::Result<()> {
     // the server can never disagree about which configuration is acceptable.
     check_config(&config)?;
     let tracer_provider = init_tracing(&config);
+    // Parse AGENT_TLS_CA_FILE now. The edge callback client is otherwise built
+    // lazily on the first purge/cert/ACME call, so a configured private CA used
+    // to produce no startup log at all and a bad path stayed invisible until an
+    // operator triggered a callback.
+    control::service::agent_http::warm_up();
     if !config.cors_allowed_origins.is_empty() {
         tracing::info!(
             origins = %config.cors_allowed_origins.join(","),
@@ -280,6 +285,9 @@ async fn handle_cli() -> anyhow::Result<bool> {
         "check-config" | "config-check" => {
             let config = AppConfig::load();
             check_config(&config)?;
+            if let Some(status) = control::service::agent_http::check_pinned_ca() {
+                println!("agent_tls_ca_file: {status}");
+            }
             Ok(true)
         }
         "migrate" | "db-migrate" => {

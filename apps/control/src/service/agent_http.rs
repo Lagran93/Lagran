@@ -35,6 +35,63 @@ type PublicClient = Client<GuardedConnector, Full<Bytes>>;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTEMPTS: usize = 2;
 
+/// Configured `AGENT_TLS_CA_FILE`, trimmed, or `None` when unset/empty.
+fn pinned_ca_path() -> Option<String> {
+    std::env::var("AGENT_TLS_CA_FILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Load and report the operator-pinned private CA.
+///
+/// Returns the number of certificates added. Kept separate from the client so
+/// `check-config` and startup can validate the file *without* dialling an edge:
+/// the client used to be built lazily on the first callback, which meant a
+/// typo in this path only surfaced the first time an operator pressed
+/// "purge" — with no hint that the CA had never been loaded.
+fn load_pinned_ca(roots: &mut rustls::RootCertStore, path: &str) -> usize {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::error!(
+                ca = %path,
+                error = %e,
+                "cannot read AGENT_TLS_CA_FILE; https edge callbacks may fail"
+            );
+            return 0;
+        }
+    };
+    let mut reader = std::io::BufReader::new(&data[..]);
+    let mut added = 0usize;
+    let mut rejected = 0usize;
+    for cert in rustls_pemfile::certs(&mut reader).flatten() {
+        if roots.add(cert).is_ok() {
+            added += 1;
+        } else {
+            rejected += 1;
+        }
+    }
+    if added == 0 {
+        // A readable file with no usable certificate is the worst case: the
+        // operator believes the CA is pinned while TLS silently falls back to
+        // WebPKI and every self-signed management endpoint fails verification.
+        tracing::error!(
+            ca = %path,
+            bytes = data.len(),
+            "AGENT_TLS_CA_FILE contains no usable PEM certificate; the private CA is NOT trusted"
+        );
+    } else {
+        tracing::info!(
+            ca = %path,
+            certs = added,
+            rejected,
+            "trusting private CA for edge agent callbacks"
+        );
+    }
+    added
+}
+
 /// Trust anchors for `https://` edge agent callbacks.
 ///
 /// WebPKI roots cover the normal case; `AGENT_TLS_CA_FILE` lets an operator pin
@@ -43,31 +100,40 @@ const ATTEMPTS: usize = 2;
 fn agent_tls_config() -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if let Ok(path) = std::env::var("AGENT_TLS_CA_FILE") {
-        let path = path.trim();
-        if !path.is_empty() {
-            match std::fs::read(path) {
-                Ok(data) => {
-                    let mut reader = std::io::BufReader::new(&data[..]);
-                    let mut added = 0;
-                    for cert in rustls_pemfile::certs(&mut reader).flatten() {
-                        if roots.add(cert).is_ok() {
-                            added += 1;
-                        }
-                    }
-                    tracing::info!(ca = %path, certs = added, "trusting private CA for edge agent callbacks");
-                }
-                Err(e) => tracing::error!(
-                    ca = %path,
-                    error = %e,
-                    "cannot read AGENT_TLS_CA_FILE; https edge callbacks may fail"
-                ),
-            }
-        }
+    if let Some(path) = pinned_ca_path() {
+        load_pinned_ca(&mut roots, &path);
     }
     rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth()
+}
+
+/// Build the edge callback client up front when a private CA is configured.
+///
+/// Called from startup and `check-config` so the CA is parsed (and any mistake
+/// reported) before the first purge/cert/ACME callback, instead of on the first
+/// request that needs it. Without this, a correctly configured
+/// `AGENT_TLS_CA_FILE` produces no log line at all until an edge callback
+/// happens, which reads exactly like "the setting was ignored".
+pub fn warm_up() {
+    if pinned_ca_path().is_none() {
+        return;
+    }
+    // Forces `agent_tls_config()`, which emits the trust/parse diagnostics.
+    let _ = client();
+}
+
+/// Report the pinned CA on stdout for `check-config`.
+///
+/// Returns a human-readable status so the CLI can fail loudly on a file that
+/// exists but yields no certificate.
+pub fn check_pinned_ca() -> Option<String> {
+    let path = pinned_ca_path()?;
+    let mut roots = rustls::RootCertStore::empty();
+    let added = load_pinned_ca(&mut roots, &path);
+    Some(format!(
+        "{path}: {added} certificate(s) trusted for https edge callbacks"
+    ))
 }
 
 pub fn client() -> &'static EdgeClient {
@@ -780,5 +846,61 @@ mod tests {
 
         let err = get_response(url, &[]).await.unwrap_err();
         assert!(err.contains("disallowed address"), "{err}");
+    }
+
+    /// A pinned private CA must be parsed before the first edge callback.
+    ///
+    /// Regression guard: `agent_tls_config()` only ran inside the lazily built
+    /// client, so a configured `AGENT_TLS_CA_FILE` produced no log line during
+    /// startup and a broken path stayed hidden until someone pressed "purge".
+    #[test]
+    fn pinned_ca_is_loaded_and_counted() {
+        let dir = std::env::temp_dir().join(format!("lagran-ca-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ca.pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["edge.internal".to_string()]).unwrap();
+        std::fs::write(&path, cert.cert.pem()).unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        let added = load_pinned_ca(&mut roots, path.to_str().unwrap());
+        assert_eq!(added, 1, "one PEM certificate must be trusted");
+        assert_eq!(roots.len(), 1);
+
+        // A readable file with no PEM certificate must be reported as zero, not
+        // silently treated as "CA configured".
+        let junk = dir.join("junk.pem");
+        std::fs::write(&junk, b"not a certificate").unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        assert_eq!(load_pinned_ca(&mut roots, junk.to_str().unwrap()), 0);
+        assert!(roots.is_empty());
+
+        // Missing files are reported too, and never panic.
+        let mut roots = rustls::RootCertStore::empty();
+        assert_eq!(
+            load_pinned_ca(&mut roots, dir.join("missing.pem").to_str().unwrap()),
+            0
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `warm_up()` is a no-op without the variable, and must not panic when the
+    /// variable points nowhere: the startup path calls it unconditionally.
+    #[test]
+    fn warm_up_never_panics_for_a_bad_path() {
+        let saved = std::env::var("AGENT_TLS_CA_FILE").ok();
+        std::env::set_var("AGENT_TLS_CA_FILE", "/nonexistent/lagran-ca.pem");
+        // A path that exists but holds no certificate must also be tolerated.
+        warm_up();
+        std::env::set_var("AGENT_TLS_CA_FILE", "   ");
+        assert!(
+            pinned_ca_path().is_none(),
+            "blank value means: no pinned CA"
+        );
+        warm_up();
+        match saved {
+            Some(v) => std::env::set_var("AGENT_TLS_CA_FILE", v),
+            None => std::env::remove_var("AGENT_TLS_CA_FILE"),
+        }
     }
 }

@@ -1667,7 +1667,12 @@ echo | openssl s_client -connect 10.0.0.21:8082 -servername edge-01.internal \
 
 sudo systemctl restart lagran-control
 sudo journalctl -u lagran-control -n 20 | grep -i "private CA"
-# 期望：trusting private CA for edge agent callbacks ... certs=1
+# 期望：trusting private CA for edge agent callbacks ... certs=1 rejected=0
+#
+# 这条日志在启动阶段就会打印，不需要等到第一次 purge/证书回调。
+# 如果完全没有这条日志：AGENT_TLS_CA_FILE 为空、变量没进 EnvironmentFile，
+# 或进程没重启（CA 只在启动时读取一次）。
+# 如果打印的是 "contains no usable PEM certificate"：文件存在但不是 PEM 证书。
 
 # 在控制面机器上：模拟一次真实回调（节点令牌从控制台/节点 env 获取）
 curl --cacert /etc/lagran/edge-admin-ca.pem \
@@ -1741,8 +1746,14 @@ curl --cacert /etc/lagran/edge-admin-ca.pem \
 
 说明：
 
-- `AGENT_TLS_CA_FILE` 在控制面首次创建 agent HTTP 客户端时读取，**修改后必须重启
+- `AGENT_TLS_CA_FILE` 在控制面启动时读取并立即解析，**修改后必须重启
   `lagran-control`**；该文件可以包含多个 CA PEM。
+  启动日志三种结果：
+  - `trusting private CA for edge agent callbacks ... certs=N`：已加载 N 张证书；
+  - `contains no usable PEM certificate`：文件可读但没有可用证书，私有 CA **未** 生效；
+  - `cannot read AGENT_TLS_CA_FILE`：路径不存在/无权限，回退为只用 WebPKI 根。
+  也可以用 `lagran-control check-config` 单独检查，它会打印
+  `agent_tls_ca_file: <path>: N certificate(s) trusted`。
 - 轮换：只换叶子证书时重启 Edge 即可，控制面 CA 不变；轮换 CA 时需同时更新各节点证书
   与控制面 `AGENT_TLS_CA_FILE`。
 - 不要复用公共数据面的证书/私钥；管理面私钥只用于管理端口。
