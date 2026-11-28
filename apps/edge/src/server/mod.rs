@@ -2,6 +2,7 @@ pub mod access_log;
 pub mod shutdown;
 pub mod acme_challenge;
 pub mod agent_auth;
+pub mod body_inspect;
 pub mod bot_guard;
 pub mod cache_diag;
 pub mod cc;

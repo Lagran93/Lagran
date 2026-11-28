@@ -533,7 +533,8 @@ lagran_edge_chunk_fill_drop_budget_total
 - 总开关、拦截/观察模式
 - 托管规则：SQLi、XSS、路径穿越、扫描器、RCE、SSRF、XXE、Log4Shell、CRLF、SSTI、NoSQL、LDAP 等
 - 托管规则集：OWASP 核心防护、注入扩展防护、SSRF/XXE 防护、扫描器与协议基线
-- 自定义规则：路径、Query、UA、Referer、Method、请求头、IP
+- 自定义规则：路径、Query、UA、Referer、Method、请求头、IP；DSL 另支持 `body`
+- 请求体检查（预览）：按域名开启后检查 JSON/form/text 请求体，见下文
 - IP 黑白名单：支持单 IP 与 CIDR
 - Geo/ASN 黑白名单：按国家/地区（ISO 3166-1 两位代码）与 ASN 控制访问，见下方「Geo/ASN 黑白名单」
 - 安全级别：低/中/高/攻击中
@@ -555,7 +556,36 @@ WAF 检查会先做最多两次百分号解码，`%2527`、`%253Cscript%253E` �
 - 空字节、超长 path/query
 - 扫描器 UA、敏感路径、SQLi/XSS/路径穿越/RCE/SSRF/XXE/Log4Shell/SSTI/NoSQL/LDAP/Java 反序列化/WebShell 等托管规则
 
-WAF 目前不读取请求体（在代理读取 body 前执行），GET/HEAD 的 path/query/header 是主要检查面。
+#### 请求体检查（预览）
+
+默认关闭。控制台的按域名开关尚未接入（下一阶段），当前用 Edge 环境变量灰度：
+
+```text
+WAF_BODY_INSPECTION=true        为所有已启用 WAF 的域名强制开启
+WAF_BODY_MAX_BYTES=32768        检查上限，默认 32 KiB，硬上限 64 KiB
+WAF_BODY_OVERSIZE_POLICY=log    超限策略：log（放行并记录）/ block（413）/ allow
+WAF_BODY_UNINSPECTABLE_POLICY=log  无法检查时策略（见下）
+WAF_BODY_TIMEOUT_MS=1000        读取整个 body 的总超时
+```
+
+检查范围与限制：
+
+- 只检查 `POST/PUT/PATCH`，`Content-Type` 为 `application/json`、
+  `application/x-www-form-urlencoded` 或 `text/*`；
+- 必须带 `Content-Length` 且不超过上限；**不支持** chunked/无长度、gzip/br 压缩、
+  multipart、`Expect: 100-continue` 和 WebSocket 升级，这些请求按
+  `WAF_BODY_UNINSPECTABLE_POLICY` 处理（默认 `log` 放行）；
+- 超过 `WAF_BODY_MAX_BYTES` 的请求按 `WAF_BODY_OVERSIZE_POLICY` 处理；
+  `block` 时返回 413；
+- 64 KiB 是 Pingora 请求体回放缓冲区的硬上限：允许通过的 body 会先完整读入内存
+  （最多 64 KiB），再原样回源；读取超时返回 408，长度不一致返回 400；
+- JSON 字符串值会做 `\uXXXX` 等转义解码，form body 会做 `+`/百分号解码（最多两层），
+  然后转小写扫描；命中后沿用现有 block/monitor/challenge 流程；
+- 事件与访问日志**不记录完整 body**；检查失败/跳过目前只写 debug 日志，指标将在下一阶段补充；
+- 自定义 DSL 规则可写 `body contains "..."`、`body equals "..."` 等（`in` 仍只允许 `ip`）。
+
+> 说明：因为要“先看完整 body 再决定是否回源”，开启后带 body 的请求会多一次完整读取
+> 的延迟；不要对上传接口开启。控制台的按域名配置与指标将在 P2 接入。
 
 托管规则集是**增量启用**：
 

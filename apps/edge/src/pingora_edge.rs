@@ -21,6 +21,7 @@ use crate::origin_dns::OriginDnsCache;
 use crate::security::header_guard;
 use crate::security::origin_auth;
 use crate::security::signed_url;
+use crate::server::body_inspect;
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
 use crate::server::compression::{CompressionConfig, GzipEncoder, replay_chunk, should_compress};
@@ -34,6 +35,7 @@ use crate::server::host_util::normalized_authority_host;
 use crate::server::native_cache::{META_HEADER, NativeStorage, leak_storage_with_large};
 use crate::server::pipeline::{RequestFacts, RequestPipeline};
 use crate::server::purge;
+use crate::waf::body::decode_for_scan;
 use async_trait::async_trait;
 use axum::Json;
 use axum::body::Body;
@@ -873,6 +875,87 @@ impl ProxyHttp for DataPlaneProxy {
             .map(|v| v.eq_ignore_ascii_case("https"))
             .unwrap_or(false);
         if !internal_prefetch {
+            // WAF body inspection must run before the origin sees a byte, and
+            // before the shared preflight evaluates the WAF. Pingora replays the
+            // retry buffer upstream after this read, so the body is forwarded
+            // unchanged when the verdict allows it.
+            let decision =
+                body_inspect::decide(&domain, &ctx.method, &session.req_header().headers);
+            let body_text = match decision {
+                body_inspect::Decision::Skip { reason, log } => {
+                    if log {
+                        // Per-request WARN here would let a normal upload path
+                        // flood the logs. Metrics cover the aggregate; keep the
+                        // detail at debug level.
+                        tracing::debug!(
+                            domain = %domain.domain,
+                            reason,
+                            "WAF body inspection skipped; request forwarded uninspected"
+                        );
+                    }
+                    None
+                }
+                body_inspect::Decision::Reject { status, reason } => {
+                    ctx.status = status.as_u16();
+                    ctx.cache_label = "BYPASS";
+                    ctx.cache_reason = Some(reason);
+                    write_plain(
+                        session,
+                        status.as_u16(),
+                        "text/plain; charset=utf-8",
+                        Bytes::from_static(b"request body rejected by WAF policy"),
+                    )
+                    .await;
+                    return Ok(true);
+                }
+                body_inspect::Decision::Inspect { max_bytes, timeout } => {
+                    match body_inspect::read(session, max_bytes, timeout).await {
+                        Ok(bytes) => {
+                            let expected =
+                                body_inspect::content_length(&session.req_header().headers);
+                            if expected.is_some_and(|length| length != bytes.len()) {
+                                ctx.status = 400;
+                                ctx.cache_label = "BYPASS";
+                                ctx.cache_reason = Some("content-length-mismatch");
+                                write_plain(
+                                    session,
+                                    400,
+                                    "text/plain; charset=utf-8",
+                                    Bytes::from_static(b"request body length mismatch"),
+                                )
+                                .await;
+                                return Ok(true);
+                            }
+                            let content_type = session
+                                .req_header()
+                                .headers
+                                .get(axum::http::header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            Some(decode_for_scan(content_type, &bytes))
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                domain = %domain.domain,
+                                reason = error.reason(),
+                                error = ?error,
+                                "WAF body read failed; request rejected"
+                            );
+                            ctx.status = error.status().as_u16();
+                            ctx.cache_label = "BYPASS";
+                            ctx.cache_reason = Some(error.reason());
+                            write_plain(
+                                session,
+                                error.status().as_u16(),
+                                "text/plain; charset=utf-8",
+                                Bytes::from_static(b"request body could not be inspected"),
+                            )
+                            .await;
+                            return Ok(true);
+                        }
+                    }
+                }
+            };
             let pipeline = RequestPipeline::new(&self.state);
             let preflight = {
                 let headers = &session.req_header().headers;
@@ -882,6 +965,7 @@ impl ProxyHttp for DataPlaneProxy {
                     path_only: &ctx.path,
                     path_and_query: &path_and_query,
                     headers,
+                    body: body_text.as_deref(),
                     client_ip: &ctx.client_ip,
                     is_https,
                     start: ctx.start,

@@ -20,7 +20,7 @@ use crate::server::shared::{
     challenge_accepts_html, hotlink_allowed, log_access, uuid_like_request_id,
 };
 use crate::server::{bot_guard, challenge, default_page};
-use crate::waf::{evaluate as waf_evaluate, WafAction, WafMode, WafRequest};
+use crate::waf::{evaluate_with_body as waf_evaluate, WafAction, WafMode, WafRequest};
 
 fn url_query(path_and_query: &str) -> &str {
     path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("")
@@ -38,6 +38,8 @@ pub(crate) async fn preflight_cacheable(
     path_only: &str,
     path_and_query: &str,
     headers: &HeaderMap,
+    // Decoded body for WAF inspection, when the caller buffered one.
+    body: Option<&str>,
     client_ip: &str,
     is_https: bool,
     start: Instant,
@@ -322,7 +324,7 @@ pub(crate) async fn preflight_cacheable(
             asn: geo.asn,
             headers,
         };
-        if let Some(verdict) = waf_evaluate(&domain.waf, &waf_request) {
+        if let Some(verdict) = waf_evaluate(&domain.waf, &waf_request, body) {
             if verdict.action != WafAction::Allow {
                 let mode_is_block = domain.waf.mode == WafMode::Block;
                 let challenge_capable = challenge_accepts_html(method, headers);

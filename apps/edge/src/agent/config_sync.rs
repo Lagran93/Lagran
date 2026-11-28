@@ -25,6 +25,7 @@ use crate::config::registry::{DomainEntry, DomainRegistry};
 use crate::metrics::EdgeMetrics;
 use crate::origin::OriginClient;
 use std::sync::Arc;
+use crate::waf::body::{BodyInspection, BodyPolicy, DEFAULT_MAX_BYTES};
 use crate::waf::{
     IpNet, ManagedRules, SecurityLevel, WafAction, WafConfig, WafField, WafMode, WafOp, WafRule,
 };
@@ -326,6 +327,28 @@ struct WafCfg {
     managed_rulesets: Vec<String>,
     #[serde(default)]
     rulepack: Option<crate::waf::rulepack::SignedRulepack>,
+    /// Optional bounded request-body inspection. Absent means disabled; the
+    /// control plane will start sending this in the next phase.
+    #[serde(default)]
+    body: BodyCfg,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BodyCfg {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    content_types: Vec<String>,
+    #[serde(default)]
+    oversize_policy: String,
+    #[serde(default)]
+    uninspectable_policy: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 fn default_challenge_difficulty() -> u8 {
@@ -570,12 +593,66 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig, metrics: &Arc<EdgeMetrics>
         challenge_difficulty: cfg.challenge_difficulty.clamp(1, 6),
         challenge_ttl_secs: cfg.challenge_ttl_secs.clamp(60, 86_400),
         security_level: SecurityLevel::parse(&cfg.security_level),
+        body: body_inspection(&cfg.body),
         compiled: Default::default(),
     };
     // Sort and filter the custom rules once here so the request path never
     // builds or sorts a temporary rule list.
     waf.finalize();
     waf
+}
+
+/// Build the body-inspection policy from the config document, then apply the
+/// operator preview switches. These env switches exist until the console sends
+/// per-domain settings; `WAF_BODY_INSPECTION=true` forces inspection for every
+/// WAF-enabled domain using the defaults below.
+fn body_inspection(cfg: &BodyCfg) -> BodyInspection {
+    let mut body = BodyInspection {
+        enabled: cfg.enabled,
+        max_bytes: cfg.max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
+        methods: cfg.methods.clone(),
+        content_types: cfg.content_types.clone(),
+        oversize: BodyPolicy::parse(&cfg.oversize_policy),
+        uninspectable: BodyPolicy::parse(&cfg.uninspectable_policy),
+        timeout_ms: cfg.timeout_ms.unwrap_or(1000),
+    };
+    if env_truthy("WAF_BODY_INSPECTION") {
+        body.enabled = true;
+    }
+    if let Some(max) = env_u64("WAF_BODY_MAX_BYTES") {
+        body.max_bytes = max as usize;
+    }
+    if let Some(policy) = env_string("WAF_BODY_OVERSIZE_POLICY") {
+        body.oversize = BodyPolicy::parse(&policy);
+    }
+    if let Some(policy) = env_string("WAF_BODY_UNINSPECTABLE_POLICY") {
+        body.uninspectable = BodyPolicy::parse(&policy);
+    }
+    if let Some(timeout) = env_u64("WAF_BODY_TIMEOUT_MS") {
+        body.timeout_ms = timeout;
+    }
+    body.finalize();
+    body
+}
+
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    env_string(name).and_then(|v| v.parse().ok())
+}
+
+fn env_truthy(name: &str) -> bool {
+    env_string(name).is_some_and(|v| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn parse_nets(entries: Vec<String>) -> Vec<IpNet> {

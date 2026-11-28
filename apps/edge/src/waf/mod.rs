@@ -6,10 +6,12 @@
 //!   vulnerability scanners;
 //! * per-domain custom rules (field + operator + value, block/allow/log).
 //!
-//! The body is not inspected: WAF runs before the proxy reads a request body,
-//! and CDN traffic is dominated by GET/HEAD. Managed checks cover the
-//! path/query/UA/referer, which is where most automated attacks show up.
+//! Request bodies are inspected only when a domain opts in (and the edge
+//! passed the operator preview switch). The body is bounded by Pingora's 64 KiB
+//! replay buffer; larger or uninspectable bodies follow an explicit policy
+//! instead of silently bypassing checks. See [`body`] for decoding and limits.
 
+pub mod body;
 pub mod geo;
 pub mod rulepack;
 
@@ -47,6 +49,8 @@ pub enum WafField {
     Referer,
     Method,
     Ip,
+    /// Decoded request body (only populated when body inspection ran).
+    Body,
     /// Arbitrary request header (`header:x-api-key`).
     Header(String),
 }
@@ -68,6 +72,7 @@ impl WafField {
             "referer" | "referrer" => Some(WafField::Referer),
             "method" => Some(WafField::Method),
             "ip" => Some(WafField::Ip),
+            "body" | "request_body" | "request-body" => Some(WafField::Body),
             _ => None,
         }
     }
@@ -544,6 +549,8 @@ pub struct WafConfig {
     pub asn_allow: Vec<u32>,
     /// ASNs blocked outright (takes precedence over allow).
     pub asn_deny: Vec<u32>,
+    /// Optional bounded request-body inspection.
+    pub body: body::BodyInspection,
     /// Number of leading hex zeroes the challenge hash must have (1..=6).
     pub challenge_difficulty: u8,
     /// How long a solved challenge keeps the client cleared (seconds).
@@ -567,6 +574,7 @@ impl Default for WafConfig {
             country_deny: Vec::new(),
             asn_allow: Vec::new(),
             asn_deny: Vec::new(),
+            body: body::BodyInspection::default(),
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
             security_level: SecurityLevel::Off,
@@ -596,6 +604,7 @@ impl WafConfig {
     /// Config construction is the right place for that work: rules are static
     /// between config syncs.
     pub fn finalize(&mut self) {
+        self.body.finalize();
         self.rules.retain(|rule| rule.enabled);
         // Highest priority first; ties keep declaration order (stable sort).
         self.rules
@@ -1070,12 +1079,17 @@ fn managed_verdict(
     // signature. The boundary path is only needed for signatures containing a
     // logical separator.
     let mut hits = if matchers.has_plain_patterns(enabled_in_config) {
-        let mut hits = matchers.full_plain_hits(parts[0]);
-        hits |= matchers.full_plain_hits(parts[1]);
-        hits |= matchers.full_plain_hits(parts[2]);
-        hits |= matchers.full_plain_hits(parts[3]);
+        let mut hits = 0;
+        for part in parts {
+            hits |= matchers.full_plain_hits(part);
+        }
         hits |= matchers.url_plain_hits(url_parts[0]);
         hits |= matchers.url_plain_hits(url_parts[1]);
+        if let Some(body) = parts.get(4) {
+            // SSRF/NoSQL signatures are URL-oriented but also matter in JSON
+            // bodies (metadata URLs, `$where`, ...).
+            hits |= matchers.url_plain_hits(body);
+        }
         hits
     } else {
         0
@@ -1163,7 +1177,10 @@ fn legacy_managed_verdict(
     if cfg.managed.log4shell && contains_any_joined(parts, full_separators, LOG4SHELL) {
         return Some(verdict("Log4Shell", "log4shell"));
     }
-    if cfg.managed.ssrf && contains_any_joined(&parts[..2], url_separators, SSRF) {
+    if cfg.managed.ssrf
+        && (contains_any_joined(&parts[..2], url_separators, SSRF)
+            || parts.get(4).is_some_and(|body| contains_any(body, SSRF)))
+    {
         return Some(verdict("SSRF / 云元数据", "ssrf"));
     }
     if cfg.managed.xxe && contains_any_joined(parts, full_separators, XXE) {
@@ -1172,7 +1189,10 @@ fn legacy_managed_verdict(
     if cfg.managed.ssti && contains_any_joined(parts, full_separators, SSTI) {
         return Some(verdict("模板注入 SSTI", "ssti"));
     }
-    if cfg.managed.nosql && contains_any_joined(&parts[..2], url_separators, NOSQL) {
+    if cfg.managed.nosql
+        && (contains_any_joined(&parts[..2], url_separators, NOSQL)
+            || parts.get(4).is_some_and(|body| contains_any(body, NOSQL)))
+    {
         return Some(verdict("NoSQL 注入", "nosql"));
     }
     if cfg.managed.ldap && contains_any_joined(parts, full_separators, LDAP) {
@@ -1308,6 +1328,9 @@ fn eval_dsl(
             if let lagran_waf_dsl::Field::Header(name) = field {
                 return op.matches(&fields.header_for(name), value);
             }
+            if *field == lagran_waf_dsl::Field::Body && fields.body.is_none() {
+                return false;
+            }
             let haystack = match field {
                 lagran_waf_dsl::Field::Path => fields.path,
                 lagran_waf_dsl::Field::Query => fields.query,
@@ -1315,6 +1338,7 @@ fn eval_dsl(
                 lagran_waf_dsl::Field::Referer => fields.referer,
                 lagran_waf_dsl::Field::Method => fields.method,
                 lagran_waf_dsl::Field::Ip => fields.ip_text,
+                lagran_waf_dsl::Field::Body => fields.body.unwrap_or(""),
                 lagran_waf_dsl::Field::Header(_) => unreachable!(),
             };
             op.matches(haystack, value)
@@ -1323,6 +1347,19 @@ fn eval_dsl(
 }
 
 pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
+    evaluate_with_body(cfg, req, None)
+}
+
+/// Evaluate the WAF with an optional, already-decoded body.
+///
+/// `body` must come from [`body::decode_for_scan`]: lowercase and decoded for
+/// the request content type. Managed signatures and custom `body` rules scan
+/// this text; no raw body is stored or logged.
+pub fn evaluate_with_body(
+    cfg: &WafConfig,
+    req: &WafRequest,
+    body: Option<&str>,
+) -> Option<WafVerdict> {
     if !cfg.enabled {
         return None;
     }
@@ -1391,12 +1428,28 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
     // The managed signatures run over "path?query ua referer". Concatenating
     // that into one String allocated and copied every component on every
     // request. `contains_any_joined` walks the same logical text without
-    // materialising it, including matches that straddle a separator.
-    let parts: [&str; 4] = [path.as_ref(), query.as_ref(), ua.as_ref(), referer.as_ref()];
-    const FULL_SEPS: [char; 3] = ['?', ' ', ' '];
+    // materialising it, including matches that straddle a separator. When a
+    // body was inspected it is appended as one more component so signatures
+    // such as "union select" match inside JSON/form payloads too.
+    let parts4: [&str; 4] = [path.as_ref(), query.as_ref(), ua.as_ref(), referer.as_ref()];
+    let parts5: [&str; 5] = [
+        path.as_ref(),
+        query.as_ref(),
+        ua.as_ref(),
+        referer.as_ref(),
+        body.unwrap_or(""),
+    ];
+    const FULL_SEPS4: [char; 3] = ['?', ' ', ' '];
+    const FULL_SEPS5: [char; 4] = ['?', ' ', ' ', ' '];
     const URL_SEPS: [char; 1] = ['?'];
+    let parts: &[&str] = if body.is_some() { &parts5 } else { &parts4 };
+    let full_seps: &[char] = if body.is_some() {
+        &FULL_SEPS5
+    } else {
+        &FULL_SEPS4
+    };
 
-    if let Some(verdict) = managed_verdict(cfg, &parts, &FULL_SEPS, &URL_SEPS, &ua, &path) {
+    if let Some(verdict) = managed_verdict(cfg, parts, full_seps, &URL_SEPS, &ua, &path) {
         return Some(verdict);
     }
     if cfg.managed.crlf
@@ -1457,6 +1510,7 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
         referer: referer.as_ref(),
         method: method.as_ref(),
         ip_text: ip_text.as_ref(),
+        body,
         header_names: &cfg.compiled.header_names,
         header_values: &header_values,
     };
@@ -1496,6 +1550,7 @@ struct RuleFields<'a, 'r> {
     ip_text: &'a str,
     header_names: &'a [String],
     header_values: &'a [Option<Cow<'r, str>>],
+    body: Option<&'a str>,
 }
 
 impl RuleFields<'_, '_> {
@@ -1522,6 +1577,7 @@ impl RuleFields<'_, '_> {
             WafField::Referer => Cow::Borrowed(self.referer),
             WafField::Method => Cow::Borrowed(self.method),
             WafField::Ip => Cow::Borrowed(self.ip_text),
+            WafField::Body => Cow::Borrowed(self.body.unwrap_or("")),
             // Header lookups are rare and already decoded on demand.
             WafField::Header(name) => self.header_for(name),
         }
@@ -1536,6 +1592,10 @@ fn rule_verdict(
 ) -> Option<WafVerdict> {
     let matched = if let Some(expr) = &rule.expr {
         eval_dsl(expr, fields, compiled)
+    } else if rule.field == WafField::Body && fields.body.is_none() {
+        // An inspected body is absent on GET/HEAD and on skipped bodies; a
+        // `body equals ""` rule must not fire on those requests.
+        false
     } else {
         let value = fields.value_for(&rule.field);
         rule.op.matches(&value, &rule.value)
@@ -1571,6 +1631,7 @@ mod tests {
             country_deny: vec![],
             asn_allow: vec![],
             asn_deny: vec![],
+            body: body::BodyInspection::default(),
             challenge_difficulty: 4,
             challenge_ttl_secs: 1800,
             security_level: SecurityLevel::Off,
@@ -1595,6 +1656,76 @@ mod tests {
             asn: None,
             headers,
         }
+    }
+
+    #[test]
+    fn body_matches_managed_rules_only_when_supplied() {
+        let mut c = cfg();
+        c.managed.sqli = true;
+        c.finalize();
+        let h = HeaderMap::new();
+        let r = req(&h, "/login", "", "curl");
+        let verdict = evaluate_with_body(&c, &r, Some("' or 1=1")).expect("body SQLi");
+        assert_eq!(verdict.category, "sqli");
+        assert!(
+            evaluate(&c, &r).is_none(),
+            "without a body the request is clean"
+        );
+    }
+
+    #[test]
+    fn custom_dsl_body_rule_matches() {
+        let mut c = cfg();
+        c.rules = vec![WafRule {
+            name: "请求体黑名单".into(),
+            field: WafField::Body,
+            op: WafOp::Contains,
+            value: "evil-body".into(),
+            action: WafAction::Block,
+            priority: 10,
+            enabled: true,
+            expr: Some(lagran_waf_dsl::parse(r#"body contains "evil-body""#).unwrap()),
+        }];
+        c.finalize();
+        let h = HeaderMap::new();
+        let r = req(&h, "/login", "", "curl");
+        let verdict = evaluate_with_body(&c, &r, Some("x evil-body y")).expect("custom body rule");
+        assert_eq!(verdict.category, "custom");
+        assert!(evaluate_with_body(&c, &r, Some("clean")).is_none());
+    }
+
+    #[test]
+    fn body_rule_does_not_fire_without_an_inspected_body() {
+        let mut c = cfg();
+        c.rules = vec![WafRule {
+            name: "空请求体".into(),
+            field: WafField::Body,
+            op: WafOp::Equals,
+            value: String::new(),
+            action: WafAction::Block,
+            priority: 10,
+            enabled: true,
+            expr: None,
+        }];
+        c.finalize();
+        let h = HeaderMap::new();
+        let r = req(&h, "/", "", "curl");
+        assert!(
+            evaluate(&c, &r).is_none(),
+            "a body rule must not match GET/HEAD"
+        );
+    }
+
+    #[test]
+    fn ssrf_signatures_are_scanned_in_the_body() {
+        let mut c = cfg();
+        c.managed.ssrf = true;
+        c.finalize();
+        let h = HeaderMap::new();
+        let r = req(&h, "/api/import", "", "curl");
+        let verdict = evaluate_with_body(&c, &r, Some("http://169.254.169.254/latest/meta-data"))
+            .expect("body SSRF");
+        assert_eq!(verdict.category, "ssrf");
     }
 
     #[test]

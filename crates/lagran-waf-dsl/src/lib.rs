@@ -8,7 +8,7 @@
 //! and     := unary ("AND" unary)*
 //! unary   := "NOT" unary | "(" expr ")" | condition
 //! condition := field operator "string"
-//! field   := path | query | user_agent | ua | referer | method | ip | header:name
+//! field   := path | query | user_agent | ua | referer | method | ip | body | header:name
 //! op      := contains | equals | eq | prefix | suffix
 //! ```
 //!
@@ -29,6 +29,9 @@ pub enum Field {
     Referer,
     Method,
     Ip,
+    /// Decoded request body. Only populated when body inspection is enabled
+    /// for the domain and the request is eligible (see the edge WAF config).
+    Body,
     Header(String),
 }
 
@@ -328,6 +331,7 @@ fn parse_field(input: &str) -> Option<Field> {
         "referer" | "referrer" => Some(Field::Referer),
         "method" => Some(Field::Method),
         "ip" => Some(Field::Ip),
+        "body" | "request_body" | "request-body" => Some(Field::Body),
         _ => None,
     }
 }
@@ -433,6 +437,20 @@ mod tests {
         assert!(parse(r#"path in "10.0.0.0/8""#).is_err());
         assert!(parse(r#"ip in "10.0.0.0/33""#).is_err());
         assert!(parse(r#"ip in "not-an-ip""#).is_err());
+    }
+
+    #[test]
+    fn parses_body_field() {
+        let expr = parse(r#"body contains "union select""#).unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Condition {
+                field: Field::Body,
+                op: Op::Contains,
+                ..
+            }
+        ));
+        assert!(parse(r#"body in "10.0.0.0/8""#).is_err());
     }
 
     #[test]

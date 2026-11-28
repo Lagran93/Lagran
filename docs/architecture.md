@@ -33,7 +33,9 @@
 3. WAF 评估（按域名）：IP 白名单放行 → IP 黑名单拦截 → Geo/ASN 黑名单拦截（国家/地区或 ASN，
    优先于白名单）→ Geo/ASN 白名单门槛（配置了才生效，命中任一才继续，**不跳过**后续检查）→
    托管规则（SQLi/XSS/路径穿越/扫描器/RCE/SSRF/XXE/Log4Shell/CRLF）→ 自定义规则（按优先级，
-   支持请求头）→ 安全级别（低/中/高/攻击中）；动作为拦截时返回 403 页，动作为质询时返回 JS PoW
+   支持请求头/请求体）→ 安全级别（低/中/高/攻击中）；开启请求体检查时先在 64 KiB 上限内
+   读取并解码 JSON/form/text body（无长度/压缩/超限按策略处理），再按原有顺序评估；
+   动作为拦截时返回 403 页，动作为质询时返回 JS PoW
    页面，通过后签发 HMAC 免质询 Cookie；观察模式只记录事件。
    Geo/ASN 判定使用 Edge 本地 MaxMind GeoLite2-Country / GeoLite2-ASN 查询可信客户端 IP；
    数据库缺失时黑名单不生效、白名单 fail-closed，其余 WAF 功能不受影响
