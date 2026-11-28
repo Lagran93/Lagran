@@ -875,10 +875,36 @@ impl ProxyHttp for DataPlaneProxy {
             .map(|v| v.eq_ignore_ascii_case("https"))
             .unwrap_or(false);
         if !internal_prefetch {
+            // Redirect/bot/CC/rate-limit first. Only a request that passed those
+            // may make the edge buffer a body, so a banned or rate-limited client
+            // cannot force a slow-body read.
+            let pipeline = RequestPipeline::new(&self.state);
+            let early = {
+                let headers = &session.req_header().headers;
+                let facts = RequestFacts {
+                    method: &ctx.method,
+                    host: &ctx.host,
+                    path_only: &ctx.path,
+                    path_and_query: &path_and_query,
+                    headers,
+                    body: None,
+                    client_ip: &ctx.client_ip,
+                    is_https,
+                    request_id: &ctx.request_id,
+                    start: ctx.start,
+                };
+                pipeline.preflight_early(&domain, &facts).await
+            };
+            if let Some(resp) = early {
+                let is_head = ctx.method == Method::HEAD;
+                write_axum_response(session, resp, is_head, Some(&self.compression)).await;
+                return Ok(true);
+            }
+
             // WAF body inspection must run before the origin sees a byte, and
-            // before the shared preflight evaluates the WAF. Pingora replays the
-            // retry buffer upstream after this read, so the body is forwarded
-            // unchanged when the verdict allows it.
+            // before the WAF stage evaluates the body. Pingora replays the retry
+            // buffer upstream after this read, so the body is forwarded unchanged
+            // when the verdict allows it.
             let decision =
                 body_inspect::decide(&domain, &ctx.method, &session.req_header().headers);
             let body_text = match decision {
@@ -1014,7 +1040,6 @@ impl ProxyHttp for DataPlaneProxy {
                     }
                 }
             };
-            let pipeline = RequestPipeline::new(&self.state);
             let preflight = {
                 let headers = &session.req_header().headers;
                 let facts = RequestFacts {
@@ -1026,9 +1051,10 @@ impl ProxyHttp for DataPlaneProxy {
                     body: body_text.as_deref(),
                     client_ip: &ctx.client_ip,
                     is_https,
+                    request_id: &ctx.request_id,
                     start: ctx.start,
                 };
-                pipeline.preflight(&domain, &facts).await
+                pipeline.preflight_waf(&domain, &facts).await
             };
             if let Some(resp) = preflight {
                 if body_text.is_some() && resp.headers().contains_key("x-lagran-waf") {

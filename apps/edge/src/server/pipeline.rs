@@ -11,9 +11,9 @@ use crate::cache::policy::{
 };
 use crate::config::registry::DomainEntry;
 use crate::server::state::AppState;
-use crate::server::preflight::preflight_cacheable;
+use crate::server::preflight::{preflight_pre_waf, preflight_waf};
 use axum::body::Body;
-use axum::http::{HeaderMap, Method, Request, Response};
+use axum::http::{HeaderMap, Method, Response};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,6 +28,9 @@ pub struct RequestFacts<'a> {
     pub body: Option<&'a str>,
     pub client_ip: &'a str,
     pub is_https: bool,
+    /// Stable request id shared by the early and WAF/late phases, so block logs
+    /// and access logs correlate even when the client sent no `x-request-id`.
+    pub request_id: &'a str,
     pub start: Instant,
 }
 
@@ -204,15 +207,38 @@ impl<'a> RequestPipeline<'a> {
         )
     }
 
-    /// HTTPS redirect, bot challenge, CC, rate limit, WAF and hotlink checks.
-    /// This is the same implementation used by both data planes today; moving
-    /// the body of the function here is the next mechanical step.
-    pub async fn preflight(
+    /// HTTPS redirect, bot challenge, CC and rate limiting.
+    ///
+    /// Runs before the request body is read, so a banned or rate-limited client
+    /// never makes the edge buffer a body.
+    pub async fn preflight_early(
         &self,
         domain: &DomainEntry,
         facts: &RequestFacts<'_>,
     ) -> Option<Response<Body>> {
-        preflight_cacheable(
+        preflight_pre_waf(
+            self.state,
+            domain,
+            facts.method,
+            facts.host,
+            facts.path_only,
+            facts.path_and_query,
+            facts.headers,
+            facts.client_ip,
+            facts.is_https,
+            facts.request_id,
+            facts.start,
+        )
+        .await
+    }
+
+    /// WAF and hotlink, after the body (when eligible) has been inspected.
+    pub async fn preflight_waf(
+        &self,
+        domain: &DomainEntry,
+        facts: &RequestFacts<'_>,
+    ) -> Option<Response<Body>> {
+        preflight_waf(
             self.state,
             domain,
             facts.method,
@@ -223,6 +249,7 @@ impl<'a> RequestPipeline<'a> {
             facts.body,
             facts.client_ip,
             facts.is_https,
+            facts.request_id,
             facts.start,
         )
         .await
@@ -231,28 +258,6 @@ impl<'a> RequestPipeline<'a> {
 
 /// Build facts from an Axum request. Pingora has its own context builder but
 /// passes the same fields to `RequestFacts`.
-pub fn facts_from_request<'a>(
-    req: &'a Request<Body>,
-    host: &'a str,
-    path_only: &'a str,
-    path_and_query: &'a str,
-    client_ip: &'a str,
-    is_https: bool,
-    start: Instant,
-) -> RequestFacts<'a> {
-    RequestFacts {
-        method: req.method(),
-        host,
-        path_only,
-        path_and_query,
-        headers: req.headers(),
-        body: None,
-        client_ip,
-        is_https,
-        start,
-    }
-}
-
 fn query_of(path_and_query: &str) -> &str {
     path_and_query
         .split_once('?')

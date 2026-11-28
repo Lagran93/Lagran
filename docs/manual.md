@@ -612,8 +612,9 @@ WAF_BODY_MAX_CONCURRENT=256     同时读取 body 的请求上限（1–4096）
   `lagran_edge_waf_body_{inspected,bytes,skipped,blocked,errors}_total` 指标；
 - 自定义 DSL 规则可写 `body contains "..."`、`body equals "..."` 等（`in` 仍只允许 `ip`）。
 
-> 说明：因为要“先看完整 body 再决定是否回源”，开启后带 body 的请求会多一次完整读取
-> 的延迟；不要对上传接口开启；超过并发上限的请求按跳过策略处理。
+> 说明：请求体在 HTTPS 跳转、Bot/CC 与限流都通过之后才读取；因为要“先看完整 body
+> 再决定是否回源”，开启后带 body 的请求会多一次完整读取的延迟；不要对上传接口开启；
+> 超过并发上限的请求按跳过策略处理。
 
 托管规则集是**增量启用**：
 

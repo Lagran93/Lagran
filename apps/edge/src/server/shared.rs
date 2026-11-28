@@ -6,7 +6,7 @@
 //! module depends on the legacy handler.
 
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::cache::policy::{ResolvedPolicy, RuleAction};
 use crate::server::access_log::AccessLog;
@@ -170,14 +170,6 @@ pub(crate) async fn log_access(
         request_id,
     );
     log.write(rec).await;
-}
-
-pub(crate) fn uuid_like_request_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("lr-{:x}", nanos)
 }
 
 pub(crate) fn apply_security_headers(headers: &mut HeaderMap) {

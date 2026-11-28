@@ -16,9 +16,7 @@ use crate::cache::policy::CacheStatus;
 use crate::config::registry::DomainEntry;
 use crate::server::cc::{CcDecision, CcMode};
 use crate::server::state::AppState;
-use crate::server::shared::{
-    challenge_accepts_html, hotlink_allowed, log_access, uuid_like_request_id,
-};
+use crate::server::shared::{challenge_accepts_html, hotlink_allowed, log_access};
 use crate::server::{bot_guard, challenge, default_page};
 use crate::waf::{evaluate_with_body as waf_evaluate, WafAction, WafMode, WafRequest};
 
@@ -26,11 +24,12 @@ fn url_query(path_and_query: &str) -> &str {
     path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("")
 }
 
-/// Preflight for the native Pingora cache path: HTTPS redirect, CC, rate-limit,
-/// WAF and hotlink checks. Returns a response when the request must not reach
-/// cache/origin. This mirrors the corresponding part of `proxy_handler`.
+/// Early preflight for the native Pingora cache path: HTTPS redirect, bot
+/// challenge, CC and rate limiting. Returns a response when the request must not
+/// reach cache/origin. WAF and hotlink run in [`preflight_waf`] after the body
+/// (when eligible) has been buffered.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn preflight_cacheable(
+pub(crate) async fn preflight_pre_waf(
     state: &Arc<AppState>,
     domain: &DomainEntry,
     method: &Method,
@@ -38,10 +37,9 @@ pub(crate) async fn preflight_cacheable(
     path_only: &str,
     path_and_query: &str,
     headers: &HeaderMap,
-    // Decoded body for WAF inspection, when the caller buffered one.
-    body: Option<&str>,
     client_ip: &str,
     is_https: bool,
+    request_id: &str,
     start: Instant,
 ) -> Option<Response> {
     let user_agent = headers
@@ -54,13 +52,6 @@ pub(crate) async fn preflight_cacheable(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let request_id = headers
-        .get("x-request-id")
-        .or_else(|| headers.get("x-correlation-id"))
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(uuid_like_request_id);
     let client_ip_addr: Option<IpAddr> = client_ip.parse().ok();
 
     if domain.ssl_enabled && !is_https {
@@ -304,6 +295,39 @@ pub(crate) async fn preflight_cacheable(
             return Some(default_page::rate_limited_page(host, path_only, 1, false));
         }
     }
+
+    None
+}
+
+/// WAF + hotlink, evaluated only after CC/rate limiting passed and (when
+/// enabled) the request body was buffered. Splitting from the early phase means
+/// a rate-limited or banned client never makes the edge read its body.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn preflight_waf(
+    state: &Arc<AppState>,
+    domain: &DomainEntry,
+    method: &Method,
+    host: &str,
+    path_only: &str,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: Option<&str>,
+    client_ip: &str,
+    is_https: bool,
+    request_id: &str,
+    start: Instant,
+) -> Option<Response> {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let client_ip_addr: Option<IpAddr> = client_ip.parse().ok();
 
     if domain.waf.enabled {
         // Only pay for a database lookup when this domain configured Geo/ASN

@@ -24,9 +24,11 @@ cd "$ROOT" || exit 1
 CONTROL_PORT="${CONTROL_PORT:-18390}"
 EDGE_PORT="${EDGE_PORT:-18391}"
 ORIGIN_PORT="${ORIGIN_PORT:-19391}"
+HTTPS_PORT="${HTTPS_PORT:-18392}"
 DOMAIN="${DOMAIN:-waf-body-$$.test}"
 LOG_DIR="${LOG_DIR:-/tmp/lagran-waf-body}"
-mkdir -p "$LOG_DIR"
+CERT_DIR="$LOG_DIR/certs"
+mkdir -p "$LOG_DIR" "$CERT_DIR"
 
 PIDS=()
 FAILED=0
@@ -251,6 +253,90 @@ PADDING=$(printf 'a%.0s' $(seq 1 2048))
 CODE=$(body_request "{\"data\":\"$PADDING\"}")
 check "oversize body rejected under block policy" "$CODE" "413"
 contains "block policy explains the rejection" "$(cat "$LOG_DIR/body")" "request body rejected"
+
+echo "== HTTP/2 + TLS end-to-end =="
+command -v openssl >/dev/null || { echo "openssl required"; exit 1; }
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout "$CERT_DIR/ca.key" -out "$CERT_DIR/ca.crt" -subj "/CN=WAF Body Test CA" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes \
+  -keyout "$CERT_DIR/$DOMAIN.key" -out "$CERT_DIR/$DOMAIN.csr" \
+  -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN" >/dev/null 2>&1
+openssl x509 -req -in "$CERT_DIR/$DOMAIN.csr" -CA "$CERT_DIR/ca.crt" \
+  -CAkey "$CERT_DIR/ca.key" -CAcreateserial -days 1 -copy_extensions copy \
+  -out "$CERT_DIR/$DOMAIN.leaf.crt" >/dev/null 2>&1
+cat "$CERT_DIR/$DOMAIN.leaf.crt" "$CERT_DIR/ca.crt" >"$CERT_DIR/$DOMAIN.crt"
+
+kill "$EDGE_PID" 2>/dev/null
+wait "$EDGE_PID" 2>/dev/null
+CONTROL_URL="http://127.0.0.1:$CONTROL_PORT" \
+EDGE_LISTEN="127.0.0.1:$EDGE_PORT" \
+EDGE_HTTPS_LISTEN="127.0.0.1:$HTTPS_PORT" \
+EDGE_ADMIN_LISTEN= \
+AGENT_URL="http://127.0.0.1:$EDGE_PORT" \
+AGENT_TOKEN="$NODE_TOKEN" \
+NODE_ID="waf-body-edge-$$" \
+CERT_DIR="$CERT_DIR" \
+CACHE_BACKEND=memory \
+CACHE_TTL=60 \
+RUST_LOG=lagran_edge=warn,edge=warn \
+./target/debug/lagran-edge >>"$LOG_DIR/edge.log" 2>&1 &
+EDGE_PID=$!
+PIDS+=($!)
+for _ in $(seq 1 80); do
+  curl -skf --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
+    "https://$DOMAIN:$HTTPS_PORT/__lagran/health" >/dev/null && break
+  sleep 0.5
+done
+H2_CODE=""
+for _ in $(seq 1 40); do
+  H2_CODE=$(curl -sk --http2 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
+    -o "$LOG_DIR/body" -w '%{http_code}:%{http_version}' \
+    -X POST -H 'content-type: application/json' --data-binary '{"hello":"h2"}' \
+    "https://$DOMAIN:$HTTPS_PORT/api/echo")
+  [[ "$H2_CODE" == 200:* ]] && break
+  sleep 0.5
+done
+check "benign H2 body forwarded" "${H2_CODE%%:*}" "200"
+check "request used HTTP/2" "${H2_CODE##*:}" "2"
+check "origin received the H2 body unchanged" \
+  "$(jq -r '.echo' "$LOG_DIR/body" 2>/dev/null)" '{"hello":"h2"}'
+H2_ATTACK=$(curl -sk --http2 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" \
+  -o "$LOG_DIR/body" -w '%{http_code}' -X POST -H 'content-type: application/json' \
+  --data-binary '{"q":"'\'' or 1=1"}' "https://$DOMAIN:$HTTPS_PORT/api/echo")
+check "H2 SQLi body blocked" "$H2_ATTACK" "403"
+
+echo "== CC/rate-limit runs before body inspection =="
+curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/settings" \
+  -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"rate_limit_rps":1,"rate_limit_burst":1}' >/dev/null
+curl -s -X POST -H "x-lagran-agent-token: $NODE_TOKEN" \
+  "http://127.0.0.1:$EDGE_PORT/__lagran/config/reload" >/dev/null
+RATE_ACTIVE=0
+for _ in $(seq 1 60); do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" \
+    "http://127.0.0.1:$EDGE_PORT/")
+  if [[ "$CODE" == "429" ]]; then RATE_ACTIVE=1; break; fi
+  sleep 0.5
+done
+check "rate limit reached the edge" "$RATE_ACTIVE" "1"
+BEFORE=$(curl -s -H "x-lagran-agent-token: $NODE_TOKEN" \
+  "http://127.0.0.1:$EDGE_PORT/__lagran/metrics" \
+  | awk '/^lagran_edge_waf_body_inspected_total /{print $2; exit}')
+# Give the token bucket one refill so the first request is the allowed one.
+sleep 2
+FIRST=$(body_request '{"rate":"first"}')
+SECOND=$(body_request '{"rate":"second"}')
+AFTER=$(curl -s -H "x-lagran-agent-token: $NODE_TOKEN" \
+  "http://127.0.0.1:$EDGE_PORT/__lagran/metrics" \
+  | awk '/^lagran_edge_waf_body_inspected_total /{print $2; exit}')
+check "first request passes the rate limit" "$FIRST" "200"
+check "second request is rate limited" "$SECOND" "429"
+DELTA=$(( ${AFTER:-0} - ${BEFORE:-0} ))
+if [[ "$DELTA" -eq 1 ]]; then
+  pass "rate-limited request did not read a body (inspected +$DELTA)"
+else
+  fail "rate-limited request body read (inspected +$DELTA, want +1)"
+fi
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then
