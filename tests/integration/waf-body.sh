@@ -91,7 +91,7 @@ DOMAIN_ID=$(curl -s -H "$AUTH" "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" \
   | jq -r --arg n "$DOMAIN" '.[] | select(.name == $n) | .id')
 [[ -n "$DOMAIN_ID" ]] || { echo "domain not found"; exit 1; }
 
-BODY_SETTINGS='{"enabled":true,"max_bytes":1024,"methods":["POST","PUT","PATCH"],"content_types":["application/json"],"oversize_policy":"log","uninspectable_policy":"log","timeout_ms":1000,"inspect_unknown_length":true,"decompress_gzip":true}'
+BODY_SETTINGS='{"enabled":true,"max_bytes":1024,"methods":["POST","PUT","PATCH"],"content_types":["application/json","multipart/form-data"],"oversize_policy":"log","uninspectable_policy":"log","timeout_ms":1000,"inspect_unknown_length":true,"decompress_gzip":true,"decompress_brotli":true}'
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"enabled":true,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true,"rce":true,"ssrf":true,"xxe":true,"log4shell":true,"crlf":true,"ssti":true,"nosql":true,"ldap":true,"java":true,"webshell":true,"protocol":true,"challenge_difficulty":2,"challenge_ttl_secs":300,"body":'"$BODY_SETTINGS"'}' >/dev/null
@@ -198,6 +198,41 @@ CHUNKED_BIG=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}'
   --data-binary @"$LOG_DIR/chunked-big.json" \
   "http://127.0.0.1:$EDGE_PORT/api/echo")
 check "oversized chunked body rejected (cannot replay)" "$CHUNKED_BIG" "413"
+
+echo "== brotli / multipart / Expect: 100-continue =="
+printf '%s' 'iweAeyJxIjoiJyBvciAxPTEifQM=' | base64 -d >"$LOG_DIR/evil.json.br"
+BR=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  -X POST -H "Host: $DOMAIN" -H 'content-type: application/json' \
+  -H 'Content-Encoding: br' --data-binary @"$LOG_DIR/evil.json.br" \
+  "http://127.0.0.1:$EDGE_PORT/api/echo")
+check "SQLi in a brotli body blocked" "$BR" "403"
+
+python3 - "$LOG_DIR/evil.multipart" <<'PY'
+import sys
+boundary = "X"
+payload = (
+    f"--{boundary}\r\n"
+    'Content-Disposition: form-data; name="q"\r\n'
+    "\r\n"
+    "' or 1=1\r\n"
+    f"--{boundary}--\r\n"
+)
+open(sys.argv[1], "wb").write(payload.encode())
+PY
+MULTIPART=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  -X POST -H "Host: $DOMAIN" \
+  -H 'content-type: multipart/form-data; boundary=X' \
+  --data-binary @"$LOG_DIR/evil.multipart" \
+  "http://127.0.0.1:$EDGE_PORT/api/echo")
+check "SQLi in a multipart text part blocked" "$MULTIPART" "403"
+
+EXPECT=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  -X POST -H "Host: $DOMAIN" -H 'content-type: application/json' \
+  -H 'Expect: 100-continue' \
+  --data-binary '{"q":"'\'' or 1=1"}' \
+  "http://127.0.0.1:$EDGE_PORT/api/echo")
+check "SQLi with Expect: 100-continue blocked" "$EXPECT" "403"
+contains "edge sent 100 Continue" "$(cat "$LOG_DIR/headers")" "100 Continue"
 
 echo "== oversize follows the configured policy =="
 PADDING=$(printf 'a%.0s' $(seq 1 2048))

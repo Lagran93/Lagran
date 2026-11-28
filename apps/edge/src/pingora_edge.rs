@@ -940,6 +940,12 @@ impl ProxyHttp for DataPlaneProxy {
                 }
                 body_inspect::Decision::Inspect { max_bytes, timeout } => {
                     if let Some(_permit) = body_inspect::try_acquire() {
+                        if body_inspect::expects_continue(&session.req_header().headers) {
+                            let interim = ResponseHeader::build(100, Some(0))?;
+                            session
+                                .write_response_header(Box::new(interim), false)
+                                .await?;
+                        }
                         match body_inspect::read(session, max_bytes, timeout).await {
                             Ok(bytes) => {
                                 let expected =
@@ -963,45 +969,58 @@ impl ProxyHttp for DataPlaneProxy {
                                     .get(axum::http::header::CONTENT_TYPE)
                                     .and_then(|v| v.to_str().ok())
                                     .unwrap_or("");
-                                let gzip = session
+                                let encoding = session
                                     .req_header()
                                     .headers
                                     .get(axum::http::header::CONTENT_ENCODING)
                                     .and_then(|v| v.to_str().ok())
-                                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("gzip"));
-                                let decompressed = if gzip && domain.waf.body.decompress_gzip {
-                                    match crate::waf::body::gunzip_for_scan(
-                                        &bytes,
-                                        crate::waf::body::MAX_DECOMPRESSED_BYTES,
-                                    ) {
-                                        Ok(decoded) => Some(decoded),
-                                        Err(error) => {
-                                            self.state.metrics.record_waf_body_error();
-                                            let status = match error {
-                                                crate::waf::body::DecodeError::TooLarge => {
-                                                    axum::http::StatusCode::PAYLOAD_TOO_LARGE
-                                                }
-                                                crate::waf::body::DecodeError::Invalid => {
-                                                    axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
-                                                }
-                                            };
-                                            ctx.status = status.as_u16();
-                                            ctx.cache_label = "BYPASS";
-                                            ctx.cache_reason = Some("body-decode-error");
-                                            write_plain(
-                                                session,
-                                                status.as_u16(),
-                                                "text/plain; charset=utf-8",
-                                                Bytes::from_static(
-                                                    b"request body could not be decoded",
-                                                ),
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_ascii_lowercase();
+                                let decoded: Result<Option<Vec<u8>>, crate::waf::body::DecodeError> =
+                                    match encoding.as_str() {
+                                        "gzip" if domain.waf.body.decompress_gzip => {
+                                            crate::waf::body::gunzip_for_scan(
+                                                &bytes,
+                                                crate::waf::body::MAX_DECOMPRESSED_BYTES,
                                             )
-                                            .await;
-                                            return Ok(true);
+                                            .map(Some)
                                         }
+                                        "br" if domain.waf.body.decompress_brotli => {
+                                            crate::waf::body::brotli_for_scan(
+                                                &bytes,
+                                                crate::waf::body::MAX_DECOMPRESSED_BYTES,
+                                            )
+                                            .map(Some)
+                                        }
+                                        _ => Ok(None),
+                                    };
+                                let decompressed = match decoded {
+                                    Ok(decoded) => decoded,
+                                    Err(error) => {
+                                        self.state.metrics.record_waf_body_error();
+                                        let status = match error {
+                                            crate::waf::body::DecodeError::TooLarge => {
+                                                axum::http::StatusCode::PAYLOAD_TOO_LARGE
+                                            }
+                                            crate::waf::body::DecodeError::Invalid => {
+                                                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+                                            }
+                                        };
+                                        ctx.status = status.as_u16();
+                                        ctx.cache_label = "BYPASS";
+                                        ctx.cache_reason = Some("body-decode-error");
+                                        write_plain(
+                                            session,
+                                            status.as_u16(),
+                                            "text/plain; charset=utf-8",
+                                            Bytes::from_static(
+                                                b"request body could not be decoded",
+                                            ),
+                                        )
+                                        .await;
+                                        return Ok(true);
                                     }
-                                } else {
-                                    None
                                 };
                                 let scan_bytes: &[u8] =
                                     decompressed.as_deref().unwrap_or(&bytes);

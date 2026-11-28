@@ -303,7 +303,10 @@
               <div class="field">
                 <label class="field-label">Content-Type</label>
                 <input v-model="bodyContentTypesText" class="input" type="text" />
-                <span class="field-hint">逗号分隔；支持 text/* 与 */* 通配。</span>
+                <span class="field-hint">
+                  逗号分隔；支持 text/* 与 */* 通配。检查 multipart 时加入
+                  multipart/form-data（只扫描文本 part，跳过二进制文件）。
+                </span>
               </div>
               <div class="field">
                 <label class="field-label">超过上限时</label>
@@ -345,6 +348,18 @@
               <label class="switch" :class="{ on: settings.body.decompress_gzip }">
                 <span class="switch-track" />
                 <input v-model="settings.body.decompress_gzip" type="checkbox" style="display: none" />
+              </label>
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-title">解压 br（Brotli）后检查</div>
+                <div class="setting-desc">
+                  仅 Content-Encoding: br；解压后最多扫描 256 KiB，失败返回 413/415。
+                </div>
+              </div>
+              <label class="switch" :class="{ on: settings.body.decompress_brotli }">
+                <span class="switch-track" />
+                <input v-model="settings.body.decompress_brotli" type="checkbox" style="display: none" />
               </label>
             </div>
           </template>
@@ -1002,6 +1017,7 @@ function emptyBody() {
     timeout_ms: 1000,
     inspect_unknown_length: false,
     decompress_gzip: false,
+    decompress_brotli: false,
   }
 }
 

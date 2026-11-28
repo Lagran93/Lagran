@@ -74,6 +74,8 @@ pub struct BodyInspection {
     pub inspect_unknown_length: bool,
     /// Decompress `Content-Encoding: gzip` (bounded) before scanning.
     pub decompress_gzip: bool,
+    /// Decompress `Content-Encoding: br` (bounded) before scanning.
+    pub decompress_brotli: bool,
 }
 
 impl Default for BodyInspection {
@@ -88,6 +90,7 @@ impl Default for BodyInspection {
             timeout_ms: 1000,
             inspect_unknown_length: false,
             decompress_gzip: false,
+            decompress_brotli: false,
         }
     }
 }
@@ -164,31 +167,121 @@ impl BodyInspection {
 }
 
 /// Extract the lowercase media type from a `Content-Type` header value.
-pub fn media_type(content_type: &str) -> &str {
+pub fn media_type(content_type: &str) -> String {
     content_type
         .split(';')
         .next()
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
-        .leak()
 }
 
 /// Decode a body into the lowercase text the managed signatures and custom
 /// rules scan. JSON/form payloads are decoded so `\u003c`, `%27` and `+` do
-/// not hide a payload from the WAF.
+/// not hide a payload from the WAF. Multipart bodies are split into text parts;
+/// binary file parts are skipped.
 pub fn decode_for_scan(content_type: &str, body: &[u8]) -> String {
     let media = media_type(content_type);
-    let text = if media == "application/json" || media.ends_with("+json") {
+    let text = if media == "multipart/form-data" {
+        decode_multipart(content_type, body)
+    } else {
+        decode_content(&media, body)
+    };
+    let mut lowered = text.to_lowercase();
+    truncate_scan_text(&mut lowered);
+    lowered
+}
+
+fn decode_content(media: &str, body: &[u8]) -> String {
+    if media == "application/json" || media.ends_with("+json") {
         decode_json(body)
     } else if media == "application/x-www-form-urlencoded" {
         decode_form(&String::from_utf8_lossy(body))
     } else {
         String::from_utf8_lossy(body).into_owned()
+    }
+}
+
+fn multipart_boundary(content_type: &str) -> Option<&str> {
+    content_type.split(';').skip(1).find_map(|param| {
+        let (key, value) = param.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case("boundary") {
+            Some(value.trim().trim_matches('"'))
+        } else {
+            None
+        }
+    })
+}
+
+fn part_is_scannable(content_type: &str) -> bool {
+    let media = media_type(content_type);
+    media.is_empty()
+        || media == "application/json"
+        || media.ends_with("+json")
+        || media == "application/x-www-form-urlencoded"
+        || media.starts_with("text/")
+}
+
+fn split_bytes<'a>(data: &'a [u8], needle: &[u8]) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start <= data.len() {
+        let Some(offset) = data[start..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+        else {
+            break;
+        };
+        out.push(&data[start..start + offset]);
+        start += offset + needle.len();
+    }
+    out.push(&data[start..]);
+    out
+}
+
+fn header_value<'a>(headers: &'a [u8], name: &str) -> Option<&'a str> {
+    for line in headers.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        if !line[..colon].eq_ignore_ascii_case(name.as_bytes()) {
+            continue;
+        }
+        return std::str::from_utf8(&line[colon + 1..]).ok().map(str::trim);
+    }
+    None
+}
+
+fn decode_multipart(content_type: &str, body: &[u8]) -> String {
+    let Some(boundary) = multipart_boundary(content_type).filter(|b| !b.is_empty()) else {
+        return String::from_utf8_lossy(body).into_owned();
     };
-    let mut lowered = text.to_lowercase();
-    truncate_scan_text(&mut lowered);
-    lowered
+    let delimiter = format!("--{boundary}");
+    let mut out = String::new();
+    for part in split_bytes(body, delimiter.as_bytes()) {
+        if out.len() >= MAX_SCAN_BYTES {
+            break;
+        }
+        let part = part.strip_prefix(b"\r\n").unwrap_or(part);
+        let part = part.strip_suffix(b"\r\n").unwrap_or(part);
+        if part.is_empty() || part.starts_with(b"--") {
+            continue;
+        }
+        let Some(head_end) = part.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = &part[..head_end];
+        let content = &part[head_end + 4..];
+        let part_type = header_value(headers, "content-type").unwrap_or("text/plain");
+        if !part_is_scannable(part_type) {
+            continue;
+        }
+        let media = media_type(part_type);
+        out.push_str(&decode_content(&media, content));
+        out.push(' ');
+    }
+    out
 }
 
 fn truncate_scan_text(text: &mut String) {
@@ -395,6 +488,11 @@ impl<'a> BodyFacts<'a> {
         self.content_encoding
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("gzip"))
     }
+
+    pub fn is_brotli(&self) -> bool {
+        self.content_encoding
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("br"))
+    }
 }
 
 /// Decompressed bodies are scanned through a separate, larger cap; the wire
@@ -405,6 +503,21 @@ pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024;
 pub enum DecodeError {
     TooLarge,
     Invalid,
+}
+
+/// Brotli-decompress a request body for scanning, bounded by `max`.
+pub fn brotli_for_scan(input: &[u8], max: usize) -> Result<Vec<u8>, DecodeError> {
+    use std::io::Read;
+    let decoder = brotli::Decompressor::new(input, 4096);
+    let mut out = Vec::new();
+    decoder
+        .take((max as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|_| DecodeError::Invalid)?;
+    if out.len() > max {
+        return Err(DecodeError::TooLarge);
+    }
+    Ok(out)
 }
 
 /// Gunzip a request body for scanning, bounded by `max`.
@@ -488,6 +601,31 @@ mod tests {
         assert_eq!(body.content_types, vec!["application/json".to_string()]);
         assert!(body.method_allowed("post"));
         assert!(!body.method_allowed("GET"));
+    }
+
+    #[test]
+    fn brotli_is_bounded_and_decodes() {
+        use std::io::Write;
+        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+        encoder.write_all(b"union select").unwrap();
+        let compressed = encoder.into_inner();
+        assert_eq!(brotli_for_scan(&compressed, 1024).unwrap(), b"union select");
+        assert_eq!(
+            brotli_for_scan(&compressed, 4).unwrap_err(),
+            DecodeError::TooLarge
+        );
+        assert_eq!(
+            brotli_for_scan(b"not brotli", 1024).unwrap_err(),
+            DecodeError::Invalid
+        );
+    }
+
+    #[test]
+    fn multipart_scans_text_parts_only() {
+        let body = b"--X\r\nContent-Disposition: form-data; name=\"q\"\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nq=%27+or+1%3D1\r\n--X\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.bin\"\r\nContent-Type: application/octet-stream\r\n\r\nbinary-data\r\n--X--\r\n";
+        let text = decode_for_scan("multipart/form-data; boundary=X", body);
+        assert!(text.contains("' or 1=1"), "{text}");
+        assert!(!text.contains("binary-data"));
     }
 
     #[test]

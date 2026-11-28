@@ -55,17 +55,13 @@ pub fn decide(domain: &DomainEntry, method: &Method, headers: &HeaderMap) -> Dec
             log: false,
         };
     }
-    if !facts.is_identity() && !(body.decompress_gzip && facts.is_gzip()) {
+    let decompressible =
+        (body.decompress_gzip && facts.is_gzip()) || (body.decompress_brotli && facts.is_brotli());
+    if !facts.is_identity() && !decompressible {
         return uninspectable(body, "content-encoding");
     }
     if !body.content_type_allowed(facts.content_type) {
         return uninspectable(body, "content-type");
-    }
-    if facts.expect_continue {
-        // A client using `Expect: 100-continue` waits for an interim response
-        // before sending the body. This version does not send one, so reading
-        // would deadlock until the timeout; skip with the configured policy.
-        return uninspectable(body, "expect-continue");
     }
     match facts.content_length {
         None if body.inspect_unknown_length => Decision::Inspect {
@@ -186,6 +182,14 @@ fn body_limit() -> &'static Arc<Semaphore> {
             .clamp(1, 4096);
         Arc::new(Semaphore::new(permits))
     })
+}
+
+/// Whether the client is waiting for an interim `100 Continue`.
+pub fn expects_continue(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::EXPECT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("100-continue"))
 }
 
 /// `Content-Length` as an integer, if present and valid.
@@ -362,6 +366,30 @@ mod tests {
         let d = domain(body);
         assert!(matches!(
             decide(&d, &Method::POST, &gzip),
+            Decision::Inspect { .. }
+        ));
+    }
+
+    #[test]
+    fn expect_continue_and_brotli_are_inspected() {
+        let mut body = BodyInspection {
+            enabled: true,
+            decompress_brotli: true,
+            ..BodyInspection::default()
+        };
+        body.finalize();
+        let d = domain(body);
+        let mut expect = headers("POST", "application/json", Some("10"));
+        expect.insert(axum::http::header::EXPECT, "100-continue".parse().unwrap());
+        assert!(matches!(
+            decide(&d, &Method::POST, &expect),
+            Decision::Inspect { .. }
+        ));
+
+        let mut br = headers("POST", "application/json", Some("10"));
+        br.insert(axum::http::header::CONTENT_ENCODING, "br".parse().unwrap());
+        assert!(matches!(
+            decide(&d, &Method::POST, &br),
             Decision::Inspect { .. }
         ));
     }

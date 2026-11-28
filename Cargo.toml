@@ -64,6 +64,7 @@ http = "1"
 # Edge helpers (WebSocket handshake, HTTP-date parsing)
 base64 = "0.22"
 flate2 = "1"
+brotli = "3"
 httpdate = "1"
 regex = "1"
 ring = "0.17"

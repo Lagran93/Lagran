@@ -152,6 +152,7 @@ pub struct BodyInspectionDto {
     pub timeout_ms: u32,
     pub inspect_unknown_length: bool,
     pub decompress_gzip: bool,
+    pub decompress_brotli: bool,
 }
 
 impl Default for BodyInspectionDto {
@@ -170,6 +171,7 @@ impl Default for BodyInspectionDto {
             timeout_ms: 1000,
             inspect_unknown_length: false,
             decompress_gzip: false,
+            decompress_brotli: false,
         }
     }
 }
@@ -185,6 +187,7 @@ pub struct BodyInspectionRequest {
     pub timeout_ms: Option<u32>,
     pub inspect_unknown_length: Option<bool>,
     pub decompress_gzip: Option<bool>,
+    pub decompress_brotli: Option<bool>,
 }
 
 impl Default for WafSettingsDto {
@@ -257,6 +260,7 @@ impl From<repository::WafSettingsRow> for WafSettingsDto {
                 timeout_ms: r.body_timeout_ms.clamp(100, 5000) as u32,
                 inspect_unknown_length: r.body_inspect_unknown_length,
                 decompress_gzip: r.body_decompress_gzip,
+                decompress_brotli: r.body_decompress_brotli,
             },
         }
     }
@@ -727,6 +731,7 @@ pub async fn put_settings(
         body.timeout_ms as i32,
         body.inspect_unknown_length,
         body.decompress_gzip,
+        body.decompress_brotli,
     )
     .await
     .map_err(|e| {
@@ -862,6 +867,9 @@ fn merge_body(
             .inspect_unknown_length
             .unwrap_or(current.inspect_unknown_length),
         decompress_gzip: req.decompress_gzip.unwrap_or(current.decompress_gzip),
+        decompress_brotli: req
+            .decompress_brotli
+            .unwrap_or(current.decompress_brotli),
     })
 }
 
@@ -2151,6 +2159,7 @@ mod tests {
                 timeout_ms: Some(10),
                 inspect_unknown_length: None,
                 decompress_gzip: None,
+                decompress_brotli: None,
             }),
         )
         .unwrap_or_else(|_| panic!("valid body policy was rejected"));

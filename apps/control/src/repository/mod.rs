@@ -3069,6 +3069,7 @@ pub struct WafSettingsRow {
     pub body_timeout_ms: i32,
     pub body_inspect_unknown_length: bool,
     pub body_decompress_gzip: bool,
+    pub body_decompress_brotli: bool,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -3146,7 +3147,8 @@ pub async fn get_waf_settings(
                COALESCE(body_uninspectable_policy, 'log') AS body_uninspectable_policy,
                COALESCE(body_timeout_ms, 1000) AS body_timeout_ms,
                COALESCE(body_inspect_unknown_length, FALSE) AS body_inspect_unknown_length,
-               COALESCE(body_decompress_gzip, FALSE) AS body_decompress_gzip
+               COALESCE(body_decompress_gzip, FALSE) AS body_decompress_gzip,
+               COALESCE(body_decompress_brotli, FALSE) AS body_decompress_brotli
         FROM waf_settings WHERE domain_id = $1
         "#,
     )
@@ -3191,6 +3193,7 @@ pub async fn upsert_waf_settings(
     body_timeout_ms: i32,
     body_inspect_unknown_length: bool,
     body_decompress_gzip: bool,
+    body_decompress_brotli: bool,
 ) -> sqlx::Result<WafSettingsRow> {
     sqlx::query_as::<_, WafSettingsRow>(
         r#"
@@ -3202,10 +3205,10 @@ pub async fn upsert_waf_settings(
              managed_rulesets, waf_rulepack_version, waf_gray_percent,
              body_inspection, body_max_bytes, body_methods, body_content_types,
              body_oversize_policy, body_uninspectable_policy, body_timeout_ms,
-             body_inspect_unknown_length, body_decompress_gzip)
+             body_inspect_unknown_length, body_decompress_gzip, body_decompress_brotli)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-                $25, $26, $27, $28, $29, $30, $31, $32, $33)
+                $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)
         ON CONFLICT (domain_id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
           mode = EXCLUDED.mode,
@@ -3239,6 +3242,7 @@ pub async fn upsert_waf_settings(
           body_timeout_ms = EXCLUDED.body_timeout_ms,
           body_inspect_unknown_length = EXCLUDED.body_inspect_unknown_length,
           body_decompress_gzip = EXCLUDED.body_decompress_gzip,
+          body_decompress_brotli = EXCLUDED.body_decompress_brotli,
           updated_at = NOW()
         RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners,
                   rce, ssrf, xxe, log4shell, crlf,
@@ -3247,7 +3251,8 @@ pub async fn upsert_waf_settings(
                   managed_rulesets, waf_rulepack_version, waf_gray_percent,
                   body_inspection, body_max_bytes, body_methods, body_content_types,
                   body_oversize_policy, body_uninspectable_policy, body_timeout_ms,
-                  body_inspect_unknown_length, body_decompress_gzip
+                  body_inspect_unknown_length, body_decompress_gzip,
+                  body_decompress_brotli
         "#,
     )
     .bind(domain_id)
@@ -3283,6 +3288,7 @@ pub async fn upsert_waf_settings(
     .bind(body_timeout_ms)
     .bind(body_inspect_unknown_length)
     .bind(body_decompress_gzip)
+    .bind(body_decompress_brotli)
     .fetch_one(pool)
     .await
 }
@@ -3307,7 +3313,8 @@ pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSetting
                COALESCE(body_uninspectable_policy, 'log') AS body_uninspectable_policy,
                COALESCE(body_timeout_ms, 1000) AS body_timeout_ms,
                COALESCE(body_inspect_unknown_length, FALSE) AS body_inspect_unknown_length,
-               COALESCE(body_decompress_gzip, FALSE) AS body_decompress_gzip
+               COALESCE(body_decompress_gzip, FALSE) AS body_decompress_gzip,
+               COALESCE(body_decompress_brotli, FALSE) AS body_decompress_brotli
         FROM waf_settings
         "#,
     )

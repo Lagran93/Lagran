@@ -686,7 +686,8 @@ CC_SYNC_INTERVAL=5   # 共享封禁拉取间隔（秒），最小 2
   只有边缘前面是可信代理（SLB/网关）时才可开启，否则攻击者可以伪造白名单 IP。
 - 请求体检查需按域名开启（`PUT /waf` 的 `body` 字段）：默认只检查带
   `Content-Length` 的 POST/PUT/PATCH JSON/form/text body，硬上限 64 KiB；可显式开启
-  chunked/无长度读取（超过上限 413）与 gzip 解压检查（解压后上限 256 KiB）。
+  chunked/无长度读取（超过上限 413）、gzip/br 解压检查（解压后上限 256 KiB），
+  以及 multipart 文本 part 扫描和 Expect: 100-continue。
   不支持正则，也没有 IP 信誉库/地域封禁。
 - 安全级别「攻击中」会质询所有非静态资源的 GET/HEAD，包括 API 请求；这类客户端无法执行 JS 时会收到 403，
   建议仅在应急时开启，或配合放行规则豁免 API 路径。
