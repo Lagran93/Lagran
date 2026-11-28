@@ -760,6 +760,7 @@
               <option value="referer">Referer</option>
               <option value="method">请求方法</option>
               <option value="ip">客户端 IP</option>
+              <option value="body">请求体（需开启 body 检查）</option>
               <option value="header">请求头（自定义）</option>
             </select>
           </div>
@@ -800,21 +801,29 @@
           <label class="field-label">高级条件 DSL（可选）</label>
           <div class="dsl-editor">
             <textarea ref="dslTextarea" v-model="ruleForm.expr" class="textarea mono" rows="4"
-              placeholder='例如：path prefix "/admin" AND ip in "10.0.0.0/8"' @input="updateDslSuggestions"
-              @focus="updateDslSuggestions" @click="updateDslSuggestions" @keydown="onDslKeydown"
+              placeholder='例如：path prefix "/admin" AND ip in "10.0.0.0/8"'
+              role="combobox" aria-autocomplete="list"
+              :aria-expanded="dslSuggestOpen" aria-controls="dsl-suggest-list"
+              :aria-activedescendant="dslSuggestOpen ? `dsl-suggest-${dslSuggestIndex}` : undefined"
+              @input="updateDslSuggestions" @focus="updateDslSuggestions"
+              @click="updateDslSuggestions" @keydown="onDslKeydown"
+              @keydown.ctrl.space.prevent="forceDslSuggestions"
               @blur="closeDslSuggestionsSoon" />
-            <div v-if="dslSuggestOpen && dslSuggestions.length" class="dsl-suggest">
-              <button v-for="(item, i) in dslSuggestions" :key="item.label" type="button" class="dsl-suggest-item"
+            <div v-if="dslSuggestOpen && dslSuggestions.length" id="dsl-suggest-list"
+              class="dsl-suggest" role="listbox" aria-label="DSL 补全建议">
+              <button v-for="(item, i) in dslSuggestions" :id="`dsl-suggest-${i}`" :key="item.label"
+                type="button" role="option" :aria-selected="i === dslSuggestIndex" class="dsl-suggest-item"
                 :class="{ active: i === dslSuggestIndex }" @mousedown.prevent="applyDslSuggestion(item)">
                 <span class="dsl-suggest-label mono">{{ item.label }}</span>
                 <span class="dsl-suggest-detail">{{ item.detail }}</span>
               </button>
-              <div class="dsl-suggest-foot">↑↓ 选择 · Enter/Tab 补全 · Esc 关闭</div>
+              <div class="dsl-suggest-foot">↑↓ 选择 · Enter/Tab 补全 · Esc 关闭 · Ctrl+Space 重新触发</div>
             </div>
           </div>
           <span class="field-hint">
-            DSL 非空时忽略上面的单条件。支持 path/query/user_agent/referer/method/ip/header:名称、
+            DSL 非空时忽略上面的单条件。支持 path/query/user_agent/referer/method/ip/body/header:名称、
             contains/equals/prefix/suffix、ip in "CIDR"、AND/OR/NOT 和括号；不允许正则。
+            body 仅在该域名开启请求体检查时才有内容。
           </span>
         </div>
         <label class="check">
@@ -1713,6 +1722,7 @@ const dslSuggestOpen = ref(false)
 const dslSuggestions = ref<{ label: string; insert: string; detail: string; back?: number }[]>([])
 const dslSuggestIndex = ref(0)
 const dslTokenStart = ref(0)
+const dslTokenEnd = ref(0)
 
 const DSL_FIELDS = [
   { label: 'path', insert: 'path ', detail: '请求路径' },
@@ -1721,6 +1731,7 @@ const DSL_FIELDS = [
   { label: 'referer', insert: 'referer ', detail: 'Referer' },
   { label: 'method', insert: 'method ', detail: '请求方法' },
   { label: 'ip', insert: 'ip ', detail: '客户端 IP' },
+  { label: 'body', insert: 'body ', detail: '请求体（需开启 body 检查）' },
   { label: 'header:', insert: 'header:', detail: '请求头' },
 ]
 const DSL_OPS = [
@@ -1734,6 +1745,16 @@ const DSL_KEYWORDS = [
   { label: 'OR', insert: 'OR ', detail: '任一满足' },
   { label: 'NOT', insert: 'NOT ', detail: '取反' },
 ]
+const DSL_METHOD_VALUES = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].map(
+  (value) => ({ label: value, insert: value, detail: 'HTTP 方法' }),
+)
+const DSL_CIDR_VALUES = [
+  { label: '10.0.0.0/8', insert: '10.0.0.0/8', detail: '私有网段' },
+  { label: '172.16.0.0/12', insert: '172.16.0.0/12', detail: '私有网段' },
+  { label: '192.168.0.0/16', insert: '192.168.0.0/16', detail: '私有网段' },
+  { label: '127.0.0.1', insert: '127.0.0.1', detail: '本机 IPv4' },
+  { label: '::1', insert: '::1', detail: '本机 IPv6' },
+]
 
 function dslFieldKeys() {
   return DSL_FIELDS.map((f) => f.label.replace(':', ''))
@@ -1741,10 +1762,14 @@ function dslFieldKeys() {
 function dslOpKeys() {
   return [...DSL_OPS.map((o) => o.label), 'in']
 }
-function insideDslString(before: string) {
+type DslSuggestion = { label: string; insert: string; detail: string; back?: number }
+
+function dslStringStart(before: string): number | null {
   let quote = ''
+  let start = -1
   let escaped = false
-  for (const ch of before) {
+  for (let i = 0; i < before.length; i += 1) {
+    const ch = before[i]
     if (escaped) {
       escaped = false
       continue
@@ -1754,56 +1779,106 @@ function insideDslString(before: string) {
       continue
     }
     if (quote) {
-      if (ch === quote) quote = ''
+      if (ch === quote) {
+        quote = ''
+        start = -1
+      }
     } else if (ch === '"' || ch === "'") {
       quote = ch
+      start = i
     }
   }
-  return !!quote
+  return quote ? start : null
 }
 
-function updateDslSuggestions() {
+function tokensOf(input: string): string[] {
+  return input
+    .trim()
+    .split(/\s+/)
+    .map((token) => token.toLowerCase())
+    .filter(Boolean)
+}
+
+function valueCandidates(tokens: string[]): DslSuggestion[] {
+  // `ip in` / `method equals` are the two places where a short enum beats free
+  // text. Everything else stays a quoted string.
+  const field = tokens.length >= 2 ? tokens[tokens.length - 2] : ''
+  const op = tokens[tokens.length - 1] || ''
+  if (field === 'ip' && op === 'in') return DSL_CIDR_VALUES
+  if (field === 'method' && (op === 'equals' || op === 'eq')) return DSL_METHOD_VALUES
+  return []
+}
+
+function suggestionList(tokens: string[], prior: string): DslSuggestion[] {
+  const prev = tokens[tokens.length - 1] || ''
+  const fields = dslFieldKeys()
+  if (fields.includes(prev) || prev.startsWith('header:')) {
+    return prev === 'ip'
+      ? [...DSL_OPS, { label: 'in', insert: 'in ', detail: 'CIDR 网段' }]
+      : DSL_OPS
+  }
+  if (dslOpKeys().includes(prev)) {
+    const values = valueCandidates(tokens)
+    if (values.length) {
+      return [
+        ...values.map((value) => ({ ...value, insert: `"${value.insert}"` })),
+        { label: '""', insert: '""', detail: '自定义字符串', back: 1 },
+      ]
+    }
+    return [{ label: '""', insert: '""', detail: '字符串', back: 1 }]
+  }
+  if (prev === 'and' || prev === 'or' || prev === 'not' || prior === '' || prior.endsWith('(')) {
+    return [...DSL_FIELDS, ...DSL_KEYWORDS]
+  }
+  if (prior.endsWith(')') || prior.endsWith('"') || prior.endsWith("'")) {
+    return DSL_KEYWORDS
+  }
+  return [...DSL_FIELDS, ...DSL_KEYWORDS]
+}
+
+function updateDslSuggestions(force = false) {
   const el = dslTextarea.value
   if (!el) return
   const value = ruleForm.value.expr || ''
   const caret = el.selectionStart ?? value.length
   const before = value.slice(0, caret)
-  if (insideDslString(before)) {
-    dslSuggestOpen.value = false
+  const stringStart = dslStringStart(before)
+
+  if (stringStart !== null) {
+    const content = before.slice(stringStart + 1)
+    const head = before.slice(0, stringStart).trimEnd()
+    const values = valueCandidates(tokensOf(head))
+    const lower = content.toLowerCase()
+    dslTokenStart.value = caret - content.length
+    dslTokenEnd.value = caret
+    dslSuggestions.value = values.filter((item) => item.label.toLowerCase().startsWith(lower))
+    dslSuggestIndex.value = 0
+    dslSuggestOpen.value = force || dslSuggestions.value.length > 0
     return
   }
+
   const tokenMatch = before.match(/[A-Za-z_][A-Za-z0-9_:-]*$/)
   const token = tokenMatch?.[0] ?? ''
   const start = tokenMatch ? caret - token.length : caret
+  // Also replace the suffix when the caret is in the middle of a token, e.g.
+  // `pa|th` must become `path `, not `path th`.
+  const suffix = tokenMatch ? (value.slice(caret).match(/^[A-Za-z0-9_:-]*/) || [''])[0] : ''
   dslTokenStart.value = start
+  dslTokenEnd.value = caret + suffix.length
+
   const prior = before.slice(0, start).trimEnd()
-  const prev = (prior.match(/[A-Za-z_][A-Za-z0-9_:-]*$/) || [])[0]?.toLowerCase() || ''
-  const fields = dslFieldKeys()
-  const ops = dslOpKeys()
-  let candidates: { label: string; insert: string; detail: string; back?: number }[] = []
-
-  if (fields.includes(prev) || prev.startsWith('header:')) {
-    candidates = prev === 'ip'
-      ? [...DSL_OPS, { label: 'in', insert: 'in ', detail: 'CIDR 网段' }]
-      : DSL_OPS
-  } else if (ops.includes(prev)) {
-    candidates = prev === 'in'
-      ? [{ label: '"10.0.0.0/8"', insert: '"10.0.0.0/8"', detail: 'CIDR' }]
-      : [{ label: '""', insert: '""', detail: '字符串', back: 1 }]
-  } else if (prev === 'and' || prev === 'or' || prev === 'not' || prior === '' || prior.endsWith('(')) {
-    candidates = [...DSL_FIELDS, ...DSL_KEYWORDS]
-  } else if (prior.endsWith(')') || prior.endsWith('"') || prior.endsWith("'")) {
-    candidates = DSL_KEYWORDS
-  } else {
-    candidates = [...DSL_FIELDS, ...DSL_KEYWORDS]
-  }
-
+  const tokens = tokensOf(prior)
+  const candidates = suggestionList(tokens, prior)
   const lower = token.toLowerCase()
   dslSuggestions.value = candidates.filter((item) =>
-    item.label.toLowerCase().startsWith(lower)
+    item.label.toLowerCase().startsWith(lower),
   )
   dslSuggestIndex.value = 0
   dslSuggestOpen.value = dslSuggestions.value.length > 0
+}
+
+function forceDslSuggestions() {
+  updateDslSuggestions(true)
 }
 
 function closeDslSuggestionsSoon() {
@@ -1812,19 +1887,21 @@ function closeDslSuggestionsSoon() {
   }, 120)
 }
 
-function applyDslSuggestion(item: { label: string; insert: string; back?: number }) {
+function applyDslSuggestion(item: DslSuggestion) {
   const el = dslTextarea.value
   if (!el) return
   const value = ruleForm.value.expr || ''
-  const caret = el.selectionStart ?? value.length
   const start = dslTokenStart.value
-  const next = value.slice(0, start) + item.insert + value.slice(caret)
+  const end = Math.max(start, dslTokenEnd.value)
+  const next = value.slice(0, start) + item.insert + value.slice(end)
   ruleForm.value.expr = next
   dslSuggestOpen.value = false
   nextTick(() => {
     const pos = start + item.insert.length - (item.back || 0)
     el.focus()
     el.setSelectionRange(pos, pos)
+    // Cascade: field -> operator -> quoted value / keyword.
+    updateDslSuggestions()
   })
 }
 
