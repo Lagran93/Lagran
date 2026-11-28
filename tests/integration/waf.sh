@@ -206,6 +206,9 @@ echo "== browser challenge =="
 CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.1' -H 'Accept: text/html')
 check "challenge rule returns interstitial" "$CODE" "403"
 contains "challenge page marker" "$(cat "$LOG_DIR/body")" "正在进行安全验证"
+contains "challenge page has a slide-to-start control" "$(cat "$LOG_DIR/body")" 'id="slide"'
+contains "challenge page uses the breathing indicator" "$(cat "$LOG_DIR/body")" 'class="breath"'
+not_contains "challenge page no longer has a progress bar" "$(cat "$LOG_DIR/body")" 'class="progress"'
 contains_i "challenge response header" "$(cat "$LOG_DIR/headers")" "x-lagran-challenge:"
 
 # A client that cannot render the interstitial (no Accept: text/html) must be

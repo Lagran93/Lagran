@@ -460,6 +460,7 @@ const PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
     background: #f5f7fa; color: #1d2129;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
@@ -470,8 +471,36 @@ const PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
     display: flex; align-items: center; justify-content: center; }
   h1 { font-size: 18px; margin: 0 0 8px; font-weight: 600; }
   p { margin: 0 0 18px; color: #4e5969; font-size: 14px; line-height: 1.7; }
-  .progress { height: 6px; background: #f2f3f5; border-radius: 3px; overflow: hidden; margin: 18px 0 10px; }
-  .bar { height: 100%; width: 8%; background: #1677ff; border-radius: 3px; transition: width .2s ease; }
+  .slide-wrap { position: relative; margin: 22px 0 8px; }
+  .slider { -webkit-appearance: none; appearance: none; width: 100%; height: 46px; margin: 0;
+    border: 1px solid #e5e6eb; border-radius: 23px; outline: none; cursor: pointer;
+    background: linear-gradient(90deg, #1677ff 0%, #1677ff var(--fill, 0%), #f2f3f5 var(--fill, 0%), #f2f3f5 100%);
+    transition: border-color .15s ease; }
+  .slider:hover { border-color: #bedaff; }
+  .slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 38px; height: 38px;
+    border-radius: 50%; border: 2px solid #1677ff; background: #fff; cursor: grab;
+    box-shadow: 0 2px 8px rgba(29,33,41,.16); }
+  .slider::-moz-range-thumb { width: 34px; height: 34px; border-radius: 50%; border: 2px solid #1677ff;
+    background: #fff; cursor: grab; box-shadow: 0 2px 8px rgba(29,33,41,.16); }
+  .slider:active::-webkit-slider-thumb { cursor: grabbing; }
+  .slider:disabled { cursor: default; opacity: .6; }
+  .slide-label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    pointer-events: none; font-size: 13px; color: #4e5969; letter-spacing: .01em; }
+  .slide-label b { margin-left: 5px; color: #1677ff; font-size: 16px; line-height: 1; }
+  .breath { display: grid; place-items: center; width: 58px; height: 58px; margin: 18px auto 10px;
+    border-radius: 50%; position: relative; }
+  .breath::before { content: ''; position: absolute; width: 24px; height: 24px; border-radius: 50%;
+    background: #1677ff; animation: breathe-core 1.8s ease-in-out infinite; }
+  .breath::after { content: ''; position: absolute; inset: 0; border-radius: 50%;
+    box-shadow: 0 0 0 0 rgba(22,119,255,.28); animation: breathe-halo 1.8s ease-out infinite; }
+  .breath.done::before { background: #00b42a; }
+  .breath.done::after { animation: none; box-shadow: 0 0 0 8px rgba(0,180,42,.12); }
+  @keyframes breathe-core { 0%, 100% { transform: scale(.72); opacity: .55; } 50% { transform: scale(1); opacity: 1; } }
+  @keyframes breathe-halo { 0% { transform: scale(.7); opacity: .7; } 70%, 100% { transform: scale(1.35); opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    .breath::before, .breath::after { animation: none; }
+    .breath::before { transform: scale(.9); opacity: .9; }
+  }
   .status { font-size: 12px; color: #86909c; }
   .foot { margin-top: 18px; font-size: 12px; color: #86909c; }
   .foot a { color: #1677ff; text-decoration: none; border-bottom: 1px solid rgba(22,119,255,.35); margin-left: 6px; }
@@ -482,9 +511,14 @@ const PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
   <div class="card">
     <div class="logo">L</div>
     <h1>正在进行安全验证</h1>
-    <p>正在确认你的浏览器，完成后会自动跳转。通常只需要几秒钟。</p>
-    <div class="progress"><div class="bar" id="bar"></div></div>
-    <div class="status" id="status">计算中…</div>
+    <p>请先滑动下方按钮，浏览器会自动完成安全校验，完成后跳转。</p>
+    <div class="slide-wrap" id="slideWrap">
+      <input id="slide" class="slider" type="range" min="0" max="100" step="1" value="0"
+        aria-label="滑动开始安全验证" />
+      <span class="slide-label" id="slideLabel">滑动开始验证 <b>→</b></span>
+    </div>
+    <div class="breath" id="breath" hidden aria-hidden="true"></div>
+    <div class="status" id="status" aria-live="polite">尚未开始</div>
     <div class="foot">Lagran CDN · 由 WAF 质询保护 · <a href="https://t.me/lagranedge" target="_blank" rel="noopener noreferrer">获取技术支持</a></div>
     <noscript>当前浏览器禁用了 JavaScript，无法完成安全验证。请启用后刷新页面。</noscript>
   </div>
@@ -554,29 +588,56 @@ const PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
   }
 
   var counter = 0;
-  var bar = document.getElementById('bar');
+  var started = false;
+  var slide = document.getElementById('slide');
+  var slideWrap = document.getElementById('slideWrap');
+  var slideLabel = document.getElementById('slideLabel');
+  var breath = document.getElementById('breath');
   var statusEl = document.getElementById('status');
-  var started = Date.now();
+  var card = document.querySelector('.card');
+
+  function setFill() {
+    var pct = Number(slide.value) || 0;
+    slide.style.setProperty('--fill', pct + '%');
+    slideLabel.innerHTML = pct >= 98 ? '松开开始验证 <b>→</b>' : '滑动开始验证 <b>→</b>';
+  }
+  setFill();
+  slide.addEventListener('input', setFill);
+  slide.addEventListener('change', function () {
+    if (Number(slide.value) >= 98) {
+      start();
+    } else {
+      slide.value = 0;
+      setFill();
+    }
+  });
+
+  function start() {
+    if (started) return;
+    started = true;
+    slide.disabled = true;
+    slideWrap.hidden = true;
+    breath.hidden = false;
+    card.classList.add('working');
+    statusEl.textContent = '正在验证浏览器…';
+    setTimeout(solve, 120);
+  }
 
   function solve() {
-    var deadline = Date.now() + 250;
+    var deadline = Date.now() + 120;
     while (Date.now() < deadline) {
       var h = sha256(nonce + ':' + counter);
       if (h.slice(0, difficulty) === target) {
         statusEl.textContent = '验证通过，正在跳转…';
+        breath.classList.add('done');
         window.location.href = '/__lagran/challenge/verify?n=' + encodeURIComponent(nonce)
           + '&a=' + encodeURIComponent(counter) + '&next=' + encodeURIComponent(next);
         return;
       }
       counter += 1;
     }
-    var elapsed = (Date.now() - started) / 1000;
-    var pct = Math.min(92, 8 + elapsed * 6);
-    bar.style.width = pct + '%';
-    statusEl.textContent = '计算中… 已尝试 ' + counter.toLocaleString() + ' 次';
     setTimeout(solve, 0);
   }
-  solve();
 })();
 </script>
 </body>
@@ -585,6 +646,39 @@ const PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn page_waits_for_a_slide_and_uses_a_breathing_light() {
+        use http_body_util::BodyExt;
+
+        let response = page("cdn.test", "nonce", "/", 2, true);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+
+        assert!(html.contains("id=\"slide\""), "slider is required");
+        assert!(
+            html.contains("滑动开始验证"),
+            "the user must be told to slide"
+        );
+        assert!(
+            html.contains("class=\"breath\""),
+            "calculation uses a breathing indicator"
+        );
+        assert!(
+            !html.contains("class=\"progress\""),
+            "the old progress bar must be gone"
+        );
+        // The PoW loop must not start at page load; it is called from the
+        // slider's `change` handler.
+        assert!(
+            !html.contains("\n  solve();\n"),
+            "PoW must wait for the slider release"
+        );
+        assert!(
+            html.contains("slide.addEventListener('change'"),
+            "slider release starts the calculation"
+        );
+    }
 
     #[test]
     fn nonce_solution_is_single_use() {

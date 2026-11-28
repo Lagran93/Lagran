@@ -2993,7 +2993,8 @@ CC_DOWNLOAD_MULTIPLIER=2
 
 ### 6.5 挑战
 
-- 使用现有 PoW 页面。
+- 使用现有 PoW 页面；页面先要求用户滑动按钮，松开后才开始 PoW 计算。
+- 计算中显示呼吸灯动画（不再显示进度条），通过后自动跳转并写 clearance cookie。
 - `CHALLENGE_SECRET` 多节点必须一致。
 - 挑战通过写 clearance cookie。
 - 挑战日志进入 WAF 事件，category 常见为 `cc` 或 `bot`。
