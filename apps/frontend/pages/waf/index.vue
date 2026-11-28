@@ -109,312 +109,312 @@
 
         <!-- 防护设置 -->
         <div v-else-if="tab === 'settings'" class="card-body">
-          <div class="alert" :class="settings.mode === 'block' ? 'alert-warning' : 'alert-info'">
-            <AppIcon name="shield" :size="16" class="icon" />
-            <span v-if="settings.mode === 'block'">
-              拦截模式会直接拒绝命中规则的请求（403 页面）。上线初期建议先用观察模式确认没有误报。
-            </span>
-            <span v-else>
-              观察模式只记录事件、不拦截请求。确认规则准确后，再切换为拦截模式。
-            </span>
-          </div>
+          <div class="settings-shell">
+            <div class="settings-hero" :class="{ 'is-off': !settings.enabled }">
+              <div class="settings-hero-main">
+                <div class="settings-hero-icon">
+                  <AppIcon name="shield" :size="18" />
+                </div>
+                <div class="settings-hero-text">
+                  <div class="settings-hero-title">
+                    WAF 防护
+                    <StatusTag :tone="settings.enabled ? 'success' : 'neutral'" dot>
+                      {{ settings.enabled ? '已启用' : '已关闭' }}
+                    </StatusTag>
+                  </div>
+                  <div class="settings-hero-desc">
+                    <template v-if="!settings.enabled">关闭后 IP 名单、托管规则与自定义规则全部不生效。</template>
+                    <template v-else-if="settings.mode === 'block'">拦截模式：命中规则直接返回 403；建议先观察再切换。</template>
+                    <template v-else>观察模式：只记录事件、不拦截请求，适合上线灰度。</template>
+                  </div>
+                </div>
+              </div>
+              <div class="settings-hero-controls">
+                <div class="settings-inline">
+                  <span>启用</span>
+                  <label class="switch" :class="{ on: settings.enabled }">
+                    <span class="switch-track" />
+                    <input v-model="settings.enabled" type="checkbox" style="display: none" />
+                  </label>
+                </div>
+                <div class="segmented compact">
+                  <button type="button" :class="{ active: settings.mode === 'monitor' }" @click="settings.mode = 'monitor'">
+                    观察
+                  </button>
+                  <button type="button" :class="{ active: settings.mode === 'block' }" @click="settings.mode = 'block'">
+                    拦截
+                  </button>
+                </div>
+              </div>
+            </div>
 
-          <div class="setting-row">
-            <div>
-              <div class="setting-title">开启 WAF 防护</div>
-              <div class="setting-desc">关闭后该域名的 IP 名单与规则全部不生效</div>
-            </div>
-            <label class="switch" :class="{ on: settings.enabled }">
-              <span class="switch-track" />
-              <input v-model="settings.enabled" type="checkbox" style="display: none" />
-            </label>
-          </div>
+            <div class="settings-grid-2">
+              <section class="settings-card">
+                <div class="settings-card-head">
+                  <div>
+                    <div class="settings-card-title">安全级别</div>
+                    <div class="settings-card-desc">对文档导航与可疑请求的质询强度</div>
+                  </div>
+                </div>
+                <div class="segmented level-seg compact">
+                  <button v-for="l in securityLevels" :key="l.value" type="button"
+                    :class="{ active: settings.security_level === l.value }"
+                    @click="settings.security_level = l.value">
+                    {{ l.label }}
+                  </button>
+                </div>
+                <p class="settings-hint">{{ levelHint }}</p>
+              </section>
 
-          <div class="setting-row">
-            <div>
-              <div class="setting-title">防护模式</div>
-              <div class="setting-desc">观察模式用于灰度验证规则，拦截模式用于正式防护</div>
+              <section class="settings-card">
+                <div class="settings-card-head">
+                  <div>
+                    <div class="settings-card-title">请求体检查</div>
+                    <div class="settings-card-desc">检查 JSON / form / text / multipart 文本 body</div>
+                  </div>
+                  <label class="switch" :class="{ on: settings.body.enabled }">
+                    <span class="switch-track" />
+                    <input v-model="settings.body.enabled" type="checkbox" style="display: none" />
+                  </label>
+                </div>
+                <p v-if="!settings.body.enabled" class="settings-hint">
+                  关闭时 WAF 只检查 URL/头；开启后会先缓冲 body（64 KiB 上限）再检查。
+                </p>
+                <template v-else>
+                  <div class="body-config-grid">
+                    <div class="field">
+                      <label class="field-label">最大字节数</label>
+                      <input v-model.number="settings.body.max_bytes" class="input" type="number"
+                        min="1024" max="65536" step="1024" />
+                      <span class="field-hint">1024–65536，硬上限 64 KiB。</span>
+                    </div>
+                    <div class="field">
+                      <label class="field-label">读取超时（ms）</label>
+                      <input v-model.number="settings.body.timeout_ms" class="input" type="number"
+                        min="100" max="5000" step="100" />
+                      <span class="field-hint">超时返回 408。</span>
+                    </div>
+                    <div class="field">
+                      <label class="field-label">检查方法</label>
+                      <input v-model="bodyMethodsText" class="input" type="text" />
+                      <span class="field-hint">逗号分隔，支持 POST/PUT/PATCH。</span>
+                    </div>
+                    <div class="field">
+                      <label class="field-label">Content-Type</label>
+                      <input v-model="bodyContentTypesText" class="input" type="text" />
+                      <span class="field-hint">支持 text/*、*/*；multipart 只扫描文本 part。</span>
+                    </div>
+                    <div class="field">
+                      <label class="field-label">超过上限时</label>
+                      <select v-model="settings.body.oversize_policy" class="select">
+                        <option value="log">log（放行并记录）</option>
+                        <option value="block">block（413）</option>
+                        <option value="allow">allow（静默放行）</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label class="field-label">无法检查时</label>
+                      <select v-model="settings.body.uninspectable_policy" class="select">
+                        <option value="log">log（放行并记录）</option>
+                        <option value="block">block（415）</option>
+                        <option value="allow">allow（静默放行）</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="option-grid">
+                    <label class="option-toggle" :class="{ on: settings.body.inspect_unknown_length }">
+                      <input v-model="settings.body.inspect_unknown_length" type="checkbox" />
+                      <span>无长度 / 分块</span>
+                    </label>
+                    <label class="option-toggle" :class="{ on: settings.body.decompress_gzip }">
+                      <input v-model="settings.body.decompress_gzip" type="checkbox" />
+                      <span>解压 gzip</span>
+                    </label>
+                    <label class="option-toggle" :class="{ on: settings.body.decompress_brotli }">
+                      <input v-model="settings.body.decompress_brotli" type="checkbox" />
+                      <span>解压 br</span>
+                    </label>
+                    <label class="option-toggle" :class="{ on: settings.body.decompress_zstd }">
+                      <input v-model="settings.body.decompress_zstd" type="checkbox" />
+                      <span>解压 zstd</span>
+                    </label>
+                    <label class="option-toggle" :class="{ on: settings.body.decompress_deflate }">
+                      <input v-model="settings.body.decompress_deflate" type="checkbox" />
+                      <span>解压 deflate</span>
+                    </label>
+                  </div>
+                  <p class="settings-hint">
+                    解压后最多扫描 256 KiB；无长度请求读到上限，超限返回 413。
+                  </p>
+                </template>
+              </section>
             </div>
-            <div class="segmented">
-              <button type="button" :class="{ active: settings.mode === 'monitor' }" @click="settings.mode = 'monitor'">
-                观察
-              </button>
-              <button type="button" :class="{ active: settings.mode === 'block' }" @click="settings.mode = 'block'">
-                拦截
-              </button>
-            </div>
-          </div>
 
-          <div class="section-label">安全级别</div>
-          <div class="segmented level-seg">
-            <button v-for="l in securityLevels" :key="l.value" type="button"
-              :class="{ active: settings.security_level === l.value }" @click="settings.security_level = l.value">
-              {{ l.label }}
-            </button>
-          </div>
-          <p class="text-muted" style="font-size: 12px; margin-top: 8px">
-            {{ levelHint }}
-          </p>
-
-          <div class="section-label">托管规则集</div>
-          <div class="ruleset-grid">
-            <label v-for="rs in rulesets" :key="rs.id" class="ruleset-card"
-              :class="{ on: settings.managed_rulesets.includes(rs.id) }">
-              <input type="checkbox" :checked="settings.managed_rulesets.includes(rs.id)"
-                @change="toggleRuleset(rs.id)" />
-              <span class="ruleset-body">
-                <span class="ruleset-head">
-                  <strong>{{ rs.name }}</strong>
-                  <span class="ruleset-version">{{ rs.version }}</span>
-                  <span v-if="rs.recommended" class="ruleset-badge">推荐</span>
-                </span>
-                <small>{{ rs.description }}</small>
-                <span class="ruleset-categories">
-                  <span v-for="(label, i) in rs.category_labels" :key="rs.categories[i]" class="ruleset-chip">
-                    {{ label }}
-                  </span>
-                </span>
-              </span>
-              <AppIcon :name="settings.managed_rulesets.includes(rs.id) ? 'check' : 'plus'" :size="15" />
-            </label>
-            <div v-if="!rulesets.length" class="text-muted" style="font-size: 13px">
-              正在加载托管规则集…
-            </div>
-          </div>
-          <p class="text-muted" style="font-size: 12px; margin-top: 8px">
-            规则集是增量启用：选中后会启用其覆盖的签名类别，不会关闭下方单独开启的规则。规则集版本由控制面统一维护。
-          </p>
-
-          <div class="section-label">规则包版本与灰度</div>
-          <div class="form-grid">
-            <div class="field">
-              <label class="field-label">规则包版本</label>
-              <select v-model="settings.waf_rulepack_version" class="select">
-                <option value="">跟随 active 版本</option>
-                <option v-for="p in rulepackVersions" :key="p.version" :value="p.version">
-                  {{ p.version }}（{{ p.slot }}）
-                </option>
-              </select>
-              <span class="field-hint">留空跟随控制面 active；固定版本可用于单域名验证/回滚。</span>
-            </div>
-            <div class="field">
-              <label class="field-label">灰度比例</label>
-              <input v-model.number="settings.waf_gray_percent" class="input" type="number" min="0" max="100" />
-              <span class="field-hint">0 = 全量 active；1~99 按域名稳定哈希切分到 active/previous。</span>
-            </div>
-          </div>
-
-          <div v-if="auth.isAdmin" class="rulepack-admin">
-            <div class="flex-between">
-              <span class="text-muted" style="font-size: 12px">
-                规则包由 Control 签名，Edge 验签后缓存到本地。回滚只切换 active/previous。
-                发布前应先在 Control 中更新内置 catalog；catalog 无变化时发布会返回 409。
-              </span>
-              <button class="btn btn-default btn-sm" type="button" :disabled="rulepackBusy" @click="publishRulepack">
-                发布新版本
-              </button>
-            </div>
-            <div v-if="rulepackVersions.length" class="rulepack-versions">
-              <div v-for="p in rulepackVersions" :key="p.version" class="rulepack-version-row"
-                :class="`slot-${p.slot}`">
-                <div class="version-main">
-                  <div class="version-title">
-                    <span class="mono version-name">{{ p.version }}</span>
-                    <span class="slot-badge" :class="`slot-badge-${p.slot}`">
-                      <span class="slot-dot" />
-                      {{ slotLabel(p.slot) }}
+            <section class="settings-card">
+              <div class="settings-card-head">
+                <div>
+                  <div class="settings-card-title">托管规则集</div>
+                  <div class="settings-card-desc">增量启用，规则集版本由控制面统一维护</div>
+                </div>
+                <span class="settings-count">{{ settings.managed_rulesets.length }}/{{ rulesets.length }}</span>
+              </div>
+              <div class="ruleset-grid">
+                <label v-for="rs in rulesets" :key="rs.id" class="ruleset-card"
+                  :class="{ on: settings.managed_rulesets.includes(rs.id) }">
+                  <input type="checkbox" :checked="settings.managed_rulesets.includes(rs.id)"
+                    @change="toggleRuleset(rs.id)" />
+                  <span class="ruleset-body">
+                    <span class="ruleset-head">
+                      <strong>{{ rs.name }}</strong>
+                      <span class="ruleset-version">{{ rs.version }}</span>
+                      <span v-if="rs.recommended" class="ruleset-badge">推荐</span>
                     </span>
-                  </div>
-                  <div class="version-meta">
-                    <span>创建 {{ formatRulepackTime(p.created_at) }}</span>
-                    <span class="meta-sep">·</span>
-                    <span class="mono" :title="p.signature">签名 {{ p.signature.slice(0, 10) }}</span>
-                  </div>
-                </div>
-
-                <div class="version-actions">
-                  <span v-if="p.slot === 'active'" class="current-label">
-                    <AppIcon name="check" :size="13" />
-                    当前生效
+                    <small>{{ rs.description }}</small>
+                    <span class="ruleset-categories">
+                      <span v-for="(label, i) in rs.category_labels" :key="rs.categories[i]" class="ruleset-chip">
+                        {{ label }}
+                      </span>
+                    </span>
                   </span>
-                  <template v-else>
-                    <button class="btn btn-default btn-sm version-action" type="button" :disabled="rulepackBusy"
-                      @click="rollbackRulepack(p.version)">
-                      设为 active
-                    </button>
-                    <button v-if="p.slot === 'previous'" class="btn btn-text btn-sm version-action" type="button"
-                      :disabled="rulepackBusy" @click="retireRulepack(p.version)">
-                      转为 retired
-                    </button>
-                    <button v-if="p.slot === 'retired'" class="btn btn-text btn-sm danger version-action" type="button"
-                      :disabled="rulepackBusy" @click="deleteRulepack(p.version)">
-                      删除
-                    </button>
-                  </template>
+                  <AppIcon :name="settings.managed_rulesets.includes(rs.id) ? 'check' : 'plus'" :size="15" />
+                </label>
+                <div v-if="!rulesets.length" class="text-muted" style="font-size: 13px">
+                  正在加载托管规则集…
                 </div>
               </div>
-            </div>
-          </div>
+            </section>
 
-          <div class="section-label">单条托管规则</div>
-          <div class="managed-grid">
-            <label v-for="m in managedRules" :key="m.key" class="managed-item" :class="{ on: settings[m.key] }">
-              <input v-model="settings[m.key]" type="checkbox" />
-              <span class="managed-info">
-                <strong>{{ m.label }}</strong>
-                <small>{{ m.desc }}</small>
-              </span>
-              <AppIcon :name="settings[m.key] ? 'check' : 'plus'" :size="15" />
-            </label>
-          </div>
-
-          <div class="section-label">请求体检查</div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-title">检查请求体</div>
-              <div class="setting-desc">
-                对 JSON/form/text 请求体执行托管规则与 body 自定义规则；默认关闭。
-              </div>
-            </div>
-            <label class="switch" :class="{ on: settings.body.enabled }">
-              <span class="switch-track" />
-              <input v-model="settings.body.enabled" type="checkbox" style="display: none" />
-            </label>
-          </div>
-          <template v-if="settings.body.enabled">
-            <div class="form-grid">
-              <div class="field">
-                <label class="field-label">最大检查字节数</label>
-                <input v-model.number="settings.body.max_bytes" class="input" type="number"
-                  min="1024" max="65536" step="1024" />
-                <span class="field-hint">1024–65536；硬上限 64 KiB（超过该长度的 body 无法回放）。</span>
-              </div>
-              <div class="field">
-                <label class="field-label">读取超时（毫秒）</label>
-                <input v-model.number="settings.body.timeout_ms" class="input" type="number"
-                  min="100" max="5000" step="100" />
-                <span class="field-hint">读取整个 body 的总超时，超时返回 408。</span>
-              </div>
-              <div class="field">
-                <label class="field-label">检查方法</label>
-                <input v-model="bodyMethodsText" class="input" type="text" />
-                <span class="field-hint">逗号分隔；目前支持 POST、PUT、PATCH。</span>
-              </div>
-              <div class="field">
-                <label class="field-label">Content-Type</label>
-                <input v-model="bodyContentTypesText" class="input" type="text" />
-                <span class="field-hint">
-                  逗号分隔；支持 text/* 与 */* 通配。检查 multipart 时加入
-                  multipart/form-data（只扫描文本 part，跳过二进制文件）。
+            <details class="settings-card settings-details">
+              <summary class="settings-summary">
+                <span class="settings-summary-title">规则包版本与灰度</span>
+                <span class="settings-summary-meta">
+                  {{ settings.waf_rulepack_version || '跟随 active' }} · 灰度 {{ settings.waf_gray_percent }}%
                 </span>
-              </div>
-              <div class="field">
-                <label class="field-label">超过上限时</label>
-                <select v-model="settings.body.oversize_policy" class="select">
-                  <option value="log">log（放行并记录）</option>
-                  <option value="block">block（413）</option>
-                  <option value="allow">allow（静默放行）</option>
-                </select>
-              </div>
-              <div class="field">
-                <label class="field-label">无法检查时</label>
-                <select v-model="settings.body.uninspectable_policy" class="select">
-                  <option value="log">log（放行并记录）</option>
-                  <option value="block">block（415）</option>
-                  <option value="allow">allow（静默放行）</option>
-                </select>
-              </div>
-            </div>
-            <div class="setting-row">
-              <div>
-                <div class="setting-title">检查无 Content-Length / 分块请求体</div>
-                <div class="setting-desc">
-                  HTTP/2 与 chunked 请求常无 Content-Length；开启后读到上限，超过上限返回 413。
+              </summary>
+              <div class="settings-details-body">
+                <div class="form-grid">
+                  <div class="field">
+                    <label class="field-label">规则包版本</label>
+                    <select v-model="settings.waf_rulepack_version" class="select">
+                      <option value="">跟随 active 版本</option>
+                      <option v-for="p in rulepackVersions" :key="p.version" :value="p.version">
+                        {{ p.version }}（{{ p.slot }}）
+                      </option>
+                    </select>
+                    <span class="field-hint">留空跟随控制面 active；固定版本可用于验证/回滚。</span>
+                  </div>
+                  <div class="field">
+                    <label class="field-label">灰度比例</label>
+                    <input v-model.number="settings.waf_gray_percent" class="input" type="number" min="0" max="100" />
+                    <span class="field-hint">0 = 全量 active；1~99 按域名稳定哈希切分。</span>
+                  </div>
+                </div>
+                <div v-if="auth.isAdmin" class="rulepack-admin">
+                  <div class="flex-between">
+                    <span class="text-muted" style="font-size: 12px">
+                      规则包由 Control 签名，Edge 验签后缓存；回滚只切换 active/previous。
+                    </span>
+                    <button class="btn btn-default btn-sm" type="button" :disabled="rulepackBusy" @click="publishRulepack">
+                      发布新版本
+                    </button>
+                  </div>
+                  <div v-if="rulepackVersions.length" class="rulepack-versions">
+                    <div v-for="p in rulepackVersions" :key="p.version" class="rulepack-version-row"
+                      :class="`slot-${p.slot}`">
+                      <div class="version-main">
+                        <div class="version-title">
+                          <span class="mono version-name">{{ p.version }}</span>
+                          <span class="slot-badge" :class="`slot-badge-${p.slot}`">
+                            <span class="slot-dot" />
+                            {{ slotLabel(p.slot) }}
+                          </span>
+                        </div>
+                        <div class="version-meta">
+                          <span>创建 {{ formatRulepackTime(p.created_at) }}</span>
+                          <span class="meta-sep">·</span>
+                          <span class="mono" :title="p.signature">签名 {{ p.signature.slice(0, 10) }}</span>
+                        </div>
+                      </div>
+                      <div class="version-actions">
+                        <span v-if="p.slot === 'active'" class="current-label">
+                          <AppIcon name="check" :size="13" />
+                          当前生效
+                        </span>
+                        <template v-else>
+                          <button class="btn btn-default btn-sm version-action" type="button" :disabled="rulepackBusy"
+                            @click="rollbackRulepack(p.version)">
+                            设为 active
+                          </button>
+                          <button v-if="p.slot === 'previous'" class="btn btn-text btn-sm version-action" type="button"
+                            :disabled="rulepackBusy" @click="retireRulepack(p.version)">
+                            转为 retired
+                          </button>
+                          <button v-if="p.slot === 'retired'" class="btn btn-text btn-sm danger version-action" type="button"
+                            :disabled="rulepackBusy" @click="deleteRulepack(p.version)">
+                            删除
+                          </button>
+                        </template>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
-              <label class="switch" :class="{ on: settings.body.inspect_unknown_length }">
-                <span class="switch-track" />
-                <input v-model="settings.body.inspect_unknown_length" type="checkbox"
-                  style="display: none" />
-              </label>
-            </div>
-            <div class="setting-row">
-              <div>
-                <div class="setting-title">解压 gzip 后检查</div>
-                <div class="setting-desc">
-                  仅 Content-Encoding: gzip；解压后最多扫描 256 KiB，失败返回 413/415。
-                </div>
-              </div>
-              <label class="switch" :class="{ on: settings.body.decompress_gzip }">
-                <span class="switch-track" />
-                <input v-model="settings.body.decompress_gzip" type="checkbox" style="display: none" />
-              </label>
-            </div>
-            <div class="setting-row">
-              <div>
-                <div class="setting-title">解压 br（Brotli）后检查</div>
-                <div class="setting-desc">
-                  仅 Content-Encoding: br；解压后最多扫描 256 KiB，失败返回 413/415。
-                </div>
-              </div>
-              <label class="switch" :class="{ on: settings.body.decompress_brotli }">
-                <span class="switch-track" />
-                <input v-model="settings.body.decompress_brotli" type="checkbox" style="display: none" />
-              </label>
-            </div>
-            <div class="setting-row">
-              <div>
-                <div class="setting-title">解压 zstd 后检查</div>
-                <div class="setting-desc">
-                  仅 Content-Encoding: zstd；解压后最多扫描 256 KiB，失败返回 413/415。
-                </div>
-              </div>
-              <label class="switch" :class="{ on: settings.body.decompress_zstd }">
-                <span class="switch-track" />
-                <input v-model="settings.body.decompress_zstd" type="checkbox" style="display: none" />
-              </label>
-            </div>
-            <div class="setting-row">
-              <div>
-                <div class="setting-title">解压 deflate 后检查</div>
-                <div class="setting-desc">
-                  仅 Content-Encoding: deflate（zlib 包装）；解压后最多扫描 256 KiB，
-                  失败返回 413/415。
-                </div>
-              </div>
-              <label class="switch" :class="{ on: settings.body.decompress_deflate }">
-                <span class="switch-track" />
-                <input v-model="settings.body.decompress_deflate" type="checkbox" style="display: none" />
-              </label>
-            </div>
-          </template>
+            </details>
 
-          <div class="section-label">浏览器质询</div>
-          <div class="form-grid">
-            <div class="field">
-              <label class="field-label">质询难度（前导 0 的十六进制位数）</label>
-              <input v-model.number="settings.challenge_difficulty" class="input" type="number" min="1" max="6" />
-              <span class="field-hint">1 最轻、6 最重，默认 4（约 6.5 万次哈希）。</span>
-            </div>
-            <div class="field">
-              <label class="field-label">免质询有效期（秒）</label>
-              <input v-model.number="settings.challenge_ttl_secs" class="input" type="number" min="60" max="86400" />
-              <span class="field-hint">通过后签发 HttpOnly Cookie，默认 1800 秒。</span>
-            </div>
-          </div>
-          <p class="text-muted" style="font-size: 12px; margin-top: 8px">
-            规则动作选择「质询」时生效；仅对 GET/HEAD 且 Accept 包含 text/html 的文档导航返回质询页。
-            API / XHR / POST 等非文档请求会跳过质询直接放行，如需限制请使用 block 规则或限流。
-          </p>
+            <details class="settings-card settings-details">
+              <summary class="settings-summary">
+                <span class="settings-summary-title">单条托管规则</span>
+                <span class="settings-summary-meta">
+                  已启用 {{ managedRules.filter((m) => settings[m.key]).length }}/{{ managedRules.length }}
+                </span>
+              </summary>
+              <div class="settings-details-body">
+                <div class="managed-grid">
+                  <label v-for="m in managedRules" :key="m.key" class="managed-item" :class="{ on: settings[m.key] }">
+                    <input v-model="settings[m.key]" type="checkbox" />
+                    <span class="managed-info">
+                      <strong>{{ m.label }}</strong>
+                      <small>{{ m.desc }}</small>
+                    </span>
+                    <AppIcon :name="settings[m.key] ? 'check' : 'plus'" :size="15" />
+                  </label>
+                </div>
+              </div>
+            </details>
 
-          <div class="flex-between mt-24">
-            <span class="text-muted" style="font-size: 12px">
-              托管规则匹配 URL、查询串、UA 与 Referer；开启「请求体检查」后还会检查
-              JSON/form/text body（受上面的上限与策略约束）。
-            </span>
-            <button class="btn btn-primary" type="button" :disabled="saving" @click="saveSettings">
-              {{ saving ? '保存中…' : '保存设置' }}
-            </button>
+            <details class="settings-card settings-details">
+              <summary class="settings-summary">
+                <span class="settings-summary-title">浏览器质询</span>
+                <span class="settings-summary-meta">{{ settings.challenge_difficulty }} 级 · {{ settings.challenge_ttl_secs }}s</span>
+              </summary>
+              <div class="settings-details-body">
+                <div class="form-grid">
+                  <div class="field">
+                    <label class="field-label">质询难度（前导 0 位数）</label>
+                    <input v-model.number="settings.challenge_difficulty" class="input" type="number" min="1" max="6" />
+                    <span class="field-hint">1 最轻、6 最重，默认 4。</span>
+                  </div>
+                  <div class="field">
+                    <label class="field-label">免质询有效期（秒）</label>
+                    <input v-model.number="settings.challenge_ttl_secs" class="input" type="number" min="60" max="86400" />
+                    <span class="field-hint">通过后签发 HttpOnly Cookie，默认 1800 秒。</span>
+                  </div>
+                </div>
+                <p class="settings-hint">
+                  规则动作选择「质询」时生效；仅对 GET/HEAD 且 Accept 包含 text/html 的文档导航返回质询页。
+                  API/XHR/POST 会跳过质询，如需限制请用 block 规则或限流。
+                </p>
+              </div>
+            </details>
+
+            <div class="settings-footer">
+              <span class="settings-hint">
+                托管规则匹配 URL、查询串、UA 与 Referer；开启请求体检查后还会检查 body。
+              </span>
+              <button class="btn btn-primary" type="button" :disabled="saving" @click="saveSettings">
+                {{ saving ? '保存中…' : '保存设置' }}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -2361,6 +2361,265 @@ onMounted(reload)
   }
 }
 
+.settings-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.settings-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(135deg, var(--card), var(--brand-bg) 160%);
+}
+
+.settings-hero.is-off {
+  background: var(--card);
+  opacity: 0.92;
+}
+
+.settings-hero-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.settings-hero-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  color: var(--brand);
+  background: var(--brand-bg);
+  flex: 0 0 auto;
+}
+
+.settings-hero-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.settings-hero-desc {
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+.settings-hero-controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 0 0 auto;
+}
+
+.settings-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.segmented.compact button {
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.settings-grid-2 {
+  display: grid;
+  grid-template-columns: minmax(230px, 0.8fr) minmax(0, 1.6fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.settings-card {
+  padding: 15px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+}
+
+.settings-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.settings-card-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+.settings-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 22px;
+  padding: 0 8px;
+  border-radius: 11px;
+  color: var(--text-3);
+  background: var(--bg);
+}
+
+.settings-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+.body-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin-top: 11px;
+}
+
+.body-config-grid .field-hint {
+  margin-top: 3px;
+  font-size: 11px;
+}
+
+.option-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 11px;
+}
+
+.option-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+
+.option-toggle input {
+  margin: 0;
+  accent-color: var(--brand);
+}
+
+.option-toggle.on {
+  border-color: var(--brand-bg-strong);
+  background: var(--brand-bg);
+  color: var(--brand);
+}
+
+.settings-details {
+  padding: 0;
+}
+
+.settings-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 16px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.settings-summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-summary::after {
+  content: '⌄';
+  flex: 0 0 auto;
+  font-size: 14px;
+  color: var(--text-3);
+  transition: transform 0.15s ease;
+}
+
+.settings-details[open] > .settings-summary::after {
+  transform: rotate(180deg);
+}
+
+.settings-summary-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.settings-summary-meta {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.settings-details-body {
+  padding: 0 16px 16px;
+}
+
+.settings-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 2px;
+}
+
+.settings-footer .settings-hint {
+  margin: 0;
+}
+
+@media (max-width: 1100px) {
+  .managed-grid,
+  .ruleset-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .settings-grid-2,
+  .body-config-grid,
+  .managed-grid,
+  .ruleset-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-hero {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .settings-hero-controls {
+    justify-content: space-between;
+  }
+
+  .settings-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
 .setting-row {
   display: flex;
   align-items: center;
@@ -2390,15 +2649,15 @@ onMounted(reload)
 
 .managed-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
 }
 
 .managed-item {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 12px 14px;
+  gap: 8px;
+  padding: 10px 11px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   cursor: pointer;
@@ -2428,11 +2687,14 @@ onMounted(reload)
 }
 
 .managed-info small {
-  display: block;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   margin-top: 2px;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-3);
-  line-height: 1.5;
+  line-height: 1.4;
 }
 
 .managed-item .app-icon {
@@ -2446,15 +2708,15 @@ onMounted(reload)
 /* managed rulesets */
 .ruleset-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
 }
 
 .ruleset-card {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 14px;
+  gap: 8px;
+  padding: 11px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--card);
@@ -2510,10 +2772,13 @@ onMounted(reload)
 }
 
 .ruleset-body small {
-  display: block;
-  margin-top: 5px;
-  font-size: 12px;
-  line-height: 1.55;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-top: 4px;
+  font-size: 11.5px;
+  line-height: 1.45;
   color: var(--text-3);
 }
 
