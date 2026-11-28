@@ -995,6 +995,20 @@ impl ProxyHttp for DataPlaneProxy {
                                             )
                                             .map(Some)
                                         }
+                                        "zstd" if domain.waf.body.decompress_zstd => {
+                                            crate::waf::body::zstd_for_scan(
+                                                &bytes,
+                                                crate::waf::body::MAX_DECOMPRESSED_BYTES,
+                                            )
+                                            .map(Some)
+                                        }
+                                        "deflate" if domain.waf.body.decompress_deflate => {
+                                            crate::waf::body::inflate_for_scan(
+                                                &bytes,
+                                                crate::waf::body::MAX_DECOMPRESSED_BYTES,
+                                            )
+                                            .map(Some)
+                                        }
                                         _ => Ok(None),
                                     };
                                 let decompressed = match decoded {

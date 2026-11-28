@@ -76,6 +76,10 @@ pub struct BodyInspection {
     pub decompress_gzip: bool,
     /// Decompress `Content-Encoding: br` (bounded) before scanning.
     pub decompress_brotli: bool,
+    /// Decompress `Content-Encoding: zstd` (bounded) before scanning.
+    pub decompress_zstd: bool,
+    /// Decompress `Content-Encoding: deflate` (zlib-wrapped) before scanning.
+    pub decompress_deflate: bool,
 }
 
 impl Default for BodyInspection {
@@ -91,6 +95,8 @@ impl Default for BodyInspection {
             inspect_unknown_length: false,
             decompress_gzip: false,
             decompress_brotli: false,
+            decompress_zstd: false,
+            decompress_deflate: false,
         }
     }
 }
@@ -493,6 +499,16 @@ impl<'a> BodyFacts<'a> {
         self.content_encoding
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("br"))
     }
+
+    pub fn is_zstd(&self) -> bool {
+        self.content_encoding
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("zstd"))
+    }
+
+    pub fn is_deflate(&self) -> bool {
+        self.content_encoding
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("deflate"))
+    }
 }
 
 /// Decompressed bodies are scanned through a separate, larger cap; the wire
@@ -509,6 +525,36 @@ pub enum DecodeError {
 pub fn brotli_for_scan(input: &[u8], max: usize) -> Result<Vec<u8>, DecodeError> {
     use std::io::Read;
     let decoder = brotli::Decompressor::new(input, 4096);
+    let mut out = Vec::new();
+    decoder
+        .take((max as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|_| DecodeError::Invalid)?;
+    if out.len() > max {
+        return Err(DecodeError::TooLarge);
+    }
+    Ok(out)
+}
+
+/// zstd-decompress a request body for scanning, bounded by `max`.
+pub fn zstd_for_scan(input: &[u8], max: usize) -> Result<Vec<u8>, DecodeError> {
+    use std::io::Read;
+    let decoder = zstd::stream::read::Decoder::new(input).map_err(|_| DecodeError::Invalid)?;
+    let mut out = Vec::new();
+    decoder
+        .take((max as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|_| DecodeError::Invalid)?;
+    if out.len() > max {
+        return Err(DecodeError::TooLarge);
+    }
+    Ok(out)
+}
+
+/// Inflate a zlib-wrapped (`Content-Encoding: deflate`) request body.
+pub fn inflate_for_scan(input: &[u8], max: usize) -> Result<Vec<u8>, DecodeError> {
+    use std::io::Read;
+    let decoder = flate2::read::ZlibDecoder::new(input);
     let mut out = Vec::new();
     decoder
         .take((max as u64).saturating_add(1))
@@ -616,6 +662,31 @@ mod tests {
         );
         assert_eq!(
             brotli_for_scan(b"not brotli", 1024).unwrap_err(),
+            DecodeError::Invalid
+        );
+    }
+
+    #[test]
+    fn zstd_and_deflate_are_bounded_and_decode() {
+        use std::io::Write;
+        let zstd = zstd::stream::encode_all(&b"union select"[..], 3).unwrap();
+        assert_eq!(zstd_for_scan(&zstd, 1024).unwrap(), b"union select");
+        assert_eq!(zstd_for_scan(&zstd, 4).unwrap_err(), DecodeError::TooLarge);
+        assert_eq!(
+            zstd_for_scan(b"not zstd", 1024).unwrap_err(),
+            DecodeError::Invalid
+        );
+
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"union select").unwrap();
+        let deflate = encoder.finish().unwrap();
+        assert_eq!(inflate_for_scan(&deflate, 1024).unwrap(), b"union select");
+        assert_eq!(
+            inflate_for_scan(&deflate, 4).unwrap_err(),
+            DecodeError::TooLarge
+        );
+        assert_eq!(
+            inflate_for_scan(b"not deflate", 1024).unwrap_err(),
             DecodeError::Invalid
         );
     }

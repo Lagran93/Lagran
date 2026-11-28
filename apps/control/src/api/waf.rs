@@ -153,6 +153,8 @@ pub struct BodyInspectionDto {
     pub inspect_unknown_length: bool,
     pub decompress_gzip: bool,
     pub decompress_brotli: bool,
+    pub decompress_zstd: bool,
+    pub decompress_deflate: bool,
 }
 
 impl Default for BodyInspectionDto {
@@ -172,6 +174,8 @@ impl Default for BodyInspectionDto {
             inspect_unknown_length: false,
             decompress_gzip: false,
             decompress_brotli: false,
+            decompress_zstd: false,
+            decompress_deflate: false,
         }
     }
 }
@@ -188,6 +192,8 @@ pub struct BodyInspectionRequest {
     pub inspect_unknown_length: Option<bool>,
     pub decompress_gzip: Option<bool>,
     pub decompress_brotli: Option<bool>,
+    pub decompress_zstd: Option<bool>,
+    pub decompress_deflate: Option<bool>,
 }
 
 impl Default for WafSettingsDto {
@@ -261,6 +267,8 @@ impl From<repository::WafSettingsRow> for WafSettingsDto {
                 inspect_unknown_length: r.body_inspect_unknown_length,
                 decompress_gzip: r.body_decompress_gzip,
                 decompress_brotli: r.body_decompress_brotli,
+                decompress_zstd: r.body_decompress_zstd,
+                decompress_deflate: r.body_decompress_deflate,
             },
         }
     }
@@ -732,6 +740,8 @@ pub async fn put_settings(
         body.inspect_unknown_length,
         body.decompress_gzip,
         body.decompress_brotli,
+        body.decompress_zstd,
+        body.decompress_deflate,
     )
     .await
     .map_err(|e| {
@@ -870,6 +880,10 @@ fn merge_body(
         decompress_brotli: req
             .decompress_brotli
             .unwrap_or(current.decompress_brotli),
+        decompress_zstd: req.decompress_zstd.unwrap_or(current.decompress_zstd),
+        decompress_deflate: req
+            .decompress_deflate
+            .unwrap_or(current.decompress_deflate),
     })
 }
 
@@ -2160,6 +2174,8 @@ mod tests {
                 inspect_unknown_length: None,
                 decompress_gzip: None,
                 decompress_brotli: None,
+                decompress_zstd: None,
+                decompress_deflate: None,
             }),
         )
         .unwrap_or_else(|_| panic!("valid body policy was rejected"));

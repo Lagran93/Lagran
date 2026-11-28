@@ -55,8 +55,10 @@ pub fn decide(domain: &DomainEntry, method: &Method, headers: &HeaderMap) -> Dec
             log: false,
         };
     }
-    let decompressible =
-        (body.decompress_gzip && facts.is_gzip()) || (body.decompress_brotli && facts.is_brotli());
+    let decompressible = (body.decompress_gzip && facts.is_gzip())
+        || (body.decompress_brotli && facts.is_brotli())
+        || (body.decompress_zstd && facts.is_zstd())
+        || (body.decompress_deflate && facts.is_deflate());
     if !facts.is_identity() && !decompressible {
         return uninspectable(body, "content-encoding");
     }
@@ -392,6 +394,32 @@ mod tests {
             decide(&d, &Method::POST, &br),
             Decision::Inspect { .. }
         ));
+    }
+
+    #[test]
+    fn zstd_and_deflate_are_inspected_when_enabled() {
+        let mut body = BodyInspection {
+            enabled: true,
+            decompress_zstd: true,
+            decompress_deflate: true,
+            ..BodyInspection::default()
+        };
+        body.finalize();
+        let d = domain(body);
+        for coding in ["zstd", "deflate"] {
+            let mut headers = headers("POST", "application/json", Some("10"));
+            headers.insert(
+                axum::http::header::CONTENT_ENCODING,
+                coding.parse().unwrap(),
+            );
+            assert!(
+                matches!(
+                    decide(&d, &Method::POST, &headers),
+                    Decision::Inspect { .. }
+                ),
+                "{coding} should be inspectable"
+            );
+        }
     }
 
     #[test]

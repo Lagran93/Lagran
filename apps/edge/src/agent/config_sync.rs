@@ -355,6 +355,10 @@ struct BodyCfg {
     decompress_gzip: bool,
     #[serde(default)]
     decompress_brotli: bool,
+    #[serde(default)]
+    decompress_zstd: bool,
+    #[serde(default)]
+    decompress_deflate: bool,
 }
 
 fn default_challenge_difficulty() -> u8 {
@@ -624,6 +628,8 @@ fn body_inspection(cfg: &BodyCfg) -> BodyInspection {
         inspect_unknown_length: cfg.inspect_unknown_length,
         decompress_gzip: cfg.decompress_gzip,
         decompress_brotli: cfg.decompress_brotli,
+        decompress_zstd: cfg.decompress_zstd,
+        decompress_deflate: cfg.decompress_deflate,
     };
     if env_truthy("WAF_BODY_INSPECTION") {
         body.enabled = true;

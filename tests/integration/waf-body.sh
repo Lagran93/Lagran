@@ -91,7 +91,7 @@ DOMAIN_ID=$(curl -s -H "$AUTH" "http://127.0.0.1:$CONTROL_PORT/api/v1/domains" \
   | jq -r --arg n "$DOMAIN" '.[] | select(.name == $n) | .id')
 [[ -n "$DOMAIN_ID" ]] || { echo "domain not found"; exit 1; }
 
-BODY_SETTINGS='{"enabled":true,"max_bytes":1024,"methods":["POST","PUT","PATCH"],"content_types":["application/json","multipart/form-data"],"oversize_policy":"log","uninspectable_policy":"log","timeout_ms":1000,"inspect_unknown_length":true,"decompress_gzip":true,"decompress_brotli":true}'
+BODY_SETTINGS='{"enabled":true,"max_bytes":1024,"methods":["POST","PUT","PATCH"],"content_types":["application/json","multipart/form-data"],"oversize_policy":"log","uninspectable_policy":"log","timeout_ms":1000,"inspect_unknown_length":true,"decompress_gzip":true,"decompress_brotli":true,"decompress_zstd":true,"decompress_deflate":true}'
 curl -s -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"enabled":true,"mode":"block","sqli":true,"xss":true,"traversal":true,"scanners":true,"rce":true,"ssrf":true,"xxe":true,"log4shell":true,"crlf":true,"ssti":true,"nosql":true,"ldap":true,"java":true,"webshell":true,"protocol":true,"challenge_difficulty":2,"challenge_ttl_secs":300,"body":'"$BODY_SETTINGS"'}' >/dev/null
@@ -206,6 +206,23 @@ BR=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
   -H 'Content-Encoding: br' --data-binary @"$LOG_DIR/evil.json.br" \
   "http://127.0.0.1:$EDGE_PORT/api/echo")
 check "SQLi in a brotli body blocked" "$BR" "403"
+
+printf '%s' 'KLUv/SAQgQAAeyJxIjoiJyBvciAxPTEifQ==' | base64 -d >"$LOG_DIR/evil.json.zst"
+ZSTD=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  -X POST -H "Host: $DOMAIN" -H 'content-type: application/json' \
+  -H 'Content-Encoding: zstd' --data-binary @"$LOG_DIR/evil.json.zst" \
+  "http://127.0.0.1:$EDGE_PORT/api/echo")
+check "SQLi in a zstd body blocked" "$ZSTD" "403"
+
+python3 - "$LOG_DIR/evil.json.zz" <<'PY'
+import sys, zlib
+open(sys.argv[1], "wb").write(zlib.compress(b'{"q":"\' or 1=1"}'))
+PY
+DEFLATE=$(curl -s -o "$LOG_DIR/body" -D "$LOG_DIR/headers" -w '%{http_code}' \
+  -X POST -H "Host: $DOMAIN" -H 'content-type: application/json' \
+  -H 'Content-Encoding: deflate' --data-binary @"$LOG_DIR/evil.json.zz" \
+  "http://127.0.0.1:$EDGE_PORT/api/echo")
+check "SQLi in a deflate body blocked" "$DEFLATE" "403"
 
 python3 - "$LOG_DIR/evil.multipart" <<'PY'
 import sys

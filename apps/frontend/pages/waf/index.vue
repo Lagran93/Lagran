@@ -362,6 +362,31 @@
                 <input v-model="settings.body.decompress_brotli" type="checkbox" style="display: none" />
               </label>
             </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-title">解压 zstd 后检查</div>
+                <div class="setting-desc">
+                  仅 Content-Encoding: zstd；解压后最多扫描 256 KiB，失败返回 413/415。
+                </div>
+              </div>
+              <label class="switch" :class="{ on: settings.body.decompress_zstd }">
+                <span class="switch-track" />
+                <input v-model="settings.body.decompress_zstd" type="checkbox" style="display: none" />
+              </label>
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-title">解压 deflate 后检查</div>
+                <div class="setting-desc">
+                  仅 Content-Encoding: deflate（zlib 包装）；解压后最多扫描 256 KiB，
+                  失败返回 413/415。
+                </div>
+              </div>
+              <label class="switch" :class="{ on: settings.body.decompress_deflate }">
+                <span class="switch-track" />
+                <input v-model="settings.body.decompress_deflate" type="checkbox" style="display: none" />
+              </label>
+            </div>
           </template>
 
           <div class="section-label">浏览器质询</div>
@@ -1018,6 +1043,8 @@ function emptyBody() {
     inspect_unknown_length: false,
     decompress_gzip: false,
     decompress_brotli: false,
+    decompress_zstd: false,
+    decompress_deflate: false,
   }
 }
 

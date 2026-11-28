@@ -138,6 +138,8 @@ pub struct WafBodyOut {
     pub inspect_unknown_length: bool,
     pub decompress_gzip: bool,
     pub decompress_brotli: bool,
+    pub decompress_zstd: bool,
+    pub decompress_deflate: bool,
 }
 
 impl Default for WafBodyOut {
@@ -157,6 +159,8 @@ impl Default for WafBodyOut {
             inspect_unknown_length: false,
             decompress_gzip: false,
             decompress_brotli: false,
+            decompress_zstd: false,
+            decompress_deflate: false,
         }
     }
 }
@@ -449,6 +453,8 @@ fn waf_config_from(
             inspect_unknown_length: settings.body_inspect_unknown_length,
             decompress_gzip: settings.body_decompress_gzip,
             decompress_brotli: settings.body_decompress_brotli,
+            decompress_zstd: settings.body_decompress_zstd,
+            decompress_deflate: settings.body_decompress_deflate,
         },
     }
 }
@@ -997,6 +1003,8 @@ mod tests {
             body_inspect_unknown_length: false,
             body_decompress_gzip: false,
             body_decompress_brotli: false,
+            body_decompress_zstd: false,
+            body_decompress_deflate: false,
         }
     }
 
@@ -1258,6 +1266,8 @@ mod tests {
         settings.body_inspect_unknown_length = true;
         settings.body_decompress_gzip = true;
         settings.body_decompress_brotli = true;
+        settings.body_decompress_zstd = true;
+        settings.body_decompress_deflate = true;
         let waf = waf_config_from("example.com", settings, vec![], vec![], vec![], &[]);
         assert!(waf.body.enabled);
         assert_eq!(waf.body.max_bytes, 65_536);
@@ -1269,6 +1279,8 @@ mod tests {
         assert!(waf.body.inspect_unknown_length);
         assert!(waf.body.decompress_gzip);
         assert!(waf.body.decompress_brotli);
+        assert!(waf.body.decompress_zstd);
+        assert!(waf.body.decompress_deflate);
     }
 
     #[test]
